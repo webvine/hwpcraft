@@ -1,0 +1,11 @@
+[package]
+name = "hwpcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+hwpcraft-ui-egui.workspace = true
+eframe.workspace = true
+anyhow.workspace = true
+[lints]
+workspace = true

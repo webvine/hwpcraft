@@ -1,0 +1,62 @@
+HwpCraft third-party notices
+
+HwpCraft itself is released under the MIT License (see LICENSE). The source
+tree and binary distributions include or link the following third-party work.
+Full license texts for bundled assets are kept in assets/licenses/ and
+assets/icons/lucide/LICENSE.txt and are shipped with every binary package.
+A complete list of Rust crate dependencies with their licenses is generated
+into THIRD-PARTY-DEPENDENCIES.md from Cargo.lock.
+
+1. RHWP — https://github.com/edwardkim/rhwp
+   Copyright (c) 2025-2026 Edward Kim. MIT License.
+   HWP / HWPX document engine, linked as a path dependency (../rhwp, v0.8.7).
+   Only the RHWP library crates are used; no RHWP Studio web assets are
+   included. RHWP's vendored svg2pdf patch (MIT OR Apache-2.0) keeps its own
+   notices. License text: assets/licenses/LICENSE-RHWP-MIT.txt.
+   RHWP's PDF export may embed its bundled fallback font Noto Sans KR
+   (SIL Open Font License 1.1) into exported documents.
+
+2. Lucide Icons — https://lucide.dev
+   Copyright (c) 2026 Lucide Icons and Contributors. ISC License.
+   The ribbon icon atlas assets/toolbar-icons.png is built from the SVG files
+   in assets/icons/lucide/ by crates/render/examples/build_icon_atlas.rs.
+   License text: assets/icons/lucide/LICENSE.txt.
+
+3. WordCraft — https://github.com/storytold/wordcraft
+   Copyright (c) 2026 ArtCraft Team and the WordCraft contributors. MIT License.
+   crates/ui-egui/src/ribbon_layout.rs adapts WordCraft's ribbon_fit.rs;
+   crates/formats/src/file_access.rs adapts WordCraft's file_access.rs; the
+   MCP lifecycle / tools / session structure follows WordCraft's crates/mcp.
+   License text: assets/licenses/LICENSE-WordCraft-MIT.txt.
+
+4. DeckCraft and DesignCraft (MIT License)
+   Copyright (c) 2026 ArtCraft Team and the respective contributors.
+   crates/ui-egui/src/chrome.rs adapts DesignCraft's theme tokens and
+   DeckCraft's modal action sizing; format_dialogs.rs uses their draft/commit
+   dialog pattern. License texts: assets/licenses/LICENSE-DeckCraft-MIT.txt,
+   assets/licenses/LICENSE-DesignCraft-MIT.txt.
+
+5. egui / eframe / epaint (MIT OR Apache-2.0) and their default fonts, which
+   are compiled into the desktop binary by epaint_default_fonts:
+   - Hack (MIT License) — assets/licenses/LICENSE-Hack-MIT.txt
+   - Noto Emoji (SIL Open Font License 1.1) — assets/licenses/LICENSE-NotoEmoji-OFL.txt
+   - Ubuntu Light (Ubuntu Font Licence 1.0) — assets/licenses/LICENSE-Ubuntu-UFL.txt
+   - emoji-icon-font (MIT License) — assets/licenses/LICENSE-emoji-icon-font-MIT.txt
+
+6. resvg / usvg / tiny-skia (MIT OR Apache-2.0), image (MIT OR Apache-2.0),
+   serde / serde_json / anyhow (MIT OR Apache-2.0) and the other crates listed
+   in THIRD-PARTY-DEPENDENCIES.md. Crates offered under a choice of licenses
+   are used under the MIT license where available, otherwise under
+   Apache-2.0; no GPL-only or AGPL code is included.
+
+Runtime fonts: the desktop UI uses Korean fonts already installed on the
+user's system (for example Malgun Gothic on Windows, Apple SD Gothic Neo on
+macOS, Noto Sans CJK KR or NanumGothic on Linux). No Microsoft or Hancom
+fonts are included in the source tree or in binary packages. Sample
+documents under samples/ reference the open Noto Sans KR font.
+
+HwpCraft is an independent open-source project. It is not affiliated with,
+sponsored by or endorsed by Hancom Inc. "Hancom", "Hangul" (한글), "HWP" and
+"HWPX" are trademarks of their respective owners and are used only to
+describe file-format compatibility. No Hancom application code, icons,
+logos, fonts, templates or clip art are included.

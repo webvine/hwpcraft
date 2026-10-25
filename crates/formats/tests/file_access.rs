@@ -1,0 +1,79 @@
+use hwpcraft_formats::file_access::{Access, AutomationRoots, check_read, check_write, confine};
+
+#[test]
+fn confinement_checks_components_traversal_and_restores_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    let sibling = dir.path().join("work2");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+    let roots = AutomationRoots::new(Some(&root), Some(&root))
+        .unwrap()
+        .unwrap();
+    let path = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+    assert!(
+        roots
+            .check(&path(root.join("new/deep/doc.hwpx")), Access::Write)
+            .is_ok()
+    );
+    for bad in [
+        sibling.join("doc.hwpx"),
+        root.join("../work2/doc.hwpx"),
+        root.join("missing/../../work2/doc.hwpx"),
+    ] {
+        assert!(roots.check(&path(bad), Access::Write).is_err());
+    }
+    confine(Some(&roots), || {
+        assert!(check_read(&path(sibling.join("x"))).is_err());
+        assert!(check_write(&path(root.join("ok"))).is_ok());
+    });
+    assert!(check_read(&path(sibling.join("x"))).is_ok());
+    let write_only = AutomationRoots::new(None, Some(&root)).unwrap().unwrap();
+    assert!(
+        write_only
+            .check(&path(root.join("x")), Access::Read)
+            .is_err()
+    );
+    assert!(AutomationRoots::new(Some(&dir.path().join("missing")), None).is_err());
+    #[cfg(windows)]
+    for device in ["NUL", "CON.txt", "COM1"] {
+        assert!(
+            roots
+                .check(&path(root.join(device)), Access::Write)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn links_outside_roots_are_rejected_when_platform_allows_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let link = root.join("link");
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_dir(&outside, &link);
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(&outside, &link);
+    #[cfg(not(any(windows, unix)))]
+    let made: std::io::Result<()> = Err(std::io::ErrorKind::Unsupported.into());
+    if let Err(e) = made {
+        eprintln!("symlink test skipped: {e}");
+        return;
+    }
+    let roots = AutomationRoots::new(Some(&root), Some(&root))
+        .unwrap()
+        .unwrap();
+    assert!(
+        roots
+            .check(&link.join("doc.hwpx").to_string_lossy(), Access::Write)
+            .is_err()
+    );
+    assert!(
+        roots
+            .check(&link.join("doc.hwpx").to_string_lossy(), Access::Read)
+            .is_err()
+    );
+}

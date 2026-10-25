@@ -1,0 +1,18 @@
+/target/
+/runtime/
+/output/
+/logs/
+*.tmp
+
+# Internal analysis and team-process notes: kept locally, never published.
+/docs/REA-GHIDRA-PHASE3.md
+/docs/HWP-COMMAND-COVERAGE.csv
+/docs/HWP-UI-PARITY.md
+/docs/PHASE4-AUDIT.md
+/docs/VERIFICATION.md
+/docs/TEAM-PLAN.md
+/docs/TEAM-PLAN-0.13.md
+/docs/team/
+/tools/rea_ghidra_session.mjs
+/tools/inventory_hwp_ui.py
+/tools/build_feature_catalog.py

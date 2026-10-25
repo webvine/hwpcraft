@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+default-members = ["apps/hwpcraft", "apps/hwpcraft-cli"]
+
+[workspace.package]
+version = "0.12.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"
+
+[workspace.dependencies]
+hwpcraft-doc = { path = "crates/doc" }
+hwpcraft-formats = { path = "crates/formats" }
+hwpcraft-render = { path = "crates/render" }
+hwpcraft-engine = { path = "crates/engine" }
+hwpcraft-mcp = { path = "crates/mcp" }
+hwpcraft-ui-egui = { path = "crates/ui-egui" }
+rhwp = { path = "../rhwp", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+egui = "0.36"
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+rfd = "0.17"
+arboard = { version = "3.7", default-features = false, features = ["windows-sys"] }
+resvg = "0.45"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
+tempfile = "3"
+base64 = "0.22"
+
+[patch.crates-io]
+svg2pdf = { path = "../rhwp/vendor/svg2pdf" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+opt-level = 2
+debug = 0
+lto = false
+codegen-units = 16
+
+[profile.dev]
+debug = 0
+

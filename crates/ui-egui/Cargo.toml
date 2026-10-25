@@ -1,0 +1,19 @@
+[package]
+name = "hwpcraft-ui-egui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+hwpcraft-engine.workspace = true
+hwpcraft-doc.workspace = true
+hwpcraft-render.workspace = true
+hwpcraft-formats.workspace = true
+egui.workspace = true
+eframe.workspace = true
+rfd.workspace = true
+arboard.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+image.workspace = true
+[lints]
+workspace = true

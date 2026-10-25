@@ -1,0 +1,13 @@
+[package]
+name = "hwpcraft-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+resvg.workspace = true
+anyhow.workspace = true
+hwpcraft-doc.workspace = true
+[lints]
+workspace = true
+[dev-dependencies]
+hwpcraft-formats.workspace = true
