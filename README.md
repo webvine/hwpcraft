@@ -10,6 +10,19 @@ HwpCraft는 독립적인 오픈소스 프로젝트이며 한글과컴퓨터와 �
 
 라이선스: **MIT** ([LICENSE](LICENSE)). 적용 범위와 제3자 구성 요소는 [라이선스](#라이선스) 절을 참조하세요. 기여 방법: [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## 최종 목표
+
+HwpCraft의 최종 목표는 **AI가 MCP를 통해 아래한글 문서를 작성하고, 보고서·리포트로 완성해 출력하는 일을 사람 손 없이 끝까지 해내는 것**입니다. 데스크톱 편집기는 사람이 결과를 검토하고 손보는 자리이고, 자동화의 중심은 `hwpcraft-cli mcp`가 제공하는 MCP 서버입니다.
+
+이를 위해 다음을 최대한 완성합니다.
+
+- **문서 작성·편집의 전 과정을 MCP 명령으로 노출** — 새 문서, 텍스트 입력, 글자·문단 모양, 스타일, 표, 그림, 차트, 수식, 각주·미주, 머리말·꼬리말, 쪽 번호, 다단, 책갈피, 하이퍼링크, 찾기/바꾸기, 한자 변환, 상용구, 문서 비교까지 데스크톱에서 할 수 있는 편집은 모두 에이전트도 할 수 있어야 합니다. 아래한글 자동화 동작 이름(`hwp_action`)을 그대로 받아 기존 매크로·스크립트 지식을 재사용합니다.
+- **보고서·리포트 산출에 필요한 요소를 갖춤** — 표지, 목차, 제목 체계, 번호 매기기, 표와 그림 캡션, 참조, 쪽 설정과 인쇄용 레이아웃을 명령으로 조립할 수 있게 하고, 서식 템플릿과 스타일을 적용해 일관된 문서를 만듭니다.
+- **출력과 검증을 자동화** — HWP/HWPX 저장, PDF 출력, PNG 렌더로 결과를 확인하고, 일괄 명령(`batch`)이 하나라도 실패하면 문서를 되돌려 깨진 산출물을 남기지 않습니다.
+- **아래한글과의 호환성** — RHWP 엔진 위에서 아래한글이 읽고 쓰는 그대로 저장하며, 지원하지 않는 기능은 숨기지 않고 [현재 범위와 한계](#현재-범위와-한계)에 적습니다.
+
+진행 상황은 [하는 일](#하는-일)과 릴리스 노트(`docs/`)에, 남은 항목은 한계 절에 기록합니다.
+
 ## 구성 원리
 
 HwpCraft는 두 오픈소스 프로젝트를 결합해 구현했습니다. 어느 부분이 어디서 왔는지 분명히 적습니다.
@@ -32,7 +45,8 @@ HwpCraft는 두 오픈소스 프로젝트를 결합해 구현했습니다. 어�
 ### 편집
 
 - 여러 문단 선택(Shift+클릭·끌기·Shift+방향키), 전체 선택(Ctrl+A), 두 번 클릭 낱말·세 번 클릭 문단 선택, 수정 모드(Insert), Windows 한글 IME.
-- 커서 이동: 문단을 넘는 화살표, Home/End, 낱말(Ctrl+←/→), 문단(Ctrl+↑/↓), 문서 처음/끝(Ctrl+Home/End), PageUp/PageDown.
+- 커서 이동: 문단을 넘는 화살표, Home/End, 낱말(Ctrl+←/→), 앞/다음 문단 처음(Ctrl+↑/↓), 문서 처음/끝(Ctrl+Home/End), PageUp/PageDown.
+- 한글 글쇠 동작(0.14): Shift+Enter 줄 나눔(문단 안), Tab, Ctrl+T·Ctrl+Delete 한 단어 지우기, Ctrl+Backspace 낱말 앞 지우기, Ctrl+Y 한 줄 지우기(다시 실행은 Ctrl+Shift+Z), Alt+Y 이후 지우기, Ctrl+Alt+Space 묶음 빈 칸, Alt+Space 고정폭 빈 칸, Ctrl+Shift+- 하이픈. 같은 동작을 엔진 명령으로도 제공합니다: `caret.move`(22가지 이동, 선택 확장), `select.all/word/paragraph/line/clear/get`, `edit.copy/cut/paste`(헤드리스에서도 표·개체 포함), `edit.clipboard.get`, `text.delete_word/_back`, `text.delete_line`, `text.delete_to_line_end`, `insert.line_break/tab/nbsp/fixed_width_space/soft_hyphen`, `insert.auto_text`(날짜·시각·쪽 번호·전체 쪽수·파일 이름·사용자 이름), `edit.overwrite`, `edit.goto`(쪽·구역·문단·책갈피), `hyperlink.jump/next/prev`, `edit.find_all`, `document.statistics`, `document.outline`.
 - 복사·잘라내기·붙이기: 앱 안에서는 서식·표·개체 유지. 다른 프로그램과는 **HTML**로 주고받아 굵게·색·문단이 살아남고, HTML이 없거나 해석에 실패하면 일반 텍스트로 붙입니다.
 - 암호 문서: 암호가 걸린 HWP/HWPX/HWP3를 열면 암호를 묻고, 연 문서는 같은 암호로 저장합니다. 보안 탭 **문서 암호**로 암호를 걸거나 바꾸거나 풉니다. CLI는 `--password <암호>`.
 - 실행 취소/다시 실행 40단계. 이어서 친 글자는 낱말 단위로 묶습니다.
@@ -84,7 +98,7 @@ hwpcraft-cli mcp --help                     # 로컬 stdio MCP 서버
 
 `edit`의 명령 파일은 `[{"command":"text.insert","params":{"text":"안녕하세요"}},{"command":"page.setup","params":{"landscape":true}}]` 형태의 JSON 배열이며 최대 1 MB / 1,000개 명령입니다. 전체 명령이 성공한 뒤에만 출력 파일을 저장합니다. 텍스트 위치(offset)는 유니코드 스칼라 값 단위입니다.
 
-`hwpcraft-cli mcp`는 헤드리스 stdio MCP 서버입니다. 한글 문서 생성, 텍스트/서식/표/개체 편집, HWP/HWPX 저장, PDF/TXT 출력, PNG 확인, 읽기/쓰기 폴더 제한을 지원합니다. 실행 중인 데스크톱 창이나 한컴 프로그램은 제어하지 않습니다. [MCP 연결과 사용법](docs/mcp.md), [명령 인자](docs/mcp-commands.md)를 참조하세요.
+`hwpcraft-cli mcp`는 헤드리스 stdio MCP 서버입니다. 한글 문서 생성, 텍스트/서식/표/개체 편집, HWP/HWPX 저장, PDF/TXT 출력, PNG 확인, 읽기/쓰기 폴더 제한을 지원합니다. 0.14: `hwp_action` 도구가 한글 자동화 동작 이름(`MoveLineEnd`, `CharShapeBold`, `DeleteWord` 등 300여 개)을 그대로 받아 대응 명령을 실행하고, `batch {atomic:true}`는 하나라도 실패하면 문서 변경을 모두 되돌리며, `get_selection`이 선택 영역을 돌려줍니다. 명령 인자 도움말은 엔진 모듈의 `PARAMS` 표에서 나옵니다. 실행 중인 데스크톱 창이나 한컴 프로그램은 제어하지 않습니다. [MCP 연결과 사용법](docs/mcp.md), [명령 인자](docs/mcp-commands.md)를 참조하세요.
 
 ## 빌드
 
@@ -153,6 +167,10 @@ hwpcraft ./samples/HwpCraft-시작하기.hwpx --view replace --screenshot out.pn
 - 문단 테두리 위·아래 간격이 줄 배치에 반영되지 않아 화면과 한글에서 연 저장본 모두 문단이 겹칠 수 있습니다. 좌우 간격과 일부 선 종류(이중선 등)는 단선으로 그려집니다.
 - 각주 구분선 길이 −1(단 너비)은 짧게, 바깥 여백이 있는 개체는 여백만큼 다른 자리에 그립니다(저장본은 한글에서 정상).
 - 형광펜은 markpen으로 저장되지만 RHWP 렌더러가 그리지 않아 HwpCraft가 화면에만 덧그립니다(인쇄·PDF에는 없음). 새 번호 목록은 새 번호 정의로 저장합니다(RHWP `set_numbering_restart`는 저장되지 않음). 곡선은 촘촘한 직선 구간으로 저장합니다.
+- 본문에 넣은 쪽 번호·전체 쪽수 자동 번호(`insert.auto_text`)는 저장되고 한글에서 번호로 표시되지만, RHWP 렌더러가 본문 자동 번호를 그리지 않아 HwpCraft 화면과 PDF에서는 빈칸입니다. 한글의 날짜 코드 필드는 RHWP에 없어 현재 날짜 글로 넣습니다.
+- 쪽 복사/지우기는 문단 단위입니다(앞 쪽에서 이어진 문단은 제외, 한 문단이 쪽 전체면 지우기 거부). 끼워 넣기는 파일 메뉴에서만(Ctrl+O는 불러오기). PDF 인쇄 옵션(형광펜·그리기 개체·그림·메모 포함)·쪽 윤곽 끄기·격자·줄 번호·바탕쪽 편집·문서 이력은 RHWP에 옵션·모델이 없어 제공하지 않습니다. 맞쪽 보기는 쪽 배치만 바꾸며 쪽 번호 안/바깥 구분은 없습니다.
+- 상용구는 글 상용구만 지원하며 서식·표·개체가 든 본문 상용구는 저장하지 않습니다(그룹·가져오기/내보내기 없음).
+- 한자 변환은 Unicode Unihan 독음표로 음절마다 후보를 고르는 방식이며 낱말 사전이 없어 아래한글처럼 낱말 단위 후보·빈도순 정렬은 하지 않습니다. 변경 내용 추적·메모 새로 넣기·맞춤법 검사는 RHWP에 모델·사전이 없어 제공하지 않습니다. 문서 비교는 추가·삭제·변경 문단 목록으로 보여 주며 나란히 보기는 없습니다. 음영 없음은 RHWP가 흰색(#ffffff)으로 보고합니다.
 - 바탕쪽, 문서 요약 정보, 쪽 테두리의 홀수/짝수·첫 쪽만·그림 채우기, 새 메모(MemoShape 미지원), 양식 개체 생성, 차트·글맵시·OLE 생성은 RHWP API가 없어 지원하지 않습니다. 스타일 추가·고치기·지우기는 RHWP wasm 래퍼에만 있어 HwpCraft가 모델을 직접 고칩니다. 줄 단위 커서 이동·선택 영역 좌표 조회는 RHWP 비공개라 캐럿 좌표로 계산합니다.
 - 탭 폭 자동 기록은 본문과 1단계 표 셀만 대상입니다. 머리말·글상자·주석 안의 탭은 폭 0으로 저장됩니다.
 - 여러 문단 선택은 한 구역 본문 또는 한 셀 안에서만 되며, 전체 선택은 현재 구역입니다.
@@ -215,6 +233,19 @@ HwpCraft is an independent open-source project. It is not affiliated with, endor
 
 License: **MIT** ([LICENSE](LICENSE)). See the [License](#license) section for scope and third-party components. Contributions: [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Final goal
+
+The final goal of HwpCraft is for **an AI agent to write Hangul (HWP / HWPX) documents through MCP and finish them as reports, exported and ready to deliver, without a person at the keyboard**. The desktop editor is where people review and touch up the result; the centre of automation is the MCP server provided by `hwpcraft-cli mcp`.
+
+To get there, HwpCraft aims to complete the following as fully as possible.
+
+- **Expose the whole writing and editing workflow as MCP commands** — new documents, text input, character and paragraph shapes, styles, tables, pictures, charts, equations, footnotes and endnotes, headers and footers, page numbers, columns, bookmarks, hyperlinks, find / replace, hanja conversion, autotext and document comparison: everything the desktop can edit, an agent must be able to edit too. Hancom Office Hangul automation action names are accepted as they are (`hwp_action`) so existing macro and script knowledge carries over.
+- **Provide the building blocks of reports** — cover pages, tables of contents, heading hierarchies, numbering, table and figure captions, references, page setup and print layout, assembled by commands, with templates and styles for consistent documents.
+- **Automate output and verification** — save as HWP / HWPX, export PDF, render PNG to check the result, and roll the document back when any step of a `batch` fails so that no broken output is left behind.
+- **Stay compatible with Hancom Office Hangul** — save exactly what Hangul reads and writes, on top of the RHWP engine, and record unsupported features honestly under [Scope and limits](#scope-and-limits) instead of hiding them.
+
+Progress is tracked under [What it does](#what-it-does) and in the release notes (`docs/`); remaining items live in the limits section.
+
 ## How HwpCraft is built
 
 HwpCraft combines two open-source projects. This section states which part comes from where.
@@ -237,7 +268,8 @@ No Hancom code or resources are used in any layer. Hancom Office Hangul is the r
 ### Editing
 
 - Multi-paragraph selection (Shift+click, drag, Shift+arrows), Ctrl+A, double-click word / triple-click paragraph selection, overwrite mode (Insert), Windows Korean IME input.
-- Cursor movement across paragraphs, Home/End, Ctrl+←/→ by word, Ctrl+↑/↓ by paragraph, Ctrl+Home/End, PageUp/PageDown.
+- Cursor movement across paragraphs, Home/End, Ctrl+←/→ by word, Ctrl+↑/↓ to the previous / next paragraph start, Ctrl+Home/End, PageUp/PageDown.
+- Hangul keyboard actions (0.14): Shift+Enter line break inside a paragraph, Tab, Ctrl+T / Ctrl+Delete delete word, Ctrl+Backspace delete word back, Ctrl+Y delete line (redo is Ctrl+Shift+Z), Alt+Y delete to end of line, Ctrl+Alt+Space non-breaking space, Alt+Space fixed-width space, Ctrl+Shift+- soft hyphen. The same actions are engine commands: `caret.move` (22 motions, selection extension), `select.all/word/paragraph/line/clear/get`, `edit.copy/cut/paste` (tables and objects included, also headless), `edit.clipboard.get`, `text.delete_word/_back`, `text.delete_line`, `text.delete_to_line_end`, `insert.line_break/tab/nbsp/fixed_width_space/soft_hyphen`, `insert.auto_text` (date, time, page number, total pages, file name, user name), `edit.overwrite`, `edit.goto` (page, section, paragraph, bookmark), `hyperlink.jump/next/prev`, `edit.find_all`, `document.statistics`, `document.outline`.
 - Copy, cut and paste that keep formatting, tables and objects inside the app; **HTML** to and from other programs (bold, colours and paragraphs survive), with plain text as the fallback.
 - Password-protected documents: an encrypted HWP / HWPX / HWP3 asks for its password on open and is saved with the same password; the Security tab sets, changes or clears a password. The CLI takes `--password`.
 - Undo/redo (40 steps, consecutive typing grouped by word).
@@ -289,7 +321,7 @@ hwpcraft-cli mcp --help                     # local stdio MCP server
 
 The `edit` command file is a JSON array such as `[{"command":"text.insert","params":{"text":"Hello"}},{"command":"page.setup","params":{"landscape":true}}]`, limited to 1 MB / 1,000 commands. The output file is written only when every command succeeds. Text offsets count Unicode scalar values.
 
-`hwpcraft-cli mcp` is a headless stdio MCP server: create Korean documents, edit text / formatting / tables / objects, save HWP / HWPX, export PDF / TXT, render PNG for checking, and restrict read / write roots. It does not control a running desktop window or Hancom software. See [docs/mcp.md](docs/mcp.md) and [docs/mcp-commands.md](docs/mcp-commands.md) (Korean).
+`hwpcraft-cli mcp` is a headless stdio MCP server: create Korean documents, edit text / formatting / tables / objects, save HWP / HWPX, export PDF / TXT, render PNG for checking, and restrict read / write roots. 0.14 adds `hwp_action`, which accepts Hangul automation action names (`MoveLineEnd`, `CharShapeBold`, `DeleteWord`, about 300 of them) and runs the matching command, `batch {atomic:true}` that rolls every document change back when any command fails, and `get_selection`. It does not control a running desktop window or Hancom software. See [docs/mcp.md](docs/mcp.md) and [docs/mcp-commands.md](docs/mcp-commands.md) (Korean).
 
 ## Build
 
@@ -358,6 +390,10 @@ Feature areas plug in through `extensions.rs`, so each area adds its own command
 - Paragraph border top / bottom spacing is not reflected in line layout, so paragraphs may overlap both on screen and in Hangul. Side spacing and some line styles (double lines) draw as single lines.
 - Footnote separator length −1 (column width) is drawn short, and objects with outer margins are offset on screen (saved files open correctly in Hangul).
 - The highlighter is saved as markpen marks but RHWP's renderer does not paint them, so HwpCraft overlays them on screen only (not in print / PDF). New numbered lists create new numbering definitions (RHWP's `set_numbering_restart` is not saved); curves are saved as dense polylines.
+- Page-number / total-page auto numbers inserted into body text (`insert.auto_text`) are saved and Hangul shows the numbers, but RHWP's renderer does not draw body auto numbers, so HwpCraft's screen and PDF leave them blank. Hangul's date-code field has no RHWP counterpart; the current date is inserted as text.
+- Page copy / delete work per paragraph (a paragraph continued from the previous page is left out; deleting is refused when one paragraph fills the page). Insert file lives in the File menu only (Ctrl+O stays Open). PDF print options (highlighter, drawing objects, pictures, memos), page outline off, grid, line numbers, master-page editing and document history are not provided because RHWP has no option or model for them. Facing pages only changes the page layout.
+- AutoText (상용구) stores plain-text entries only; body entries with formatting, tables or objects are not saved (no groups or import / export).
+- Hanja conversion picks candidates per syllable from the Unicode Unihan reading table; without a word dictionary it does not offer word-level candidates or frequency ordering like Hangul. Track changes, new memos and spell checking are not provided because RHWP has no model or dictionary for them. Document compare lists added / removed / changed paragraphs without a side-by-side view. "No shading" is reported by RHWP as white (#ffffff).
 - Master pages, document summary, odd / even / first-page-only page borders, picture fill, new memos (MemoShape unsupported), form-object creation, chart / WordArt / OLE creation are unavailable because RHWP has no API for them. Style create / update / delete exist only in RHWP's wasm wrapper, so HwpCraft edits the model directly. Line-based caret motion and selection-rectangle queries are crate-private in RHWP; HwpCraft computes them from caret geometry.
 - Automatic tab-width recording covers body text and first-level table cells only; tabs inside headers, text boxes and notes are saved with width 0.
 - Multi-paragraph selection works within one section body or one cell; Select All covers the current section.
