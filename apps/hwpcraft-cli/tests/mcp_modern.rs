@@ -1043,17 +1043,52 @@ fn native_chart_authoring_via_mcp_preserves_state_and_roundtrips_real_doughnut_o
             let [r, g, b, a] = pixel.0;
             a > 200 && r.max(g).max(b) - r.min(g).min(b) > 60
         };
-        let points: Vec<_> = raster
-            .enumerate_pixels()
-            .filter(|(_, _, pixel)| colored(pixel))
-            .map(|(x, y, _)| (x, y))
-            .collect();
+        // Legend is explicitly disabled, but other colored output on the page
+        // (for example an emoji drawn by a color font) must not widen the box:
+        // measure the largest 8-connected colored region, which is the ring.
+        let (width, height) = raster.dimensions();
+        let mut seen = vec![false; (width * height) as usize];
+        let mut points: Vec<(u32, u32)> = Vec::new();
+        for (x, y, pixel) in raster.enumerate_pixels() {
+            if seen[(y * width + x) as usize] || !colored(pixel) {
+                continue;
+            }
+            seen[(y * width + x) as usize] = true;
+            let mut region = vec![(x, y)];
+            let mut next = 0;
+            while next < region.len() {
+                let (px, py) = region[next];
+                next += 1;
+                for (dx, dy) in [
+                    (-1, -1),
+                    (0, -1),
+                    (1, -1),
+                    (-1, 0),
+                    (1, 0),
+                    (-1, 1),
+                    (0, 1),
+                    (1, 1),
+                ] {
+                    let (nx, ny) = (px as i64 + dx, py as i64 + dy);
+                    if nx < 0 || ny < 0 || nx >= width as i64 || ny >= height as i64 {
+                        continue;
+                    }
+                    let (nx, ny) = (nx as u32, ny as u32);
+                    let index = (ny * width + nx) as usize;
+                    if !seen[index] && colored(raster.get_pixel(nx, ny)) {
+                        seen[index] = true;
+                        region.push((nx, ny));
+                    }
+                }
+            }
+            if region.len() > points.len() {
+                points = region;
+            }
+        }
         assert!(
             points.len() > 1000,
             "{extension} has no actual colored chart"
         );
-        // Legend is explicitly disabled. The colored bounding box is therefore
-        // the ring itself, independently measured from output pixels.
         let left = points
             .iter()
             .map(|(x, _)| *x)
