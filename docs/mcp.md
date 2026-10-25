@@ -58,6 +58,8 @@ MCP 클라이언트의 서버 설정 예제입니다. 클라이언트가 프로�
 | `get_text` | `start?`, `limit?`: 본문과 1단계 표 셀 텍스트 조회 |
 | `inspect_document` | `start?`, `limit?`: 요약·선택·문단·스타일/서식 참조 조회 |
 | `render_page` | `page?`: 1부터, `scale?`: 0.25–2.0. PNG를 MCP 이미지로 반환 |
+| `hwp_action` | `id?`, `params?`, `query?`: 한글 자동화 동작 이름(`MoveLineEnd`, `CharShapeBold`, `DeleteWord` …)으로 대응 명령 실행. 대응표의 기본 인자 위에 `params`를 덮어씀. `id`를 생략하면 동작 목록(`query`로 거름) |
+| `get_selection` | 커서·anchor·spanAnchor·선택 텍스트 조회 |
 
 상세 인자는 [명령 참고](mcp-commands.md)에 있습니다. 명령 검색 결과는 엔진 목록에서 생성하며 별도 편집 엔진을 만들지 않습니다.
 `file.new/open/save/save_as/pdf`는 MCP 경계에서 경로 기반 작업으로 처리합니다. GUI 대화상자는 열지 않습니다.
@@ -67,8 +69,9 @@ MCP 클라이언트의 서버 설정 예제입니다. 클라이언트가 프로�
 읽기 실패는 기존 문서·선택·undo를 보존합니다. 저장은 임시 파일을 완성한 뒤 교체합니다.
 PDF/TXT 내보내기는 현재 HWP/HWPX 저장 경로나 미저장 상태를 변경하지 않습니다.
 
-`batch`는 전체 트랜잭션이 아닙니다. 기본값은 첫 실패에서 중단하며 앞서 성공한 편집·파일 쓰기는 남습니다.
+`batch`는 기본적으로 전체 트랜잭션이 아닙니다. 기본값은 첫 실패에서 중단하며 앞서 성공한 편집·파일 쓰기는 남습니다.
 `keepGoing:true`이면 나머지를 실행하지만 하나라도 실패하면 `isError:true`와 명령별 결과를 반환합니다.
+`atomic:true`이면 시작 전 스냅샷을 잡고, 하나라도 실패하면 그때까지의 문서 변경을 모두 되돌려 `rolledBack:true`로 알립니다(파일 명령은 넣을 수 없고 `keepGoing`은 무시, 되돌린 뒤 다시 실행 기록은 비워집니다).
 전체 batch의 JSON 명령 구조는 실행 전에 검증합니다. 문서 편집의 undo/redo는 기존 엔진 정책을 따릅니다.
 
 ## 예제: 한글 보고서
@@ -103,7 +106,8 @@ UTF-8 바이트나 UTF-16 코드 유닛 수로 계산하지 마세요. `inspect_
 - 구현 프로토콜: `2025-06-18`. 다른 버전 요청에는 이 버전을 제안하며 클라이언트가 호환성을 판단합니다.
 - `initialize` → `notifications/initialized` 이후 도구와 리소스를 사용할 수 있습니다. `ping`은 초기화 전에도 가능합니다.
 - `hwpcraft://document`: 첫 100개 문단의 구조. 이후는 `inspect_document`로 조회합니다.
-- `hwpcraft://commands`: 전체 명령 목록·인자 설명·예제.
+- `hwpcraft://commands`: 전체 명령 목록·인자 설명·예제. 각 명령에 대응하는 한글 동작 이름(`hwpActions`)도 포함합니다.
+- `hwpcraft://hwp-actions`: 한글 자동화 동작 이름 → HwpCraft 명령·기본 인자 대응표(`mapping`: mapped/partial).
 - stdout에는 JSON-RPC 응답만 기록하고 오류 진단은 stderr로 보냅니다. EOF 또는 출력 파이프 종료로 세션을 끝냅니다.
 - 잘못된 JSON/프로토콜은 JSON-RPC error, 유효한 도구 실행 실패는 `isError:true`로 반환합니다.
 - 요청 한 줄은 최대 4 MiB, 응답은 최대 32 MiB입니다. 과대 입력은 오류 응답 후 연결을 끝냅니다.

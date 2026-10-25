@@ -140,8 +140,50 @@ pub(crate) struct State {
     style_update: Option<(bool, Value)>,
     font_language: usize,
     text_color: Option<String>,
+    shade_color: Option<String>,
     highlight: Option<String>,
     copied: Option<(Value, Value)>,
+    overlap: Option<OverlapDialog>,
+}
+/// 글자 겹치기 window: `control` is set when editing the control under the caret.
+struct OverlapDialog {
+    chars: String,
+    border: usize,
+    size: f64,
+    overlap: bool,
+    control: Option<usize>,
+}
+/// Hangul's 글자 겹치기 테두리 모양 list, in HWP border-type order (0–6).
+const OVERLAP_BORDERS: [&str; 7] = [
+    "글자끼리 겹치기",
+    "원",
+    "반전 원",
+    "사각형",
+    "반전 사각형",
+    "삼각형",
+    "반전 삼각형",
+];
+/// One row of Hangul's preset 글자 색 / 음영 / 형광펜 swatches (the engine's measured
+/// `COLOR_PRESETS`); returns the clicked preset's `#rrggbb`.
+fn preset_row(ui: &mut egui::Ui) -> Option<String> {
+    let mut out = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        for (_, label, hex) in hwpcraft_engine::COLOR_PRESETS {
+            let (r, resp) = ui.allocate_exact_size(Vec2::splat(20.0), egui::Sense::click());
+            ui.painter().rect(
+                r,
+                1.0,
+                rgb(hex),
+                Stroke::new(1.0, Color32::from_gray(150)),
+                egui::StrokeKind::Inside,
+            );
+            if resp.on_hover_text(label).clicked() {
+                out = Some(hex.to_owned());
+            }
+        }
+    });
+    out
 }
 impl State {
     /// Called by the 글자/문단 모양 window in style mode.
@@ -205,6 +247,12 @@ const ENGINE_IDS: &[&str] = &[
     "format.outline.toggle",
     "format.level.increase",
     "format.level.decrease",
+    "format.superscript.cycle",
+    "format.indent.at_caret",
+    "format.paragraph.up",
+    "format.paragraph.down",
+    "format.style.clear_char",
+    "format.style.update_from_caret",
 ];
 /// Hangul commands shown on the ribbon that HwpCraft cannot perform yet.
 const UNSUPPORTED: &[&str] = &[
@@ -220,6 +268,10 @@ const UI_IDS: &[&str] = &[
     "format.copy_shape",
     "format.highlight",
     "format.text_color",
+    "format.shade_color",
+    "format.font.next",
+    "format.font.prev",
+    "format.char_overlap.dialog",
     "format.char_border",
     "format.paragraph_border",
     "format.tabs",
@@ -281,8 +333,23 @@ impl HwpApp {
                     .text_color
                     .clone()
                     .unwrap_or("#ff0000".into());
-                self.run("format.character", json!({ "textColor": c }));
+                self.run("format.text_color", json!({ "color": c }));
             }
+            "format.shade_color" => {
+                let c = self
+                    .ext
+                    .format
+                    .shade_color
+                    .clone()
+                    .unwrap_or("#ffff00".into());
+                self.run("format.shade_color", json!({ "color": c }));
+            }
+            "format.font.next" | "format.font.prev" => {
+                format_dialogs::load_fonts(&self.renderer);
+                let fonts = format_dialogs::font_names();
+                self.run(id, json!({ "fonts": fonts }));
+            }
+            "format.char_overlap.dialog" => self.open_overlap(),
             "format.copy_shape" => self.copy_shape(),
             _ => return false,
         }
@@ -385,6 +452,118 @@ impl HwpApp {
             start,
             previous: 0,
         });
+    }
+    /// 글자 겹치기 window: edits the control at the caret when there is one, else inserts.
+    fn open_overlap(&mut self) {
+        let list = self
+            .session
+            .run("format.char_overlap.get", json!({}))
+            .unwrap_or_default();
+        let offset = self.session.cursor.offset as u64;
+        let at_caret = list
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|c| c["position"].as_u64() == Some(offset))
+            .cloned();
+        self.ext.format.overlap = Some(match at_caret {
+            Some(c) => OverlapDialog {
+                chars: c["chars"].as_str().unwrap_or("").to_owned(),
+                border: c["border"].as_u64().unwrap_or(0) as usize,
+                size: c["size"].as_f64().unwrap_or(100.0),
+                overlap: c["expansion"].as_u64() != Some(0),
+                control: c["control"].as_u64().map(|x| x as usize),
+            },
+            None => OverlapDialog {
+                chars: String::new(),
+                border: 0,
+                size: 100.0,
+                overlap: true,
+                control: None,
+            },
+        });
+    }
+    fn overlap_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.ext.format.overlap.take() else {
+            return;
+        };
+        let (mut close, mut apply, mut delete) = (false, false, false);
+        let editing = d.control.is_some();
+        let r = chrome::modal("format-char-overlap").show(ctx, |ui| {
+            ui.set_width(380.0);
+            close = chrome::title(ui, "글자 겹치기");
+            group(ui, "겹쳐 쓸 글자 (최대 9자)", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.chars)
+                        .desired_width(330.0)
+                        .char_limit(9),
+                );
+            });
+            group(ui, "테두리 모양", |ui| {
+                combo(ui, "overlap-border", &mut d.border, &OVERLAP_BORDERS, 200.0);
+                ui.checkbox(&mut d.overlap, "글자끼리 겹침 (끄면 펼쳐 씀)");
+            });
+            group(ui, "글자 크기 조절", |ui| {
+                ui.horizontal(|ui| {
+                    lbl(ui, "크기", 60.0);
+                    spin(ui, &mut d.size, 1.0..=127.0, 0, "%", 90.0);
+                });
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let ok = !d.chars.trim().is_empty();
+                if ui
+                    .add_enabled(
+                        ok,
+                        egui::Button::new(if editing { "고치기(D)" } else { "넣기(D)" })
+                            .min_size(Vec2::new(80.0, 26.0)),
+                    )
+                    .clicked()
+                {
+                    apply = true;
+                }
+                if editing
+                    && ui
+                        .add(egui::Button::new("지우기").min_size(Vec2::new(80.0, 26.0)))
+                        .clicked()
+                {
+                    delete = true;
+                }
+                if ui
+                    .add(egui::Button::new("취소").min_size(Vec2::new(80.0, 26.0)))
+                    .clicked()
+                {
+                    close = true;
+                }
+            });
+        });
+        if apply {
+            let mut params = json!({
+                "chars": d.chars.trim(),
+                "border": d.border,
+                "size": d.size.round() as i64,
+                "expansion": u8::from(d.overlap),
+            });
+            let id = match d.control {
+                Some(c) => {
+                    params["control"] = json!(c);
+                    "format.char_overlap.update"
+                }
+                None => "format.char_overlap",
+            };
+            if self.run(id, params) {
+                return;
+            }
+        } else if delete {
+            if let Some(c) = d.control
+                && self.run("format.char_overlap.delete", json!({ "control": c }))
+            {
+                return;
+            }
+        } else if close || r.should_close() {
+            return;
+        }
+        self.ext.format.overlap = Some(d);
     }
     /// 모양 복사 (Alt+C): without a block it copies the caret's 글자·문단 모양; with a
     /// block it applies both in one undo step (`format.copy_shape.apply`).
@@ -525,13 +704,16 @@ impl HwpApp {
             "paragraph-border" => self.open_shape(false, 3),
             "character-ext" => self.open_shape(true, 1),
             "character-border" => self.open_shape(true, 2),
+            "char-overlap" => self.open_overlap(),
             _ => return false,
         }
         true
     }
     /// A formatting dialog owned by this module is open.
     pub(crate) fn format_ext_modal_open(&self) -> bool {
-        self.ext.format.style.is_some() || self.ext.format.numbering.is_some()
+        self.ext.format.style.is_some()
+            || self.ext.format.numbering.is_some()
+            || self.ext.format.overlap.is_some()
     }
     /// Called every frame after the built-in dialogs.
     pub(crate) fn format_ext_dialogs(&mut self, ctx: &egui::Context) {
@@ -546,6 +728,7 @@ impl HwpApp {
         }
         self.style_dialog(ctx);
         self.numbering_dialog(ctx);
+        self.overlap_dialog(ctx);
     }
 
     // ---- 스타일 (F6) ----
@@ -722,26 +905,61 @@ impl HwpApp {
                                     if small(ui, "delete", "스타일 지우기", d.selected > 0) {
                                         d.delete = Some(0);
                                     }
-                                    if small(ui, "replace", "커서 위치의 스타일로 바꾸기", true)
+                                    if small(ui, "replace", "커서 위치의 모양으로 바꾸기", true)
+                                        && self.run(
+                                            "format.style.update_from_caret",
+                                            json!({ "id": d.selected }),
+                                        )
                                     {
-                                        let c = self.session.character_properties().ok();
-                                        let p = self.session.paragraph_format().ok();
-                                        if let (Some(c), Some(p)) = (c, p) {
-                                            self.run("format.style.update", json!({
-                                                "id": d.selected,
-                                                "character": format_dialogs::writable(&c, true),
-                                                "paragraph": format_dialogs::writable(&p, false),
-                                            }));
-                                            d.preview = None;
-                                        }
+                                        d.preview = None;
                                     }
                                     ui.add_space(6.0);
-                                    small(ui, "up", "한 줄 위로 이동하기", false);
-                                    small(ui, "down", "한 줄 아래로 이동하기", false);
+                                    // 바탕글 stays first, so the second style cannot move up.
+                                    if small(ui, "up", "한 줄 위로 이동하기", d.selected > 1)
+                                        && self.run(
+                                            "format.style.move",
+                                            json!({"id": d.selected, "direction": "up"}),
+                                        )
+                                    {
+                                        d.selected -= 1;
+                                        d.preview = None;
+                                    }
+                                    let can_down = d.selected > 0 && d.selected + 1 < styles.len();
+                                    if small(ui, "down", "한 줄 아래로 이동하기", can_down)
+                                        && self.run(
+                                            "format.style.move",
+                                            json!({"id": d.selected, "direction": "down"}),
+                                        )
+                                    {
+                                        d.selected += 1;
+                                        d.preview = None;
+                                    }
                                     ui.add_space(6.0);
                                     small(ui, "gallery", "스타일마당 (지원하지 않음)", false);
-                                    small(ui, "import", "스타일 가져오기 (지원하지 않음)", false);
-                                    small(ui, "export", "스타일 내보내기 (지원하지 않음)", false);
+                                    if small(ui, "import", "스타일 가져오기 (JSON)", true)
+                                        && let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("스타일 JSON", &["json"])
+                                            .pick_file()
+                                        && self.run(
+                                            "format.style.import",
+                                            json!({ "path": path.to_string_lossy() }),
+                                        )
+                                    {
+                                        self.message = "스타일을 가져왔습니다.".into();
+                                        d.preview = None;
+                                    }
+                                    if small(ui, "export", "스타일 내보내기 (JSON)", true)
+                                        && let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("스타일 JSON", &["json"])
+                                            .set_file_name("styles.json")
+                                            .save_file()
+                                        && self.run(
+                                            "format.style.export",
+                                            json!({ "path": path.to_string_lossy() }),
+                                        )
+                                    {
+                                        self.message = "스타일을 내보냈습니다.".into();
+                                    }
                                 });
                             });
                             ui.add_space(14.0);
@@ -901,7 +1119,10 @@ impl HwpApp {
                                             .and_then(|s| s["name"].as_str())
                                             .unwrap_or("")
                                     ));
-                                    ui.add_enabled(false, egui::Button::new("글자 스타일 해제"));
+                                    if ui.button("글자 스타일 해제").clicked() {
+                                        self.run("format.style.clear_char", json!({}));
+                                        d.preview = None;
+                                    }
                                 });
                                 if let Some(character) = edit_shape {
                                     let values = if character {
@@ -1556,6 +1777,7 @@ impl HwpApp {
             "format.underline"
             | "format.strikethrough"
             | "format.text_color"
+            | "format.shade_color"
             | "format.highlight"
             | "format.char_border" => self.split_button(ui, id, size, &chars),
             "format.align" => {
@@ -1593,6 +1815,7 @@ impl HwpApp {
         let on = match id {
             "format.underline" => chars["underline"] == true,
             "format.strikethrough" => chars["strikethrough"] == true,
+            "format.char_border" => chars["borderLeft"]["type"].as_u64().unwrap_or(0) > 0,
             _ => false,
         };
         let text_color = self
@@ -1601,6 +1824,12 @@ impl HwpApp {
             .text_color
             .clone()
             .unwrap_or("#ff0000".into());
+        let shade = self
+            .ext
+            .format
+            .shade_color
+            .clone()
+            .unwrap_or("#ffff00".into());
         let highlight = self
             .ext
             .format
@@ -1630,11 +1859,16 @@ impl HwpApp {
         let icon = match id {
             "format.underline" => super::icons::Icon::Underline,
             "format.strikethrough" => super::icons::Icon::Strike,
-            "format.text_color" => super::icons::Icon::TextColor,
+            "format.text_color" | "format.shade_color" => super::icons::Icon::TextColor,
             "format.highlight" => super::icons::Icon::Highlight,
             _ => super::icons::Icon::CharBorder,
         };
         let glyph = Rect::from_center_size(main.center(), Vec2::splat(18.0));
+        if id == "format.shade_color" {
+            // 음영: the glyph sits on its shade color, as on Hangul's button.
+            ui.painter()
+                .rect_filled(glyph.shrink(1.0), 1.0, rgb(&shade));
+        }
         self.icons.paint(ui, glyph, icon, true);
         // The color bar shows the color the button will apply, as in Hangul.
         let bar = match id {
@@ -1655,18 +1889,8 @@ impl HwpApp {
         thin_chevron(ui.painter(), arrow.center());
         if main_resp.clicked() {
             match id {
-                "format.underline" | "format.strikethrough" => {
+                "format.underline" | "format.strikethrough" | "format.char_border" => {
                     self.run(id, json!({}));
-                }
-                "format.char_border" => {
-                    let line = json!({"type": 1, "width": 0, "color": "#000000"});
-                    let has = chars["borderLeft"]["type"].as_u64().unwrap_or(0) > 0;
-                    let side = if has {
-                        json!({"type": 0, "width": 0, "color": "#000000"})
-                    } else {
-                        line
-                    };
-                    self.run("format.character", json!({"borderLeft": side, "borderRight": side, "borderTop": side, "borderBottom": side}));
                 }
                 id => {
                     self.format_ext_dispatch(id, ui.ctx());
@@ -1677,24 +1901,51 @@ impl HwpApp {
             .id(egui::Id::new((id, "popup")))
             .show(|ui| match id {
                 "format.text_color" => {
-                    if let Some(Some(c)) = color_menu(ui, "글자 색", None) {
+                    ui.label("글자 색");
+                    let pick = preset_row(ui).or_else(|| color_menu(ui, "", None).flatten());
+                    if let Some(c) = pick {
                         self.ext.format.text_color = Some(c.clone());
-                        self.run("format.character", json!({ "textColor": c }));
+                        self.run("format.text_color", json!({ "color": c }));
+                    }
+                }
+                "format.shade_color" => {
+                    ui.label("음영 색");
+                    let pick = preset_row(ui)
+                        .map(Some)
+                        .or_else(|| color_menu(ui, "", Some("음영 없음")));
+                    if let Some(c) = pick {
+                        self.ext.format.shade_color = c.clone();
+                        self.run("format.shade_color", json!({ "color": c }));
                     }
                 }
                 "format.highlight" => {
-                    if let Some(c) = color_menu(ui, "형광펜", Some("색 없음")) {
+                    ui.label("형광펜");
+                    let pick = preset_row(ui)
+                        .map(Some)
+                        .or_else(|| color_menu(ui, "", Some("색 없음")));
+                    if let Some(c) = pick {
                         self.ext.format.highlight = c.clone();
                         self.run("format.highlight", json!({ "color": c }));
                     }
                 }
                 "format.underline" | "format.strikethrough" => {
-                    let key = if id == "format.underline" { "underlineShape" } else { "strikeShape" };
+                    let key = if id == "format.underline" {
+                        "underlineShape"
+                    } else {
+                        "strikeShape"
+                    };
                     for (i, name) in format_dialogs::LINE_TYPES[1..12].iter().enumerate() {
-                        let resp = ui.add_sized([150.0, 20.0], egui::Button::selectable(false, "")).on_hover_text(*name);
-                        format_dialogs::paint_line(ui.painter(),
+                        let resp = ui
+                            .add_sized([150.0, 20.0], egui::Button::selectable(false, ""))
+                            .on_hover_text(*name);
+                        format_dialogs::paint_line(
+                            ui.painter(),
                             Pos2::new(resp.rect.left() + 8.0, resp.rect.center().y),
-                            Pos2::new(resp.rect.right() - 8.0, resp.rect.center().y), i as u8 + 1, 1.0, Color32::BLACK);
+                            Pos2::new(resp.rect.right() - 8.0, resp.rect.center().y),
+                            i as u8 + 1,
+                            1.0,
+                            Color32::BLACK,
+                        );
                         if resp.clicked() {
                             let mut patch = json!({ key: i });
                             if id == "format.underline" {
@@ -1707,18 +1958,47 @@ impl HwpApp {
                         }
                     }
                     ui.separator();
-                    if ui.button(if id == "format.underline" { "밑줄 없음" } else { "취소선 없음" }).clicked() {
+                    if ui
+                        .button(if id == "format.underline" {
+                            "밑줄 없음"
+                        } else {
+                            "취소선 없음"
+                        })
+                        .clicked()
+                    {
                         self.run(id, json!({"value": false}));
                     }
                 }
                 _ => {
                     if ui.button("테두리 없음").clicked() {
-                        let none = json!({"type": 0, "width": 0, "color": "#000000"});
-                        self.run("format.character", json!({"borderLeft": none, "borderRight": none, "borderTop": none, "borderBottom": none}));
+                        self.run("format.char_border", json!({ "value": false }));
                     }
                     if ui.button("바깥쪽 테두리").clicked() {
-                        let line = json!({"type": 1, "width": 0, "color": "#000000"});
-                        self.run("format.character", json!({"borderLeft": line, "borderRight": line, "borderTop": line, "borderBottom": line}));
+                        self.run(
+                            "format.char_border",
+                            json!({"type": 1, "width": 0, "color": "#000000"}),
+                        );
+                    }
+                    ui.label(RichText::new("선 종류").weak());
+                    for (i, name) in format_dialogs::LINE_TYPES[1..12].iter().enumerate() {
+                        let resp = ui
+                            .add_sized([150.0, 20.0], egui::Button::selectable(false, ""))
+                            .on_hover_text(*name);
+                        format_dialogs::paint_line(
+                            ui.painter(),
+                            Pos2::new(resp.rect.left() + 8.0, resp.rect.center().y),
+                            Pos2::new(resp.rect.right() - 8.0, resp.rect.center().y),
+                            i as u8 + 1,
+                            1.0,
+                            Color32::BLACK,
+                        );
+                        if resp.clicked() {
+                            self.run("format.char_border", json!({ "type": i + 1 }));
+                        }
+                    }
+                    ui.label(RichText::new("테두리 색").weak());
+                    if let Some(c) = preset_row(ui) {
+                        self.run("format.char_border", json!({ "color": c }));
                     }
                     ui.separator();
                     if ui.button("글자 테두리/배경...").clicked() {
@@ -1730,6 +2010,7 @@ impl HwpApp {
             "format.underline" => "밑줄 (Ctrl+U)",
             "format.strikethrough" => "취소선",
             "format.text_color" => "글자 색",
+            "format.shade_color" => "글자 음영 색",
             "format.highlight" => "형광펜",
             _ => "글자 테두리",
         };

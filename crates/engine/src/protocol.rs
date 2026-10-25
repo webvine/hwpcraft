@@ -24,6 +24,267 @@ struct Replace {
     options: Option<crate::FindOptions>,
 }
 
+/// (command id, parameter help, JSON example) for the core commands registered
+/// in `COMMANDS`; shown by `list_commands` and docs/mcp-commands.md.
+pub const PARAMS: &[(&str, &str, &str)] = &[
+    (
+        "edit.delete_ctrl_marks",
+        "kinds array: table,picture,shape,equation,footnote,endnote,bookmark,hyperlink,hidden_comment,field.",
+        r##"{"kinds":["bookmark"]}"##,
+    ),
+    (
+        "edit.find",
+        "query, optional replacement and options:{case_sensitive,whole_word,direction:down/up/all}.",
+        r##"{"query":"기존","replacement":"변경","options":{"case_sensitive":true,"direction":"all"}}"##,
+    ),
+    (
+        "edit.paste_html",
+        "HTML fragment (max 4 MB) inserted at the caret with its formatting; the selection is replaced.",
+        r##"{"html":"<p><b>굵게</b> 보통</p>"}"##,
+    ),
+    (
+        "edit.replace",
+        "query, optional replacement and options:{case_sensitive,whole_word,direction:down/up/all}.",
+        r##"{"query":"기존","replacement":"변경","options":{"case_sensitive":true,"direction":"all"}}"##,
+    ),
+    (
+        "edit.replace_all",
+        "query, optional replacement and options:{case_sensitive,whole_word,direction:down/up/all}.",
+        r##"{"query":"기존","replacement":"변경","options":{"case_sensitive":true,"direction":"all"}}"##,
+    ),
+    (
+        "file.new",
+        "Blank document; force:true explicitly discards unsaved changes.",
+        r##"{"force":false}"##,
+    ),
+    (
+        "file.save",
+        "HWP/HWPX save or PDF/TXT export. Only file.save permits omitting path.",
+        r##"{"path":"output.hwpx"}"##,
+    ),
+    (
+        "file.save_as",
+        "HWP/HWPX save or PDF/TXT export. Only file.save permits omitting path.",
+        r##"{"path":"output.hwpx"}"##,
+    ),
+    (
+        "format.paragraph",
+        "Partial paragraph properties. Use format.paragraph.get to inspect.",
+        r##"{"alignment":"center","lineSpacing":160}"##,
+    ),
+    (
+        "hyperlink.update",
+        "field_id from hyperlink.list; new uri (http/https) and/or one-line text. Equal values are a no-op.",
+        r##"{"field_id":1,"uri":"https://example.org","text":"새 표시 글"}"##,
+    ),
+    (
+        "insert.equation",
+        "Hancom equation script, size_pt 4–100.",
+        r##"{"script":"a over b","size_pt":12}"##,
+    ),
+    (
+        "insert.hyperlink",
+        "HTTP/HTTPS uri and optional displayed text.",
+        r##"{"uri":"https://example.com","text":"참고"}"##,
+    ),
+    (
+        "insert.picture",
+        "Image path, subject to read root.",
+        r##"{"path":"picture.png"}"##,
+    ),
+    (
+        "note.set",
+        "ObjectAddress and replacement text.",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"text":"수정한 내용"}"##,
+    ),
+    (
+        "page.header_footer",
+        "Header or footer plain text.",
+        r##"{"is_header":true,"text":"보고서"}"##,
+    ),
+    (
+        "page.setup",
+        "Partial page setup; dimensions/margins in mm, landscape bool.",
+        r##"{"landscape":false,"width_mm":210,"height_mm":297}"##,
+    ),
+    (
+        "select.text",
+        "Case-sensitive search within a paragraph. occurrence starts at 1.",
+        r##"{"text":"한글","occurrence":1}"##,
+    ),
+    (
+        "selection.set",
+        "Zero-based Unicode scalar offset. Optional cell:{control,index,paragraph}; anchor is a scalar offset in the same paragraph.",
+        r##"{"cursor":{"section":0,"paragraph":0,"offset":2,"cell":null},"anchor":0}"##,
+    ),
+    (
+        "symbol.search",
+        "query: U+XXXX / hex / #decimal code point, a typed character, a special-character name, or set keywords (Korean or English).",
+        r##"{"query":"화살표"}"##,
+    ),
+    ("symbol.sets", "No parameters.", r##"{}"##),
+    ("symbol.special", "No parameters.", r##"{}"##),
+    (
+        "textbox.set",
+        "ObjectAddress and replacement text.",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"text":"수정한 내용"}"##,
+    ),
+    (
+        "file.open",
+        "HWP/HWPX/HWP3/HML input path; force:true explicitly discards unsaved changes.",
+        r##"{"path":"input.hwpx","force":false}"##,
+    ),
+    (
+        "file.pdf",
+        "Export to a .pdf path.",
+        r##"{"path":"output.pdf"}"##,
+    ),
+    (
+        "file.password",
+        "password string sets the password used by later HWP/HWPX saves; null clears it. Never logged.",
+        r##"{"password":"비밀번호"}"##,
+    ),
+    (
+        "text.insert",
+        "text string; newlines split paragraphs. Maximum 1 MB per call.",
+        r##"{"text":"안녕하세요"}"##,
+    ),
+    (
+        "insert.footnote",
+        "text of the new footnote at the caret.",
+        r##"{"text":"각주 내용"}"##,
+    ),
+    (
+        "insert.endnote",
+        "text of the new endnote at the caret.",
+        r##"{"text":"미주 내용"}"##,
+    ),
+    (
+        "document.text",
+        "Paginated body and first-level cells; follow nextStart. start >= 0, limit 1–1000.",
+        r##"{"start":0,"limit":100}"##,
+    ),
+    (
+        "document.inspect",
+        "Paginated structure with style/shape references and selection; start >= 0, limit 1–1000.",
+        r##"{"start":0,"limit":100}"##,
+    ),
+    (
+        "format.character",
+        "Partial character properties. fontSize is 1/100 pt, colors #RRGGBB. Use format.character.get to inspect.",
+        r##"{"bold":true,"fontSize":1200}"##,
+    ),
+    (
+        "format.character.get",
+        "No parameters; properties at the caret (or selection start).",
+        r##"{}"##,
+    ),
+    (
+        "format.paragraph.get",
+        "No parameters; paragraph properties at the caret.",
+        r##"{}"##,
+    ),
+    (
+        "insert.table",
+        "rows 1–30, columns 1–12 at the caret (body only).",
+        r##"{"rows":2,"columns":3}"##,
+    ),
+    (
+        "bookmark.add",
+        "Bookmark name at the caret.",
+        r##"{"name":"요약"}"##,
+    ),
+    (
+        "bookmark.goto",
+        "Bookmark name to move to.",
+        r##"{"name":"요약"}"##,
+    ),
+    (
+        "bookmark.delete",
+        "Bookmark name to remove.",
+        r##"{"name":"요약"}"##,
+    ),
+    ("bookmark.list", "No parameters.", r##"{}"##),
+    (
+        "style.apply",
+        "Existing numeric style ID from style.list.",
+        r##"{"id":0}"##,
+    ),
+    ("style.list", "No parameters.", r##"{}"##),
+    (
+        "page.columns",
+        "Column count and spacing in mm for the caret section.",
+        r##"{"count":2,"spacing_mm":8}"##,
+    ),
+    (
+        "object.delete",
+        "ObjectAddress from object.list, passed directly (no address wrapper).",
+        r##"{"section":0,"paragraph":0,"control":0}"##,
+    ),
+    ("object.list", "No parameters.", r##"{}"##),
+    (
+        "shape.resize",
+        "ObjectAddress and dimensions in mm.",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"width_mm":40,"height_mm":20}"##,
+    ),
+    (
+        "equation.set",
+        "ObjectAddress and options:{script,size_pt}.",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"options":{"script":"x^2","size_pt":12}}"##,
+    ),
+    (
+        "insert.shape",
+        "kind rectangle/ellipse/line/textbox/arc/polygon/curve, dimensions mm, text required.",
+        r##"{"kind":"rectangle","width_mm":40,"height_mm":20,"text":""}"##,
+    ),
+    (
+        "edit.sort",
+        "key text/number, descending and case_sensitive booleans. Selected body paragraphs or whole section.",
+        r##"{"key":"text","descending":false,"case_sensitive":false}"##,
+    ),
+    (
+        "table.edit",
+        "action: row_above,row_below,column_left,column_right,delete_row,delete_column,fit_page,merge_right,split_merged. Select a cell first.",
+        r##"{"action":"row_below"}"##,
+    ),
+    (
+        "insert.symbol",
+        "문자표: text (1–1000 characters, no line breaks) inserted at the caret; optional font applied to them only.",
+        r##"{"text":"★","font":"Segoe UI Symbol"}"##,
+    ),
+    (
+        "symbol.list",
+        "set id from symbol.sets (hnc.*, ks.*, u.<hex>, emoji.*, special); start offset, limit 1–4096 (default 256).",
+        r##"{"set":"hnc.circled","start":0,"limit":64}"##,
+    ),
+    (
+        "hyperlink.list",
+        "No parameters; links of the caret paragraph with fieldId/start/end/text/uri.",
+        r##"{}"##,
+    ),
+    (
+        "hyperlink.remove",
+        "field_id from hyperlink.list; restore_format puts back the colour/underline the link covered.",
+        r##"{"field_id":1,"restore_format":true}"##,
+    ),
+    ("edit.undo", "No parameters.", r##"{}"##),
+    ("edit.redo", "No parameters.", r##"{}"##),
+    ("text.backspace", "No parameters.", r##"{}"##),
+    ("text.delete", "No parameters.", r##"{}"##),
+    ("paragraph.split", "No parameters.", r##"{}"##),
+    ("insert.page_break", "No parameters; body only.", r##"{}"##),
+    (
+        "insert.column_break",
+        "No parameters; body only.",
+        r##"{}"##,
+    ),
+    (
+        "insert.page_number",
+        "No parameters; centred page number in a new footer of the caret section.",
+        r##"{}"##,
+    ),
+];
+
 impl Session {
     /// The CLI and automation share the exact desktop editing transactions.
     /// File destinations stay at the application boundary, never in a document command.
@@ -242,6 +503,61 @@ impl Session {
                 let p: Password = serde_json::from_value(params)?;
                 self.set_password(p.password)?;
                 return Ok(json!({ "protected": self.has_password() }));
+            }
+            "insert.symbol" => {
+                let p: crate::SymbolInsert = serde_json::from_value(params)?;
+                let range = self.insert_symbol(&p)?;
+                return Ok(json!({"start": range.start, "end": range.end, "cursor": self.cursor}));
+            }
+            "symbol.sets" | "symbol.special" => {
+                if !object.is_empty() {
+                    bail!("{id} 명령에는 매개 변수가 없습니다.");
+                }
+                return Ok(if id == "symbol.sets" {
+                    serde_json::to_value(crate::symbol_sets())?
+                } else {
+                    serde_json::to_value(crate::special_chars())?
+                });
+            }
+            "symbol.list" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct List {
+                    set: String,
+                    #[serde(default)]
+                    start: usize,
+                    #[serde(default = "default_limit")]
+                    limit: usize,
+                }
+                fn default_limit() -> usize {
+                    256
+                }
+                let p: List = serde_json::from_value(params)?;
+                if p.limit == 0 || p.limit > 4096 {
+                    bail!("limit은 1–4096입니다.");
+                }
+                let chars = crate::symbol_chars(&p.set)
+                    .ok_or_else(|| anyhow::anyhow!("알 수 없는 문자표 영역: {}", p.set))?;
+                let total = chars.len();
+                let page: Vec<Value> = chars
+                    .iter()
+                    .skip(p.start)
+                    .take(p.limit)
+                    .map(|c| json!({"ch": c.to_string(), "code": format!("U+{:04X}", *c as u32)}))
+                    .collect();
+                return Ok(json!({"set": p.set, "total": total, "start": p.start, "chars": page}));
+            }
+            "symbol.search" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Query {
+                    query: String,
+                }
+                let p: Query = serde_json::from_value(params)?;
+                if p.query.chars().count() > 100 {
+                    bail!("검색어는 100자 이하입니다.");
+                }
+                return Ok(serde_json::to_value(crate::symbol_search(&p.query))?);
             }
             "bookmark.list" => {
                 if !object.is_empty() {

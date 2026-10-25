@@ -16,3 +16,7 @@
 /tools/rea_ghidra_session.mjs
 /tools/inventory_hwp_ui.py
 /tools/build_feature_catalog.py
+/docs/TEAM-PLAN-0.14.md
+/tools/hwp_probe.py
+/output/reference/
+/tools/gen_hwp_actions.py

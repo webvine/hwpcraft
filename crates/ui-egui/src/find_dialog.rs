@@ -1,4 +1,5 @@
-//! Owner: core area. Hangul's modeless 찾기 / 찾아 바꾸기 windows (Ctrl+F / Ctrl+H).
+//! Owner: review-tools area. Hangul's modeless 찾기 / 찾아 바꾸기 windows (Ctrl+F / Ctrl+H)
+//! with the 선택 사항 (띄어쓰기 무시, 아무개 문자, 조건식, 여러 단어, 한글로 한자) and 서식 찾기 options.
 use super::*;
 use hwpcraft_engine::{FindDirection, FindOptions};
 
@@ -71,7 +72,7 @@ impl HwpApp {
                 .corner_radius(0),
         )
         .show(ctx, |ui| {
-            ui.set_width(430.0);
+            ui.set_width(470.0);
             close |= chrome::title(
                 ui,
                 if replace {
@@ -88,7 +89,7 @@ impl HwpApp {
             v.widgets.inactive.bg_fill = Color32::WHITE;
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
-                    ui.set_width(300.0);
+                    ui.set_width(340.0);
                     egui::Grid::new("find-fields")
                         .num_columns(2)
                         .spacing([8.0, 6.0])
@@ -118,9 +119,55 @@ impl HwpApp {
                         });
                     chrome::section(ui, "선택 사항");
                     let o = &mut self.find_state.options;
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.checkbox(&mut o.case_sensitive, "대소문자 구별");
                         ui.checkbox(&mut o.whole_word, "온전한 낱말");
+                        ui.checkbox(&mut o.ignore_spaces, "띄어쓰기 무시");
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_enabled(
+                            !o.regex,
+                            egui::Checkbox::new(&mut o.wildcards, "아무개 문자(?, *)"),
+                        );
+                        ui.checkbox(&mut o.regex, "조건식(정규식)");
+                        ui.checkbox(&mut o.any_word, "여러 단어 찾기");
+                        ui.checkbox(&mut o.hanja_by_hangul, "한글로 한자 찾기");
+                    });
+                    chrome::section(ui, "서식 찾기 (글자 모양)");
+                    ui.horizontal_wrapped(|ui| {
+                        for (value, label) in [
+                            (&mut o.bold, "진하게"),
+                            (&mut o.italic, "기울임"),
+                            (&mut o.underline, "밑줄"),
+                        ] {
+                            egui::ComboBox::from_id_salt(("find-format", label))
+                                .width(96.0)
+                                .selected_text(match value {
+                                    None => format!("{label}: 무관"),
+                                    Some(true) => format!("{label}: 있음"),
+                                    Some(false) => format!("{label}: 없음"),
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(value, None, "무관");
+                                    ui.selectable_value(value, Some(true), "있음");
+                                    ui.selectable_value(value, Some(false), "없음");
+                                });
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let mut size = o.size_pt.unwrap_or(0);
+                        ui.label("크기");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut size)
+                                    .range(0..=4096)
+                                    .suffix(" pt"),
+                            )
+                            .on_hover_text("0이면 크기 조건 없음")
+                            .changed()
+                        {
+                            o.size_pt = (size > 0).then_some(size);
+                        }
                     });
                     chrome::section(ui, "찾을 방향");
                     ui.horizontal(|ui| {
@@ -131,7 +178,7 @@ impl HwpApp {
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new(if self.find_state.status.is_empty() {
-                            "본문과 표 셀에서 찾습니다."
+                            "본문과 표 셀에서 찾습니다. 바꿀 내용은 문자 그대로 넣습니다."
                         } else {
                             self.find_state.status.as_str()
                         })

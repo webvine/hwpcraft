@@ -444,44 +444,11 @@ impl Session {
             Ok(())
         })
     }
+    /// Tab / Shift+Tab inside a table: Hangul's TableRightCellAppend / TableLeftCell.
     pub fn move_cell(&mut self, backward: bool) -> Result<()> {
-        let t = self.current_table()?;
-        let current = self
-            .cursor
-            .cell
-            .ok_or_else(|| anyhow!("표 셀을 선택하세요."))?;
-        let mut cells: Vec<_> = t
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.row, c.col, i))
-            .collect();
-        cells.sort_unstable();
-        let pos = cells
-            .iter()
-            .position(|x| x.2 == current.index)
-            .ok_or_else(|| anyhow!("표 셀을 찾지 못했습니다."))?;
-        let next = if backward {
-            pos.saturating_sub(1)
-        } else {
-            (pos + 1).min(cells.len().saturating_sub(1))
-        };
-        let index = cells
-            .get(next)
-            .ok_or_else(|| anyhow!("표가 비었습니다."))?
-            .2;
-        self.select(
-            Cursor {
-                cell: Some(Cell {
-                    index,
-                    paragraph: 0,
-                    ..current
-                }),
-                offset: 0,
-                ..self.cursor
-            },
-            false,
-        )
+        let a = self.table_target(None)?;
+        self.move_in_table(a, if backward { "prev" } else { "next" })?;
+        Ok(())
     }
     pub fn bookmarks(&self) -> Result<Value> {
         Ok(serde_json::from_str(

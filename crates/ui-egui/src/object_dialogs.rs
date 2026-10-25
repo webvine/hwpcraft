@@ -24,10 +24,6 @@ pub(super) enum ObjectDialog {
     },
     Objects,
     Styles,
-    Symbols {
-        category: usize,
-        text: String,
-    },
 }
 impl ObjectDialog {
     pub(super) fn equation() -> Self {
@@ -232,6 +228,8 @@ impl HwpApp {
                                             "textbox" => "글상자",
                                             "picture" => "그림",
                                             "table" => "표",
+                                            "group" => "묶음 개체",
+                                            "form" => "양식 개체",
                                             _ => "도형",
                                         },
                                         address.section + 1,
@@ -247,8 +245,18 @@ impl HwpApp {
                                             self.open_object_properties(address);
                                             close = true;
                                         }
-                                        if !matches!(kind, "shape" | "picture" | "table")
-                                            && ui.button("내용 고치기").clicked()
+                                        if kind == "group" && ui.button("풀기").clicked() {
+                                            close = self
+                                                .run("object.ungroup", json!({"address":address}));
+                                        }
+                                        if kind == "form" && ui.button("값 고치기").clicked() {
+                                            self.open_form_editor();
+                                            close = true;
+                                        }
+                                        if !matches!(
+                                            kind,
+                                            "shape" | "picture" | "table" | "group" | "form"
+                                        ) && ui.button("내용 고치기").clicked()
                                         {
                                             let next =
                                                 match kind {
@@ -304,40 +312,6 @@ impl HwpApp {
                             }
                         }
                     });
-            }
-            ObjectDialog::Symbols { category, text } => {
-                ui.heading("문자표");
-                ui.separator();
-                let sets = [
-                    ("기호", "※☆★○●◎◇◆□■△▲▽▼♠♣♥♦☎☞☜✓"),
-                    ("수학", "±×÷≠≈≤≥∞∑∏√∫∂∆∇∈∉∪∩⊂⊃∀∃"),
-                    ("화살표", "←↑→↓↔↕↖↗↘↙⇐⇑⇒⇓⇔"),
-                    ("괄호·번호", "①②③④⑤⑥⑦⑧⑨⑩㈀㈁㈂㈃「」『』【】〈〉"),
-                ];
-                ui.horizontal(|ui| {
-                    for (i, (label, _)) in sets.iter().enumerate() {
-                        ui.selectable_value(category, i, *label);
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    for c in sets[*category].1.chars() {
-                        if ui
-                            .add_sized([34.0, 32.0], egui::Button::new(c.to_string()))
-                            .clicked()
-                        {
-                            text.push(c);
-                        }
-                    }
-                });
-                ui.separator();
-                ui.label("넣을 문자");
-                ui.text_edit_singleline(text);
-                if ui
-                    .add_enabled(!text.is_empty(), egui::Button::new("넣기"))
-                    .clicked()
-                {
-                    close = self.run("text.insert", json!({"text":text}));
-                }
             }
         }
         close

@@ -49,6 +49,13 @@ into THIRD-PARTY-DEPENDENCIES.md from Cargo.lock.
    are used under the MIT license where available, otherwise under
    Apache-2.0; no GPL-only or AGPL code is included.
 
+7. Unicode Character Database — Unihan (https://www.unicode.org/charts/unihan.html)
+   Copyright (c) 1991-2026 Unicode, Inc. Unicode License v3.
+   assets/data/hanja-readings.txt is generated from the kHangul property of
+   Unihan_Readings.txt (Unicode 18.0.0) and compiled into the binary for 한자
+   conversion and 한글로 한자 찾기. License text: assets/licenses/LICENSE-Unicode.txt.
+   Unicode is a registered trademark of Unicode, Inc.
+
 Runtime fonts: the desktop UI uses Korean fonts already installed on the
 user's system (for example Malgun Gothic on Windows, Apple SD Gothic Neo on
 macOS, Noto Sans CJK KR or NanumGothic on Linux). No Microsoft or Hancom

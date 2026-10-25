@@ -151,7 +151,7 @@ impl Server {
             return Ok(
                 json!({"protocolVersion":version,"capabilities":{"tools":{},"resources":{}},
                 "serverInfo":{"name":"hwpcraft","title":"HwpCraft","version":hwpcraft_engine::VERSION},
-                "instructions":"HWP/HWPX editor using RHWP, headless. Use list_commands to discover IDs and parameter examples, execute or batch to edit. Cursor section/paragraph/offset/cell indexes are zero-based; offset counts Unicode scalar values, not UTF-8 bytes or UTF-16 units. render_page page is one-based. type_text splits newlines into paragraphs. get_text/inspect_document cover body and first-level table cells, paginated by start/limit; follow nextStart. Read objects via object.list and specialized get commands. New/open refuse unsaved changes unless force:true. Save explicitly to HWP/HWPX; PDF/TXT are exports. Batch is sequential and not atomic. No desktop UI, remote bridge, tracking, or Hancom COM control."}),
+                "instructions":"HWP/HWPX editor using RHWP, headless. Use list_commands to discover IDs and parameter examples, execute or batch to edit, hwp_action to run Hangul automation action names (MoveLineEnd, CharShapeBold, …). Cursor section/paragraph/offset/cell indexes are zero-based; offset counts Unicode scalar values, not UTF-8 bytes or UTF-16 units. render_page page is one-based. type_text splits newlines into paragraphs. get_text/inspect_document cover body and first-level table cells, paginated by start/limit; follow nextStart. Read objects via object.list and specialized get commands. New/open refuse unsaved changes unless force:true. Save explicitly to HWP/HWPX; PDF/TXT are exports. Batch is sequential and not atomic. No desktop UI, remote bridge, tracking, or Hancom COM control."}),
             );
         }
         if method == "ping" {
@@ -181,7 +181,8 @@ impl Server {
             }
             "resources/list" => Ok(json!({"resources":[
                 {"uri":"hwpcraft://document","name":"document","description":"First 100 body/table-cell paragraphs; use inspect_document for subsequent windows","mimeType":"application/json"},
-                {"uri":"hwpcraft://commands","name":"commands","description":"Command IDs, labels, shortcuts and parameter examples","mimeType":"application/json"}
+                {"uri":"hwpcraft://commands","name":"commands","description":"Command IDs, labels, shortcuts and parameter examples","mimeType":"application/json"},
+                {"uri":"hwpcraft://hwp-actions","name":"hwp-actions","description":"Hangul automation action names mapped to HwpCraft commands","mimeType":"application/json"}
             ]})),
             "resources/templates/list" => Ok(json!({"resourceTemplates":[]})),
             "resources/read" => {
@@ -195,6 +196,7 @@ impl Server {
                         .execute("document.inspect", json!({}))
                         .map_err(|e| (-32603, e.to_string()))?,
                     "hwpcraft://commands" => catalog::commands(""),
+                    "hwpcraft://hwp-actions" => catalog::actions(""),
                     _ => return Err((-32002, format!("resource not found: {uri}"))),
                 };
                 Ok(

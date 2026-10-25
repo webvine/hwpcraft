@@ -10,6 +10,7 @@ pub(crate) struct ExtState {
     pub pen: table_drawing::State,
     pub object: ext_object::State,
     pub shell: ext_shell::State,
+    pub tools: review_dialogs::State,
 }
 
 impl HwpApp {
@@ -20,6 +21,7 @@ impl HwpApp {
             .or_else(|| self.table_ext_enabled(id))
             .or_else(|| self.object_ext_enabled(id))
             .or_else(|| self.shell_ext_enabled(id))
+            .or_else(|| self.tools_ext_enabled(id))
             .unwrap_or(false)
     }
     pub(crate) fn ext_dispatch(&mut self, id: &str, ctx: &egui::Context) {
@@ -31,7 +33,8 @@ impl HwpApp {
             || self.format_ext_dispatch(id, ctx)
             || self.table_ext_dispatch(id, ctx)
             || self.object_ext_dispatch(id, ctx)
-            || self.shell_ext_dispatch(id, ctx);
+            || self.shell_ext_dispatch(id, ctx)
+            || self.tools_ext_dispatch(id, ctx);
     }
     pub(crate) fn ext_dialogs(&mut self, ctx: &egui::Context) {
         self.pen_dialog(ctx);
@@ -40,10 +43,13 @@ impl HwpApp {
         self.table_ext_dialogs(ctx);
         self.object_ext_dialogs(ctx);
         self.shell_ext_dialogs(ctx);
+        self.tools_ext_dialogs(ctx);
     }
     /// Module keyboard shortcuts, consumed before the built-in ones. True when handled.
     pub(crate) fn ext_shortcuts(&mut self, ctx: &egui::Context) -> bool {
-        self.format_ext_shortcuts(ctx) || self.shell_ext_shortcuts(ctx)
+        self.format_ext_shortcuts(ctx)
+            || self.shell_ext_shortcuts(ctx)
+            || self.tools_ext_shortcuts(ctx)
     }
     /// Start-up `--view` names owned by modules.
     pub(crate) fn ext_view(&mut self, name: &str) -> bool {
@@ -71,6 +77,7 @@ impl HwpApp {
             || self.format_ext_view(name)
             || self.table_ext_view(name, &ctx)
             || self.shell_ext_view(name)
+            || self.tools_ext_view(name)
     }
     /// A module dialog that must block document typing and shortcuts.
     pub(crate) fn ext_modal_open(&self) -> bool {
@@ -78,6 +85,7 @@ impl HwpApp {
             || self.format_ext_modal_open()
             || self.table_ext_modal_open()
             || self.shell_ext_modal_open()
+            || self.tools_ext_modal_open()
     }
     /// Pointer input on a page; true when a module consumed it (skip default selection).
     pub(crate) fn ext_canvas(&mut self, page: u32, response: &egui::Response, rect: Rect) -> bool {

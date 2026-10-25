@@ -2,6 +2,7 @@
 /// User-facing x.xx release number, shared by desktop, CLI and MCP.
 pub const VERSION: &str = include_str!("../../../VERSION");
 pub use rhwp::DocumentCore;
+pub use rhwp::docdiff;
 pub use rhwp::document_core::hyperlink::{HyperlinkInfo, HyperlinkTarget};
 /// Privacy scan option/result types for `DocumentCore::scan_pii` / `detect_hidden_text`.
 pub use rhwp::document_core::queries::{hidden_text, pii_scan};

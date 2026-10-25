@@ -19,7 +19,7 @@ use std::{
 pub use tools::tool_definitions;
 
 pub struct Headless {
-    session: Session,
+    pub(crate) session: Session,
     roots: Option<Arc<AutomationRoots>>,
     renderer: Option<hwpcraft_render::Renderer>,
 }

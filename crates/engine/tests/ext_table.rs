@@ -851,3 +851,198 @@ fn caption_text_matches_hangul_native_layout() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn table_move_follows_hangul_cell_navigation() -> anyhow::Result<()> {
+    let mut s = new_table(3, 3)?;
+    cell_text(&mut s, 0, 1, "가나")?;
+    let mv = |s: &mut Session, m: &str| s.run("table.cell_move", json!({"motion": m}));
+    let at = |v: &Value| (v["row"].as_u64(), v["col"].as_u64());
+    let v = mv(&mut s, "row_begin")?;
+    assert_eq!(at(&v), (Some(0), Some(0)));
+    let v = mv(&mut s, "right")?;
+    assert_eq!(
+        (v["moved"].as_bool(), at(&v), s.cursor.offset),
+        (Some(true), (Some(0), Some(1)), 0)
+    );
+    let v = mv(&mut s, "right")?;
+    assert_eq!(at(&v), (Some(0), Some(2)));
+    let v = mv(&mut s, "right")?;
+    assert_eq!(v["moved"], false, "edge: {v}");
+    // Moving left / up lands at the end of the neighbour's text.
+    let v = mv(&mut s, "left")?;
+    assert_eq!((at(&v), s.cursor.offset), ((Some(0), Some(1)), 2));
+    let v = mv(&mut s, "down")?;
+    assert_eq!((at(&v), s.cursor.offset), ((Some(1), Some(1)), 0));
+    let v = mv(&mut s, "up")?;
+    assert_eq!((at(&v), s.cursor.offset), ((Some(0), Some(1)), 2));
+    assert_eq!(at(&mv(&mut s, "col_bottom")?), (Some(2), Some(1)));
+    assert_eq!(at(&mv(&mut s, "col_top")?), (Some(0), Some(1)));
+    assert_eq!(at(&mv(&mut s, "row_end")?), (Some(0), Some(2)));
+    // Tab wraps to the next row; Shift+Tab walks back.
+    let v = mv(&mut s, "next")?;
+    assert_eq!(
+        (at(&v), v["appended"].as_bool()),
+        ((Some(1), Some(0)), Some(false))
+    );
+    assert_eq!(at(&mv(&mut s, "prev")?), (Some(0), Some(2)));
+    // Tab in the last cell appends a row (Hangul TableRightCellAppend).
+    assert_eq!(at(&mv(&mut s, "col_bottom")?), (Some(2), Some(2)));
+    let v = mv(&mut s, "next")?;
+    assert_eq!(
+        (at(&v), v["appended"].as_bool()),
+        ((Some(3), Some(0)), Some(true))
+    );
+    assert_eq!(info(&mut s)?["rows"], 4);
+    let mut r = reopen(&mut s, "hwpx")?;
+    assert_eq!(r.run("table.info", json!({}))?["rows"], 4);
+    s.execute(Command::Undo)?;
+    assert_eq!(info(&mut s)?["rows"], 3);
+    assert!(s.cursor.cell.is_some());
+    // Shift+Tab in the first cell stays; unknown motions are rejected without change.
+    mv(&mut s, "col_top")?;
+    mv(&mut s, "row_begin")?;
+    assert_eq!(mv(&mut s, "prev")?["moved"], false);
+    assert!(mv(&mut s, "diagonal").is_err());
+    assert_eq!(at(&mv(&mut s, "row_begin")?), (Some(0), Some(0)));
+    // Merged cells count as one stop.
+    s.run(
+        "table.merge",
+        json!({"range":{"start_row":0,"start_col":0,"end_row":1,"end_col":1}}),
+    )?;
+    assert_eq!(at(&mv(&mut s, "row_end")?), (Some(0), Some(2)));
+    assert_eq!(at(&mv(&mut s, "left")?), (Some(0), Some(0)));
+    assert_eq!(at(&mv(&mut s, "down")?), (Some(2), Some(0)));
+    assert_eq!(at(&mv(&mut s, "up")?), (Some(0), Some(0)));
+    // Tab / Shift+Tab use the same navigation.
+    s.move_cell(false)?;
+    assert_eq!(
+        info(&mut s)?["current"],
+        info(&mut s)?["cells"]
+            .as_array()
+            .and_then(|c| c.iter().find(|c| c["row"] == 0 && c["col"] == 2))
+            .and_then(|c| c["index"].as_u64())
+            .map(Value::from)
+            .unwrap_or(Value::Null)
+    );
+    s.move_cell(true)?;
+    assert_eq!(at(&mv(&mut s, "right")?), (Some(0), Some(2)));
+    // Outside a table the command fails.
+    let mut body = Session::new()?;
+    assert!(
+        body.run("table.cell_move", json!({"motion":"right"}))
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn table_style_options_shade_and_user_auto_fill() -> anyhow::Result<()> {
+    let mut s = new_table(4, 3)?;
+    let fill = |s: &mut Session, row: u16, col: u16| -> anyhow::Result<(String, String)> {
+        let v = s.run(
+            "table.cell_properties.get",
+            json!({"range":{"start_row":row,"start_col":col,"end_row":row,"end_col":col}}),
+        )?;
+        Ok((
+            v["fillType"].as_str().unwrap_or("").to_ascii_lowercase(),
+            v["fillColor"].as_str().unwrap_or("").to_ascii_lowercase(),
+        ))
+    };
+    // Default options: header row filled, body clear.
+    s.run("table.style", json!({"preset":"blue_header"}))?;
+    assert_eq!(fill(&mut s, 0, 0)?, ("solid".into(), "#dbe5f1".into()));
+    assert_eq!(fill(&mut s, 1, 0)?.0, "none");
+    // 첫째 칸 + 마지막 줄 on, 제목 줄 off, 회색조: luminance gray of the accent color.
+    s.run(
+        "table.style",
+        json!({"preset":"blue_header","header_row":false,"first_column":true,"last_row":true,"grayscale":true}),
+    )?;
+    assert_eq!(fill(&mut s, 0, 1)?.0, "none");
+    let (t, c) = fill(&mut s, 2, 0)?;
+    assert_eq!(t, "solid");
+    assert_eq!(c, "#e3e3e3", "gray of #dbe5f1");
+    assert_eq!(fill(&mut s, 3, 2)?.0, "solid");
+    // 셀 배경 off keeps fills untouched; 테두리 off + 배경 off is rejected.
+    s.run("table.style", json!({"preset":"basic","background":false}))?;
+    assert_eq!(fill(&mut s, 2, 0)?.1, "#e3e3e3");
+    assert!(
+        s.run(
+            "table.style",
+            json!({"preset":"basic","background":false,"borders":false})
+        )
+        .is_err()
+    );
+    assert!(
+        s.run("table.style", json!({"preset":"basic","stripes":true}))
+            .is_err()
+    );
+    s.execute(Command::Undo)?;
+    s.execute(Command::Undo)?;
+    s.execute(Command::Undo)?;
+    assert_eq!(fill(&mut s, 0, 0)?.0, "none");
+
+    // 셀 음영: Hangul-measured steps from #dbe5f1 and from white.
+    s.run(
+        "table.cell_properties",
+        json!({"range":{"start_row":0,"start_col":0,"end_row":0,"end_col":0},"props":{"fillType":"solid","fillColor":"#dbe5f1"}}),
+    )?;
+    let one = json!({"start_row":0,"start_col":0,"end_row":0,"end_col":0});
+    let v = s.run("table.cell_shade", json!({"range":one,"darker":true}))?;
+    assert_eq!(v["cells"], 1);
+    assert_eq!(fill(&mut s, 0, 0)?.1, "#c8d7e9");
+    s.execute(Command::Undo)?;
+    s.run("table.cell_shade", json!({"range":one,"darker":false}))?;
+    assert_eq!(fill(&mut s, 0, 0)?.1, "#ecf1f7");
+    let white = json!({"start_row":1,"start_col":0,"end_row":1,"end_col":1});
+    let v = s.run("table.cell_shade", json!({"range":white,"darker":true}))?;
+    assert_eq!(v["cells"], 2);
+    assert_eq!(fill(&mut s, 1, 1)?.1, "#f2f2f2");
+    let v = s.run("table.cell_shade", json!({"range":white,"darker":false}))?;
+    assert_eq!(v["cells"], 2);
+    assert_eq!(fill(&mut s, 1, 1)?.0, "none");
+    assert_eq!(
+        s.run("table.cell_shade", json!({"range":white,"darker":false}))?["cells"],
+        0
+    );
+    assert!(s.run("table.cell_shade", json!({"darker":"yes"})).is_err());
+
+    // 사용자 정의 자동 채우기 cycles the list from the first cell's entry.
+    cell_text(&mut s, 2, 0, "중")?;
+    let row = json!({"start_row":2,"start_col":0,"end_row":3,"end_col":2});
+    let v = s.run(
+        "table.auto_fill",
+        json!({"range":row,"values":["상","중","하"]}),
+    )?;
+    assert_eq!(v["cells"], 5);
+    let texts: Vec<String> = info(&mut s)?["cells"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["row"].as_u64() >= Some(2))
+        .map(|c| c["text"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(texts, ["중", "하", "상", "중", "하", "상"]);
+    s.execute(Command::Undo)?;
+    assert!(
+        s.run("table.auto_fill", json!({"range":row,"values":[]}))
+            .is_err()
+    );
+    assert!(
+        s.run("table.auto_fill", json!({"range":one,"values":["a"]}))
+            .is_err()
+    );
+    for ext in ["hwp", "hwpx"] {
+        let mut r = reopen(&mut s, ext)?;
+        let v = r.run(
+            "table.cell_properties.get",
+            json!({"range":{"start_row":0,"start_col":0,"end_row":0,"end_col":0}}),
+        )?;
+        assert_eq!(
+            v["fillColor"].as_str().map(str::to_ascii_lowercase),
+            Some("#ecf1f7".into()),
+            "{ext}"
+        );
+    }
+    Ok(())
+}

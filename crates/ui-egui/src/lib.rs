@@ -2,6 +2,7 @@ pub const APP_NAME: &str = "HwpCraft";
 use anyhow::Result;
 use egui::{Color32, Event, ImeEvent, Key, Pos2, Rect, RichText, Stroke, Vec2};
 use hwpcraft_engine::{Command, Cursor, PageSetup, Session};
+mod autotext_dialog;
 mod chrome;
 mod clipboard;
 mod document_scroll;
@@ -14,13 +15,16 @@ mod extensions;
 mod feature_dialogs;
 mod find_dialog;
 mod format_dialogs;
+mod hanja_dialog;
 mod icons;
 mod margin_guides;
 mod object_dialogs;
 mod page_setup;
+mod review_dialogs;
 mod ribbon;
 mod ribbon_layout;
 mod rulers;
+mod symbol_dialog;
 mod table_drawing;
 mod wheel_zoom;
 use hwpcraft_render::Renderer;
@@ -57,12 +61,16 @@ pub struct HwpApp {
     format_clipboard: Option<serde_json::Value>,
     /// Asked when an encrypted document is opened without a password.
     password_prompt: Option<PasswordPrompt>,
+    /// 문자표 (Ctrl+F10).
+    symbol_dialog: Option<symbol_dialog::State>,
+    /// 형광펜 overlay rectangles for the current document generation.
+    highlights: (u64, Vec<hwpcraft_engine::HighlightRect>),
     equation_preview: Option<(String, egui::TextureHandle, Vec2)>,
     font_family: String,
     line_spacing: f32,
     line_spacing_type: String,
     alignment: String,
-    pages: BTreeMap<u32, (egui::TextureHandle, Vec2)>,
+    pub(crate) pages: BTreeMap<u32, (egui::TextureHandle, Vec2)>,
     cache_generation: u64,
     zoom: f32,
     wheel_zoom: wheel_zoom::State,
@@ -105,6 +113,16 @@ pub struct HwpApp {
     /// Screen rectangle of the top visible page, for rulers and overlays.
     view_page_rect: Option<Rect>,
 }
+/// `#rrggbb` markpen colour as a translucent overlay (Hangul paints it behind glyphs).
+fn markpen_color(hex: &str) -> Color32 {
+    let v = hex.trim_start_matches('#');
+    let channel = |i: usize| u8::from_str_radix(v.get(i..i + 2).unwrap_or("ff"), 16).unwrap_or(255);
+    if v.len() == 6 {
+        Color32::from_rgba_unmultiplied(channel(0), channel(2), channel(4), 110)
+    } else {
+        Color32::from_rgba_unmultiplied(255, 255, 0, 110)
+    }
+}
 /// Gap between pages in the continuous view, matching Hangul's page spacing.
 const PAGE_GAP: f32 = 14.0;
 impl HwpApp {
@@ -136,13 +154,13 @@ impl HwpApp {
                     object_dialogs::ObjectDialog::Styles,
                 ))
             }
-            "symbols" => {
-                self.feature_dialog = Some(feature_dialogs::FeatureDialog::Object(
-                    object_dialogs::ObjectDialog::Symbols {
-                        category: 0,
-                        text: String::new(),
-                    },
-                ))
+            "symbols" => self.open_symbol_dialog(),
+            // symbols-user / -unicode / -hnc / -ks / -emoji / -special / -search:<query>
+            name if name.starts_with("symbols-") => {
+                self.open_symbol_dialog();
+                if let Some(st) = self.symbol_dialog.as_mut() {
+                    st.show_view(&name["symbols-".len()..]);
+                }
             }
             "shape" => {
                 self.feature_dialog = Some(feature_dialogs::FeatureDialog::Object(
@@ -224,6 +242,20 @@ impl HwpApp {
                 .or_default()
                 .push("korean".into());
         }
+        // Symbol / emoji fonts widen 문자표 coverage; they sit after the Korean font.
+        for (i, (path, index)) in hwpcraft_render::symbol_font_faces().into_iter().enumerate() {
+            if let Ok(bytes) = std::fs::read(&path) {
+                let mut data = egui::FontData::from_owned(bytes);
+                data.index = index;
+                let name = format!("symbol-{i}");
+                fonts.font_data.insert(name.clone(), data.into());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .push(name);
+            }
+        }
         ctx.set_fonts(fonts);
         ctx.set_visuals(egui::Visuals::light());
         ctx.style_mut_of(egui::Theme::Light, |s| {
@@ -237,8 +269,17 @@ impl HwpApp {
             s.visuals.selection.bg_fill = Color32::from_rgb(196, 219, 255);
         });
         let mut session = Session::new()?;
+        // An encrypted file given on the command line opens the password prompt
+        // instead of failing app start-up.
+        let mut deferred_password = None;
         if let Some(path) = file {
-            session.open(path)?;
+            match session.open(path) {
+                Ok(()) => {}
+                Err(e) if hwpcraft_formats::needs_password(&e) => {
+                    deferred_password = Some(path.to_owned());
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(Self {
             session,
@@ -254,9 +295,15 @@ impl HwpApp {
             show_paragraph: false,
             feature_dialog: None,
             format_clipboard: None,
-            password_prompt: None,
+            password_prompt: deferred_password.map(|path| PasswordPrompt {
+                path,
+                password: String::new(),
+                error: None,
+            }),
+            highlights: (u64::MAX, Vec::new()),
+            symbol_dialog: None,
             equation_preview: None,
-            font_family: "맑은 고딕".into(),
+            font_family: hwpcraft_render::default_korean_font().into(),
             line_spacing: 160.0,
             line_spacing_type: "Percent".into(),
             alignment: "justify".into(),
@@ -333,7 +380,7 @@ impl HwpApp {
             self.font_size = properties["fontSize"].as_f64().unwrap_or(1100.0) as f32 / 100.0;
             self.font_family = properties["fontFamily"]
                 .as_str()
-                .unwrap_or("맑은 고딕")
+                .unwrap_or(hwpcraft_render::default_korean_font())
                 .to_owned();
         }
         if let Ok(properties) = self.session.paragraph_format() {
@@ -583,12 +630,10 @@ impl HwpApp {
         if let Some((texture, _)) = self.pages.get(&index) {
             return Ok(texture.clone());
         }
-        let p = self.renderer.page(&self.session.core, index, 1.25)?;
-        let size = Vec2::new(p.width as f32 / 1.25, p.height as f32 / 1.25);
-        let image = egui::ColorImage::from_rgba_premultiplied(
-            [p.width as usize, p.height as usize],
-            &p.rgba,
-        );
+        // The shell-page area applies the document view colour and picture
+        // placeholder options on top of the renderer's bitmap.
+        let image = self.shell_page_image(index, 1.25)?;
+        let size = Vec2::new(image.size[0] as f32 / 1.25, image.size[1] as f32 / 1.25);
         let texture = ctx.load_texture(
             format!("page-{index}-{}", self.cache_generation),
             image,
@@ -655,24 +700,53 @@ impl HwpApp {
                     ui.add_space(15.0);
                     let caret = self.session.caret().ok();
                     let mut top_page = None;
-                    for (index, base) in sizes.iter().enumerate() {
-                        let index = index as u32;
-                        let size = *base * self.zoom;
+                    // 맞쪽 보기 (Hangul's facing pages): page 1 alone on the right, then
+                    // even/odd pairs side by side; otherwise one page per row.
+                    let mirror = self.ext.shell.mirror_pages;
+                    let mut rows: Vec<Vec<u32>> = Vec::new();
+                    for index in 0..count {
+                        if mirror
+                            && index > 0
+                            && index % 2 == 0
+                            && let Some(row) = rows.last_mut()
+                        {
+                            row.push(index);
+                            continue;
+                        }
+                        rows.push(vec![index]);
+                    }
+                    for row in rows {
+                        let page_sizes: Vec<egui::Vec2> =
+                            row.iter().map(|i| sizes[*i as usize] * self.zoom).collect();
+                        let total_width = page_sizes.iter().map(|s| s.x).sum::<f32>()
+                            + PAGE_GAP * (row.len() as f32 - 1.0);
+                        // A lone first page in facing view sits where the right page goes.
+                        let lone_right = mirror && row.len() == 1 && row[0] == 0 && count > 1;
                         ui.horizontal(|ui| {
-                            ui.add_space(((ui.available_width() - size.x) / 2.0).max(0.0));
-                            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                            if jump == Some(index) {
-                                ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                            let mut lead = ((ui.available_width() - total_width) / 2.0).max(0.0);
+                            if lone_right {
+                                lead = ((ui.available_width() + PAGE_GAP) / 2.0).max(lead);
                             }
-                            let visible = ui.is_rect_visible(rect);
-                            if visible {
-                                self.wheel_zoom.pages.push((index, rect));
-                            }
-                            if visible && top_page.is_none() {
-                                top_page = Some((index, rect));
-                            }
-                            if visible || jump == Some(index) {
-                                self.page_canvas(ui, &ctx, index, rect, caret.as_ref(), follow);
+                            ui.add_space(lead);
+                            for (n, index) in row.iter().copied().enumerate() {
+                                if n > 0 {
+                                    ui.add_space(PAGE_GAP);
+                                }
+                                let size = page_sizes[n];
+                                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                                if jump == Some(index) {
+                                    ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                                }
+                                let visible = ui.is_rect_visible(rect);
+                                if visible {
+                                    self.wheel_zoom.pages.push((index, rect));
+                                }
+                                if visible && top_page.is_none() {
+                                    top_page = Some((index, rect));
+                                }
+                                if visible || jump == Some(index) {
+                                    self.page_canvas(ui, &ctx, index, rect, caret.as_ref(), follow);
+                                }
                             }
                         });
                         ui.add_space(PAGE_GAP);
@@ -738,6 +812,20 @@ impl HwpApp {
             ctx.memory_mut(|m| m.request_focus(canvas));
         }
         let focused = ctx.memory(|m| m.has_focus(canvas));
+        // 형광펜: RHWP saves markpen marks but does not paint them; overlay them here.
+        if self.highlights.0 != self.session.generation {
+            self.highlights = (self.session.generation, self.session.highlight_rects());
+        }
+        for h in self.highlights.1.iter().filter(|h| h.page == page) {
+            ui.painter().rect_filled(
+                Rect::from_min_size(
+                    rect.min + Vec2::new(h.x as f32, h.y as f32) * self.zoom,
+                    Vec2::new(h.width as f32, h.height as f32) * self.zoom,
+                ),
+                0.0,
+                markpen_color(&h.color),
+            );
+        }
         // Highlight every selected paragraph, bounded for very large spans.
         let selected = if self.session.has_selection() {
             self.session.selected_paragraphs().unwrap_or_default()
@@ -879,6 +967,7 @@ impl HwpApp {
             || self.show_table
             || self.feature_dialog.is_some()
             || self.password_prompt.is_some()
+            || self.symbol_dialog_open()
             || self.ext_modal_open()
         {
             return;
@@ -907,8 +996,8 @@ impl HwpApp {
                         let motion = match key {
                             Key::ArrowLeft => Motion::WordLeft,
                             Key::ArrowRight => Motion::WordRight,
-                            Key::ArrowUp => Motion::ParagraphStart,
-                            Key::ArrowDown => Motion::ParagraphEnd,
+                            Key::ArrowUp => Motion::PrevParagraphStart,
+                            Key::ArrowDown => Motion::NextParagraphStart,
                             Key::Home => Motion::DocumentStart,
                             _ => Motion::DocumentEnd,
                         };
@@ -926,7 +1015,21 @@ impl HwpApp {
                     } else {
                         Command::Undo
                     }),
-                    Key::Y => self.command(Command::Redo),
+                    Key::Y => {
+                        self.run("text.delete_line", json!({}));
+                    }
+                    Key::T | Key::Delete => {
+                        self.run("text.delete_word", json!({}));
+                    }
+                    Key::Backspace => {
+                        self.run("text.delete_word_back", json!({}));
+                    }
+                    Key::Space if modifiers.alt => {
+                        self.run("insert.nbsp", json!({}));
+                    }
+                    Key::Minus if modifiers.shift => {
+                        self.run("insert.soft_hyphen", json!({}));
+                    }
                     Key::F => self.open_find(false),
                     Key::H => self.open_find(true),
                     Key::B => {
@@ -1005,7 +1108,19 @@ impl HwpApp {
                         self.result(r);
                         self.follow_cursor();
                     }
+                    Key::Tab if !modifiers.any() => {
+                        self.run("insert.tab", json!({}));
+                    }
+                    Key::Enter if modifiers.shift => {
+                        self.run("insert.line_break", json!({}));
+                    }
                     Key::Enter => self.command(Command::Split),
+                    Key::Y if modifiers.alt => {
+                        self.run("text.delete_to_line_end", json!({}));
+                    }
+                    Key::Space if modifiers.alt => {
+                        self.run("insert.fixed_width_space", json!({}));
+                    }
                     Key::Backspace => self.command(Command::Backspace),
                     Key::Delete => self.command(Command::Delete),
                     Key::Insert if !modifiers.any() => {
@@ -1053,6 +1168,7 @@ impl HwpApp {
             || self.show_table
             || self.feature_dialog.is_some()
             || self.password_prompt.is_some()
+            || self.symbol_dialog_open()
             || self.ext_modal_open()
         {
             return;
@@ -1062,6 +1178,16 @@ impl HwpApp {
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F7)) {
             self.open_page_setup();
+            return;
+        }
+        // Hangul: Ctrl+F10 opens 문자표.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::F10)) {
+            self.open_symbol_dialog();
+            return;
+        }
+        // Hangul: Alt+G opens 이동 (찾아가기).
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, Key::G)) {
+            self.core_ext_dispatch("edit.goto");
             return;
         }
         let canvas = ctx.memory(|m| m.focused() == Some(egui::Id::new("document-canvas")));
@@ -1178,7 +1304,7 @@ impl HwpApp {
         }
     }
     /// Hangul's 암호 입력 prompt for an encrypted document.
-    fn password_dialog(&mut self, ctx: &egui::Context) {
+    fn password_prompt_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut prompt) = self.password_prompt.take() else {
             return;
         };
@@ -1248,7 +1374,8 @@ impl HwpApp {
         }
     }
     fn dialogs(&mut self, ctx: &egui::Context) {
-        self.password_dialog(ctx);
+        self.password_prompt_dialog(ctx);
+        self.symbol_dialog(ctx);
         self.page_setup_dialog(ctx);
         self.editing_dialogs(ctx);
         if self.error.is_none() {

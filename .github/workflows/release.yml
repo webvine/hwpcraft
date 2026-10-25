@@ -1,0 +1,108 @@
+# Build HwpCraft for Windows, macOS and Linux and attach the archives to a
+# GitHub release when a version tag (v0.14, v0.15, …) is pushed. RHWP is a
+# path dependency, so its tagged source is checked out next to the project.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  RHWP_TAG: v0.8.7
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: .exe
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            exe: ""
+          - name: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            exe: ""
+          - name: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            exe: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hwpcraft
+      - uses: actions/checkout@v4
+        with:
+          repository: edwardkim/rhwp
+          ref: ${{ env.RHWP_TAG }}
+          path: rhwp
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --no-self-update
+          rustup default 1.98.1
+          rustup target add ${{ matrix.target }}
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev libfontconfig1-dev libssl-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hwpcraft
+      - name: Build
+        working-directory: hwpcraft
+        run: cargo build --release --locked --target ${{ matrix.target }} -p hwpcraft -p hwpcraft-cli
+      - name: Test (CLI and engine)
+        working-directory: hwpcraft
+        run: cargo test --release --locked --target ${{ matrix.target }} -p hwpcraft-engine -p hwpcraft-mcp -p hwpcraft-cli
+      - name: Package
+        shell: bash
+        working-directory: hwpcraft
+        run: |
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          NAME=HwpCraft-$VERSION-${{ matrix.name }}
+          mkdir -p dist/$NAME/licenses
+          cp target/${{ matrix.target }}/release/hwpcraft${{ matrix.exe }} target/${{ matrix.target }}/release/hwpcraft-cli${{ matrix.exe }} dist/$NAME/
+          cp README.md LICENSE THIRD-PARTY-NOTICES.txt THIRD-PARTY-DEPENDENCIES.md VERSION dist/$NAME/
+          cp assets/licenses/* dist/$NAME/licenses/
+          cp assets/icons/lucide/LICENSE.txt dist/$NAME/licenses/LICENSE-Lucide-ISC.txt
+          cp ../rhwp/LICENSE dist/$NAME/licenses/LICENSE-RHWP.txt
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then 7z a -tzip $NAME.zip $NAME; else tar czf $NAME.tar.gz $NAME; fi
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            hwpcraft/dist/*.zip
+            hwpcraft/dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

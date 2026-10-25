@@ -261,7 +261,7 @@ fn view_marks_change_the_screen_but_not_the_document() -> anyhow::Result<()> {
     s.execute(Command::Insert("한 줄 본문".into()))?;
     let plain_svg = svg(&s)?;
     let plain_bytes = hwpx(&s)?;
-    let (generation, dirty) = (s.generation, s.dirty());
+    let (generation, dirty, undo) = (s.generation, s.dirty(), s.can_undo());
     assert_eq!(
         s.run("view.marks.get", json!({}))?,
         json!({"paragraphMarks": false, "controlCodes": false, "transparentBorders": false})
@@ -277,7 +277,12 @@ fn view_marks_change_the_screen_but_not_the_document() -> anyhow::Result<()> {
     // The page cache must be redrawn, but nothing is recorded as an edit.
     assert_ne!(s.generation, generation);
     assert_eq!(s.dirty(), dirty);
-    assert!(!s.can_undo());
+    assert_eq!(s.can_undo(), undo);
+    // Undo still targets the text insertion, not the view change.
+    s.execute(Command::Undo)?;
+    assert!(s.entries().iter().all(|(_, t)| t.trim().is_empty()));
+    assert_eq!(s.run("view.marks.get", json!({}))?["paragraphMarks"], true);
+    s.execute(Command::Redo)?;
     assert_ne!(svg(&s)?, plain_svg, "marks must be drawn");
     assert_eq!(hwpx(&s)?, plain_bytes, "saved bytes unchanged");
     // Setting the same flags again is a no-op for the cache generation.
@@ -341,14 +346,25 @@ fn header_footer_text_with_fields_roundtrips_and_undoes() -> anyhow::Result<()> 
         s.save(&path)?;
         let mut r = Session::new()?;
         r.open(&path)?;
-        assert_eq!(
-            header_text(&r).as_deref(),
-            Some("\u{17}쪽 \u{15}/\u{16}"),
-            "{ext}"
-        );
+        // On save RHWP lowers the markers to AutoNumber (page/total) and a path Field
+        // around the literal file name, so the raw text now holds placeholders.
+        let raw = header_text(&r).unwrap_or_default();
+        assert!(raw.contains("쪽") && raw.contains('/'), "{ext} {raw:?}");
         let v = r.run("page.header_footer.text.get", json!({"header": true}))?;
         assert_eq!(v["text"], "쪽 /", "{ext}");
-        assert_eq!(v["fields"].as_array().map(Vec::len), Some(3), "{ext}");
+        let kinds: Vec<&str> = v["fields"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|f| f["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, ["file_name", "page_number", "total_pages"], "{ext}");
+        // Editing a reopened header rebuilds it from the lowered controls.
+        r.run(
+            "page.header_footer.text",
+            json!({"header": true, "text": "다시", "fields": [{"offset": 2, "kind": "page_number"}]}),
+        )?;
+        assert_eq!(header_text(&r).as_deref(), Some("다시\u{15}"), "{ext}");
     }
     let generation = s.generation;
     for bad in [
@@ -547,6 +563,252 @@ fn save_pages_writes_the_range_and_leaves_the_document_alone() -> anyhow::Result
         s.run(
             "file.save_hml",
             json!({"path": temp.path().join("out.txt")})
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+// ----- 0.14: 쪽 여백 사전 값 · 구역 이동 · 쪽 복사/붙이기/지우기 · 끼워 넣기 · 블록 저장 -----
+
+fn three_pages() -> anyhow::Result<Session> {
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("1쪽 가".into()))?;
+    s.execute(Command::Split)?;
+    s.execute(Command::Insert("1쪽 나".into()))?;
+    s.execute(Command::PageBreak)?;
+    s.execute(Command::Insert("2쪽 다".into()))?;
+    s.execute(Command::Split)?;
+    s.execute(Command::Insert("2쪽 라".into()))?;
+    s.execute(Command::PageBreak)?;
+    s.execute(Command::Insert("3쪽 마".into()))?;
+    assert_eq!(s.core.page_count(), 3);
+    Ok(s)
+}
+
+fn has_section_def(s: &Session) -> bool {
+    s.core.document().sections[0].paragraphs[0]
+        .controls
+        .iter()
+        .any(|c| matches!(c, Control::SectionDef(_)))
+}
+
+fn at(paragraph: usize, offset: usize) -> hwpcraft_engine::Cursor {
+    hwpcraft_engine::Cursor {
+        paragraph,
+        offset,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn margin_presets_match_hangul_gallery_and_undo() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    let list = s.run("page.margins.presets", json!({}))?;
+    let names: Vec<&str> = list
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["preset"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "default",
+            "narrow1_hf",
+            "narrow2_hf",
+            "wide_hf",
+            "narrow",
+            "wide"
+        ]
+    );
+    let before = s.page_setup()?;
+    let r = s.run("page.margins.preset", json!({"preset": "narrow"}))?;
+    assert_eq!(r["label"], "좁게");
+    let after = s.page_setup()?;
+    // RHWP stores 1/7200 inch units, so millimetres come back within 0.01 mm.
+    let mm = |v: f64| (v * 100.0).round() / 100.0;
+    assert_eq!(
+        [
+            after.top_mm,
+            after.bottom_mm,
+            after.left_mm,
+            after.right_mm,
+            after.header_mm,
+            after.footer_mm
+        ]
+        .map(mm),
+        [10.0, 10.0, 10.0, 10.0, 0.0, 0.0]
+    );
+    assert_eq!(after.width_mm, before.width_mm);
+    assert_eq!(after.gutter_mm, before.gutter_mm);
+    s.run("page.margins.preset", json!({"preset": "wide_hf"}))?;
+    let wide = s.page_setup()?;
+    assert_eq!(
+        (mm(wide.top_mm), mm(wide.left_mm), mm(wide.header_mm)),
+        (35.0, 40.0, 10.0)
+    );
+    s.execute(Command::Undo)?;
+    s.execute(Command::Undo)?;
+    assert_eq!(s.page_setup()?, before);
+    let generation = s.generation;
+    assert!(
+        s.run("page.margins.preset", json!({"preset": "huge"}))
+            .is_err()
+    );
+    assert!(s.run("page.margins.preset", json!({})).is_err());
+    assert_eq!(s.generation, generation);
+    Ok(())
+}
+
+#[test]
+fn section_navigation_stops_at_document_ends() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("본문".into()))?;
+    assert!(s.run("page.section.next", json!({})).is_err());
+    assert!(s.run("page.section.prev", json!({})).is_err());
+    assert_eq!(s.cursor.offset, 2);
+    Ok(())
+}
+
+#[test]
+fn page_copy_paste_delete_follow_hangul_order() -> anyhow::Result<()> {
+    let mut s = three_pages()?;
+    let r = s.run("page.copy", json!({"page": 2}))?;
+    assert_eq!(r["paragraphs"], 2);
+    // Caret on page 1: the copy becomes a new page 2, caret at the end of the pasted text.
+    s.select(at(0, 1), false)?;
+    let r = s.run("page.paste", json!({}))?;
+    assert_eq!(r["afterPage"], 1, "{r}");
+    assert_eq!(r["pages"], 4, "{r}");
+    assert_eq!(
+        texts(&s),
+        [
+            "1쪽 가", "1쪽 나", "2쪽 다", "2쪽 라", "2쪽 다", "2쪽 라", "3쪽 마"
+        ]
+    );
+    assert_eq!((s.cursor.paragraph, s.cursor.offset), (3, 4));
+    // The pasted page survives a save and reopen.
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("pasted.hwpx");
+    s.save(&path)?;
+    let mut again = Session::new()?;
+    again.open(&path)?;
+    assert_eq!(again.core.page_count(), 4);
+    assert_eq!(texts(&again).len(), 7);
+    s.execute(Command::Undo)?;
+    assert_eq!(s.core.page_count(), 3);
+    assert_eq!(texts(&s).len(), 5);
+    // Paste after the last page.
+    let r = s.run("page.paste", json!({"page": 3}))?;
+    assert_eq!(r["pages"], 4);
+    assert_eq!(
+        texts(&s),
+        [
+            "1쪽 가", "1쪽 나", "2쪽 다", "2쪽 라", "3쪽 마", "2쪽 다", "2쪽 라"
+        ]
+    );
+    s.execute(Command::Undo)?;
+    // Delete the middle page: the pages after it move up.
+    let r = s.run("page.delete", json!({"page": 2}))?;
+    assert_eq!(r["paragraphsRemoved"], 2);
+    assert_eq!(r["pages"], 2);
+    assert_eq!(texts(&s), ["1쪽 가", "1쪽 나", "3쪽 마"]);
+    assert_eq!(s.cursor.paragraph, 2);
+    // Delete the first page: the section definition stays on the first paragraph.
+    let r = s.run("page.delete", json!({"page": 1}))?;
+    assert_eq!(r["pages"], 1, "{r}");
+    assert_eq!(texts(&s), ["3쪽 마"]);
+    assert!(has_section_def(&s));
+    assert!(s.run("page.delete", json!({})).is_err());
+    s.execute(Command::Undo)?;
+    assert_eq!(texts(&s), ["1쪽 가", "1쪽 나", "3쪽 마"]);
+    s.execute(Command::Undo)?;
+    assert_eq!(s.core.page_count(), 3);
+    assert_eq!(texts(&s).len(), 5);
+    for bad in [json!({"page": 0}), json!({"page": 9}), json!({"pages": 1})] {
+        assert!(s.run("page.delete", bad.clone()).is_err(), "{bad}");
+        assert!(s.run("page.copy", bad).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn insert_file_merges_another_document_at_the_caret_with_undo() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let other = temp.path().join("other.hwpx");
+    {
+        let mut o = Session::new()?;
+        o.execute(Command::Insert("끼워 넣을 첫 문단".into()))?;
+        o.execute(Command::Split)?;
+        o.execute(Command::Insert("둘째 문단".into()))?;
+        o.execute(Command::Character(json!({"bold": true})))?;
+        o.save(&other)?;
+    }
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("앞뒤".into()))?;
+    s.select(at(0, 1), false)?;
+    let r = s.run("file.insert", json!({"path": other}))?;
+    assert_eq!(r["paragraphs"], 2, "{r}");
+    let t = texts(&s);
+    assert_eq!(t, ["앞끼워 넣을 첫 문단", "둘째 문단뒤"]);
+    assert_eq!((s.cursor.paragraph, s.cursor.offset), (1, 5));
+    let path = temp.path().join("merged.hwp");
+    s.save(&path)?;
+    let mut again = Session::new()?;
+    again.open(&path)?;
+    assert_eq!(texts(&again), t);
+    s.execute(Command::Undo)?;
+    assert_eq!(texts(&s), ["앞뒤"]);
+    let generation = s.generation;
+    assert!(
+        s.run(
+            "file.insert",
+            json!({"path": temp.path().join("missing.hwpx")})
+        )
+        .is_err()
+    );
+    assert!(s.run("file.insert", json!({})).is_err());
+    assert_eq!(s.generation, generation);
+    Ok(())
+}
+
+#[test]
+fn save_block_writes_only_the_selection() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("가나다라마".into()))?;
+    let path = temp.path().join("block.hwpx");
+    assert!(s.run("file.save_block", json!({"path": path})).is_err());
+    s.select(at(0, 1), false)?;
+    s.select(at(0, 4), true)?;
+    let (generation, cursor) = (s.generation, s.cursor);
+    let r = s.run("file.save_block", json!({"path": path}))?;
+    assert_eq!(r["text"], "나다라", "{r}");
+    let mut part = Session::new()?;
+    part.open(&path)?;
+    assert_eq!(texts(&part), ["나다라"]);
+    assert_eq!(s.generation, generation);
+    assert_eq!(s.cursor, cursor);
+    assert_eq!(texts(&s), ["가나다라마"]);
+    // A span over three paragraphs keeps the middle one whole.
+    s.select(at(0, 5), false)?;
+    s.execute(Command::Split)?;
+    s.execute(Command::Insert("둘째".into()))?;
+    s.execute(Command::Split)?;
+    s.execute(Command::Insert("셋째 끝".into()))?;
+    s.select(at(0, 3), false)?;
+    s.select(at(2, 2), true)?;
+    let span = temp.path().join("span.hwp");
+    let r = s.run("file.save_block", json!({"path": span}))?;
+    assert_eq!(r["paragraphs"], 3, "{r}");
+    let mut part = Session::new()?;
+    part.open(&span)?;
+    assert_eq!(texts(&part), ["라마", "둘째", "셋째"]);
+    assert!(
+        s.run(
+            "file.save_block",
+            json!({"path": temp.path().join("x.docx")})
         )
         .is_err()
     );

@@ -9,6 +9,26 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("table.pen", "표 구분선 그리기 / 지우기", ""),
     ("table.move", "표 위치 이동", ""),
 ];
+
+/// (command id, parameter help, JSON example object) for list_commands and
+/// docs/mcp-commands.md; owner fills this for every command above.
+pub const PARAMS: &[(&str, &str, &str)] = &[
+    (
+        "table.move",
+        "Move a top-level table on its current page. page is zero-based; dx_mm/dy_mm are millimetre deltas. Inline tables become floating; split tables are rejected.",
+        r##"{"table":{"section":0,"paragraph":0,"control":0},"page":0,"dx_mm":10,"dy_mm":5}"##,
+    ),
+    (
+        "table.draw_create",
+        "Draw a floating single-cell table. Dimensions and paper-relative origin are millimetres; no active selection or nested table.",
+        r##"{"width_mm":100,"height_mm":50,"x_mm":30,"y_mm":40}"##,
+    ),
+    (
+        "table.pen",
+        "Start/end are [x,y] millimetres from the table origin. erase merges a shared rectangular edge or hides an outer edge. line uses HWP type/width indices.",
+        r##"{"table":{"section":0,"paragraph":0,"control":0},"start":[30,0],"end":[30,50],"erase":false,"line":{"type":1,"width":0,"color":"#000000"}}"##,
+    ),
+];
 const HU: f64 = 7200.0 / 25.4;
 const SNAP: f64 = 170.0; // 0.6 mm: make near-boundary strokes deterministic.
 #[derive(Deserialize)]

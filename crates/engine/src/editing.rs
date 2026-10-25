@@ -18,6 +18,18 @@ pub enum Motion {
     PageDown,
     ParagraphStart,
     ParagraphEnd,
+    /// Start of the current word (Hangul MoveWordBegin).
+    WordStart,
+    /// End of the current word, before the following spaces (MoveWordEnd).
+    WordEnd,
+    /// Start of the previous paragraph, or of this one when not at its start.
+    PrevParagraphStart,
+    NextParagraphStart,
+    PageStart,
+    PageEnd,
+    /// First/last position of the current list: the table cell, or the body.
+    ListStart,
+    ListEnd,
     DocumentStart,
     DocumentEnd,
 }
@@ -278,6 +290,67 @@ impl Session {
         let v = self.caret_at(c).ok()?;
         Some((v["pageIndex"].as_u64()?, v["y"].as_f64()?))
     }
+    /// Zero-based global page of a position (body paragraph of a cell caret).
+    pub fn page_of(&self, c: Cursor) -> Option<usize> {
+        let raw = self
+            .core
+            .get_page_of_position_native(c.section, c.paragraph)
+            .ok()?;
+        serde_json::from_str::<Value>(&raw).ok()?["page"]
+            .as_u64()
+            .map(|p| p as usize)
+    }
+    /// First body position of a zero-based global page; `None` past the last page.
+    pub fn page_first_position(&self, page: usize) -> Option<Cursor> {
+        let raw = self.core.get_position_of_page_native(page).ok()?;
+        let v: Value = serde_json::from_str(&raw).ok()?;
+        let n = |k: &str| v[k].as_u64().map(|x| x as usize);
+        let c = Cursor {
+            section: n("sec")?,
+            paragraph: n("para")?,
+            offset: n("charOffset").unwrap_or(0),
+            cell: None,
+        };
+        self.paragraph(c).ok().map(|_| c)
+    }
+    /// The last position before a body paragraph start (end of the previous paragraph).
+    fn position_before(&self, c: Cursor) -> Result<Cursor> {
+        if c.offset > 0 {
+            return Ok(Cursor {
+                offset: c.offset - 1,
+                ..c
+            });
+        }
+        let prev = if c.paragraph > 0 {
+            Cursor {
+                paragraph: c.paragraph - 1,
+                offset: 0,
+                cell: None,
+                ..c
+            }
+        } else if c.section > 0 {
+            let s = c.section - 1;
+            let p = self
+                .core
+                .document()
+                .sections
+                .get(s)
+                .map(|x| x.paragraphs.len().saturating_sub(1))
+                .unwrap_or(0);
+            Cursor {
+                section: s,
+                paragraph: p,
+                offset: 0,
+                cell: None,
+            }
+        } else {
+            return Ok(c);
+        };
+        Ok(Cursor {
+            offset: self.paragraph(prev)?.text.chars().count(),
+            ..prev
+        })
+    }
     /// The caret position a motion lands on, without changing the session.
     pub fn motion_target(&self, motion: Motion) -> Result<Cursor> {
         let c = self.cursor;
@@ -387,6 +460,84 @@ impl Session {
             }
             Motion::ParagraphStart => Cursor { offset: 0, ..c },
             Motion::ParagraphEnd => Cursor { offset: len, ..c },
+            Motion::WordStart => {
+                // Inside or at the end of a word: its start. Otherwise the previous word.
+                let o = c.offset.min(len);
+                if o > 0
+                    && class(chars[o - 1]) != 0
+                    && (o == len || class(chars[o]) == class(chars[o - 1]))
+                {
+                    let kind = class(chars[o - 1]);
+                    let mut start = o;
+                    while start > 0 && class(chars[start - 1]) == kind {
+                        start -= 1;
+                    }
+                    Cursor { offset: start, ..c }
+                } else {
+                    self.motion_target(Motion::WordLeft)?
+                }
+            }
+            Motion::WordEnd => {
+                let mut o = c.offset.min(len);
+                // Skip spaces first, then run to the end of the word they precede.
+                while o < len && class(chars[o]) == 0 {
+                    o += 1;
+                }
+                if o >= len {
+                    return Ok(if i + 1 < count {
+                        with_index(c, i + 1, 0)
+                    } else {
+                        Cursor { offset: len, ..c }
+                    });
+                }
+                let kind = class(chars[o]);
+                while o < len && class(chars[o]) == kind {
+                    o += 1;
+                }
+                Cursor { offset: o, ..c }
+            }
+            Motion::PrevParagraphStart => {
+                if c.offset > 0 || i == 0 {
+                    Cursor { offset: 0, ..c }
+                } else {
+                    with_index(c, i - 1, 0)
+                }
+            }
+            Motion::NextParagraphStart => {
+                if i + 1 < count {
+                    with_index(c, i + 1, 0)
+                } else {
+                    Cursor { offset: len, ..c }
+                }
+            }
+            Motion::PageStart => {
+                let page = self.page_of(c);
+                page.and_then(|p| self.page_first_position(p))
+                    .unwrap_or(Cursor { offset: 0, ..c })
+            }
+            Motion::PageEnd => match self
+                .page_of(c)
+                .and_then(|p| self.page_first_position(p + 1))
+            {
+                Some(next) => self.position_before(next)?,
+                None => self.motion_target(Motion::DocumentEnd)?,
+            },
+            Motion::ListStart => {
+                if c.cell.is_some() {
+                    with_index(c, 0, 0)
+                } else {
+                    Cursor::default()
+                }
+            }
+            Motion::ListEnd => {
+                if c.cell.is_some() {
+                    let last = count.saturating_sub(1);
+                    let end = with_index(c, last, 0);
+                    with_index(c, last, self.paragraph(end)?.text.chars().count())
+                } else {
+                    self.motion_target(Motion::DocumentEnd)?
+                }
+            }
             Motion::DocumentStart => Cursor::default(),
             Motion::DocumentEnd => {
                 let sections = &self.core.document().sections;

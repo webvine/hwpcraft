@@ -57,16 +57,20 @@ fn lifecycle_errors_resources_and_bounded_framing() {
             .as_array()
             .unwrap()
             .len(),
-        11
+        13
     );
     assert_eq!(
         rpc(&mut s, "resources/list", json!({}))["result"]["resources"]
             .as_array()
             .unwrap()
             .len(),
-        2
+        3
     );
-    for uri in ["hwpcraft://document", "hwpcraft://commands"] {
+    for uri in [
+        "hwpcraft://document",
+        "hwpcraft://commands",
+        "hwpcraft://hwp-actions",
+    ] {
         let r = rpc(&mut s, "resources/read", json!({"uri":uri}));
         assert!(
             serde_json::from_str::<Value>(r["result"]["contents"][0]["text"].as_str().unwrap())
@@ -403,6 +407,194 @@ fn unsupported_save_never_truncates_and_exports_keep_dirty_state() {
     );
     assert_eq!(
         tool(&mut s, "inspect_document", json!({}))["document"]["dirty"],
+        true
+    );
+}
+
+#[test]
+fn hangul_action_aliases_selection_and_atomic_batch() {
+    let mut s = server();
+    tool(
+        &mut s,
+        "type_text",
+        json!({"text":"첫째 줄 낱말
+둘째"}),
+    );
+    // Listing and lookup of Hangul automation names.
+    let listed = tool(&mut s, "hwp_action", json!({"query":"movelineend"}));
+    assert_eq!(listed[0]["id"], "MoveLineEnd");
+    assert_eq!(listed[0]["command"], "caret.move");
+    let r = tool(&mut s, "hwp_action", json!({"id":"MoveDocumentBegin"}));
+    assert_eq!(r["command"], "caret.move");
+    assert_eq!(r["result"]["cursor"]["paragraph"], 0);
+    // Defaults merge under the caller's params.
+    let r = tool(
+        &mut s,
+        "hwp_action",
+        json!({"id":"MoveSelNextWord","params":{"extend":false}}),
+    );
+    assert_eq!(r["result"]["anchor"], Value::Null);
+    tool(&mut s, "hwp_action", json!({"id":"DeleteWord"}));
+    fails(&mut s, "hwp_action", json!({"id":"NoSuchHangulAction"}));
+    fails(
+        &mut s,
+        "hwp_action",
+        json!({"id":"MoveLineEnd","params":[]}),
+    );
+    let selection = tool(&mut s, "get_selection", json!({}));
+    assert_eq!(selection["hasSelection"], false);
+    // list_commands exposes the reverse index.
+    let commands = tool(&mut s, "list_commands", json!({"query":"caret.move"}));
+    assert!(
+        commands[0]["hwpActions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "MoveLineEnd")
+    );
+
+    // An atomic batch rolls everything back on failure and keeps nothing.
+    let before = tool(&mut s, "get_text", json!({}))["text"].clone();
+    let r = raw_tool(
+        &mut s,
+        "batch",
+        json!({"atomic":true,"commands":[
+            {"command":"text.insert","params":{"text":"추가"}},
+            {"command":"paragraph.split"},
+            {"command":"caret.move","params":{"motion":"nowhere"}}
+        ]}),
+    );
+    assert_eq!(r["isError"], true);
+    let body: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["rolledBack"], true);
+    assert_eq!(body["results"].as_array().unwrap().len(), 3);
+    assert_eq!(tool(&mut s, "get_text", json!({}))["text"], before);
+    assert_eq!(
+        execute(&mut s, "document.inspect", json!({"limit":1}))["document"]["dirty"],
+        true
+    );
+    // A successful atomic batch keeps its work.
+    let r = tool(
+        &mut s,
+        "batch",
+        json!({"atomic":true,"commands":[{"command":"text.insert","params":{"text":"유지"}}]}),
+    );
+    assert_eq!(r["rolledBack"], false);
+    assert!(
+        tool(&mut s, "get_text", json!({}))["text"]
+            .as_str()
+            .unwrap()
+            .contains("유지")
+    );
+    fails(
+        &mut s,
+        "batch",
+        json!({"atomic":true,"commands":[{"command":"file.new","params":{"force":true}}]}),
+    );
+}
+
+/// The project goal: an agent writes a short Korean report through the MCP alone
+/// and ends with saved HWPX, a PDF and a rendered page.
+#[test]
+fn korean_report_authored_end_to_end_through_mcp() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = server();
+    tool(&mut s, "new_document", json!({}));
+    tool(
+        &mut s,
+        "type_text",
+        json!({"text":"주간 업무 보고서
+1. 개요
+이번 주 진행 내용을 정리합니다.
+2. 실적"}),
+    );
+    // Title: bold, larger, centred — via Hangul action names and engine commands.
+    tool(&mut s, "select_text", json!({"text":"주간 업무 보고서"}));
+    tool(&mut s, "hwp_action", json!({"id":"CharShapeBold"}));
+    execute(&mut s, "format.character", json!({"fontSize":1800}));
+    tool(
+        &mut s,
+        "hwp_action",
+        json!({"id":"ParagraphShapeAlignCenter"}),
+    );
+    // Heading numbering on "1. 개요".
+    tool(&mut s, "select_text", json!({"text":"1. 개요"}));
+    execute(
+        &mut s,
+        "format.numbering.apply",
+        json!({"kind":"number","level":0}),
+    );
+    // A table with a caption at the end, a footnote, a footer page number and today's date.
+    tool(&mut s, "hwp_action", json!({"id":"MoveDocumentEnd"}));
+    execute(&mut s, "paragraph.split", json!({}));
+    execute(&mut s, "insert.table", json!({"rows":2,"columns":3}));
+    let doc = tool(&mut s, "inspect_document", json!({}));
+    let cell = doc["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["cursor"]["cell"].is_object())
+        .unwrap()["cursor"]
+        .clone();
+    execute(&mut s, "selection.set", json!({"cursor":cell}));
+    tool(&mut s, "type_text", json!({"text":"항목"}));
+    execute(
+        &mut s,
+        "table.properties",
+        json!({"props":{"hasCaption":true}}),
+    );
+    execute(
+        &mut s,
+        "table.caption_text",
+        json!({"text":"표 1 주간 실적"}),
+    );
+    tool(&mut s, "hwp_action", json!({"id":"MoveDocumentBegin"}));
+    tool(&mut s, "hwp_action", json!({"id":"MoveLineEnd"}));
+    execute(
+        &mut s,
+        "insert.footnote",
+        json!({"text":"작성 기준일은 보고서 날짜입니다."}),
+    );
+    execute(
+        &mut s,
+        "page.number",
+        json!({"position":"bottom_center","format":0,"dash":false}),
+    );
+    tool(&mut s, "hwp_action", json!({"id":"MoveDocumentEnd"}));
+    let r = tool(
+        &mut s,
+        "batch",
+        json!({"atomic":true,"commands":[
+            {"command":"paragraph.split"},
+            {"command":"insert.auto_text","params":{"kind":"date","format":"%Y-%m-%d"}}
+        ]}),
+    );
+    assert_eq!(r["rolledBack"], false);
+    let stats = execute(&mut s, "document.statistics", json!({}));
+    assert_eq!(stats["tables"], 1);
+    assert_eq!(stats["footnotes"], 1);
+    assert!(stats["words"].as_u64().unwrap() >= 8);
+    // Outputs: HWPX, PDF, inline PNG.
+    let hwpx = dir.path().join("주간 보고서.hwpx");
+    tool(&mut s, "save_document", json!({"path":hwpx}));
+    let pdf = dir.path().join("주간 보고서.pdf");
+    tool(&mut s, "save_document", json!({"path":pdf}));
+    assert!(std::fs::metadata(&pdf).unwrap().len() > 1000);
+    let page = raw_tool(&mut s, "render_page", json!({"page":1,"scale":0.5}));
+    assert_eq!(page["isError"], false);
+    assert_eq!(page["content"][0]["type"], "image");
+    // Re-open and verify the structure survived.
+    tool(&mut s, "new_document", json!({"force":true}));
+    tool(&mut s, "open_document", json!({"path":hwpx}));
+    let text = tool(&mut s, "get_text", json!({}))["text"].clone();
+    assert!(text.as_str().unwrap().starts_with("주간 업무 보고서"));
+    assert_eq!(
+        execute(&mut s, "document.statistics", json!({}))["tables"],
+        1
+    );
+    tool(&mut s, "select_text", json!({"text":"주간 업무 보고서"}));
+    assert_eq!(
+        execute(&mut s, "format.character.get", json!({}))["bold"],
         true
     );
 }

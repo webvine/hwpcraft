@@ -4,7 +4,7 @@
 
 ArtCraft 팀의 [WordCraft](https://github.com/storytold/wordcraft) 기본 구조 위에, [RHWP](https://github.com/edwardkim/rhwp) 문서 엔진의 아래한글 편집 기능과 [egui](https://github.com/emilk/egui) 화면을 결합해 만든 Rust 네이티브 HWP/HWPX 편집기입니다. 두 프로젝트는 모두 MIT 라이선스입니다.
 
-현재 버전은 **0.12**이며, 버전은 `0.10 → 0.11 → 0.12 …`처럼 `x.xx` 형식으로 증가합니다.
+현재 버전은 **0.14**이며, 버전은 `0.10 → 0.11 → 0.12 …`처럼 `x.xx` 형식으로 증가합니다. 0.14는 아래한글의 편집 동작을 실제 프로그램으로 확인해 같은 결과를 내도록 맞춘 판입니다: 한글식 캐럿·선택·삭제·특수 문자 명령, 한글 자동화 동작 이름을 그대로 받는 MCP `hwp_action`(580여 개)과 원자적 `batch`, 서식 증감·글자 겹치기·스타일 가져오기/내보내기, 표 안 이동·표 마당 옵션·개체 맞춤/회전/그림자·글상자 정렬·각주↔미주·자동 번호, 쪽 여백 사전 값·문서 보기 색·쪽 복사/붙이기·끼워 넣기·맞쪽 보기, 한자 변환·찾기 확장(조건식·아무개 문자)·문서 비교·상용구. 자세한 내용: [docs/RELEASE-0.14.md](docs/RELEASE-0.14.md), 이전 판: [docs/RELEASE-0.13.md](docs/RELEASE-0.13.md).
 
 HwpCraft는 독립적인 오픈소스 프로젝트이며 한글과컴퓨터와 관련이 없습니다. 한컴의 코드·아이콘·로고·글꼴은 포함하지 않습니다. **아래한글의 모든 기능·화면과 100 % 같은 제품은 아닙니다.** 구현하지 않은 기능과 차이는 [현재 범위와 한계](#현재-범위와-한계)에 숨기지 않고 적었습니다.
 
@@ -72,6 +72,7 @@ HwpCraft는 두 오픈소스 프로젝트를 결합해 구현했습니다. 어�
 - 그림: PNG·JPG·BMP·GIF, 크기·위치·배치·회전·대칭·자르기·효과·밝기·대비·투명도·캡션.
 - 도형·글상자: 직선·사각형·타원·호·다각형·자유 곡선·글상자를 끌어 그리기, 8개 핸들·회전 손잡이, 선·채우기·그림자 속성, 여러 문단 글상자.
 - 수식 편집기(구조·기호 도구와 미리 보기), 여러 문단 각주·미주, 기존 차트 값 편집, 메모 목록.
+- 표·개체(0.14): 표 안 셀 이동(Tab/Shift+Tab, 마지막 셀에서 줄 추가, `table.cell_move`), 표 마당 옵션(제목 줄·첫/마지막 칸·마지막 줄·회색조·테두리·배경), 셀 음영 진하게/연하게, 사용자 목록 자동 채우기, 개체 맞춤 11종·크기·회전·크기 고정·바깥 여백 사전 값·채우기/선/화살표 빠른 설정·그림자 이동·개체 모양 복사/붙이기·Tab 개체 순환·개체 선택 단추·연결선 종류 바꾸기, 글상자 9방향 정렬·여백·세로 글상자, 그림 파일로 저장·색조(회색조·흑백), 자동 번호(쪽·전체·그림·표·수식), 각주↔미주 변환과 각주/미주 모양(구분선·번호 모양), 주석·누름틀 지우기.
 - 개체 조작(0.13): 묶기/풀기(Shift+클릭 다중 선택), 맨 앞/맨 뒤/앞/뒤 순서, 개체 보호(보호된 개체는 끌기·삭제·편집 거부)와 보호 모두 해제, 가로/세로 대칭, 연결선 6종(도형→도형 끌기, 도형 이동 시 재계산), 직선 끝점 손잡이, 누름틀 넣기와 이름·값 편집, 기존 양식 개체 값 편집.
 
 ### 쪽·보기·파일 서비스
@@ -80,6 +81,7 @@ HwpCraft는 두 오픈소스 프로젝트를 결합해 구현했습니다. 어�
 - 편집 용지(F7), 쪽 번호 매기기(위치 11종·모양 10종), 머리말/꼬리말(마당 11종 × 양쪽/홀수/짝수), 쪽 테두리/배경, 새 번호로 시작, 현재 쪽만 감추기, 다단.
 - 문서 정보, 인쇄(범위·매수, PDF를 거쳐 Windows 인쇄 동사·macOS `open`·Linux `xdg-open` 또는 PDF 저장), 보기 배율·쪽 맞춤·폭 맞춤, 눈금자·문서 탭 보이기.
 - 한글처럼 여러 쪽을 세로로 이어 보는 연속 보기(쪽 사이 14 px). 보이는 쪽만 그리고 커서를 따라 스크롤합니다.
+- 0.14: 쪽 여백 사전 값 6종(한글 실측 수치), 문서 보기 색(기본·어둡게·고대비·옛 한글·사용자 설정)과 그림 자리 표시, 맞쪽 보기, 쪽 복사/붙이기/지우기, 끼워 넣기(`file.insert`), 블록 저장, 그림 파일로 저장(쪽 PNG), 머리말/꼬리말 편집 창 이전·다음, 문서 정보(일반·글꼴 대체·그림), 구역 이전/다음. 서식(0.14): 글자 크기·장평·줄 간격·여백 증감, 글꼴 순환, 글자 색/음영/형광펜 사전 색, 글자 테두리, 현재 위치로 들여쓰기, 문단 위/아래 이동, 위/아래 첨자 순환, 글자 스타일 해제, 현재 모양으로 스타일 갱신, 스타일 순서·JSON 가져오기/내보내기, 글자 겹치기. 검토·도구(0.14): 한자 변환(F9, Unihan 독음표), 찾기 확장(띄어쓰기 무시·아무개 문자·조건식·여러 단어·한글로 한자·서식 조건), 문서 비교(RHWP docdiff), 상용구(Ctrl+F3·Alt+I). 편집(0.14): 이동 창(Alt+G).
 - 0.13: 보기 탭 문단 부호·조판 부호·투명 선, 보안 탭 문서 암호와 *개인 정보 찾아서 보호*(주민등록번호·카드·전화·전자우편·숨은 글자, 선택 값 가리기 1단계 실행 취소), 머리말/꼬리말 쪽 번호·전체 쪽수·파일 이름 필드, 파일 메뉴 미리 보기·최근 문서·HML로 저장(HML 원본만)·쪽 범위 저장, 구역 설정, 탭·리본 Alt 키팁.
 
 ### CLI와 MCP
@@ -168,6 +170,7 @@ hwpcraft ./samples/HwpCraft-시작하기.hwpx --view replace --screenshot out.pn
 - 각주 구분선 길이 −1(단 너비)은 짧게, 바깥 여백이 있는 개체는 여백만큼 다른 자리에 그립니다(저장본은 한글에서 정상).
 - 형광펜은 markpen으로 저장되지만 RHWP 렌더러가 그리지 않아 HwpCraft가 화면에만 덧그립니다(인쇄·PDF에는 없음). 새 번호 목록은 새 번호 정의로 저장합니다(RHWP `set_numbering_restart`는 저장되지 않음). 곡선은 촘촘한 직선 구간으로 저장합니다.
 - 본문에 넣은 쪽 번호·전체 쪽수 자동 번호(`insert.auto_text`)는 저장되고 한글에서 번호로 표시되지만, RHWP 렌더러가 본문 자동 번호를 그리지 않아 HwpCraft 화면과 PDF에서는 빈칸입니다. 한글의 날짜 코드 필드는 RHWP에 없어 현재 날짜 글로 넣습니다.
+- 표: 셀 음영 진하게/연하게는 한글처럼 ±1단계에서 멈추지 않고 누를 때마다 적용됩니다. 표 마당의 글자 모양 적용·사용자 표 마당은 없습니다. 개체: 그림 그림자·네온·옅은 테두리·반사(RHWP는 보존만), 자유선·그리기 마당·안내선·격자·서식 저장은 없습니다. 바깥 여백·글상자 여백 사전 값과 그림자 이동 단위는 한글 수치를 확인하지 못한 가정값입니다. 각주 번호 '쪽마다 새로'는 모양 값만 저장하고 번호는 구역 단위로 매깁니다.
 - 쪽 복사/지우기는 문단 단위입니다(앞 쪽에서 이어진 문단은 제외, 한 문단이 쪽 전체면 지우기 거부). 끼워 넣기는 파일 메뉴에서만(Ctrl+O는 불러오기). PDF 인쇄 옵션(형광펜·그리기 개체·그림·메모 포함)·쪽 윤곽 끄기·격자·줄 번호·바탕쪽 편집·문서 이력은 RHWP에 옵션·모델이 없어 제공하지 않습니다. 맞쪽 보기는 쪽 배치만 바꾸며 쪽 번호 안/바깥 구분은 없습니다.
 - 상용구는 글 상용구만 지원하며 서식·표·개체가 든 본문 상용구는 저장하지 않습니다(그룹·가져오기/내보내기 없음).
 - 한자 변환은 Unicode Unihan 독음표로 음절마다 후보를 고르는 방식이며 낱말 사전이 없어 아래한글처럼 낱말 단위 후보·빈도순 정렬은 하지 않습니다. 변경 내용 추적·메모 새로 넣기·맞춤법 검사는 RHWP에 모델·사전이 없어 제공하지 않습니다. 문서 비교는 추가·삭제·변경 문단 목록으로 보여 주며 나란히 보기는 없습니다. 음영 없음은 RHWP가 흰색(#ffffff)으로 보고합니다.
@@ -189,7 +192,7 @@ HwpCraft는 **MIT 라이선스**로 배포합니다. 전문은 [LICENSE](LICENSE
 
 **MIT 라이선스가 적용되는 범위** — 이 저장소에 들어 있는 HwpCraft의 모든 산출물입니다.
 
-- 소스 코드: `crates/`, `apps/`의 Rust 코드와 빌드·패키징 스크립트(`HwpCraft.ps1`).
+- 소스 코드: `crates/`, `apps/`의 Rust 코드와 빌드·패키징 스크립트(`HwpCraft.ps1`, `hwpcraft.sh`).
 - 문서와 예제: `README.md`, `docs/`, `CONTRIBUTING.md`, `samples/`의 HWP/HWPX/PDF 예제 문서.
 - HwpCraft가 직접 만든 자산: 앱 아이콘 `assets/icon.svg`, 리본 아이콘 아틀라스 `assets/toolbar-icons.png`(Lucide 아이콘을 조합한 결과물).
 - 기여물: 풀 리퀘스트로 들어오는 모든 변경은 MIT로 제공되며 DCO 서명을 요구합니다([CONTRIBUTING.md](CONTRIBUTING.md)).
@@ -227,7 +230,7 @@ HwpCraft는 **MIT 라이선스**로 배포합니다. 전문은 [LICENSE](LICENSE
 
 A native Rust desktop editor for Korean HWP / HWPX word-processor documents. It takes its application structure from the ArtCraft team's [WordCraft](https://github.com/storytold/wordcraft), its Hangul editing capabilities from the [RHWP](https://github.com/edwardkim/rhwp) document engine, and its user interface from [egui](https://github.com/emilk/egui). Both WordCraft and RHWP are MIT-licensed.
 
-Current version: **0.12**. Versions increase as `0.10 → 0.11 → 0.12 …`.
+Current version: **0.14**. Versions increase as `0.10 → 0.11 → 0.12 …`. 0.14 matches Hangul's editing behaviour as observed in the real program: Hangul-style caret / selection / deletion / special-character commands, the MCP `hwp_action` tool that accepts Hangul automation action names (about 580) plus atomic `batch`, formatting steps, character overlap and style import / export, in-table navigation, table-style options, object align / rotate / shadow, text-box alignment, footnote ↔ endnote conversion and auto numbers, margin presets, document view colours, page copy / paste, insert file and facing pages, Hanja conversion, extended find (regex, wildcards), document compare and AutoText. Details: [docs/RELEASE-0.14.md](docs/RELEASE-0.14.md) (Korean); previous: [docs/RELEASE-0.13.md](docs/RELEASE-0.13.md).
 
 HwpCraft is an independent open-source project. It is not affiliated with, endorsed by, or derived from Hancom Inc. It ships no Hancom code, icons, logos or fonts. **It is not a 100 % replacement for Hancom Office Hangul.** Unimplemented features and known differences are listed under [Scope and limits](#scope-and-limits) rather than hidden.
 
@@ -295,6 +298,7 @@ No Hancom code or resources are used in any layer. Hancom Office Hangul is the r
 - Pictures: PNG, JPG, BMP, GIF with size, position, wrap, rotation, flip, crop, effects, brightness, contrast, transparency and caption.
 - Shapes and text boxes: line, rectangle, ellipse, arc, polygon, freeform and text box drawn by dragging; eight resize handles, rotation handle, line / fill / shadow properties, multi-paragraph text boxes.
 - Equation editor with Hangul-style structure and symbol palettes and live preview, multi-paragraph footnotes and endnotes, editing of existing chart values, memo list.
+- Tables and objects (0.14): in-table cell navigation (Tab / Shift+Tab, append a row from the last cell, `table.cell_move`), table-style options (header row, first / last column, last row, grayscale, borders, background), darker / lighter cell shading, user-list auto fill, eleven object alignments, size, rotation, size lock, outer-margin presets, quick fill / outline / arrow styles, shadow nudging, object format copy / paste, Tab cycling through objects, the object-selection button, connector type change, nine-way text-box alignment, text-box margins and vertical text boxes, save pictures to files and recolour (grayscale, black-and-white), auto numbers (page, total, picture, table, equation), footnote ↔ endnote conversion with note shape (separator, number format), note and field deletion.
 - Object operations (0.13): group / ungroup (Shift+click multi-select), bring to front / send to back / forward / backward, object protection (locked objects refuse drag, delete and edits) and unlock all, horizontal / vertical flip, six connector kinds drawn shape-to-shape and re-routed when a shape moves, line end-point handles, click-here fields (누름틀) with name / value editing, and value editing of existing form objects.
 
 ### Page, view and file services
@@ -303,6 +307,7 @@ No Hancom code or resources are used in any layer. Hancom Office Hangul is the r
 - Page setup (F7), page numbering (11 positions, 10 formats), headers / footers (11 templates × both / odd / even), page borders and backgrounds, restart numbering, hide current page, columns.
 - Document information, print (range, copies; via PDF to the Windows print verb, macOS `open` or Linux `xdg-open`, or a PDF file), zoom presets, fit page / fit width, show or hide rulers and document tabs.
 - Continuous multi-page view like Hangul (14 px page gap), drawing only visible pages and scrolling with the caret.
+- 0.14: six page-margin presets (values measured in Hangul), document view colours (default, dark, high contrast, classic, custom) and picture placeholders, facing pages, page copy / paste / delete, insert file (`file.insert`), save block, save pages as PNG, previous / next in the header-footer editor, document info (general, font substitution, pictures), previous / next section. Formatting (0.14): font size / width / line spacing / margin steps, font cycling, preset text / shade / highlight colours, character borders, indent at caret, move paragraph up / down, super- / subscript cycle, clear character style, update style from caret, style ordering and JSON import / export, character overlap. Review and tools (0.14): Hanja conversion (F9, Unihan readings), extended find (ignore spaces, wildcards, regex, any word, Hanja by Hangul reading, format conditions), document compare (RHWP docdiff), AutoText (Ctrl+F3, Alt+I). Editing (0.14): Go To dialog (Alt+G).
 - 0.13: View tab paragraph marks / control codes / transparent lines; Security tab document password and *find and protect personal information* (resident numbers, cards, phones, e-mail, hidden text; mask selected values in one undo step); header / footer page-number, total-pages and file-name fields; File menu preview, recent documents, save as HML (HML-sourced documents only) and save a page range; section settings; Alt key tips for tabs and ribbon items.
 
 ### CLI and MCP
@@ -391,6 +396,7 @@ Feature areas plug in through `extensions.rs`, so each area adds its own command
 - Footnote separator length −1 (column width) is drawn short, and objects with outer margins are offset on screen (saved files open correctly in Hangul).
 - The highlighter is saved as markpen marks but RHWP's renderer does not paint them, so HwpCraft overlays them on screen only (not in print / PDF). New numbered lists create new numbering definitions (RHWP's `set_numbering_restart` is not saved); curves are saved as dense polylines.
 - Page-number / total-page auto numbers inserted into body text (`insert.auto_text`) are saved and Hangul shows the numbers, but RHWP's renderer does not draw body auto numbers, so HwpCraft's screen and PDF leave them blank. Hangul's date-code field has no RHWP counterpart; the current date is inserted as text.
+- Tables: darker / lighter cell shading applies on every press instead of stopping after one step like Hangul; table-style font application and user table styles are missing. Objects: picture shadow / glow / soft edge / reflection (RHWP only preserves them), free-form lines, drawing gallery, guides, grid and saved formats are missing; outer-margin / text-box-margin presets and the shadow nudge unit are assumptions not verified against Hangul. Footnote "restart per page" stores the shape value only; numbers run per section.
 - Page copy / delete work per paragraph (a paragraph continued from the previous page is left out; deleting is refused when one paragraph fills the page). Insert file lives in the File menu only (Ctrl+O stays Open). PDF print options (highlighter, drawing objects, pictures, memos), page outline off, grid, line numbers, master-page editing and document history are not provided because RHWP has no option or model for them. Facing pages only changes the page layout.
 - AutoText (상용구) stores plain-text entries only; body entries with formatting, tables or objects are not saved (no groups or import / export).
 - Hanja conversion picks candidates per syllable from the Unicode Unihan reading table; without a word dictionary it does not offer word-level candidates or frequency ordering like Hangul. Track changes, new memos and spell checking are not provided because RHWP has no model or dictionary for them. Document compare lists added / removed / changed paragraphs without a side-by-side view. "No shading" is reported by RHWP as white (#ffffff).
@@ -412,7 +418,7 @@ HwpCraft is released under the **MIT License**. The full text is in [LICENSE](LI
 
 **What the MIT License covers** — everything HwpCraft itself produces in this repository.
 
-- Source code: the Rust code in `crates/` and `apps/`, plus the build / packaging script (`HwpCraft.ps1`).
+- Source code: the Rust code in `crates/` and `apps/`, plus the build / packaging scripts (`HwpCraft.ps1`, `hwpcraft.sh`).
 - Documentation and samples: `README.md`, `docs/`, `CONTRIBUTING.md`, and the HWP / HWPX / PDF documents in `samples/`.
 - Assets made by HwpCraft: the application icon `assets/icon.svg` and the ribbon icon atlas `assets/toolbar-icons.png` (a composition of Lucide icons).
 - Contributions: every change submitted by pull request is provided under MIT and requires a DCO sign-off ([CONTRIBUTING.md](CONTRIBUTING.md)).

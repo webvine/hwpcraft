@@ -13,11 +13,11 @@ pub(super) const LANGUAGES: [&str; 8] = [
     "기호",
     "사용자",
 ];
-/// Fallback 글꼴 list when the system font database is empty.
-const FONTS: [&str; 18] = [
+/// Fallback 글꼴 list when the system font database is empty; the platform's Korean
+/// font (`hwpcraft_render::default_korean_font`) is put first by `fallback_fonts`.
+const FONTS: [&str; 17] = [
     "함초롬바탕",
     "함초롬돋움",
-    "맑은 고딕",
     "바탕",
     "바탕체",
     "돋움",
@@ -35,22 +35,26 @@ const FONTS: [&str; 18] = [
     "Segoe UI",
 ];
 static FONT_LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+fn fallback_fonts() -> Vec<String> {
+    let default = hwpcraft_render::default_korean_font();
+    std::iter::once(default)
+        .chain(FONTS.iter().copied().filter(|f| *f != default))
+        .map(str::to_owned)
+        .collect()
+}
 /// Installed font families (Korean names first), read once: the database holds hundreds.
 pub(super) fn load_fonts(renderer: &hwpcraft_render::Renderer) {
     FONT_LIST.get_or_init(|| {
         let names = renderer.font_families();
         if names.is_empty() {
-            FONTS.iter().map(|s| (*s).to_owned()).collect()
+            fallback_fonts()
         } else {
             names
         }
     });
 }
 pub(super) fn font_names() -> Vec<String> {
-    FONT_LIST
-        .get()
-        .cloned()
-        .unwrap_or_else(|| FONTS.iter().map(|s| (*s).to_owned()).collect())
+    FONT_LIST.get().cloned().unwrap_or_else(fallback_fonts)
 }
 
 /// HWP border width indices (표 28), in mm.

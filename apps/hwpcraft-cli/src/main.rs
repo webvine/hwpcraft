@@ -196,7 +196,9 @@ fn demo(dir: &Path) -> Result<()> {
     ]) {
         s.select(c, false)?;
         s.execute(Command::Insert(text.into()))?;
-        s.execute(Command::Character(json!({"fontFamily":"Noto Sans KR","fontSize":1000,"bold":false})))?;
+        s.execute(Command::Character(
+            json!({"fontFamily":"Noto Sans KR","fontSize":1000,"bold":false}),
+        ))?;
     }
     s.select(Cursor::default(), false)?;
     for extension in ["hwpx", "hwp", "pdf"] {

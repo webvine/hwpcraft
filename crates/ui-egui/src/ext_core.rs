@@ -1,11 +1,28 @@
-//! Owner: core area. Core editing tools on the ribbon: 정렬, 조판 부호 지우기, 한자 변환.
+//! Owner: core area. Core editing tools on the ribbon: 정렬, 조판 부호 지우기, 이동(Alt+G).
 use super::*;
 use hwpcraft_engine::{MarkKind, SortKey, SortOptions};
+
+/// Hangul's 이동 (찾아가기) targets HwpCraft can reach.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GotoKind {
+    Page,
+    Section,
+    Paragraph,
+    Bookmark,
+}
+
+pub(crate) struct GotoState {
+    kind: GotoKind,
+    value: String,
+    bookmarks: Vec<String>,
+    bookmark: usize,
+}
 
 #[derive(Default)]
 pub(crate) struct State {
     sort: Option<SortOptions>,
     marks: Option<Vec<(MarkKind, usize, bool)>>,
+    goto: Option<GotoState>,
 }
 
 impl HwpApp {
@@ -16,8 +33,7 @@ impl HwpApp {
                 Some(self.session.cursor.cell.is_none() && self.session.span().is_some())
             }
             "edit.delete_ctrl_marks" => Some(self.session.cursor.cell.is_none()),
-            // 한자 변환 needs a Hanja dictionary that HwpCraft does not ship yet.
-            "insert.hanja" => Some(false),
+            "edit.goto" => Some(true),
             _ => None,
         }
     }
@@ -31,23 +47,140 @@ impl HwpApp {
                         Some(counts.into_iter().map(|(k, n)| (k, n, n > 0)).collect());
                 }
             }
+            "edit.goto" => {
+                let bookmarks: Vec<String> = self
+                    .session
+                    .bookmarks()
+                    .ok()
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|b| b["name"].as_str().map(str::to_owned))
+                    .collect();
+                let page = self.session.page_of(self.session.cursor).unwrap_or(0) + 1;
+                self.ext.core.goto = Some(GotoState {
+                    kind: GotoKind::Page,
+                    value: page.to_string(),
+                    bookmarks,
+                    bookmark: 0,
+                });
+            }
             _ => return false,
         }
         true
     }
     pub(crate) fn core_ext_modal_open(&self) -> bool {
-        self.ext.core.sort.is_some() || self.ext.core.marks.is_some()
+        self.ext.core.sort.is_some()
+            || self.ext.core.marks.is_some()
+            || self.ext.core.goto.is_some()
     }
     pub(crate) fn core_ext_view(&mut self, name: &str) -> bool {
         match name {
             "sort" => self.core_ext_dispatch("edit.sort"),
             "ctrl-marks" => self.core_ext_dispatch("edit.delete_ctrl_marks"),
+            "goto" => self.core_ext_dispatch("edit.goto"),
             _ => false,
         }
     }
     pub(crate) fn core_ext_dialogs(&mut self, ctx: &egui::Context) {
         self.sort_dialog(ctx);
         self.marks_dialog(ctx);
+        self.goto_dialog(ctx);
+    }
+    /// Hangul 이동 (Alt+G): jump to a page, section, paragraph or bookmark.
+    fn goto_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut g) = self.ext.core.goto.take() else {
+            return;
+        };
+        let pages = self.session.core.page_count();
+        let sections = self.session.core.document().sections.len();
+        let paragraphs = self
+            .session
+            .core
+            .document()
+            .sections
+            .get(self.session.cursor.section)
+            .map(|s| s.paragraphs.len())
+            .unwrap_or(0);
+        let (mut apply, mut cancel) = (false, false);
+        chrome::modal("goto-dialog").show(ctx, |ui| {
+            ui.set_width(380.0);
+            cancel = chrome::title(ui, "이동");
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(270.0);
+                    chrome::section(ui, "이동할 곳");
+                    let before = g.kind;
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut g.kind, GotoKind::Page, format!("쪽 (1–{pages})"));
+                        ui.radio_value(
+                            &mut g.kind,
+                            GotoKind::Section,
+                            format!("구역 (1–{sections})"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.radio_value(
+                            &mut g.kind,
+                            GotoKind::Paragraph,
+                            format!("문단 (1–{paragraphs})"),
+                        );
+                        ui.add_enabled_ui(!g.bookmarks.is_empty(), |ui| {
+                            ui.radio_value(&mut g.kind, GotoKind::Bookmark, "책갈피");
+                        });
+                    });
+                    if g.kind != before {
+                        g.value = "1".into();
+                    }
+                    if g.kind == GotoKind::Bookmark {
+                        egui::ComboBox::from_id_salt("goto-bookmark")
+                            .selected_text(g.bookmarks.get(g.bookmark).cloned().unwrap_or_default())
+                            .show_ui(ui, |ui| {
+                                for (i, name) in g.bookmarks.iter().enumerate() {
+                                    ui.selectable_value(&mut g.bookmark, i, name);
+                                }
+                            });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("번호");
+                            let edit = ui
+                                .add(egui::TextEdit::singleline(&mut g.value).desired_width(80.0));
+                            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                apply = true;
+                            }
+                        });
+                    }
+                });
+                ui.vertical(|ui| {
+                    let valid = g.kind == GotoKind::Bookmark
+                        || g.value.trim().parse::<usize>().is_ok_and(|n| n >= 1);
+                    let (a, c) = chrome::actions(ui, valid, "이동");
+                    apply |= a;
+                    cancel |= c;
+                });
+            });
+        });
+        if apply {
+            let params = match g.kind {
+                GotoKind::Bookmark => {
+                    json!({"bookmark": g.bookmarks.get(g.bookmark).cloned().unwrap_or_default()})
+                }
+                kind => {
+                    let n = g.value.trim().parse::<usize>().unwrap_or(0);
+                    match kind {
+                        GotoKind::Page => json!({"page": n}),
+                        GotoKind::Section => json!({"section": n.saturating_sub(1)}),
+                        _ => json!({"paragraph": n.saturating_sub(1)}),
+                    }
+                }
+            };
+            if self.run("edit.goto", params) {
+                return;
+            }
+        }
+        if !cancel {
+            self.ext.core.goto = Some(g);
+        }
     }
     fn scope_label(&self) -> &'static str {
         if self.session.span().is_some() {

@@ -12,6 +12,7 @@ egui.workspace = true
 eframe.workspace = true
 rfd.workspace = true
 arboard.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 image.workspace = true

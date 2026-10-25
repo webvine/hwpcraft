@@ -49,6 +49,292 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("form.list", "양식 개체 목록", ""),
     ("form.get", "양식 개체 정보 조회", ""),
     ("form.set", "양식 개체 값 고치기 (value·text·caption)", ""),
+    (
+        "object.align",
+        "개체 맞춤 (왼쪽·가운데·오른쪽·위·중간·아래, 같은 너비·높이·크기, 가로·세로 간격 동일)",
+        "",
+    ),
+    ("object.size", "개체 너비·높이 (mm)", ""),
+    ("object.rotate", "개체 회전 (각도·증감)", ""),
+    ("object.protect_size", "개체 크기 고정", ""),
+    ("object.outer_margin", "개체 바깥 여백 (사전 값·mm)", ""),
+    (
+        "object.style",
+        "개체 빠른 스타일 (채우기·선 색, 선 종류·굵기, 화살표)",
+        "",
+    ),
+    ("object.shadow", "개체 그림자 (종류·이동·없음)", ""),
+    (
+        "object.format.get",
+        "개체 모양 복사 (선·채우기·그림자 읽기)",
+        "",
+    ),
+    ("object.format", "개체 모양 붙이기", ""),
+    ("object.neighbor", "다음·이전 개체 찾기", "Tab / Shift+Tab"),
+    (
+        "object.connector_type",
+        "연결선 종류 바꾸기 (직선·꺾인·곡선)",
+        "",
+    ),
+    ("textbox.align", "글상자 글자 정렬 (가로 3 × 세로 3)", ""),
+    ("textbox.margin", "글상자 안 여백 (사전 값·mm)", ""),
+    (
+        "textbox.direction",
+        "글상자 글자 방향 (가로·세로·영문 세움)",
+        "",
+    ),
+    ("picture.save", "그림 파일로 저장", ""),
+    ("picture.save_all", "모든 그림 파일로 저장", ""),
+    (
+        "picture.recolor",
+        "그림 색 조정 (원래·회색조·흑백·워터마크)",
+        "",
+    ),
+    (
+        "insert.auto_number",
+        "번호 넣기 (쪽·전체 쪽·그림·표·수식 번호)",
+        "",
+    ),
+    ("note.convert", "각주 ↔ 미주 변환", ""),
+    ("note.shape.get", "각주·미주 모양 조회 (번호·구분선)", ""),
+    (
+        "note.shape",
+        "각주·미주 모양 (번호 모양·구분선 길이·종류·색)",
+        "",
+    ),
+    ("note.delete", "각주·미주 지우기", ""),
+    ("field.delete", "누름틀 지우기 (글자 유지)", ""),
+];
+
+/// (command id, parameter help, JSON example object) for list_commands and
+/// docs/mcp-commands.md; owner fills this for every command above.
+pub const PARAMS: &[(&str, &str, &str)] = &[
+    (
+        "picture.insert",
+        "path(PNG·JPG·BMP·GIF, 20 MB·8192 px 이하), width_mm(없으면 원본 비율), treat_as_char",
+        r##"{"path":"C:/img/logo.png","width_mm":60.0}"##,
+    ),
+    (
+        "object.properties.get",
+        "address{section,paragraph,control} → kind, props",
+        r##"{"address":{"section":0,"paragraph":0,"control":0}}"##,
+    ),
+    (
+        "object.properties",
+        "address, props{width, height, treatAsChar, textWrap, horz/vertRelTo, horz/vertAlign, horz/vertOffset, rotationAngle, sizeProtect, outerMargin*, caption*, 그림: crop*, brightness, contrast, effect, transparency; 도형: borderColor(BGR), borderWidth, lineType 0–17, arrowStart/End, fillType, fillBgColor, shadowType 0–8, shadowOffsetX/Y(%), tbMargin*, tbVerticalAlign}",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"props":{"rotationAngle":90}}"##,
+    ),
+    (
+        "shape.insert",
+        "kind rectangle|ellipse|line|textbox|arc|polygon|curve|connector_*, width_mm, height_mm, treat_as_char, text_wrap, points_mm[[x,y]], paragraphs[], x_mm·y_mm(종이 기준), flip_x/flip_y, start/end{address,point}, direction horizontal|vertical|vertical_all(글상자)",
+        r##"{"kind":"rectangle","width_mm":40.0,"height_mm":20.0}"##,
+    ),
+    (
+        "textbox.paragraphs.get",
+        "address → paragraphs[]",
+        r##"{"address":{"section":0,"paragraph":0,"control":0}}"##,
+    ),
+    (
+        "textbox.paragraphs",
+        "address, paragraphs[](1–200문단)",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"paragraphs":["첫 문단","둘째 문단"]}"##,
+    ),
+    (
+        "note.paragraphs.get",
+        "address → paragraphs[] (첫 문단은 번호 뒤 글자)",
+        r##"{"address":{"section":0,"paragraph":0,"control":0}}"##,
+    ),
+    (
+        "note.paragraphs",
+        "address, paragraphs[]",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"paragraphs":["주석 내용"]}"##,
+    ),
+    (
+        "note.insert",
+        "endnote(false: 각주), paragraphs[] → address",
+        r##"{"endnote":false,"paragraphs":["각주 내용"]}"##,
+    ),
+    (
+        "equation.insert",
+        "script(수식 스크립트), size_pt, color(BGR), baseline, font_name → address",
+        r##"{"script":"a^2+b^2=c^2","size_pt":10.0}"##,
+    ),
+    ("chart.list", "(없음) → 차트 목록", r##"{}"##),
+    ("chart.data.get", "index → 계열·값", r##"{"index":0}"##),
+    (
+        "chart.data",
+        "index, series[{name, values[]}]",
+        r##"{"index":0,"series":[{"name":"1분기","values":[1,2,3]}]}"##,
+    ),
+    ("memo.list", "(없음) → 메모 목록(읽기)", r##"{}"##),
+    (
+        "object.group",
+        "targets[address…](같은 구역의 떠 있는 도형·그림 2–256개) → address",
+        r##"{"targets":[{"section":0,"paragraph":0,"control":0},{"section":0,"paragraph":0,"control":1}]}"##,
+    ),
+    (
+        "object.ungroup",
+        "address(묶음) → 한 단계 풀기",
+        r##"{"address":{"section":0,"paragraph":0,"control":0}}"##,
+    ),
+    (
+        "object.z_order",
+        "address, mode front|back|forward|backward → moved",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"mode":"front"}"##,
+    ),
+    (
+        "object.lock",
+        "address, locked(없으면 토글) → locked",
+        r##"{"address":{"section":0,"paragraph":0,"control":0}}"##,
+    ),
+    ("object.unlock_all", "(없음) → unlocked 개수", r##"{}"##),
+    (
+        "object.flip",
+        "address, axis horizontal|vertical",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"axis":"horizontal"}"##,
+    ),
+    (
+        "object.line_endpoint",
+        "address(직선), start_mm[x,y], end_mm[x,y] (종이 기준)",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"start_mm":[20.0,30.0],"end_mm":[80.0,30.0]}"##,
+    ),
+    (
+        "insert.field",
+        "guide(안내문), name, memo(도움말), editable",
+        r##"{"guide":"이름을 입력하세요","name":"이름"}"##,
+    ),
+    ("field.list", "(없음) → 누름틀 목록", r##"{}"##),
+    (
+        "field.set",
+        "field_id 또는 name+occurrence, value",
+        r##"{"name":"이름","value":"홍길동"}"##,
+    ),
+    ("form.list", "(없음) → 양식 개체 목록", r##"{}"##),
+    (
+        "form.get",
+        "at{section,paragraph,control,cell?} → 종류·값",
+        r##"{"at":{"section":0,"paragraph":0,"control":0}}"##,
+    ),
+    (
+        "form.set",
+        "at, value|text|caption (종류별)",
+        r##"{"at":{"section":0,"paragraph":0,"control":0},"value":true}"##,
+    ),
+    (
+        "object.align",
+        "targets[address…](없으면 1개는 종이 기준), mode left|center|right|top|middle|bottom|same_width|same_height|same_size|space_h|space_v → moved 개수",
+        r##"{"targets":[{"section":0,"paragraph":0,"control":0},{"section":0,"paragraph":0,"control":1}],"mode":"left"}"##,
+    ),
+    (
+        "object.size",
+        "address, width_mm, height_mm(둘 중 하나 이상), keep_ratio",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"width_mm":50.0,"keep_ratio":true}"##,
+    ),
+    (
+        "object.rotate",
+        "address, angle(절대 0–359) 또는 by(증감 ±) → angle",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"by":90}"##,
+    ),
+    (
+        "object.protect_size",
+        "address, protected(없으면 토글) → protected",
+        r##"{"address":{"section":0,"paragraph":0,"control":0}}"##,
+    ),
+    (
+        "object.outer_margin",
+        "address, preset none|narrow|normal|wide 또는 mm(0–50)",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"preset":"normal"}"##,
+    ),
+    (
+        "object.style",
+        "address, fill \"#rrggbb\"|\"none\", outline \"#rrggbb\"|\"none\", line_type 0–17, line_width_mm 0–5, arrow_start/arrow_end 0–8, arrow_size 0–8",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"fill":"#ffe08a","outline":"#000000","line_width_mm":0.5}"##,
+    ),
+    (
+        "object.shadow",
+        "address, mode none|on|left|right|up|down|reset, kind 1–8(on), step(%, 기본 1)",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"mode":"on","kind":4}"##,
+    ),
+    (
+        "object.format.get",
+        "address → format{선·채우기·그림자·회전 속성}",
+        r##"{"address":{"section":0,"paragraph":0,"control":0}}"##,
+    ),
+    (
+        "object.format",
+        "address, format(object.format.get 결과)",
+        r##"{"address":{"section":0,"paragraph":0,"control":1},"format":{"borderColor":255,"borderWidth":28}}"##,
+    ),
+    (
+        "object.neighbor",
+        "address(없으면 커서 문단), direction next|prev, wrap(기본 true) → address, kind, page",
+        r##"{"direction":"next"}"##,
+    ),
+    (
+        "object.connector_type",
+        "address(연결선), kind straight|stroke|arc",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"kind":"stroke"}"##,
+    ),
+    (
+        "textbox.align",
+        "address, horizontal left|center|right|justify, vertical top|center|bottom (둘 중 하나 이상)",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"horizontal":"center","vertical":"center"}"##,
+    ),
+    (
+        "textbox.margin",
+        "address, preset none|narrow|normal|wide 또는 mm(0–50)",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"preset":"normal"}"##,
+    ),
+    (
+        "textbox.direction",
+        "address, direction horizontal|vertical(세로 글상자)|vertical_all(영문 세움)",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"direction":"vertical"}"##,
+    ),
+    (
+        "picture.save",
+        "address, path(확장자는 원본대로 바뀜), overwrite → path",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"path":"C:/out/picture1.png"}"##,
+    ),
+    (
+        "picture.save_all",
+        "dir, prefix(기본 picture), overwrite → files[]",
+        r##"{"dir":"C:/out"}"##,
+    ),
+    (
+        "picture.recolor",
+        "address, mode original|grayscale|black_white|watermark",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"mode":"grayscale"}"##,
+    ),
+    (
+        "insert.auto_number",
+        "kind page|total|picture|table|equation (본문 커서 위치)",
+        r##"{"kind":"picture"}"##,
+    ),
+    (
+        "note.convert",
+        "address(각주 또는 미주) → address(변환된 주석)",
+        r##"{"address":{"section":0,"paragraph":0,"control":0}}"##,
+    ),
+    (
+        "note.shape.get",
+        "kind footnote|endnote, section(없으면 커서 구역) → 번호·구분선 속성",
+        r##"{"kind":"footnote"}"##,
+    ),
+    (
+        "note.shape",
+        "kind, section, props{numberFormat, prefixChar, suffixChar, startNumber, separatorEnabled, separatorLength(HWPUNIT; -1 단 폭), separatorLineType 0–17, separatorLineWidth, separatorColor \"#rrggbb\", numberCodeSuperscript, numbering continue|section|page}",
+        r##"{"kind":"footnote","props":{"separatorLength":5669,"startNumber":1}}"##,
+    ),
+    (
+        "note.delete",
+        "address(없으면 커서 문단의 첫 주석)",
+        r##"{}"##,
+    ),
+    (
+        "field.delete",
+        "field_id(없으면 커서 위치의 누름틀) → removed",
+        r##"{}"##,
+    ),
 ];
 /// Connector connection points, as RHWP numbers them.
 const CONNECT_POINTS: u32 = 4; // 0 top, 1 right, 2 bottom, 3 left
@@ -319,6 +605,9 @@ pub(crate) struct ShapeInsert {
     start: Option<ConnectorEnd>,
     #[serde(default)]
     end: Option<ConnectorEnd>,
+    /// 글상자 글자 방향: horizontal(기본) · vertical(세로 글상자) · vertical_all(영문 세움).
+    #[serde(default)]
+    direction: Option<String>,
 }
 #[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -754,6 +1043,331 @@ impl Session {
                 self.set_form_value(&p.at, p.value, p.text.as_deref(), p.caption.as_deref())?;
                 Ok(self.info())
             }
+            "object.align" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Align {
+                    targets: Vec<ObjectAddress>,
+                    mode: String,
+                }
+                let p: Align = serde_json::from_value(params)?;
+                Ok(json!({"moved":self.align_objects(&p.targets, &p.mode)?}))
+            }
+            "object.size" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Size {
+                    address: ObjectAddress,
+                    #[serde(default)]
+                    width_mm: Option<f64>,
+                    #[serde(default)]
+                    height_mm: Option<f64>,
+                    #[serde(default)]
+                    keep_ratio: bool,
+                }
+                let p: Size = serde_json::from_value(params)?;
+                self.size_object(p.address, p.width_mm, p.height_mm, p.keep_ratio)?;
+                Ok(self.info())
+            }
+            "object.rotate" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Rotate {
+                    address: ObjectAddress,
+                    #[serde(default)]
+                    angle: Option<i64>,
+                    #[serde(default)]
+                    by: Option<i64>,
+                }
+                let p: Rotate = serde_json::from_value(params)?;
+                Ok(json!({"angle":self.rotate_object(p.address, p.angle, p.by)?}))
+            }
+            "object.protect_size" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Protect {
+                    address: ObjectAddress,
+                    #[serde(default)]
+                    protected: Option<bool>,
+                }
+                let p: Protect = serde_json::from_value(params)?;
+                let now = self.object_properties(p.address)?["props"]["sizeProtect"] == true;
+                let next = p.protected.unwrap_or(!now);
+                if next != now {
+                    self.set_object_properties(p.address, &json!({"sizeProtect":next}))?;
+                }
+                Ok(json!({"protected":next}))
+            }
+            "object.outer_margin" | "textbox.margin" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Margin {
+                    address: ObjectAddress,
+                    #[serde(default)]
+                    preset: Option<String>,
+                    #[serde(default)]
+                    mm: Option<f64>,
+                }
+                let p: Margin = serde_json::from_value(params)?;
+                let hu = margin_hu(p.preset.as_deref(), p.mm)?;
+                let keys: [&str; 4] = if id == "object.outer_margin" {
+                    [
+                        "outerMarginLeft",
+                        "outerMarginRight",
+                        "outerMarginTop",
+                        "outerMarginBottom",
+                    ]
+                } else {
+                    if self.textbox_list(p.address).is_err() {
+                        bail!("글상자가 아닙니다.");
+                    }
+                    [
+                        "tbMarginLeft",
+                        "tbMarginRight",
+                        "tbMarginTop",
+                        "tbMarginBottom",
+                    ]
+                };
+                let mut props = Map::new();
+                for k in keys {
+                    props.insert(k.into(), json!(hu));
+                }
+                self.set_object_properties(p.address, &Value::Object(props))?;
+                Ok(json!({"mm":hu as f64 * 25.4 / HU as f64}))
+            }
+            "object.style" => {
+                let p: QuickStyle = serde_json::from_value(params)?;
+                self.quick_style(p)?;
+                Ok(self.info())
+            }
+            "object.shadow" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Shadow {
+                    address: ObjectAddress,
+                    mode: String,
+                    #[serde(default)]
+                    kind: Option<i64>,
+                    #[serde(default)]
+                    step: Option<i64>,
+                }
+                let p: Shadow = serde_json::from_value(params)?;
+                self.shadow_object(p.address, &p.mode, p.kind, p.step.unwrap_or(1))
+            }
+            "object.format.get" => {
+                let p: Address = serde_json::from_value(params)?;
+                Ok(json!({"format":self.object_format(p.address)?}))
+            }
+            "object.format" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Format {
+                    address: ObjectAddress,
+                    format: Value,
+                }
+                let p: Format = serde_json::from_value(params)?;
+                self.apply_object_format(p.address, &p.format)?;
+                Ok(self.info())
+            }
+            "object.neighbor" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Neighbor {
+                    #[serde(default)]
+                    address: Option<ObjectAddress>,
+                    direction: String,
+                    #[serde(default = "yes")]
+                    wrap: bool,
+                }
+                fn yes() -> bool {
+                    true
+                }
+                let p: Neighbor = serde_json::from_value(params)?;
+                let next = match p.direction.as_str() {
+                    "next" => true,
+                    "prev" => false,
+                    _ => bail!("direction은 next 또는 prev입니다."),
+                };
+                match self.neighbor_object(p.address, next, p.wrap)? {
+                    Some((a, kind)) => {
+                        let page = self.page_of_object(a).unwrap_or(0);
+                        Ok(json!({"address":a,"kind":kind,"page":page}))
+                    }
+                    None => Ok(json!({"address":Value::Null})),
+                }
+            }
+            "object.connector_type" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Conn {
+                    address: ObjectAddress,
+                    kind: String,
+                }
+                let p: Conn = serde_json::from_value(params)?;
+                self.set_connector_type(p.address, &p.kind)?;
+                Ok(self.info())
+            }
+            "textbox.align" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct TbAlign {
+                    address: ObjectAddress,
+                    #[serde(default)]
+                    horizontal: Option<String>,
+                    #[serde(default)]
+                    vertical: Option<String>,
+                }
+                let p: TbAlign = serde_json::from_value(params)?;
+                self.align_textbox(p.address, p.horizontal.as_deref(), p.vertical.as_deref())?;
+                Ok(self.info())
+            }
+            "textbox.direction" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Dir {
+                    address: ObjectAddress,
+                    direction: String,
+                }
+                let p: Dir = serde_json::from_value(params)?;
+                let d = textbox_direction_code(&p.direction)?;
+                self.set_textbox_direction(p.address, d)?;
+                Ok(json!({"direction":self.textbox_direction(p.address)?}))
+            }
+            "picture.save" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Save {
+                    address: ObjectAddress,
+                    path: std::path::PathBuf,
+                    #[serde(default)]
+                    overwrite: bool,
+                }
+                let p: Save = serde_json::from_value(params)?;
+                let written = self.save_picture(p.address, &p.path, p.overwrite)?;
+                Ok(json!({"path":written}))
+            }
+            "picture.save_all" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct SaveAll {
+                    dir: std::path::PathBuf,
+                    #[serde(default)]
+                    prefix: Option<String>,
+                    #[serde(default)]
+                    overwrite: bool,
+                }
+                let p: SaveAll = serde_json::from_value(params)?;
+                let files = self.save_all_pictures(
+                    &p.dir,
+                    p.prefix.as_deref().unwrap_or("picture"),
+                    p.overwrite,
+                )?;
+                Ok(json!({"files":files}))
+            }
+            "picture.recolor" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Recolor {
+                    address: ObjectAddress,
+                    mode: String,
+                }
+                let p: Recolor = serde_json::from_value(params)?;
+                let effect = match p.mode.as_str() {
+                    "original" => "RealPic",
+                    "grayscale" => "GrayScale",
+                    "black_white" => "BlackWhite",
+                    "watermark" => "Pattern8x8",
+                    _ => bail!("mode는 original·grayscale·black_white·watermark입니다."),
+                };
+                if !matches!(self.object(p.address)?, Control::Picture(_)) {
+                    bail!("그림이 아닙니다.");
+                }
+                self.set_object_properties(p.address, &json!({"effect":effect}))?;
+                Ok(self.info())
+            }
+            "insert.auto_number" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct AutoNum {
+                    kind: String,
+                }
+                let p: AutoNum = serde_json::from_value(params)?;
+                Ok(json!({"address":self.insert_auto_number(&p.kind)?}))
+            }
+            "note.convert" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Convert {
+                    #[serde(default)]
+                    address: Option<ObjectAddress>,
+                }
+                let p: Convert = serde_json::from_value(params)?;
+                let a = match p.address {
+                    Some(a) => a,
+                    None => self
+                        .note_at_caret()
+                        .ok_or_else(|| anyhow!("커서 문단에 각주·미주가 없습니다."))?,
+                };
+                Ok(json!({"address":self.convert_note(a)?}))
+            }
+            "note.shape.get" | "note.shape" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct NoteShape {
+                    kind: String,
+                    #[serde(default)]
+                    section: Option<usize>,
+                    #[serde(default)]
+                    props: Option<Value>,
+                }
+                let p: NoteShape = serde_json::from_value(params)?;
+                let endnote = match p.kind.as_str() {
+                    "footnote" => false,
+                    "endnote" => true,
+                    _ => bail!("kind는 footnote 또는 endnote입니다."),
+                };
+                let section = p.section.unwrap_or(self.cursor.section);
+                if id == "note.shape.get" {
+                    if p.props.is_some() {
+                        bail!("조회에는 props를 쓰지 않습니다.");
+                    }
+                    self.note_shape(section, endnote)
+                } else {
+                    let props = p.props.ok_or_else(|| anyhow!("props가 필요합니다."))?;
+                    self.set_note_shape(section, endnote, &props)?;
+                    self.note_shape(section, endnote)
+                }
+            }
+            "note.delete" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Del {
+                    #[serde(default)]
+                    address: Option<ObjectAddress>,
+                }
+                let p: Del = serde_json::from_value(params)?;
+                let a = match p.address {
+                    Some(a) => a,
+                    None => self
+                        .note_at_caret()
+                        .ok_or_else(|| anyhow!("커서 문단에 각주·미주가 없습니다."))?,
+                };
+                if !matches!(self.object(a)?, Control::Footnote(_) | Control::Endnote(_)) {
+                    bail!("각주/미주가 아닙니다.");
+                }
+                self.delete_object(a)?;
+                Ok(self.info())
+            }
+            "field.delete" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct DelField {
+                    #[serde(default)]
+                    field_id: Option<u32>,
+                }
+                let p: DelField = serde_json::from_value(params)?;
+                Ok(json!({"removed":self.delete_field(p.field_id)?}))
+            }
             _ => bail!("알 수 없는 개체 명령: {id}"),
         }
     }
@@ -850,6 +1464,26 @@ impl Session {
     }
 
     pub fn set_object_properties(&mut self, a: ObjectAddress, props: &Value) -> Result<()> {
+        let Some((kind, json)) = self.object_props_json(a, props)? else {
+            return Ok(());
+        };
+        self.transaction(|s| s.apply_object_props(a, kind, &json))
+    }
+    /// Validate and apply properties without opening a transaction (for callers that
+    /// already hold one). Same checks as `set_object_properties`.
+    fn put_object_props(&mut self, a: ObjectAddress, props: &Value) -> Result<()> {
+        match self.object_props_json(a, props)? {
+            Some((kind, json)) => self.apply_object_props(a, kind, &json),
+            None => Ok(()),
+        }
+    }
+    /// Validated RHWP property JSON and object kind (0 picture, 1 shape, 2 equation);
+    /// `None` when nothing would change. Tables are handled by `set_table_properties`.
+    fn object_props_json(
+        &mut self,
+        a: ObjectAddress,
+        props: &Value,
+    ) -> Result<Option<(u8, String)>> {
         let kind = match self.object(a)? {
             Control::Picture(_) => 0,
             Control::Shape(s) if matches!(s.as_ref(), ShapeObject::Picture(_)) => {
@@ -857,7 +1491,10 @@ impl Session {
             }
             Control::Shape(_) => 1,
             Control::Equation(_) => 2,
-            Control::Table(_) => return self.set_table_properties(a, props),
+            Control::Table(_) => {
+                self.set_table_properties(a, props)?;
+                return Ok(None);
+            }
             _ => bail!("속성을 고칠 수 없는 개체입니다."),
         };
         let mut map = match kind {
@@ -866,7 +1503,7 @@ impl Session {
             _ => validate(props, &[COMMON, EQUATION])?,
         };
         if map.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // Hangul's 개체 보호 keeps a locked object out of every edit except unlocking.
         self.guard_object_lock(a)?;
@@ -889,36 +1526,44 @@ impl Session {
                 size_pt: size,
             })?;
         }
-        let json = Value::Object(map).to_string();
-        self.transaction(|s| {
-            match kind {
-                0 => s
-                    .core
-                    .set_picture_properties_native(a.section, a.paragraph, a.control, &json),
-                1 => s
-                    .core
-                    .set_shape_properties_native(a.section, a.paragraph, a.control, &json),
-                _ => s.core.set_equation_properties_native(
-                    a.section,
-                    a.paragraph,
-                    a.control,
-                    None,
-                    None,
-                    &json,
-                ),
-            }
-            .map_err(err)?;
-            if kind != 2 {
-                s.reroute_connectors(a)?;
-            }
-            Ok(())
-        })
+        Ok(Some((kind, Value::Object(map).to_string())))
+    }
+    fn apply_object_props(&mut self, a: ObjectAddress, kind: u8, json: &str) -> Result<()> {
+        match kind {
+            0 => self
+                .core
+                .set_picture_properties_native(a.section, a.paragraph, a.control, json),
+            1 => self
+                .core
+                .set_shape_properties_native(a.section, a.paragraph, a.control, json),
+            _ => self.core.set_equation_properties_native(
+                a.section,
+                a.paragraph,
+                a.control,
+                None,
+                None,
+                json,
+            ),
+        }
+        .map_err(err)?;
+        if kind != 2 {
+            self.reroute_connectors(a)?;
+        }
+        Ok(())
     }
 
     /// Floating shapes start at the caret position on the page, like a click-to-draw in Hangul.
     fn insert_shape_ex(&mut self, p: ShapeInsert) -> Result<ObjectAddress> {
         self.body_insert()?;
         let (width, height) = (mm_to_hu(p.width_mm)?, mm_to_hu(p.height_mm)?);
+        let direction = p
+            .direction
+            .as_deref()
+            .map(textbox_direction_code)
+            .transpose()?;
+        if p.kind != ShapeKind::Textbox && direction.is_some() {
+            bail!("글자 방향은 글상자에만 지정합니다.");
+        }
         if p.kind != ShapeKind::Textbox && !p.paragraphs.is_empty() {
             bail!("글은 글상자에만 넣을 수 있습니다.");
         }
@@ -1059,6 +1704,9 @@ impl Session {
             }
             if !p.paragraphs.is_empty() {
                 s.write_textbox(a, &p.paragraphs)?;
+            }
+            if let Some(d) = direction {
+                s.textbox_direction_raw(a, d)?;
             }
             address = Some(a);
             Ok(())
@@ -1316,8 +1964,10 @@ impl Session {
     }
 
     fn connector_ends(&self, start: ConnectorEnd, end: ConnectorEnd) -> Result<ConnectorEnds> {
+        /// (subject id, connection point index, the four connection points).
+        type Subject = (u32, u32, [(i32, i32); 4]);
         let section = self.cursor.section;
-        let resolve = |e: ConnectorEnd| -> Result<(u32, u32, [(i32, i32); 4])> {
+        let resolve = |e: ConnectorEnd| -> Result<Subject> {
             if e.address.section != section {
                 bail!("연결선과 연결할 도형은 같은 구역에 있어야 합니다.");
             }
@@ -1858,5 +2508,1560 @@ impl Session {
             ok_value(&raw)?;
             Ok(())
         })
+    }
+}
+
+/// Hangul stream position of a character index: extended controls take 8 code units
+/// (automatic numbers 7 beside their placeholder), tabs 8, click-here fields 8 + 8
+/// (+ the guide text while empty). Mirrors RHWP's cursor arithmetic for body paragraphs.
+fn stream_pos_of(p: &Paragraph, char_idx: usize) -> usize {
+    let positions = p.control_text_positions();
+    let mut units = char_idx + p.text.chars().take(char_idx).filter(|c| *c == '\t').count() * 7;
+    for (ci, ctrl) in p.controls.iter().enumerate() {
+        if matches!(ctrl, Control::Field(_)) {
+            continue;
+        }
+        if positions.get(ci).is_some_and(|pos| *pos <= char_idx) {
+            units += match ctrl {
+                Control::AutoNumber(_) | Control::NewNumber(_) => 7,
+                _ => 8,
+            };
+        }
+    }
+    for fr in &p.field_ranges {
+        if fr.start_char_idx <= char_idx {
+            units += 8;
+        }
+        if fr.end_char_idx <= char_idx {
+            units += 8;
+            if fr.start_char_idx == fr.end_char_idx
+                && let Some(Control::Field(f)) = p.controls.get(fr.control_idx)
+            {
+                units += f.guide_text().map(|g| g.chars().count()).unwrap_or(0);
+            }
+        }
+    }
+    units
+}
+/// Hangul 바깥 여백 / 글상자 안 여백 사전 값 (mm): 없음·좁게·보통·넓게.
+fn margin_hu(preset: Option<&str>, mm: Option<f64>) -> Result<i64> {
+    let mm = match (preset, mm) {
+        (Some(p), None) => match p {
+            "none" => 0.0,
+            "narrow" => 1.0,
+            "normal" => 2.0,
+            "wide" => 3.0,
+            _ => bail!("preset은 none·narrow·normal·wide입니다."),
+        },
+        (None, Some(v)) => v,
+        _ => bail!("preset 또는 mm 중 하나만 지정하세요."),
+    };
+    if !mm.is_finite() || !(0.0..=50.0).contains(&mm) {
+        bail!("여백은 0–50 mm입니다.");
+    }
+    Ok((mm * HU as f64 / 25.4).round() as i64)
+}
+/// Text box direction names → 0 horizontal, 1 vertical, 2 vertical_all.
+fn textbox_direction_code(name: &str) -> Result<u8> {
+    Ok(match name {
+        "horizontal" => 0,
+        "vertical" => 1,
+        "vertical_all" => 2,
+        _ => bail!("direction은 horizontal·vertical·vertical_all입니다."),
+    })
+}
+/// "#rrggbb" → RHWP drawing color (BGR integer).
+fn bgr_of(hex: &str) -> Result<i64> {
+    let h = hex
+        .strip_prefix('#')
+        .filter(|h| h.len() == 6 && h.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow!("색은 #rrggbb 형식입니다: {hex}"))?;
+    let v = i64::from_str_radix(h, 16)?;
+    Ok(((v & 0xff) << 16) | (v & 0xff00) | ((v >> 16) & 0xff))
+}
+/// One alignment move: (address, dx px, dy px, new width HWPUNIT, new height HWPUNIT).
+type AlignStep = (ObjectAddress, f64, f64, Option<i64>, Option<i64>);
+/// Keys copied by 개체 모양 복사 (CopyShapeFormat): look, not position or size.
+const FORMAT_KEYS: &[&str] = &[
+    "borderColor",
+    "borderWidth",
+    "lineType",
+    "lineEndShape",
+    "arrowStart",
+    "arrowEnd",
+    "arrowStartSize",
+    "arrowEndSize",
+    "fillType",
+    "fillBgColor",
+    "fillPatColor",
+    "fillPatType",
+    "fillAlpha",
+    "gradientType",
+    "gradientAngle",
+    "gradientCenterX",
+    "gradientCenterY",
+    "gradientBlur",
+    "shadowType",
+    "shadowColor",
+    "shadowOffsetX",
+    "shadowOffsetY",
+    "roundRate",
+    "brightness",
+    "contrast",
+    "effect",
+    "transparency",
+];
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuickStyle {
+    address: ObjectAddress,
+    #[serde(default)]
+    fill: Option<String>,
+    #[serde(default)]
+    outline: Option<String>,
+    #[serde(default)]
+    line_type: Option<i64>,
+    #[serde(default)]
+    line_width_mm: Option<f64>,
+    #[serde(default)]
+    arrow_start: Option<i64>,
+    #[serde(default)]
+    arrow_end: Option<i64>,
+    #[serde(default)]
+    arrow_size: Option<i64>,
+}
+
+impl Session {
+    /// Page-pixel box (96 dpi) of a floating object from the page layout, with its page.
+    fn object_box(&self, a: ObjectAddress) -> Result<(u32, [f64; 4])> {
+        let page = self.page_of_object(a)?;
+        let layout: Value = serde_json::from_str(
+            &self
+                .core
+                .get_page_control_layout_native(page)
+                .map_err(err)?,
+        )?;
+        let n = |v: &Value, k: &str| v[k].as_u64().map(|x| x as usize);
+        let c = layout["controls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|c| {
+                n(c, "secIdx") == Some(a.section)
+                    && n(c, "paraIdx") == Some(a.paragraph)
+                    && n(c, "controlIdx") == Some(a.control)
+                    && c.get("cellIdx").is_none()
+            })
+            .ok_or_else(|| anyhow!("쪽 배치에서 개체를 찾지 못했습니다."))?;
+        let f = |k: &str| c[k].as_f64().unwrap_or(0.0);
+        Ok((page, [f("x"), f("y"), f("w"), f("h")]))
+    }
+    /// Zero-based page that shows the object's anchor paragraph.
+    pub fn page_of_object(&self, a: ObjectAddress) -> Result<u32> {
+        let v: Value = serde_json::from_str(
+            &self
+                .core
+                .get_page_of_position_native(a.section, a.paragraph)
+                .map_err(err)?,
+        )?;
+        Ok(v["page"].as_u64().unwrap_or(0) as u32)
+    }
+    fn floating_unlocked(&self, a: ObjectAddress) -> Result<()> {
+        self.guard_object_lock(a)?;
+        let common = common_of(self.object(a)?).ok_or_else(|| anyhow!("그림·도형이 아닙니다."))?;
+        if common.treat_as_char {
+            bail!("글자처럼 취급한 개체는 맞출 수 없습니다. 먼저 어울림 등으로 바꾸세요.");
+        }
+        Ok(())
+    }
+
+    /// 맞춤 (ShapeAlign*): move or resize floating objects on one page. With a single
+    /// target the paper edges are the reference; with several, the group's extent.
+    /// `same_*` take the first target as reference. Returns how many objects changed.
+    pub fn align_objects(&mut self, targets: &[ObjectAddress], mode: &str) -> Result<usize> {
+        if targets.is_empty() || targets.len() > 256 {
+            bail!("맞출 개체를 1–256개 지정하세요.");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for a in targets {
+            if !seen.insert((a.section, a.paragraph, a.control)) {
+                bail!("같은 개체가 두 번 들어 있습니다.");
+            }
+            self.floating_unlocked(*a)?;
+        }
+        const PX_PER_MM: f64 = 96.0 / 25.4;
+        let mut boxes = Vec::new();
+        let mut page = None;
+        for a in targets {
+            let (pg, b) = self.object_box(*a)?;
+            if *page.get_or_insert(pg) != pg {
+                bail!("같은 쪽에 있는 개체끼리만 맞출 수 있습니다.");
+            }
+            boxes.push((*a, b));
+        }
+        let (x0, y0, x1, y1) = if boxes.len() == 1 {
+            let setup = self.page_setup()?;
+            let (w, h) = if setup.landscape {
+                (setup.height_mm, setup.width_mm)
+            } else {
+                (setup.width_mm, setup.height_mm)
+            };
+            (0.0, 0.0, w * PX_PER_MM, h * PX_PER_MM)
+        } else {
+            boxes.iter().fold(
+                (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
+                |(x0, y0, x1, y1), (_, b)| {
+                    (
+                        x0.min(b[0]),
+                        y0.min(b[1]),
+                        x1.max(b[0] + b[2]),
+                        y1.max(b[1] + b[3]),
+                    )
+                },
+            )
+        };
+        let hu_per_px = HU as f64 / 96.0;
+        let mut plan: Vec<AlignStep> = Vec::new();
+        let reference = boxes[0].1;
+        match mode {
+            "left" | "center" | "right" | "top" | "middle" | "bottom" => {
+                for (a, b) in &boxes {
+                    let (dx, dy) = match mode {
+                        "left" => (x0 - b[0], 0.0),
+                        "center" => ((x0 + x1) / 2.0 - (b[0] + b[2] / 2.0), 0.0),
+                        "right" => (x1 - (b[0] + b[2]), 0.0),
+                        "top" => (0.0, y0 - b[1]),
+                        "middle" => (0.0, (y0 + y1) / 2.0 - (b[1] + b[3] / 2.0)),
+                        _ => (0.0, y1 - (b[1] + b[3])),
+                    };
+                    plan.push((*a, dx, dy, None, None));
+                }
+            }
+            "same_width" | "same_height" | "same_size" => {
+                if boxes.len() < 2 {
+                    bail!("같은 크기로 맞출 개체를 2개 이상 지정하세요.");
+                }
+                let ref_props = self.object_properties(boxes[0].0)?;
+                let w = ref_props["props"]["width"]
+                    .as_i64()
+                    .unwrap_or((reference[2] * hu_per_px).round() as i64);
+                let h = ref_props["props"]["height"]
+                    .as_i64()
+                    .unwrap_or((reference[3] * hu_per_px).round() as i64);
+                for (a, _) in boxes.iter().skip(1) {
+                    plan.push((
+                        *a,
+                        0.0,
+                        0.0,
+                        (mode != "same_height").then_some(w),
+                        (mode != "same_width").then_some(h),
+                    ));
+                }
+            }
+            "space_h" | "space_v" => {
+                if boxes.len() < 3 {
+                    bail!("간격을 같게 할 개체를 3개 이상 지정하세요.");
+                }
+                let horizontal = mode == "space_h";
+                let mut sorted = boxes.clone();
+                sorted.sort_by(|a, b| {
+                    let (ka, kb) = if horizontal {
+                        (a.1[0], b.1[0])
+                    } else {
+                        (a.1[1], b.1[1])
+                    };
+                    ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let total: f64 = sorted
+                    .iter()
+                    .map(|(_, b)| if horizontal { b[2] } else { b[3] })
+                    .sum();
+                let span = if horizontal { x1 - x0 } else { y1 - y0 };
+                let gap = (span - total) / (sorted.len() - 1) as f64;
+                let mut cursor = if horizontal { x0 } else { y0 };
+                for (a, b) in &sorted {
+                    let (dx, dy) = if horizontal {
+                        (cursor - b[0], 0.0)
+                    } else {
+                        (0.0, cursor - b[1])
+                    };
+                    plan.push((*a, dx, dy, None, None));
+                    cursor += if horizontal { b[2] } else { b[3] } + gap;
+                }
+            }
+            _ => bail!(
+                "mode는 left·center·right·top·middle·bottom·same_width·same_height·same_size·space_h·space_v입니다."
+            ),
+        }
+        let plan: Vec<_> = plan
+            .into_iter()
+            .filter(|(_, dx, dy, w, h)| {
+                dx.abs() >= 0.5 || dy.abs() >= 0.5 || w.is_some() || h.is_some()
+            })
+            .collect();
+        if plan.is_empty() {
+            return Ok(0);
+        }
+        let count = plan.len();
+        self.transaction(|s| {
+            for (a, dx, dy, w, h) in &plan {
+                let current = s.object_properties(*a)?;
+                let p = &current["props"];
+                let mut props = Map::new();
+                if dx.abs() >= 0.5 {
+                    props.insert(
+                        "horzOffset".into(),
+                        json!(
+                            p["horzOffset"].as_i64().unwrap_or(0) + (dx * hu_per_px).round() as i64
+                        ),
+                    );
+                }
+                if dy.abs() >= 0.5 {
+                    props.insert(
+                        "vertOffset".into(),
+                        json!(
+                            p["vertOffset"].as_i64().unwrap_or(0) + (dy * hu_per_px).round() as i64
+                        ),
+                    );
+                }
+                if let Some(w) = w {
+                    props.insert("width".into(), json!(w));
+                }
+                if let Some(h) = h {
+                    props.insert("height".into(), json!(h));
+                }
+                s.put_object_props(*a, &Value::Object(props))?;
+            }
+            Ok(())
+        })?;
+        Ok(count)
+    }
+
+    /// ShapeWidth / ShapeHeight: absolute size in mm; `keep_ratio` derives the other side.
+    pub fn size_object(
+        &mut self,
+        a: ObjectAddress,
+        width_mm: Option<f64>,
+        height_mm: Option<f64>,
+        keep_ratio: bool,
+    ) -> Result<()> {
+        if width_mm.is_none() && height_mm.is_none() {
+            bail!("width_mm 또는 height_mm을 지정하세요.");
+        }
+        let current = self.object_properties(a)?;
+        let (w0, h0) = (
+            current["props"]["width"].as_f64().unwrap_or(1.0).max(1.0),
+            current["props"]["height"].as_f64().unwrap_or(1.0).max(1.0),
+        );
+        let mut props = Map::new();
+        let w = width_mm.map(mm_to_hu).transpose()?;
+        let h = height_mm.map(mm_to_hu).transpose()?;
+        match (w, h, keep_ratio) {
+            (Some(w), None, true) => {
+                props.insert("width".into(), json!(w));
+                props.insert(
+                    "height".into(),
+                    json!((f64::from(w) * h0 / w0).round().max(57.0) as u32),
+                );
+            }
+            (None, Some(h), true) => {
+                props.insert("height".into(), json!(h));
+                props.insert(
+                    "width".into(),
+                    json!((f64::from(h) * w0 / h0).round().max(57.0) as u32),
+                );
+            }
+            _ => {
+                if let Some(w) = w {
+                    props.insert("width".into(), json!(w));
+                }
+                if let Some(h) = h {
+                    props.insert("height".into(), json!(h));
+                }
+            }
+        }
+        self.set_object_properties(a, &Value::Object(props))
+    }
+
+    /// ShapeRotate: absolute `angle` or relative `by`; returns the new angle (0–359).
+    pub fn rotate_object(
+        &mut self,
+        a: ObjectAddress,
+        angle: Option<i64>,
+        by: Option<i64>,
+    ) -> Result<i64> {
+        let current = self.object_properties(a)?["props"]["rotationAngle"]
+            .as_i64()
+            .unwrap_or(0);
+        let next = match (angle, by) {
+            (Some(v), None) => v,
+            (None, Some(d)) => current + d,
+            _ => bail!("angle 또는 by 중 하나만 지정하세요."),
+        }
+        .rem_euclid(360);
+        if next != current.rem_euclid(360) {
+            self.set_object_properties(a, &json!({"rotationAngle":next}))?;
+        }
+        Ok(next)
+    }
+
+    /// Fill / outline / dash / pen width / arrows in one step (ribbon quick buttons).
+    fn quick_style(&mut self, p: QuickStyle) -> Result<()> {
+        let kind = self.object_properties(p.address)?["kind"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        let mut props = Map::new();
+        if let Some(fill) = &p.fill {
+            if kind == "picture" {
+                bail!("그림에는 채우기를 쓸 수 없습니다.");
+            }
+            if fill == "none" {
+                props.insert("fillType".into(), json!("none"));
+            } else {
+                props.insert("fillType".into(), json!("solid"));
+                props.insert("fillBgColor".into(), json!(bgr_of(fill)?));
+            }
+        }
+        if let Some(outline) = &p.outline {
+            if outline == "none" {
+                if kind == "picture" {
+                    props.insert("borderWidth".into(), json!(0));
+                } else {
+                    props.insert("lineType".into(), json!(0));
+                }
+            } else {
+                props.insert("borderColor".into(), json!(bgr_of(outline)?));
+                if kind != "picture"
+                    && self.object_properties(p.address)?["props"]["lineType"].as_i64() == Some(0)
+                {
+                    props.insert("lineType".into(), json!(1));
+                }
+            }
+        }
+        if let Some(t) = p.line_type {
+            if kind == "picture" {
+                bail!("그림 테두리는 선 종류를 바꿀 수 없습니다.");
+            }
+            props.insert("lineType".into(), json!(t));
+        }
+        if let Some(w) = p.line_width_mm {
+            if !w.is_finite() || !(0.0..=5.0).contains(&w) {
+                bail!("선 굵기는 0–5 mm입니다.");
+            }
+            props.insert(
+                "borderWidth".into(),
+                json!((w * HU as f64 / 25.4).round() as i64),
+            );
+        }
+        for (k, v) in [("arrowStart", p.arrow_start), ("arrowEnd", p.arrow_end)] {
+            if let Some(v) = v {
+                if kind == "picture" {
+                    bail!("그림에는 화살표를 쓸 수 없습니다.");
+                }
+                props.insert(k.into(), json!(v));
+            }
+        }
+        if let Some(size) = p.arrow_size {
+            props.insert("arrowStartSize".into(), json!(size));
+            props.insert("arrowEndSize".into(), json!(size));
+        }
+        if props.is_empty() {
+            bail!("바꿀 스타일 항목을 지정하세요.");
+        }
+        self.set_object_properties(p.address, &Value::Object(props))
+    }
+
+    /// Shadow quick commands: `on` (kind 1–8, Hangul default 오른쪽 아래), `none`,
+    /// `left`/`right`/`up`/`down` nudge the offset by `step` %, `reset` restores 0/0.
+    fn shadow_object(
+        &mut self,
+        a: ObjectAddress,
+        mode: &str,
+        kind: Option<i64>,
+        step: i64,
+    ) -> Result<Value> {
+        let current = self.object_properties(a)?;
+        if current["kind"] == "picture" {
+            bail!("그림 그림자는 지원하지 않습니다 (RHWP가 HWP5에 저장하지 않음).");
+        }
+        let p = &current["props"];
+        let (x, y) = (
+            p["shadowOffsetX"].as_i64().unwrap_or(0),
+            p["shadowOffsetY"].as_i64().unwrap_or(0),
+        );
+        if !(1..=20).contains(&step) {
+            bail!("step은 1–20 %입니다.");
+        }
+        let props = match mode {
+            "none" => json!({"shadowType":0}),
+            "on" => {
+                let k = kind.unwrap_or(4);
+                if !(1..=8).contains(&k) {
+                    bail!("kind는 1–8입니다.");
+                }
+                json!({"shadowType":k})
+            }
+            "left" => json!({"shadowOffsetX":(x - step).max(-100)}),
+            "right" => json!({"shadowOffsetX":(x + step).min(100)}),
+            "up" => json!({"shadowOffsetY":(y - step).max(-100)}),
+            "down" => json!({"shadowOffsetY":(y + step).min(100)}),
+            "reset" => json!({"shadowOffsetX":0,"shadowOffsetY":0}),
+            _ => bail!("mode는 none·on·left·right·up·down·reset입니다."),
+        };
+        if matches!(mode, "left" | "right" | "up" | "down") && p["shadowType"].as_i64() == Some(0) {
+            bail!("그림자가 없는 개체입니다. 먼저 mode on으로 그림자를 켜세요.");
+        }
+        self.set_object_properties(a, &props)?;
+        let after = self.object_properties(a)?;
+        Ok(
+            json!({"shadowType":after["props"]["shadowType"],"shadowOffsetX":after["props"]["shadowOffsetX"],"shadowOffsetY":after["props"]["shadowOffsetY"]}),
+        )
+    }
+
+    /// 개체 모양 복사: the look of a shape or picture (no position, size or text).
+    pub fn object_format(&self, a: ObjectAddress) -> Result<Value> {
+        let v = self.object_properties(a)?;
+        if !matches!(
+            v["kind"].as_str(),
+            Some("shape" | "picture" | "textbox" | "group")
+        ) {
+            bail!("도형·그림의 모양만 복사할 수 있습니다.");
+        }
+        let mut out = Map::new();
+        if let Some(props) = v["props"].as_object() {
+            for (k, val) in props {
+                if FORMAT_KEYS.contains(&k.as_str()) {
+                    out.insert(k.clone(), val.clone());
+                }
+            }
+        }
+        out.insert("kind".into(), v["kind"].clone());
+        Ok(Value::Object(out))
+    }
+    /// 개체 모양 붙이기: keys the target cannot take (shape ↔ picture) are skipped.
+    pub fn apply_object_format(&mut self, a: ObjectAddress, format: &Value) -> Result<()> {
+        let src = format
+            .as_object()
+            .ok_or_else(|| anyhow!("format은 object.format.get 결과여야 합니다."))?;
+        let target = self.object_properties(a)?;
+        let picture = target["kind"] == "picture";
+        let allowed: &[(&str, Kind)] = if picture { PICTURE } else { SHAPE };
+        let mut props = Map::new();
+        for (k, v) in src {
+            if !FORMAT_KEYS.contains(&k.as_str()) {
+                continue;
+            }
+            if allowed.iter().any(|(key, _)| key == k) && target["props"].get(k) != Some(v) {
+                props.insert(k.clone(), v.clone());
+            }
+        }
+        if props.is_empty() {
+            return Ok(());
+        }
+        self.set_object_properties(a, &Value::Object(props))
+    }
+
+    /// Drawable objects in document order (body paragraphs only).
+    fn drawable_objects(&self) -> Vec<(ObjectAddress, &'static str)> {
+        self.objects()
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| {
+                let kind = match o["kind"].as_str()? {
+                    "picture" => "picture",
+                    "shape" => "shape",
+                    "textbox" => "textbox",
+                    "group" => "group",
+                    "equation" => "equation",
+                    _ => return None,
+                };
+                Some((serde_json::from_value(o["address"].clone()).ok()?, kind))
+            })
+            .collect()
+    }
+    /// ShapeObjectNextObject / PrevObject: the drawable object after or before `from`
+    /// (or the caret paragraph), optionally wrapping around the document.
+    pub fn neighbor_object(
+        &self,
+        from: Option<ObjectAddress>,
+        next: bool,
+        wrap: bool,
+    ) -> Result<Option<(ObjectAddress, &'static str)>> {
+        let list = self.drawable_objects();
+        if list.is_empty() {
+            return Ok(None);
+        }
+        let key = |a: &ObjectAddress| (a.section, a.paragraph, a.control);
+        let pos = match from {
+            Some(a) => {
+                let k = key(&a);
+                if next {
+                    list.iter().position(|(o, _)| key(o) > k)
+                } else {
+                    list.iter().rposition(|(o, _)| key(o) < k)
+                }
+            }
+            None => {
+                let c = self.cursor;
+                let k = (c.section, c.paragraph, if next { 0 } else { usize::MAX });
+                if next {
+                    list.iter().position(|(o, _)| key(o) >= k)
+                } else {
+                    list.iter().rposition(|(o, _)| key(o) <= k)
+                }
+            }
+        };
+        let pos = match (pos, wrap) {
+            (Some(p), _) => p,
+            (None, true) if next => 0,
+            (None, true) => list.len() - 1,
+            (None, false) => return Ok(None),
+        };
+        Ok(Some(list[pos]))
+    }
+
+    /// ChangeConnectionLineType*: straight / stroke (꺾인) / arc (곡선), keeping arrows.
+    pub fn set_connector_type(&mut self, a: ObjectAddress, kind: &str) -> Result<()> {
+        use hwpcraft_doc::model::shape::LinkLineType as L;
+        self.guard_object_lock(a)?;
+        let class = match self.object(a)? {
+            Control::Shape(s) => match s.as_ref() {
+                ShapeObject::Line(l) => l
+                    .connector
+                    .as_ref()
+                    .map(|c| c.link_type as u8 % 3)
+                    .ok_or_else(|| anyhow!("연결선이 아닙니다."))?,
+                _ => bail!("연결선이 아닙니다."),
+            },
+            _ => bail!("연결선이 아닙니다."),
+        };
+        let base = match kind {
+            "straight" => 0u8,
+            "stroke" => 3,
+            "arc" => 6,
+            _ => bail!("kind는 straight·stroke·arc입니다."),
+        };
+        let next = match base + class {
+            0 => L::StraightNoArrow,
+            1 => L::StraightOneWay,
+            2 => L::StraightBoth,
+            3 => L::StrokeNoArrow,
+            4 => L::StrokeOneWay,
+            5 => L::StrokeBoth,
+            6 => L::ArcNoArrow,
+            7 => L::ArcOneWay,
+            _ => L::ArcBoth,
+        };
+        self.transaction(|s| {
+            let section = s
+                .core
+                .document_mut()
+                .sections
+                .get_mut(a.section)
+                .ok_or_else(|| anyhow!("구역이 없습니다."))?;
+            let mut changed = false;
+            if let Some(Control::Shape(sh)) = section
+                .paragraphs
+                .get_mut(a.paragraph)
+                .and_then(|p| p.controls.get_mut(a.control))
+                && let ShapeObject::Line(l) = sh.as_mut()
+                && let Some(c) = l.connector.as_mut()
+            {
+                changed = c.link_type != next;
+                c.link_type = next;
+            }
+            if changed {
+                section.raw_stream = None;
+                s.core.update_connectors_in_section(a.section);
+            }
+            s.relayout_object(a)
+        })
+    }
+
+    /// TextBoxAlign* (3 × 3): paragraph alignment of every text box paragraph plus
+    /// the box's vertical alignment.
+    pub fn align_textbox(
+        &mut self,
+        a: ObjectAddress,
+        horizontal: Option<&str>,
+        vertical: Option<&str>,
+    ) -> Result<()> {
+        if horizontal.is_none() && vertical.is_none() {
+            bail!("horizontal 또는 vertical을 지정하세요.");
+        }
+        let count = self.textbox_list(a)?.len();
+        let h = horizontal
+            .map(|h| match h {
+                "left" => Ok("left"),
+                "center" => Ok("center"),
+                "right" => Ok("right"),
+                "justify" => Ok("justify"),
+                _ => Err(anyhow!("horizontal은 left·center·right·justify입니다.")),
+            })
+            .transpose()?;
+        let v = vertical
+            .map(|v| match v {
+                "top" => Ok("Top"),
+                "center" => Ok("Center"),
+                "bottom" => Ok("Bottom"),
+                _ => Err(anyhow!("vertical은 top·center·bottom입니다.")),
+            })
+            .transpose()?;
+        self.guard_object_lock(a)?;
+        self.transaction(|s| {
+            if let Some(h) = h {
+                let props = json!({"alignment":h}).to_string();
+                for i in 0..count {
+                    s.core
+                        .apply_para_format_in_cell_native(
+                            a.section,
+                            a.paragraph,
+                            a.control,
+                            0,
+                            i,
+                            &props,
+                        )
+                        .map_err(err)?;
+                }
+            }
+            if let Some(v) = v {
+                s.put_object_props(a, &json!({"tbVerticalAlign":v}))?;
+            } else {
+                s.relayout_object(a)?;
+            }
+            Ok(())
+        })
+    }
+    /// Current text direction of a text box: horizontal · vertical · vertical_all.
+    pub fn textbox_direction(&self, a: ObjectAddress) -> Result<&'static str> {
+        let tb = match self.object(a)? {
+            Control::Shape(sh) => sh.drawing().and_then(|d| d.text_box.as_ref()),
+            _ => None,
+        }
+        .ok_or_else(|| anyhow!("글상자가 아닙니다."))?;
+        Ok(match (tb.list_attr & 0x07 == 1, tb.vertical_all) {
+            (true, true) => "vertical_all",
+            (true, false) => "vertical",
+            _ => "horizontal",
+        })
+    }
+    /// 세로 글상자 / 영문 세움 (TextBoxDirection, DrawObjCreatorMulti*VertTextBox).
+    /// `code`: 0 horizontal, 1 vertical, 2 vertical_all (see `textbox_direction_code`).
+    pub fn set_textbox_direction(&mut self, a: ObjectAddress, code: u8) -> Result<()> {
+        self.textbox_direction(a)?;
+        self.guard_object_lock(a)?;
+        self.transaction(|s| s.textbox_direction_raw(a, code))
+    }
+    fn textbox_direction_raw(&mut self, a: ObjectAddress, code: u8) -> Result<()> {
+        let section = self
+            .core
+            .document_mut()
+            .sections
+            .get_mut(a.section)
+            .ok_or_else(|| anyhow!("구역이 없습니다."))?;
+        let changed;
+        if let Some(Control::Shape(sh)) = section
+            .paragraphs
+            .get_mut(a.paragraph)
+            .and_then(|p| p.controls.get_mut(a.control))
+            && let Some(tb) = sh.drawing_mut().and_then(|d| d.text_box.as_mut())
+        {
+            let attr = (tb.list_attr & !0x07) | u32::from(code != 0);
+            let all = code == 2;
+            changed = tb.list_attr != attr || tb.vertical_all != all;
+            tb.list_attr = attr;
+            tb.vertical_all = all;
+        } else {
+            bail!("글상자가 아닙니다.");
+        }
+        if changed {
+            section.raw_stream = None;
+        }
+        self.relayout_object(a)
+    }
+
+    fn picture_bytes(&self, a: ObjectAddress) -> Result<(String, Vec<u8>)> {
+        let id = match self.object(a)? {
+            Control::Picture(p) => p.image_attr.bin_data_id,
+            _ => bail!("그림이 아닙니다."),
+        };
+        let doc = self.core.document();
+        let content = doc
+            .bin_data_content
+            .iter()
+            .find(|c| c.id == id)
+            .ok_or_else(|| anyhow!("그림 데이터가 문서에 없습니다 (연결 그림이거나 손상)."))?;
+        let bytes = content.data.load();
+        if bytes.is_empty() {
+            bail!("그림 데이터가 비었습니다.");
+        }
+        let ext = content
+            .extension
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        let ext = if ext.is_empty() {
+            match bytes.first().copied() {
+                Some(0x89) => "png",
+                Some(0xff) => "jpg",
+                Some(0x42) => "bmp",
+                Some(0x47) => "gif",
+                _ => "bin",
+            }
+            .to_owned()
+        } else {
+            ext
+        };
+        Ok((ext, bytes))
+    }
+    fn write_new_file(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
+        if path.exists() && !overwrite {
+            bail!(
+                "이미 있는 파일입니다: {} (overwrite:true로 덮어쓰기)",
+                path.display()
+            );
+        }
+        if let Some(dir) = path.parent()
+            && !dir.as_os_str().is_empty()
+            && !dir.is_dir()
+        {
+            bail!("폴더가 없습니다: {}", dir.display());
+        }
+        // Write beside the target and rename so a failure never leaves a torn file.
+        let tmp = path.with_extension("hwpcraft-tmp");
+        std::fs::write(&tmp, bytes)?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+    /// PictureSaveSelected: the original bytes of one picture, extension corrected.
+    pub fn save_picture(&self, a: ObjectAddress, path: &Path, overwrite: bool) -> Result<PathBuf> {
+        let (ext, bytes) = self.picture_bytes(a)?;
+        let target = path.with_extension(&ext);
+        Self::write_new_file(&target, &bytes, overwrite)?;
+        Ok(target)
+    }
+    /// PictureSaveAll: every picture as `<prefix>N.<ext>` in `dir`.
+    pub fn save_all_pictures(
+        &self,
+        dir: &Path,
+        prefix: &str,
+        overwrite: bool,
+    ) -> Result<Vec<PathBuf>> {
+        if prefix.is_empty()
+            || prefix.chars().any(|c| {
+                c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            })
+        {
+            bail!("prefix는 파일 이름에 쓸 수 있는 글자만 담아야 합니다.");
+        }
+        if !dir.is_dir() {
+            bail!("폴더가 없습니다: {}", dir.display());
+        }
+        let pictures: Vec<ObjectAddress> = self
+            .drawable_objects()
+            .into_iter()
+            .filter(|(_, k)| *k == "picture")
+            .map(|(a, _)| a)
+            .collect();
+        if pictures.is_empty() {
+            bail!("문서에 그림이 없습니다.");
+        }
+        let mut planned = Vec::new();
+        for (i, a) in pictures.iter().enumerate() {
+            let (ext, bytes) = self.picture_bytes(*a)?;
+            let target = dir.join(format!("{prefix}{}.{ext}", i + 1));
+            if target.exists() && !overwrite {
+                bail!(
+                    "이미 있는 파일입니다: {} (overwrite:true로 덮어쓰기)",
+                    target.display()
+                );
+            }
+            planned.push((target, bytes));
+        }
+        let mut out = Vec::new();
+        for (target, bytes) in planned {
+            Self::write_new_file(&target, &bytes, overwrite)?;
+            out.push(target);
+        }
+        Ok(out)
+    }
+
+    /// InsertAutoNum / InsertCaptionNum at the caret (body paragraphs).
+    pub fn insert_auto_number(&mut self, kind: &str) -> Result<ObjectAddress> {
+        use hwpcraft_doc::model::control::AutoNumberType;
+        let number_type = match kind {
+            "page" => AutoNumberType::Page,
+            "total" => AutoNumberType::TotalPage,
+            "picture" => AutoNumberType::Picture,
+            "table" => AutoNumberType::Table,
+            "equation" => AutoNumberType::Equation,
+            _ => bail!("kind는 page·total·picture·table·equation입니다."),
+        };
+        self.body_insert()?;
+        let c = self.cursor;
+        let (para_in_list, stream_pos) = {
+            let doc = self.core.document();
+            let p = doc
+                .sections
+                .get(c.section)
+                .and_then(|s| s.paragraphs.get(c.paragraph))
+                .ok_or_else(|| anyhow!("문단이 없습니다."))?;
+            // RHWP's root list counts body paragraphs across sections, in stream units.
+            let before: usize = doc
+                .sections
+                .iter()
+                .take(c.section)
+                .map(|x| x.paragraphs.len())
+                .sum();
+            (before + c.paragraph, stream_pos_of(p, c.offset))
+        };
+        let mut inserted = None;
+        self.transaction(|s| {
+            let response = s
+                .core
+                .insert_auto_number_at_cursor(
+                    0,
+                    para_in_list,
+                    stream_pos,
+                    if number_type == AutoNumberType::TotalPage {
+                        "total"
+                    } else {
+                        "page"
+                    },
+                )
+                .map_err(err)?;
+            ok_value(&response)?;
+            // RHWP records a one-unit stride for the new placeholder; give it the
+            // eight units of a control slot so position lookups and saves keep it
+            // where it was inserted (same repair as the core area's page numbers).
+            {
+                let para = s
+                    .core
+                    .document_mut()
+                    .sections
+                    .get_mut(c.section)
+                    .and_then(|x| x.paragraphs.get_mut(c.paragraph))
+                    .ok_or_else(|| anyhow!("문단이 없습니다."))?;
+                if para.text.chars().nth(c.offset) != Some(' ') {
+                    bail!("번호 자리표를 찾지 못했습니다.");
+                }
+                let offsets = &mut para.char_offsets;
+                if c.offset + 1 < offsets.len() {
+                    let stride = offsets[c.offset + 1].saturating_sub(offsets[c.offset]);
+                    if stride < 8 {
+                        let add = 8 - stride;
+                        for o in offsets.iter_mut().skip(c.offset + 1) {
+                            *o += add;
+                        }
+                    }
+                }
+            }
+            let p = s
+                .core
+                .document()
+                .sections
+                .get(c.section)
+                .and_then(|x| x.paragraphs.get(c.paragraph))
+                .ok_or_else(|| anyhow!("문단이 없습니다."))?;
+            let positions = p.control_text_positions();
+            let control = p
+                .controls
+                .iter()
+                .zip(&positions)
+                .position(|(ctrl, pos)| matches!(ctrl, Control::AutoNumber(_)) && *pos == c.offset)
+                .or_else(|| {
+                    // RHWP puts the control after every control anchored before the caret.
+                    let i = positions.iter().filter(|pos| **pos < c.offset).count();
+                    matches!(p.controls.get(i), Some(Control::AutoNumber(_))).then_some(i)
+                })
+                .ok_or_else(|| anyhow!("번호 컨트롤 위치를 찾지 못했습니다."))?;
+            let a = ObjectAddress {
+                section: c.section,
+                paragraph: c.paragraph,
+                control,
+            };
+            if !matches!(
+                number_type,
+                AutoNumberType::Page | AutoNumberType::TotalPage
+            ) {
+                let section = s
+                    .core
+                    .document_mut()
+                    .sections
+                    .get_mut(a.section)
+                    .ok_or_else(|| anyhow!("구역이 없습니다."))?;
+                match section
+                    .paragraphs
+                    .get_mut(a.paragraph)
+                    .and_then(|p| p.controls.get_mut(a.control))
+                {
+                    Some(Control::AutoNumber(n)) => n.number_type = number_type,
+                    _ => bail!("번호 컨트롤을 찾지 못했습니다."),
+                }
+                section.raw_stream = None;
+                s.relayout_section(a.section)?;
+            }
+            s.cursor = Cursor {
+                offset: c.offset + 1,
+                ..c
+            };
+            s.clear_selection();
+            inserted = Some(a);
+            Ok(())
+        })?;
+        inserted.ok_or_else(|| anyhow!("번호를 넣지 못했습니다."))
+    }
+    /// Recompose and repaginate a section after a model-only edit. The empty endnote
+    /// shape call is RHWP's public path that does exactly that.
+    pub(crate) fn relayout_section(&mut self, section: usize) -> Result<()> {
+        self.core
+            .apply_endnote_shape_native(section, "{}")
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Footnote / endnote in the caret paragraph (first one at or after the caret).
+    pub fn note_at_caret(&self) -> Option<ObjectAddress> {
+        let c = self.cursor;
+        if c.cell.is_some() {
+            return None;
+        }
+        let p = self
+            .core
+            .document()
+            .sections
+            .get(c.section)?
+            .paragraphs
+            .get(c.paragraph)?;
+        let notes: Vec<(usize, usize)> = p
+            .controls
+            .iter()
+            .enumerate()
+            .zip(p.control_text_positions())
+            .filter(|((_, ctrl), _)| matches!(ctrl, Control::Footnote(_) | Control::Endnote(_)))
+            .map(|((i, _), pos)| (i, pos))
+            .collect();
+        let control = notes
+            .iter()
+            .find(|(_, pos)| *pos >= c.offset)
+            .or_else(|| notes.last())
+            .map(|(i, _)| *i)?;
+        Some(ObjectAddress {
+            section: c.section,
+            paragraph: c.paragraph,
+            control,
+        })
+    }
+    /// FootnoteToEndnote / EndnoteToFootnote: swap the control kind in place and
+    /// renumber both kinds in the section (RHWP numbers notes per section).
+    pub fn convert_note(&mut self, a: ObjectAddress) -> Result<ObjectAddress> {
+        use hwpcraft_doc::model::footnote::{Endnote, Footnote};
+        if !matches!(self.object(a)?, Control::Footnote(_) | Control::Endnote(_)) {
+            bail!("각주/미주가 아닙니다.");
+        }
+        self.transaction(|s| {
+            let fn_start = s.note_shape(a.section, false)?["startNumber"]
+                .as_u64()
+                .unwrap_or(1)
+                .max(1) as u16;
+            let en_start = s.note_shape(a.section, true)?["startNumber"]
+                .as_u64()
+                .unwrap_or(1)
+                .max(1) as u16;
+            let section = s
+                .core
+                .document_mut()
+                .sections
+                .get_mut(a.section)
+                .ok_or_else(|| anyhow!("구역이 없습니다."))?;
+            let slot = section
+                .paragraphs
+                .get_mut(a.paragraph)
+                .and_then(|p| p.controls.get_mut(a.control))
+                .ok_or_else(|| anyhow!("주석을 찾지 못했습니다."))?;
+            let taken = std::mem::replace(slot, Control::AutoNumber(Default::default()));
+            *slot = match taken {
+                Control::Footnote(n) => Control::Endnote(Box::new(Endnote {
+                    number: n.number,
+                    paragraphs: n.paragraphs,
+                    before_decoration_letter: n.before_decoration_letter,
+                    after_decoration_letter: n.after_decoration_letter,
+                    number_shape: n.number_shape,
+                    instance_id: n.instance_id,
+                    list_header_property: n.list_header_property,
+                    ..Default::default()
+                })),
+                Control::Endnote(n) => Control::Footnote(Box::new(Footnote {
+                    number: n.number,
+                    paragraphs: n.paragraphs,
+                    before_decoration_letter: n.before_decoration_letter,
+                    after_decoration_letter: n.after_decoration_letter,
+                    number_shape: n.number_shape,
+                    instance_id: n.instance_id,
+                    list_header_property: n.list_header_property,
+                    ..Default::default()
+                })),
+                other => {
+                    *slot = other;
+                    bail!("각주/미주가 아닙니다.");
+                }
+            };
+            let (mut f, mut e) = (fn_start, en_start);
+            for p in &mut section.paragraphs {
+                for ctrl in &mut p.controls {
+                    match ctrl {
+                        Control::Footnote(n) => {
+                            n.number = f;
+                            flip_note_autonumber(&mut n.paragraphs, f, false);
+                            f = f.saturating_add(1);
+                        }
+                        Control::Endnote(n) => {
+                            n.number = e;
+                            flip_note_autonumber(&mut n.paragraphs, e, true);
+                            e = e.saturating_add(1);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            section.raw_stream = None;
+            s.relayout_section(a.section)?;
+            Ok(())
+        })?;
+        Ok(a)
+    }
+
+    /// NoteNumShape* / NoteLine*: the footnote or endnote shape of a section.
+    pub fn note_shape(&self, section: usize, endnote: bool) -> Result<Value> {
+        if endnote {
+            let v: Value =
+                serde_json::from_str(&self.core.get_endnote_shape_native(section).map_err(err)?)?;
+            return Ok(v);
+        }
+        let shape = &self
+            .core
+            .document()
+            .sections
+            .get(section)
+            .ok_or_else(|| anyhow!("구역이 없습니다."))?
+            .section_def
+            .footnote_shape;
+        let ch = |c: char| {
+            if c == '\0' {
+                String::new()
+            } else {
+                c.to_string()
+            }
+        };
+        let color = shape.separator_color;
+        Ok(json!({
+            "ok": true,
+            "numberFormat": note_number_format_name(shape.number_format),
+            "userChar": ch(shape.user_char),
+            "prefixChar": ch(shape.prefix_char),
+            "suffixChar": ch(shape.suffix_char),
+            "startNumber": shape.start_number,
+            "separatorEnabled": shape.separator_length != 0 || shape.separator_line_type != 0 || shape.separator_line_width != 0,
+            "separatorLength": shape.separator_length,
+            "separatorMarginTop": shape.separator_margin_top,
+            "separatorMarginBottom": shape.separator_margin_bottom,
+            "noteSpacing": shape.note_spacing,
+            "separatorLineType": shape.separator_line_type,
+            "separatorLineWidth": shape.separator_line_width,
+            "separatorColor": format!("#{:02x}{:02x}{:02x}", color & 0xff, (color >> 8) & 0xff, (color >> 16) & 0xff),
+            "numberCodeSuperscript": shape.number_code_superscript,
+            "printInlineAfterText": shape.print_inline_after_text,
+            "numbering": note_numbering_name(shape.numbering),
+            "placement": note_placement_name(shape.placement),
+        }))
+    }
+    /// Apply note shape properties (same keys as `note.shape.get`). Endnotes go through
+    /// RHWP; footnotes are edited on the section definition with the same semantics.
+    pub fn set_note_shape(&mut self, section: usize, endnote: bool, props: &Value) -> Result<()> {
+        let o = props
+            .as_object()
+            .ok_or_else(|| anyhow!("props는 JSON 객체여야 합니다."))?;
+        if o.is_empty() {
+            bail!("바꿀 속성을 지정하세요.");
+        }
+        for (k, v) in o {
+            let ok = match k.as_str() {
+                "numberFormat" => v
+                    .as_str()
+                    .is_some_and(|f| note_number_format_from(f).is_some()),
+                "userChar" | "prefixChar" | "suffixChar" => v
+                    .as_str()
+                    .is_some_and(|c| c.chars().count() <= 1 && !c.chars().any(char::is_control)),
+                "startNumber" => v.as_u64().is_some_and(|n| (1..=9999).contains(&n)),
+                "separatorLength" => v.as_i64().is_some_and(|n| (-1..=170_079).contains(&n)),
+                "separatorMarginTop" | "separatorMarginBottom" | "noteSpacing" => {
+                    v.as_i64().is_some_and(|n| (0..=28_346).contains(&n))
+                }
+                "separatorLineType" => v.as_u64().is_some_and(|n| n <= 17),
+                "separatorLineWidth" => v.as_u64().is_some_and(|n| n <= 15),
+                "separatorColor" => v.as_str().is_some_and(|c| bgr_of(c).is_ok()),
+                "numberCodeSuperscript" | "printInlineAfterText" | "separatorEnabled" => {
+                    v.is_boolean()
+                }
+                "numbering" => v
+                    .as_str()
+                    .is_some_and(|n| matches!(n, "continue" | "section" | "page")),
+                "placement" => v
+                    .as_str()
+                    .is_some_and(|n| matches!(n, "eachColumn" | "belowText" | "rightColumn")),
+                _ => bail!("각주·미주 모양에 없는 속성: {k}"),
+            };
+            if !ok {
+                bail!("잘못된 각주·미주 모양 값: {k}");
+            }
+        }
+        if self.core.document().sections.get(section).is_none() {
+            bail!("구역이 없습니다.");
+        }
+        let json = props.to_string();
+        self.transaction(|s| {
+            if endnote {
+                let raw = s
+                    .core
+                    .apply_endnote_shape_native(section, &json)
+                    .map_err(err)?;
+                ok_value(&raw)?;
+                return Ok(());
+            }
+            {
+                let sec = s
+                    .core
+                    .document_mut()
+                    .sections
+                    .get_mut(section)
+                    .ok_or_else(|| anyhow!("구역이 없습니다."))?;
+                let shape = &mut sec.section_def.footnote_shape;
+                let first = |v: &Value| v.as_str().and_then(|c| c.chars().next()).unwrap_or('\0');
+                for (k, v) in o {
+                    match k.as_str() {
+                        "numberFormat" => {
+                            if let Some(f) = v.as_str().and_then(note_number_format_from) {
+                                shape.number_format = f;
+                            }
+                        }
+                        "userChar" => shape.user_char = first(v),
+                        "prefixChar" => shape.prefix_char = first(v),
+                        "suffixChar" => shape.suffix_char = first(v),
+                        "startNumber" => shape.start_number = v.as_u64().unwrap_or(1) as u16,
+                        "separatorLength" => {
+                            shape.separator_length = v.as_i64().unwrap_or(0) as i32
+                        }
+                        "separatorMarginTop" => {
+                            shape.separator_margin_top = v.as_i64().unwrap_or(0) as i16;
+                            shape.separator_margin_bottom = v.as_i64().unwrap_or(0) as i16;
+                        }
+                        "separatorMarginBottom" => {
+                            shape.note_spacing = v.as_i64().unwrap_or(0) as i16
+                        }
+                        "noteSpacing" => shape.raw_unknown = v.as_i64().unwrap_or(0) as u16,
+                        "separatorLineType" => {
+                            shape.separator_line_type = v.as_u64().unwrap_or(0) as u8
+                        }
+                        "separatorLineWidth" => {
+                            shape.separator_line_width = v.as_u64().unwrap_or(0) as u8
+                        }
+                        "separatorColor" => {
+                            shape.separator_color = bgr_of(v.as_str().unwrap_or("#000000"))? as u32;
+                        }
+                        "numberCodeSuperscript" => {
+                            shape.number_code_superscript = v.as_bool().unwrap_or(false)
+                        }
+                        "printInlineAfterText" => {
+                            shape.print_inline_after_text = v.as_bool().unwrap_or(false)
+                        }
+                        "numbering" => {
+                            use hwpcraft_doc::model::footnote::FootnoteNumbering as N;
+                            shape.numbering = match v.as_str() {
+                                Some("section") => N::RestartSection,
+                                Some("page") => N::RestartPage,
+                                _ => N::Continue,
+                            };
+                        }
+                        "placement" => {
+                            use hwpcraft_doc::model::footnote::FootnotePlacement as P;
+                            shape.placement = match v.as_str() {
+                                Some("belowText") => P::BelowText,
+                                Some("rightColumn") => P::RightColumn,
+                                _ => P::EachColumn,
+                            };
+                        }
+                        "separatorEnabled" if v == false => {
+                            shape.separator_length = 0;
+                            shape.separator_line_type = 0;
+                            shape.separator_line_width = 0;
+                        }
+                        _ => {}
+                    }
+                }
+                shape.attr = shape.encode_attr();
+                let code = hwpcraft_doc::model::footnote::FootnoteShape::number_format_attr_code(
+                    shape.number_format,
+                ) as u8;
+                let (prefix, suffix) = (shape.prefix_char, shape.suffix_char);
+                let start = shape.start_number.max(1);
+                let mut n = start;
+                for p in &mut sec.paragraphs {
+                    for ctrl in &mut p.controls {
+                        if let Control::Footnote(note) = ctrl {
+                            note.number = n;
+                            sync_note_number(
+                                &mut note.paragraphs,
+                                &mut note.before_decoration_letter,
+                                &mut note.after_decoration_letter,
+                                &mut note.number_shape,
+                                n,
+                                code,
+                                prefix,
+                                suffix,
+                                false,
+                            );
+                            n = n.saturating_add(1);
+                        }
+                    }
+                }
+                sec.raw_stream = None;
+            }
+            s.relayout_section(section)
+        })
+    }
+
+    /// DeleteField: remove the click-here field at the caret (or by id), keeping its text.
+    pub fn delete_field(&mut self, field_id: Option<u32>) -> Result<bool> {
+        let c = self.cursor;
+        let (section, paragraph, offset, cell) = match field_id {
+            Some(id) => {
+                let list: Value = serde_json::from_str(&self.core.get_field_list_json())?;
+                let items = list
+                    .as_array()
+                    .cloned()
+                    .or_else(|| list["fields"].as_array().cloned())
+                    .unwrap_or_default();
+                let f = items
+                    .iter()
+                    .find(|f| f["fieldId"].as_u64() == Some(u64::from(id)))
+                    .ok_or_else(|| anyhow!("누름틀 {id}을(를) 찾지 못했습니다."))?;
+                if f["cellField"] == true || f["listId"].as_u64().unwrap_or(0) != 0 {
+                    bail!("표·글상자 안 누름틀은 커서를 그 안에 놓고 field_id 없이 지우세요.");
+                }
+                let para_in_list = f["paraInList"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("누름틀 위치 정보가 없습니다."))?
+                    as usize;
+                // Root list paragraphs run across sections.
+                let mut rest = para_in_list;
+                let mut found = None;
+                for (si, sec) in self.core.document().sections.iter().enumerate() {
+                    if rest < sec.paragraphs.len() {
+                        found = Some((si, rest));
+                        break;
+                    }
+                    rest -= sec.paragraphs.len();
+                }
+                let (section, paragraph) =
+                    found.ok_or_else(|| anyhow!("누름틀 문단을 찾지 못했습니다."))?;
+                let offset = f["startCharIdx"].as_u64().unwrap_or(0) as usize;
+                (section, paragraph, offset, None)
+            }
+            None => (c.section, c.paragraph, c.offset, c.cell),
+        };
+        let has_field = {
+            let p = match cell {
+                Some(t) => {
+                    let host = self
+                        .core
+                        .document()
+                        .sections
+                        .get(section)
+                        .and_then(|s| s.paragraphs.get(paragraph))
+                        .ok_or_else(|| anyhow!("문단이 없습니다."))?;
+                    match host.controls.get(t.control) {
+                        Some(Control::Table(tb)) => tb
+                            .cells
+                            .get(t.index)
+                            .and_then(|cell| cell.paragraphs.get(t.paragraph)),
+                        Some(Control::Shape(sh)) => sh
+                            .drawing()
+                            .and_then(|d| d.text_box.as_ref())
+                            .and_then(|tb| tb.paragraphs.get(t.paragraph)),
+                        _ => None,
+                    }
+                }
+                None => self
+                    .core
+                    .document()
+                    .sections
+                    .get(section)
+                    .and_then(|s| s.paragraphs.get(paragraph)),
+            }
+            .ok_or_else(|| anyhow!("문단이 없습니다."))?;
+            p.field_ranges
+                .iter()
+                .any(|r| r.start_char_idx <= offset && offset <= r.end_char_idx)
+        };
+        if !has_field {
+            return Ok(false);
+        }
+        self.transaction(|s| {
+            let raw = match cell {
+                Some(t) => {
+                    let textbox = matches!(
+                        s.core.document().sections[section].paragraphs[paragraph]
+                            .controls
+                            .get(t.control),
+                        Some(Control::Shape(_))
+                    );
+                    s.core.remove_field_at_in_cell(
+                        section,
+                        paragraph,
+                        t.control,
+                        t.index,
+                        t.paragraph,
+                        offset,
+                        textbox,
+                    )
+                }
+                None => s.core.remove_field_at(section, paragraph, offset),
+            }
+            .map_err(err)?;
+            ok_value(&raw)?;
+            s.clear_selection();
+            Ok(())
+        })?;
+        Ok(true)
+    }
+}
+
+/// Keep a note's inner automatic number in step with its kind and number.
+fn flip_note_autonumber(paragraphs: &mut [Paragraph], number: u16, endnote: bool) {
+    use hwpcraft_doc::model::control::AutoNumberType;
+    for p in paragraphs {
+        for c in &mut p.controls {
+            if let Control::AutoNumber(n) = c
+                && matches!(
+                    n.number_type,
+                    AutoNumberType::Footnote | AutoNumberType::Endnote
+                )
+            {
+                n.number_type = if endnote {
+                    AutoNumberType::Endnote
+                } else {
+                    AutoNumberType::Footnote
+                };
+                n.number = number;
+                n.assigned_number = number;
+            }
+        }
+    }
+}
+/// Mirror of RHWP's endnote sync for footnotes: decoration letters, number shape and the
+/// inner automatic number follow the section's note shape.
+#[allow(clippy::too_many_arguments)]
+fn sync_note_number(
+    paragraphs: &mut [Paragraph],
+    before: &mut u16,
+    after: &mut u16,
+    number_shape: &mut u32,
+    number: u16,
+    code: u8,
+    prefix: char,
+    suffix: char,
+    endnote: bool,
+) {
+    use hwpcraft_doc::model::control::AutoNumberType;
+    *before = if prefix == '\0' { 0 } else { prefix as u16 };
+    *after = if suffix == '\0' { 0 } else { suffix as u16 };
+    *number_shape = u32::from(code);
+    let kind = if endnote {
+        AutoNumberType::Endnote
+    } else {
+        AutoNumberType::Footnote
+    };
+    for p in paragraphs {
+        for c in &mut p.controls {
+            if let Control::AutoNumber(n) = c
+                && n.number_type == kind
+            {
+                n.format = code;
+                n.prefix_char = prefix;
+                n.suffix_char = suffix;
+                n.number = number;
+                n.assigned_number = number;
+            }
+        }
+    }
+}
+fn note_number_format_name(f: hwpcraft_doc::model::footnote::NumberFormat) -> &'static str {
+    use hwpcraft_doc::model::footnote::NumberFormat as F;
+    match f {
+        F::Digit => "digit",
+        F::CircledDigit => "circledDigit",
+        F::UpperRoman => "upperRoman",
+        F::LowerRoman => "lowerRoman",
+        F::UpperAlpha => "upperAlpha",
+        F::LowerAlpha => "lowerAlpha",
+        F::CircledUpperAlpha => "circledUpperAlpha",
+        F::CircledLowerAlpha => "circledLowerAlpha",
+        F::HangulSyllable => "hangulSyllable",
+        F::CircledHangulSyllable => "circledHangulSyllable",
+        F::HangulJamo => "hangulJamo",
+        F::CircledHangulJamo => "circledHangulJamo",
+        F::HangulDigit => "hangulDigit",
+        F::HanjaDigit => "hanjaDigit",
+        F::CircledHanjaDigit => "circledHanjaDigit",
+        F::HanjaGapEul => "hanjaGapEul",
+        F::HanjaGapEulHanja => "hanjaGapEulHanja",
+        F::FourSymbol => "fourSymbol",
+        F::UserChar => "userChar",
+    }
+}
+fn note_number_format_from(name: &str) -> Option<hwpcraft_doc::model::footnote::NumberFormat> {
+    use hwpcraft_doc::model::footnote::NumberFormat as F;
+    Some(match name {
+        "digit" => F::Digit,
+        "circledDigit" => F::CircledDigit,
+        "upperRoman" => F::UpperRoman,
+        "lowerRoman" => F::LowerRoman,
+        "upperAlpha" => F::UpperAlpha,
+        "lowerAlpha" => F::LowerAlpha,
+        "circledUpperAlpha" => F::CircledUpperAlpha,
+        "circledLowerAlpha" => F::CircledLowerAlpha,
+        "hangulSyllable" => F::HangulSyllable,
+        "circledHangulSyllable" => F::CircledHangulSyllable,
+        "hangulJamo" => F::HangulJamo,
+        "circledHangulJamo" => F::CircledHangulJamo,
+        "hangulDigit" => F::HangulDigit,
+        "hanjaDigit" => F::HanjaDigit,
+        "circledHanjaDigit" => F::CircledHanjaDigit,
+        "hanjaGapEul" => F::HanjaGapEul,
+        "hanjaGapEulHanja" => F::HanjaGapEulHanja,
+        "fourSymbol" => F::FourSymbol,
+        "userChar" => F::UserChar,
+        _ => return None,
+    })
+}
+fn note_numbering_name(n: hwpcraft_doc::model::footnote::FootnoteNumbering) -> &'static str {
+    use hwpcraft_doc::model::footnote::FootnoteNumbering as N;
+    match n {
+        N::RestartSection => "section",
+        N::RestartPage => "page",
+        _ => "continue",
+    }
+}
+fn note_placement_name(p: hwpcraft_doc::model::footnote::FootnotePlacement) -> &'static str {
+    use hwpcraft_doc::model::footnote::FootnotePlacement as P;
+    match p {
+        P::BelowText => "belowText",
+        P::RightColumn => "rightColumn",
+        _ => "eachColumn",
     }
 }

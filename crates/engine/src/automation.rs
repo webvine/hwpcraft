@@ -37,7 +37,7 @@ impl Session {
                 bail!("text는 비어 있지 않은 한 문단 문자열, occurrence는 1 이상이어야 합니다.");
             }
             let mut remaining = p.occurrence;
-            for (mut cursor, _) in self.entries() {
+            for mut cursor in self.cursors() {
                 let text = &self.paragraph(cursor)?.text;
                 for (byte, _) in text.match_indices(&p.text) {
                     remaining -= 1;
@@ -57,14 +57,14 @@ impl Session {
         if !(1..=1000).contains(&window.limit) {
             bail!("limit는 1–1000이어야 합니다.");
         }
-        let entries = self.entries();
+        let entries = self.cursors();
         if window.start > entries.len() {
             bail!("start가 문단 수를 벗어났습니다.");
         }
         let end = window.start.saturating_add(window.limit).min(entries.len());
         let mut blocks = Vec::new();
         let mut texts = Vec::new();
-        for (cursor, _) in entries.iter().skip(window.start).take(window.limit) {
+        for cursor in entries.iter().skip(window.start).take(window.limit) {
             let p = self.paragraph(*cursor)?;
             texts.push(p.text.as_str());
             if id == "document.inspect" {

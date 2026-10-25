@@ -3,6 +3,7 @@
 //!
 //! Shortcuts follow the key bindings Hangul users expect (Alt+L, Alt+T, F6, Ctrl+1…0).
 use super::*;
+use hwpcraft_doc::model::control::CharOverlap;
 use hwpcraft_doc::model::header_footer::HeaderFooterApply;
 use hwpcraft_doc::model::paragraph::MarkpenMark;
 use hwpcraft_doc::model::style::{
@@ -139,6 +140,392 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "format.footnote.paragraph.get",
         "각주 / 미주 문단 모양 조회",
         "",
+    ),
+    (
+        "format.superscript.cycle",
+        "위 / 아래 첨자 순환 (보통 → 위 → 아래)",
+        "",
+    ),
+    ("format.indent.at_caret", "현재 위치로 내어쓰기", ""),
+    ("format.font.next", "다음 글꼴", ""),
+    ("format.font.prev", "이전 글꼴", ""),
+    ("format.text_color", "글자 색 (사전 지정 색 포함)", ""),
+    ("format.shade_color", "글자 음영 색", ""),
+    ("format.char_border", "글자 테두리", ""),
+    ("format.paragraph.up", "문단 위로 이동", ""),
+    ("format.paragraph.down", "문단 아래로 이동", ""),
+    ("format.style.clear_char", "글자 스타일 해제", ""),
+    (
+        "format.style.update_from_caret",
+        "현재 모양으로 스타일 바꾸기",
+        "",
+    ),
+    ("format.style.move", "스타일 목록 위 / 아래로 이동", ""),
+    ("format.style.export", "스타일 내보내기 (JSON)", ""),
+    ("format.style.import", "스타일 가져오기 (JSON)", ""),
+    (
+        "format.paragraph.apply",
+        "문단 모양 창 적용 (모양 + 문단 종류)",
+        "",
+    ),
+    ("format.outline.shape", "개요 번호 모양", ""),
+    ("format.char_overlap", "글자 겹치기 넣기", ""),
+    ("format.char_overlap.get", "글자 겹치기 조회", ""),
+    ("format.char_overlap.update", "글자 겹치기 고치기", ""),
+    ("format.char_overlap.delete", "글자 겹치기 지우기", ""),
+];
+
+/// Hangul's preset 글자 색 (TextColor*) as measured: name, label, #rrggbb.
+pub const COLOR_PRESETS: [(&str, &str, &str); 8] = [
+    ("black", "검정", "#000000"),
+    ("red", "빨강", "#ff0000"),
+    ("blue", "파랑", "#0000ff"),
+    ("green", "초록", "#008000"),
+    ("yellow", "노랑", "#ffff00"),
+    ("violet", "보라", "#993366"),
+    ("bluish", "청록", "#008080"),
+    ("white", "흰색", "#ffffff"),
+];
+
+/// (command id, parameter help, JSON example object) for list_commands and
+/// docs/mcp-commands.md; owner fills this for every command above.
+pub const PARAMS: &[(&str, &str, &str)] = &[
+    (
+        "format.bold",
+        "value?: bool; omitted toggles the shape under the caret. Selection or whole caret paragraph.",
+        r##"{"value":true}"##,
+    ),
+    ("format.italic", "value?: bool; omitted toggles.", "{}"),
+    (
+        "format.underline",
+        "value?: bool; omitted toggles (underlineType Bottom/None).",
+        "{}",
+    ),
+    (
+        "format.strikethrough",
+        "value?: bool; omitted toggles.",
+        "{}",
+    ),
+    (
+        "format.superscript",
+        "value?: bool; omitted toggles. Clears subscript.",
+        "{}",
+    ),
+    (
+        "format.subscript",
+        "value?: bool; omitted toggles. Clears superscript.",
+        "{}",
+    ),
+    (
+        "format.superscript.cycle",
+        "No parameters; 보통 → 위 첨자 → 아래 첨자 → 보통 by the shape under the caret (Hangul CharShapeSuperSubscript).",
+        "{}",
+    ),
+    (
+        "format.normal",
+        "No parameters; clears bold, italic, underline, strikethrough, scripts, outline, shadow, emboss, engrave.",
+        "{}",
+    ),
+    (
+        "format.highlight",
+        "color?: #rrggbb or name?: black|red|blue|green|yellow|violet|bluish|white (Hangul presets); neither removes the 형광펜. Selection or whole caret paragraph.",
+        r##"{"color":"#ffff00"}"##,
+    ),
+    (
+        "format.highlight.get",
+        "No parameters; highlight under the caret and the caret paragraph's ranges.",
+        "{}",
+    ),
+    (
+        "format.font_size.increase",
+        "No parameters; +1 pt (100 units) like Hangul, up to 4096 pt.",
+        "{}",
+    ),
+    (
+        "format.font_size.decrease",
+        "No parameters; −1 pt, down to 1 pt.",
+        "{}",
+    ),
+    (
+        "format.ratio.increase",
+        "No parameters; 장평 +1 % for all languages, up to 200 %.",
+        "{}",
+    ),
+    (
+        "format.ratio.decrease",
+        "No parameters; 장평 −1 %, down to 50 %.",
+        "{}",
+    ),
+    (
+        "format.spacing.increase",
+        "No parameters; 자간 +1 %, up to 50 %.",
+        "{}",
+    ),
+    (
+        "format.spacing.decrease",
+        "No parameters; 자간 −1 %, down to −50 %.",
+        "{}",
+    ),
+    (
+        "format.text_color",
+        "color: #rrggbb or name: black|red|blue|green|yellow|violet|bluish|white (Hangul TextColor* presets).",
+        r##"{"name":"red"}"##,
+    ),
+    (
+        "format.shade_color",
+        "color?: #rrggbb or name? (same presets); neither removes the 음영 (white).",
+        r##"{"name":"yellow"}"##,
+    ),
+    (
+        "format.char_border",
+        "value?: bool, type?: 0–17 (HWP line type), width?: 0–15, color?: #rrggbb; all four sides. No parameters toggles a thin solid border.",
+        r##"{"type":1,"width":0,"color":"#000000"}"##,
+    ),
+    (
+        "format.font.next",
+        "fonts?: [names] in Hangul's list order (the UI passes installed fonts); omitted cycles the document's fonts. All seven languages take the font.",
+        r##"{"fonts":["함초롬바탕","함초롬돋움"]}"##,
+    ),
+    (
+        "format.font.prev",
+        "Same as format.font.next, backwards.",
+        "{}",
+    ),
+    (
+        "format.align.justify",
+        "No parameters; selected paragraphs.",
+        "{}",
+    ),
+    ("format.align.left", "No parameters.", "{}"),
+    ("format.align.center", "No parameters.", "{}"),
+    ("format.align.right", "No parameters.", "{}"),
+    ("format.align.distribute", "No parameters; 배분 정렬.", "{}"),
+    ("format.align.split", "No parameters; 나눔 정렬.", "{}"),
+    (
+        "format.line_spacing.increase",
+        "No parameters; +10 % (percent mode) or +1 pt, like Hangul.",
+        "{}",
+    ),
+    (
+        "format.line_spacing.decrease",
+        "No parameters; −10 % or −1 pt, down to 0.",
+        "{}",
+    ),
+    (
+        "format.indent.positive",
+        "No parameters; 첫 줄 들여쓰기 +1 pt (200 raw units).",
+        "{}",
+    ),
+    (
+        "format.indent.negative",
+        "No parameters; 첫 줄 −1 pt (negative = 내어쓰기).",
+        "{}",
+    ),
+    (
+        "format.indent.at_caret",
+        "No parameters; following lines start at the caret's x (negative indent), Hangul ParaShapeIndentAtCaret.",
+        "{}",
+    ),
+    (
+        "format.margin_left.increase",
+        "No parameters; 왼쪽 여백 +1 pt; margins may go negative like Hangul.",
+        "{}",
+    ),
+    (
+        "format.margin_left.decrease",
+        "No parameters; 왼쩍 여백 −1 pt.",
+        "{}",
+    ),
+    (
+        "format.margin_right.increase",
+        "No parameters; 오른쪽 여백 +1 pt.",
+        "{}",
+    ),
+    (
+        "format.margin_right.decrease",
+        "No parameters; 오른쪽 여백 −1 pt.",
+        "{}",
+    ),
+    (
+        "format.margin.increase",
+        "No parameters; both margins +1 pt.",
+        "{}",
+    ),
+    (
+        "format.margin.decrease",
+        "No parameters; both margins −1 pt.",
+        "{}",
+    ),
+    (
+        "format.paragraph.up",
+        "No parameters; swaps the caret paragraph with the previous one in its container (body or cell). 구역 정의 stays first.",
+        "{}",
+    ),
+    (
+        "format.paragraph.down",
+        "No parameters; swaps with the next paragraph.",
+        "{}",
+    ),
+    (
+        "format.paragraph.apply",
+        "format?: paragraph shape patch (format.paragraph keys), head?: {kind: none|outline|number|bullet, level?: 0–6}; one undo step.",
+        r##"{"format":{"alignment":"center"},"head":{"kind":"outline","level":0}}"##,
+    ),
+    (
+        "format.style.list",
+        "No parameters; id, name, englishName, type, nextStyleId, shortcut, current.",
+        "{}",
+    ),
+    (
+        "format.style.detail",
+        "id: style index; returns its character and paragraph shapes.",
+        r##"{"id":0}"##,
+    ),
+    (
+        "format.style.create",
+        "name, englishName?, type?: paragraph|character, nextStyleId?, character?/paragraph?: shape patches; starts from the caret's shapes.",
+        r##"{"name":"강조","type":"paragraph","character":{"bold":true}}"##,
+    ),
+    (
+        "format.style.update",
+        "id, name?, englishName?, nextStyleId?, character?/paragraph?: patches; paragraphs using the style follow.",
+        r##"{"id":1,"character":{"italic":true}}"##,
+    ),
+    (
+        "format.style.delete",
+        "id (not 0), replacement?: style for its paragraphs (default 바탕글).",
+        r##"{"id":3,"replacement":0}"##,
+    ),
+    (
+        "format.style.shortcut",
+        "number: 1–9 and 0 or 10 (Ctrl+1 … Ctrl+0), 11–20 for StyleShortcut11–20; applies that style.",
+        r##"{"number":2}"##,
+    ),
+    (
+        "format.style.clear_char",
+        "No parameters; the selection (or caret paragraph) returns to its paragraph style's character shape (StyleClearCharStyle).",
+        "{}",
+    ),
+    (
+        "format.style.update_from_caret",
+        "id?: style (default: the caret paragraph's); it takes the caret's character shape and paragraph shape (ChangeToCurrentStyle).",
+        r##"{"id":1}"##,
+    ),
+    (
+        "format.style.move",
+        "id, direction: up|down; swaps list positions, 바탕글 stays first (StyleWSListUp/Down).",
+        r##"{"id":2,"direction":"up"}"##,
+    ),
+    (
+        "format.style.export",
+        "path?: write JSON there; otherwise returns {format, version, styles:[{name, englishName, type, nextStyle, character, paragraph}]}.",
+        r##"{"path":"styles.json"}"##,
+    ),
+    (
+        "format.style.import",
+        "path? or styles?: exported JSON; styles are matched by name (update) or added, nextStyle by name. One undo step.",
+        r##"{"styles":[{"name":"강조","character":{"bold":true}}]}"##,
+    ),
+    (
+        "format.numbering.list",
+        "No parameters; numberings, bullets, the section's outline id and preceding lists.",
+        "{}",
+    ),
+    (
+        "format.numbering.create",
+        "levelFormats: 7 strings (^1. …), numberFormats: 7 codes 0–16, startNumber?.",
+        r##"{"levelFormats":["^1.","^2)","(^3)","(^4)","^5","^6)","^7)"],"numberFormats":[0,8,0,8,1,10,5]}"##,
+    ),
+    (
+        "format.numbering.apply",
+        "kind: number|bullet|outline|none, id?, char? (bullet), level?: 0–6, levelFormats?/numberFormats?/startNumber? (inline numbering), restart?: {mode, start?}.",
+        r##"{"kind":"number","level":0}"##,
+    ),
+    (
+        "format.numbering.toggle",
+        "No parameters; 문단 번호 on/off by the caret paragraph.",
+        "{}",
+    ),
+    (
+        "format.bullet.toggle",
+        "No parameters; 글머리표 on/off.",
+        "{}",
+    ),
+    ("format.outline.toggle", "No parameters; 개요 on/off.", "{}"),
+    (
+        "format.outline.shape",
+        "levelFormats, numberFormats, startNumber?: the section's 개요 번호 모양.",
+        r##"{"levelFormats":["^1.","^2.","^3)","^4)","(^5)","(^6)","^7"],"numberFormats":[0,8,0,8,0,8,1]}"##,
+    ),
+    (
+        "format.level.increase",
+        "No parameters; one level deeper for numbered paragraphs.",
+        "{}",
+    ),
+    (
+        "format.level.decrease",
+        "No parameters; one level up.",
+        "{}",
+    ),
+    (
+        "format.numbering.restart",
+        "mode: continue|previous|new, start?: 1–65535 with new.",
+        r##"{"mode":"new","start":1}"##,
+    ),
+    (
+        "format.copy_shape.apply",
+        "character?/paragraph?: copied shape patches applied in one undo step (모양 복사 Alt+C).",
+        r##"{"character":{"bold":true},"paragraph":{"alignment":"center"}}"##,
+    ),
+    (
+        "format.hf.character",
+        "header: bool, applyTo?: both|odd|even, paragraph?: index, start?/end?: offsets, format: character patch.",
+        r##"{"header":true,"format":{"bold":true}}"##,
+    ),
+    (
+        "format.hf.character.get",
+        "header, applyTo?, paragraph?, offset?.",
+        r##"{"header":true}"##,
+    ),
+    (
+        "format.hf.paragraph",
+        "header, applyTo?, paragraph?, format: paragraph patch.",
+        r##"{"header":false,"format":{"alignment":"right"}}"##,
+    ),
+    (
+        "format.hf.paragraph.get",
+        "header, applyTo?, paragraph?.",
+        r##"{"header":false}"##,
+    ),
+    (
+        "format.footnote.paragraph",
+        "paragraph?: host paragraph (default caret), control: index of the footnote/endnote, footnoteParagraph?, format: paragraph patch.",
+        r##"{"control":0,"format":{"alignment":"justify"}}"##,
+    ),
+    (
+        "format.footnote.paragraph.get",
+        "paragraph?, control, footnoteParagraph?.",
+        r##"{"control":0}"##,
+    ),
+    (
+        "format.char_overlap",
+        "chars: 1–9 characters drawn on top of each other at the caret (Hangul 글자 겹치기, HWP tcps); border?: 0 none|1 circle|2 reversed circle|3 square|4 reversed square|5 triangle|6 reversed triangle; size?: inner size % (1–127, default 100); expansion?: 1 overlap (default) | 0 spread. Body paragraphs only.",
+        r##"{"chars":"주의","border":1}"##,
+    ),
+    (
+        "format.char_overlap.get",
+        "No parameters; the caret paragraph's 글자 겹치기 controls (control index, position, chars, border, size, expansion).",
+        "{}",
+    ),
+    (
+        "format.char_overlap.update",
+        "control: index from format.char_overlap.get; chars?/border?/size?/expansion? to change.",
+        r##"{"control":0,"border":3}"##,
+    ),
+    (
+        "format.char_overlap.delete",
+        "control: index of the 글자 겹치기 control in the caret paragraph.",
+        r##"{"control":0}"##,
     ),
 ];
 
@@ -497,6 +884,35 @@ impl Session {
             "format.footnote.paragraph.get" => {
                 parse(id, params).and_then(|p| self.fmt_footnote_paragraph_get(&p))
             }
+            "format.superscript.cycle" => no_params(id, params).and_then(|_| self.cycle_script()),
+            "format.indent.at_caret" => no_params(id, params).and_then(|_| self.indent_at_caret()),
+            "format.font.next" | "format.font.prev" => {
+                parse(id, params).and_then(|p| self.cycle_font(p, id.ends_with(".next")))
+            }
+            "format.text_color" | "format.shade_color" => {
+                parse(id, params).and_then(|p| self.preset_color(id, p))
+            }
+            "format.char_border" => parse(id, params).and_then(|p| self.char_border(p)),
+            "format.paragraph.up" | "format.paragraph.down" => {
+                no_params(id, params).and_then(|_| self.move_paragraph(id.ends_with(".down")))
+            }
+            "format.style.clear_char" => {
+                no_params(id, params).and_then(|_| self.clear_char_style())
+            }
+            "format.style.update_from_caret" => {
+                parse(id, params).and_then(|p| self.style_from_caret(p))
+            }
+            "format.style.move" => parse(id, params).and_then(|p| self.move_style(p)),
+            "format.style.export" => parse(id, params).and_then(|p| self.export_styles(p)),
+            "format.style.import" => parse(id, params).and_then(|p| self.import_styles(p)),
+            "format.char_overlap" => parse(id, params).and_then(|p| self.insert_char_overlap(p)),
+            "format.char_overlap.get" => no_params(id, params).and_then(|_| self.char_overlaps()),
+            "format.char_overlap.update" => {
+                parse(id, params).and_then(|p| self.update_char_overlap(p))
+            }
+            "format.char_overlap.delete" => {
+                parse(id, params).and_then(|p| self.delete_char_overlap(p))
+            }
             _ => return None,
         })
     }
@@ -582,9 +998,12 @@ impl Session {
         struct Highlight {
             #[serde(default)]
             color: Option<String>,
+            /// Hangul's preset marker colors (TextMarkerColor*), see `COLOR_PRESETS`.
+            #[serde(default)]
+            name: Option<String>,
         }
         let p: Highlight = parse::<Highlight>(id, params)?;
-        let color = p.color.as_deref().map(hex_color).transpose()?;
+        let color = preset_or_color(p.color.as_deref(), p.name.as_deref())?;
         let parts = self.selected_paragraphs()?;
         // No selection marks the whole caret paragraph, like `format.character`.
         let whole = parts.len() == 1 && parts[0].1.is_empty();
@@ -999,29 +1418,31 @@ impl Session {
         let up = id.ends_with(".increase") || id.ends_with(".positive");
         let sign = if up { 1 } else { -1 };
         let raw = |k: &str| p[k].as_f64().unwrap_or(0.0).round() as i64;
-        // Hangul 2024 moves indents and margins 1 pt per action (200 raw units),
-        // measured through its ParagraphShapeIndentPositive / IncreaseLeftMargin actions.
+        // Hangul 2024 moves indents and margins 1 pt per action (200 raw units) and lets
+        // margins go negative (text into the page margin), as its ParagraphShape* actions show;
+        // 줄 간격 moves 10 % per action in percent mode.
         let step = 200;
+        let margin = |k: &str| (raw(k) + sign * step).clamp(-100000, 100000);
         let patch = match id {
             "format.line_spacing.increase" | "format.line_spacing.decrease" => {
                 if p["lineSpacingType"] == "Percent" {
-                    json!({"lineSpacing": (raw("lineSpacing") + sign * 10).clamp(50, 500)})
+                    json!({"lineSpacing": (raw("lineSpacing") + sign * 10).clamp(0, 500)})
                 } else {
-                    json!({"lineSpacing": (raw("lineSpacing") + sign * 100).clamp(100, 200000)})
+                    json!({"lineSpacing": (raw("lineSpacing") + sign * 100).clamp(0, 200000)})
                 }
             }
             "format.indent.positive" | "format.indent.negative" => {
-                json!({"indent": (raw("indent") + sign * step).clamp(-100000, 100000)})
+                json!({"indent": margin("indent")})
             }
             "format.margin_left.increase" | "format.margin_left.decrease" => {
-                json!({"marginLeft": (raw("marginLeft") + sign * step).clamp(0, 100000)})
+                json!({"marginLeft": margin("marginLeft")})
             }
             "format.margin_right.increase" | "format.margin_right.decrease" => {
-                json!({"marginRight": (raw("marginRight") + sign * step).clamp(0, 100000)})
+                json!({"marginRight": margin("marginRight")})
             }
             _ => json!({
-                "marginLeft": (raw("marginLeft") + sign * step).clamp(0, 100000),
-                "marginRight": (raw("marginRight") + sign * step).clamp(0, 100000),
+                "marginLeft": margin("marginLeft"),
+                "marginRight": margin("marginRight"),
             }),
         };
         self.format_paragraph(patch)
@@ -1241,35 +1662,53 @@ impl Session {
         };
         let name = p.name.trim().to_owned();
         self.transaction_value(|s| {
-            let doc = s.core.document_mut();
-            doc.doc_info.styles.push(Style {
-                raw_data: None,
-                local_name: name,
-                english_name: english,
-                style_type: u8::from(character),
-                next_style_id: p.next_style_id.unwrap_or(count) as u8,
-                lang_id: 1042,
-                para_shape_id,
+            let id = s.create_style_now(NewStyle {
+                name,
+                english,
+                character,
+                next: p.next_style_id,
                 char_shape_id,
-                lock_form: false,
-            });
-            doc.doc_info.raw_stream_dirty = true;
-            s.refresh_layout()?;
-            if p.character.is_some() || p.paragraph.is_some() {
-                let style = s.core.document().doc_info.styles[count].clone();
-                let (name, english) = (style.local_name.clone(), style.english_name.clone());
-                let update = UpdateStyle {
-                    id: count,
-                    name: None,
-                    english_name: None,
-                    next_style_id: None,
-                    character: p.character,
-                    paragraph: p.paragraph,
-                };
-                s.update_style_now(update, style, name, english)?;
-            }
-            Ok(json!({"id": count}))
+                para_shape_id,
+                char_patch: p.character,
+                para_patch: p.paragraph,
+            })?;
+            Ok(json!({"id": id}))
         })
+    }
+    /// Append a validated style (and apply its shape patches), no transaction.
+    fn create_style_now(&mut self, n: NewStyle) -> Result<usize> {
+        let count = self.core.document().doc_info.styles.len();
+        if count >= 255 {
+            bail!("스타일은 255개까지 만들 수 있습니다.");
+        }
+        let doc = self.core.document_mut();
+        doc.doc_info.styles.push(Style {
+            raw_data: None,
+            local_name: n.name,
+            english_name: n.english,
+            style_type: u8::from(n.character),
+            next_style_id: n.next.unwrap_or(count) as u8,
+            lang_id: 1042,
+            para_shape_id: n.para_shape_id,
+            char_shape_id: n.char_shape_id,
+            lock_form: false,
+        });
+        doc.doc_info.raw_stream_dirty = true;
+        self.refresh_layout()?;
+        if n.char_patch.is_some() || n.para_patch.is_some() {
+            let style = self.core.document().doc_info.styles[count].clone();
+            let (name, english) = (style.local_name.clone(), style.english_name.clone());
+            let update = UpdateStyle {
+                id: count,
+                name: None,
+                english_name: None,
+                next_style_id: None,
+                character: n.char_patch,
+                paragraph: n.para_patch,
+            };
+            self.update_style_now(update, style, name, english)?;
+        }
+        Ok(count)
     }
     fn update_style(&mut self, p: UpdateStyle) -> Result<Value> {
         let style = self
@@ -1354,60 +1793,72 @@ impl Session {
             if let Some(n) = p.next_style_id {
                 target.next_style_id = n as u8;
             }
-            target.char_shape_id = new_cs;
-            target.para_shape_id = new_ps;
             target.raw_data = None;
             doc.doc_info.raw_stream_dirty = true;
-            // Propagate like Hangul: paragraphs keep direct formatting; runs that used the
-            // style's character shape follow the edited style.
-            let paragraph_style = style.style_type == 0;
-            let mut touched = Vec::new();
-            for (si, section) in doc.sections.iter_mut().enumerate() {
-                section.raw_stream = None;
-                for (pi, para) in section.paragraphs.iter_mut().enumerate() {
-                    let mut visit = |para: &mut hwpcraft_doc::model::paragraph::Paragraph,
-                                     cell: Option<Cell>| {
-                        if para.style_id as usize == p.id {
-                            if paragraph_style && para.para_shape_id == old_ps {
-                                para.para_shape_id = new_ps;
-                            }
-                            para.replace_style_char_shape_preserving_overrides(
-                                u32::from(old_cs),
-                                u32::from(new_cs),
-                            );
-                            touched.push(Cursor {
-                                section: si,
-                                paragraph: pi,
-                                offset: 0,
-                                cell,
-                            });
+            s.retarget_style(p.id, &style, new_cs, new_ps)?;
+            Ok(json!({"id": p.id}))
+        }
+    }
+    /// Point style `id` at new shapes and propagate like Hangul: paragraphs keep direct
+    /// formatting; runs that used the style's character shape follow the edited style.
+    fn retarget_style(&mut self, id: usize, old: &Style, new_cs: u16, new_ps: u16) -> Result<()> {
+        let (old_cs, old_ps) = (old.char_shape_id, old.para_shape_id);
+        let doc = self.core.document_mut();
+        let target = doc
+            .doc_info
+            .styles
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("스타일을 찾지 못했습니다."))?;
+        target.char_shape_id = new_cs;
+        target.para_shape_id = new_ps;
+        target.raw_data = None;
+        doc.doc_info.raw_stream_dirty = true;
+        let paragraph_style = old.style_type == 0;
+        let mut touched = Vec::new();
+        for (si, section) in doc.sections.iter_mut().enumerate() {
+            section.raw_stream = None;
+            for (pi, para) in section.paragraphs.iter_mut().enumerate() {
+                let mut visit = |para: &mut Paragraph, cell: Option<Cell>| {
+                    if para.style_id as usize == id {
+                        if paragraph_style && para.para_shape_id == old_ps {
+                            para.para_shape_id = new_ps;
                         }
-                    };
-                    for (ci, control) in para.controls.iter_mut().enumerate() {
-                        if let Control::Table(t) = control {
-                            for (ti, cell) in t.cells.iter_mut().enumerate() {
-                                for (k, cp) in cell.paragraphs.iter_mut().enumerate() {
-                                    visit(
-                                        cp,
-                                        Some(Cell {
-                                            control: ci,
-                                            index: ti,
-                                            paragraph: k,
-                                        }),
-                                    );
-                                }
+                        para.replace_style_char_shape_preserving_overrides(
+                            u32::from(old_cs),
+                            u32::from(new_cs),
+                        );
+                        touched.push(Cursor {
+                            section: si,
+                            paragraph: pi,
+                            offset: 0,
+                            cell,
+                        });
+                    }
+                };
+                for (ci, control) in para.controls.iter_mut().enumerate() {
+                    if let Control::Table(t) = control {
+                        for (ti, cell) in t.cells.iter_mut().enumerate() {
+                            for (k, cp) in cell.paragraphs.iter_mut().enumerate() {
+                                visit(
+                                    cp,
+                                    Some(Cell {
+                                        control: ci,
+                                        index: ti,
+                                        paragraph: k,
+                                    }),
+                                );
                             }
                         }
                     }
-                    visit(para, None);
                 }
+                visit(para, None);
             }
-            s.refresh_layout()?;
-            for c in touched {
-                s.reflow(c)?;
-            }
-            Ok(json!({"id": p.id}))
         }
+        self.refresh_layout()?;
+        for c in touched {
+            self.reflow(c)?;
+        }
+        Ok(())
     }
     /// Re-run RHWP's line breaking for one paragraph by re-applying its own left margin.
     fn reflow(&mut self, c: Cursor) -> Result<()> {
@@ -1549,14 +2000,16 @@ impl Session {
             Ok(json!({"replaced": users.len()}))
         })
     }
-    /// `number` is the digit key: 1 … 9 and 0 (= tenth style).
+    /// `number` is the style's position: 1 … 9 and 0 or 10 (Ctrl+1 … Ctrl+0), and 11 … 20
+    /// for Hangul's StyleShortcut11–20, which have no default key.
     fn style_shortcut(&mut self, number: usize) -> Result<Value> {
-        if number > 9 {
-            bail!("스타일 단축키는 Ctrl+1 … Ctrl+0입니다.");
-        }
-        let index = (number + 9) % 10;
+        let index = match number {
+            0 => 9,
+            1..=20 => number - 1,
+            _ => bail!("스타일 단축키는 1 … 20 (Ctrl+1 … Ctrl+0은 1 … 10)입니다."),
+        };
         if index >= self.core.document().doc_info.styles.len() {
-            bail!("Ctrl+{number}에 해당하는 스타일이 없습니다.");
+            bail!("{}번째 스타일이 없습니다.", index + 1);
         }
         self.apply_style(index)?;
         Ok(self.info())
@@ -1978,6 +2431,905 @@ impl Session {
             self.apply_paragraph_at(p, json!({"numberingId": target}))?;
         }
         Ok(())
+    }
+}
+
+// ---- 0.14 format area: toolbar presets, cycles, paragraph move, style tools ----
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ColorParam {
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FontCycle {
+    /// Installed font names in Hangul's list order (the UI passes its list); omitted
+    /// headless, the fonts registered in the document are cycled instead.
+    #[serde(default)]
+    fonts: Option<Vec<String>>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CharBorder {
+    #[serde(default)]
+    value: Option<bool>,
+    #[serde(default, rename = "type")]
+    kind: Option<u8>,
+    #[serde(default)]
+    width: Option<u8>,
+    #[serde(default)]
+    color: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StyleFromCaret {
+    #[serde(default)]
+    id: Option<usize>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StyleMove {
+    id: usize,
+    direction: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StyleExport {
+    #[serde(default)]
+    path: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StyleImport {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    styles: Option<Value>,
+}
+struct NewStyle {
+    name: String,
+    english: String,
+    character: bool,
+    next: Option<usize>,
+    char_shape_id: u16,
+    para_shape_id: u16,
+    char_patch: Option<Value>,
+    para_patch: Option<Value>,
+}
+/// `#rrggbb` from a color or a preset name; `None` when neither is given.
+fn preset_or_color(color: Option<&str>, name: Option<&str>) -> Result<Option<String>> {
+    match (color, name) {
+        (Some(_), Some(_)) => bail!("color와 name은 함께 쓸 수 없습니다."),
+        (Some(c), None) => Ok(Some(hex_color(c)?)),
+        (None, Some(n)) => COLOR_PRESETS
+            .iter()
+            .find(|(id, _, _)| *id == n)
+            .map(|(_, _, hex)| Some((*hex).to_owned()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "사전 지정 색이 아닙니다: {n} (black/red/blue/green/yellow/violet/bluish/white)"
+                )
+            }),
+        (None, None) => Ok(None),
+    }
+}
+/// Shape JSON as the engine reports it → the subset `format.character` / `format.paragraph`
+/// accept (drops ids and unknown font names). Used for style export and shape copies.
+pub fn writable(mut v: Value, character: bool) -> Value {
+    let Some(o) = v.as_object_mut() else {
+        return json!({});
+    };
+    o.remove("borderFillId");
+    if character {
+        let named = |x: &Value| x.as_str().is_some_and(|s| !s.trim().is_empty());
+        let families = o
+            .get("fontFamilies")
+            .and_then(Value::as_array)
+            .is_some_and(|a| a.len() == 7 && a.iter().all(named));
+        if families {
+            o.remove("fontFamily");
+        } else {
+            o.remove("fontFamilies");
+            if !o.get("fontFamily").is_some_and(named) {
+                o.remove("fontFamily");
+            }
+        }
+        if o.get("superscript") == Some(&json!(true)) {
+            o.remove("subscript");
+        }
+    }
+    o.retain(|k, x| validate_format(&json!({ k: x }), character).is_ok());
+    v
+}
+
+impl Session {
+    /// 위 / 아래 첨자 (CharShapeSuperSubscript): 보통 → 위 첨자 → 아래 첨자 → 보통, decided by
+    /// the shape under the caret.
+    fn cycle_script(&mut self) -> Result<Value> {
+        let p = self.character_properties()?;
+        let (sup, sub) = if p["superscript"] == true {
+            (false, true)
+        } else if p["subscript"] == true {
+            (false, false)
+        } else {
+            (true, false)
+        };
+        self.format_character(json!({"superscript": sup, "subscript": sub}))
+    }
+    /// 현재 위치로 내어쓰기 (ParaShapeIndentAtCaret): the paragraph's following lines start at
+    /// the caret's x, stored as a negative indent (Hangul: caret after "둘째 문단" → −8776).
+    fn indent_at_caret(&mut self) -> Result<Value> {
+        let c = self.cursor;
+        let x_of = |s: &Self, offset: usize| -> Result<f64> {
+            s.caret_at(Cursor { offset, ..c })?["x"]
+                .as_f64()
+                .ok_or_else(|| anyhow!("캐럿 위치를 읽지 못했습니다."))
+        };
+        let caret = x_of(self, c.offset)?;
+        let first = x_of(self, 0)?;
+        let shape = self.para_shape_of(c)?;
+        // Caret x is in px (96 dpi); indents are stored at 2 × HWPUNIT = 150 units per px.
+        let margin_x = first - f64::from(shape.indent.max(0)) / 150.0;
+        let raw = ((caret - margin_x) * 150.0).round() as i64;
+        let indent = if raw <= 0 { 0 } else { -raw.min(100_000) };
+        self.format_paragraph(json!({ "indent": indent }))
+    }
+    /// 다음 / 이전 글꼴 (CharShapeNextFaceName / PrevFaceName): steps through the font list,
+    /// wrapping, and gives the font to all seven languages like Hangul.
+    fn cycle_font(&mut self, p: FontCycle, next: bool) -> Result<Value> {
+        let fonts = match p.fonts {
+            Some(list) => {
+                if list.is_empty() || list.len() > 5000 {
+                    bail!("fonts는 1–5000개의 글꼴 이름 목록입니다.");
+                }
+                for name in &list {
+                    validate_format(&json!({ "fontFamily": name }), true)?;
+                }
+                list
+            }
+            None => self.document_fonts(),
+        };
+        if fonts.is_empty() {
+            bail!("바꿀 글꼴이 없습니다.");
+        }
+        let current = self.character_properties()?["fontFamily"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        let n = fonts.len();
+        let at = fonts.iter().position(|f| f.eq_ignore_ascii_case(&current));
+        let i = match (at, next) {
+            (Some(i), true) => (i + 1) % n,
+            (Some(i), false) => (i + n - 1) % n,
+            (None, true) => 0,
+            (None, false) => n - 1,
+        };
+        self.format_character(json!({ "fontFamily": fonts[i] }))
+    }
+    /// Fonts registered in the document, Korean names first then by name (Hangul's order).
+    fn document_fonts(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .core
+            .document()
+            .doc_info
+            .font_faces
+            .iter()
+            .flatten()
+            .map(|f| f.name.clone())
+            .filter(|n| !n.trim().is_empty())
+            .collect();
+        let korean = |s: &str| s.chars().any(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c));
+        names.sort_by(|a, b| korean(b).cmp(&korean(a)).then_with(|| a.cmp(b)));
+        names.dedup();
+        names
+    }
+    /// 글자 색 / 음영 색 with Hangul's preset names. 음영 없음 is white, which RHWP reports
+    /// for a shape without shading.
+    fn preset_color(&mut self, id: &str, p: ColorParam) -> Result<Value> {
+        let color = preset_or_color(p.color.as_deref(), p.name.as_deref())?;
+        let patch = if id == "format.text_color" {
+            let color = color.ok_or_else(|| anyhow!("color 또는 name이 필요합니다."))?;
+            json!({ "textColor": color })
+        } else {
+            json!({ "shadeColor": color.unwrap_or_else(|| "#ffffff".into()) })
+        };
+        self.format_character(patch)
+    }
+    /// 글자 테두리 (TextBorder / TextBorderList / TextBorderColor): all four sides at once.
+    /// Without parameters it toggles a thin solid border; type / width / color set one.
+    fn char_border(&mut self, p: CharBorder) -> Result<Value> {
+        let current = self.character_properties()?;
+        let has = current["borderLeft"]["type"].as_u64().unwrap_or(0) > 0;
+        let explicit = p.kind.is_some() || p.width.is_some() || p.color.is_some();
+        let on = p.value.unwrap_or(!has || explicit);
+        let side = if on {
+            let keep = |k: &str, default: Value| {
+                if has {
+                    current["borderLeft"][k].clone()
+                } else {
+                    default
+                }
+            };
+            json!({
+                "type": p.kind.map_or_else(|| keep("type", json!(1)), Value::from),
+                "width": p.width.map_or_else(|| keep("width", json!(0)), Value::from),
+                "color": match p.color.as_deref() {
+                    Some(c) => json!(hex_color(c)?),
+                    None => keep("color", json!("#000000")),
+                },
+            })
+        } else {
+            json!({"type": 0, "width": 0, "color": "#000000"})
+        };
+        self.format_character(json!({
+            "borderLeft": side, "borderRight": side, "borderTop": side, "borderBottom": side,
+        }))
+    }
+    /// 문단 위로 / 아래로 이동 (ParaUp / ParaDown): swaps the caret paragraph with its
+    /// neighbour in the same container; the caret follows. 구역 / 단 정의 paragraphs stay.
+    fn move_paragraph(&mut self, down: bool) -> Result<Value> {
+        let c = self.cursor;
+        let count = self.container_len(c)?;
+        let i = c.cell.map_or(c.paragraph, |t| t.paragraph);
+        let j = if down {
+            i + 1
+        } else {
+            i.checked_sub(1)
+                .ok_or_else(|| anyhow!("첫 문단은 위로 옮길 수 없습니다."))?
+        };
+        if j >= count {
+            bail!("마지막 문단은 아래로 옮길 수 없습니다.");
+        }
+        let at = |k: usize| match c.cell {
+            Some(t) => Cursor {
+                cell: Some(Cell { paragraph: k, ..t }),
+                ..c
+            },
+            None => Cursor { paragraph: k, ..c },
+        };
+        let structural = |p: &Paragraph| {
+            p.controls
+                .iter()
+                .any(|x| matches!(x, Control::SectionDef(_) | Control::ColumnDef(_)))
+        };
+        // The section's first paragraph carries its 구역/단 정의. Like the 정렬 tool, those
+        // are lifted into an empty paragraph, the swap happens below it, and the merge
+        // gives the definitions to whichever paragraph comes first.
+        let lift = c.cell.is_none() && i.min(j) == 0 && structural(self.paragraph(at(0))?);
+        if (structural(self.paragraph(at(i))?) || structural(self.paragraph(at(j))?)) && !lift {
+            bail!("구역이나 단 정의가 있는 문단은 옮길 수 없습니다.");
+        }
+        let moved = {
+            let p = self.paragraph(at(i.max(j)))?;
+            (p.para_shape_id, p.style_id)
+        };
+        self.transaction(|s| {
+            if lift {
+                s.core
+                    .split_paragraph_native(c.section, 0, 0, None)
+                    .map_err(err)?;
+                let section = &mut s.core.document_mut().sections[c.section];
+                section.raw_stream = None;
+                section.paragraphs.swap(i + 1, j + 1);
+                s.core.merge_paragraph_native(c.section, 1).map_err(err)?;
+                let first = &mut s.core.document_mut().sections[c.section].paragraphs[0];
+                first.para_shape_id = moved.0;
+                first.style_id = moved.1;
+                s.refresh_layout()?;
+                s.clear_selection();
+                s.cursor = at(j);
+                return Ok(());
+            }
+            let doc = s.core.document_mut();
+            let section = doc
+                .sections
+                .get_mut(c.section)
+                .ok_or_else(|| anyhow!("구역이 없습니다."))?;
+            section.raw_stream = None;
+            match c.cell {
+                None => section.paragraphs.swap(i, j),
+                Some(t) => match section
+                    .paragraphs
+                    .get_mut(c.paragraph)
+                    .and_then(|p| p.controls.get_mut(t.control))
+                {
+                    Some(Control::Table(table)) => table
+                        .cells
+                        .get_mut(t.index)
+                        .ok_or_else(|| anyhow!("표의 셀이 없습니다."))?
+                        .paragraphs
+                        .swap(i, j),
+                    _ => bail!("이 개체의 문단은 옮길 수 없습니다."),
+                },
+            }
+            s.refresh_layout()?;
+            s.clear_selection();
+            s.cursor = at(j);
+            Ok(())
+        })?;
+        Ok(self.info())
+    }
+    fn container_len(&self, c: Cursor) -> Result<usize> {
+        let section = self
+            .core
+            .document()
+            .sections
+            .get(c.section)
+            .ok_or_else(|| anyhow!("구역이 없습니다."))?;
+        Ok(match c.cell {
+            None => section.paragraphs.len(),
+            Some(t) => match section
+                .paragraphs
+                .get(c.paragraph)
+                .and_then(|p| p.controls.get(t.control))
+            {
+                Some(Control::Table(table)) => table
+                    .cells
+                    .get(t.index)
+                    .map_or(0, |cell| cell.paragraphs.len()),
+                _ => 0,
+            },
+        })
+    }
+    /// Character shape of one range, no transaction.
+    fn apply_character_range(&mut self, c: Cursor, r: Range<usize>, v: Value) -> Result<()> {
+        let current = formatting::BORDER_FILL_KEYS
+            .iter()
+            .any(|k| v.get(*k).is_some())
+            .then(|| self.character_properties())
+            .transpose()?;
+        let props = self.character_parameters_from(v, current)?.to_string();
+        if let Some(t) = c.cell {
+            self.core.apply_char_format_in_cell_native(
+                c.section,
+                c.paragraph,
+                t.control,
+                t.index,
+                t.paragraph,
+                r.start,
+                r.end,
+                &props,
+            )
+        } else {
+            self.core
+                .apply_char_format_native(c.section, c.paragraph, r.start, r.end, &props)
+        }
+        .map_err(err)?;
+        Ok(())
+    }
+    /// 글자 스타일 해제 (StyleClearCharStyle): the selection (whole caret paragraph without
+    /// one) goes back to its paragraph style's character shape.
+    fn clear_char_style(&mut self) -> Result<Value> {
+        let parts = self.selected_paragraphs()?;
+        let whole = parts.len() == 1 && parts[0].1.is_empty();
+        let mut plan = Vec::new();
+        for (c, r) in parts {
+            let para = self.paragraph(c)?;
+            let len = para.text.chars().count();
+            let r = if whole {
+                0..len
+            } else {
+                r.start.min(len)..r.end.min(len)
+            };
+            if r.is_empty() {
+                continue;
+            }
+            let style = self
+                .core
+                .document()
+                .doc_info
+                .styles
+                .get(usize::from(para.style_id))
+                .ok_or_else(|| anyhow!("문단의 스타일을 찾지 못했습니다."))?;
+            plan.push((
+                c,
+                r,
+                writable(self.char_shape_json(style.char_shape_id), true),
+            ));
+        }
+        if plan.is_empty() {
+            bail!("적용할 글자가 없습니다.");
+        }
+        self.transaction(|s| {
+            for (c, r, v) in plan {
+                s.apply_character_range(c, r, v)?;
+            }
+            Ok(())
+        })?;
+        Ok(self.info())
+    }
+    /// 현재 모양으로 스타일 바꾸기 (ChangeToCurrentStyle): the style (default: the caret
+    /// paragraph's) takes the caret's character shape and the paragraph's shape.
+    fn style_from_caret(&mut self, p: StyleFromCaret) -> Result<Value> {
+        let para = self.paragraph(self.cursor)?;
+        let id = p.id.unwrap_or(usize::from(para.style_id));
+        let style = self
+            .core
+            .document()
+            .doc_info
+            .styles
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("스타일을 찾지 못했습니다."))?;
+        let offset = self
+            .selection()
+            .start
+            .min(para.text.chars().count().saturating_sub(1));
+        let cs = para
+            .char_shape_id_at(offset)
+            .map_or(style.char_shape_id, |x| x as u16);
+        let ps = if style.style_type == 1 {
+            style.para_shape_id
+        } else {
+            para.para_shape_id
+        };
+        self.transaction_value(|s| {
+            s.retarget_style(id, &style, cs, ps)?;
+            Ok(json!({ "id": id }))
+        })
+    }
+    /// 스타일 목록 위 / 아래로 (StyleWSListUp / Down). 바탕글 stays first.
+    fn move_style(&mut self, p: StyleMove) -> Result<Value> {
+        let count = self.core.document().doc_info.styles.len();
+        if p.id >= count {
+            bail!("스타일을 찾지 못했습니다.");
+        }
+        let j = match p.direction.as_str() {
+            "up" => p.id.checked_sub(1),
+            "down" => Some(p.id + 1),
+            other => bail!("direction은 up 또는 down입니다: {other}"),
+        }
+        .filter(|j| *j < count)
+        .ok_or_else(|| anyhow!("더 옮길 수 없습니다."))?;
+        if p.id == 0 || j == 0 {
+            bail!("바탕글 스타일은 맨 위에 고정됩니다.");
+        }
+        let (a, b) = (p.id as u8, j as u8);
+        self.transaction_value(|s| {
+            let doc = s.core.document_mut();
+            doc.doc_info.styles.swap(p.id, j);
+            for style in &mut doc.doc_info.styles {
+                style.raw_data = None;
+                if style.next_style_id == a {
+                    style.next_style_id = b;
+                } else if style.next_style_id == b {
+                    style.next_style_id = a;
+                }
+            }
+            let remap = |para: &mut Paragraph| {
+                if para.style_id == a {
+                    para.style_id = b;
+                } else if para.style_id == b {
+                    para.style_id = a;
+                }
+            };
+            for section in &mut doc.sections {
+                section.raw_stream = None;
+                for para in &mut section.paragraphs {
+                    for control in &mut para.controls {
+                        if let Control::Table(t) = control {
+                            for cell in &mut t.cells {
+                                cell.paragraphs.iter_mut().for_each(remap);
+                            }
+                        }
+                    }
+                    remap(para);
+                }
+            }
+            doc.doc_info.raw_stream_dirty = true;
+            s.refresh_layout()?;
+            Ok(json!({ "id": j }))
+        })
+    }
+    /// 스타일 내보내기 (StyleWSExport): every style with its shapes as `format.*` patches.
+    fn export_styles(&self, p: StyleExport) -> Result<Value> {
+        let info = &self.core.document().doc_info;
+        let styles: Vec<Value> = info
+            .styles
+            .iter()
+            .map(|s| {
+                json!({
+                    "name": s.local_name,
+                    "englishName": s.english_name,
+                    "type": if s.style_type == 1 { "character" } else { "paragraph" },
+                    "nextStyle": info.styles.get(usize::from(s.next_style_id))
+                        .map(|n| n.local_name.clone()).unwrap_or_default(),
+                    "character": writable(self.char_shape_json(s.char_shape_id), true),
+                    "paragraph": writable(self.para_shape_json(s.para_shape_id), false),
+                })
+            })
+            .collect();
+        let out = json!({"format": "hwpcraft-styles", "version": 1, "styles": styles});
+        if let Some(path) = p.path {
+            if path.trim().is_empty() {
+                bail!("경로를 입력하세요.");
+            }
+            std::fs::write(&path, serde_json::to_string_pretty(&out)?)
+                .map_err(|e| anyhow!("스타일 파일을 쓰지 못했습니다: {e}"))?;
+            return Ok(json!({"path": path, "count": info.styles.len()}));
+        }
+        Ok(out)
+    }
+    /// 스타일 가져오기 (StyleWSImport): styles by name — existing ones take the imported
+    /// shapes, new ones are added; next styles are matched by name. One undo step.
+    fn import_styles(&mut self, p: StyleImport) -> Result<Value> {
+        let data = match (p.path, p.styles) {
+            (Some(path), None) => {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow!("스타일 파일을 읽지 못했습니다: {e}"))?;
+                if text.len() > 4_000_000 {
+                    bail!("스타일 파일이 너무 큽니다.");
+                }
+                serde_json::from_str::<Value>(&text)
+                    .map_err(|e| anyhow!("스타일 JSON이 아닙니다: {e}"))?
+            }
+            (None, Some(v)) => v,
+            _ => bail!("path 또는 styles 중 하나가 필요합니다."),
+        };
+        let list = data["styles"]
+            .as_array()
+            .or_else(|| data.as_array())
+            .ok_or_else(|| anyhow!("styles 배열이 필요합니다."))?
+            .clone();
+        if list.is_empty() || list.len() > 255 {
+            bail!("스타일은 1–255개입니다.");
+        }
+        struct Entry {
+            name: String,
+            english: String,
+            character: bool,
+            next: Option<String>,
+            char_patch: Option<Value>,
+            para_patch: Option<Value>,
+            existing: Option<usize>,
+        }
+        let info = &self.core.document().doc_info;
+        let numberings = info.numberings.len();
+        let mut entries: Vec<Entry> = Vec::new();
+        for item in &list {
+            let name = item["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| anyhow!("스타일 name이 필요합니다."))?
+                .to_owned();
+            if entries.iter().any(|e| e.name == name) {
+                bail!("같은 이름의 스타일이 두 번 있습니다: {name}");
+            }
+            let english = item["englishName"].as_str().unwrap_or("").to_owned();
+            let character = match item["type"].as_str().unwrap_or("paragraph") {
+                "paragraph" => false,
+                "character" => true,
+                other => bail!("스타일 종류는 paragraph 또는 character입니다: {other}"),
+            };
+            let existing = info.styles.iter().position(|s| s.local_name == name);
+            self.validate_style_name(&name, &english, existing)?;
+            let patch = |key: &str, ch: bool| -> Result<Option<Value>> {
+                match item.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(v) => {
+                        // Reject bad values instead of silently dropping them.
+                        let mut raw = v.clone();
+                        if let Some(o) = raw.as_object_mut() {
+                            o.remove("borderFillId");
+                            if o.contains_key("fontFamilies") {
+                                o.remove("fontFamily");
+                            }
+                            if o.get("superscript") == Some(&json!(true)) {
+                                o.remove("subscript");
+                            }
+                        }
+                        validate_format(&raw, ch)?;
+                        let mut w = writable(raw, ch);
+                        if !ch
+                            && w["numberingId"]
+                                .as_u64()
+                                .is_some_and(|n| n as usize > numberings)
+                            && let Some(o) = w.as_object_mut()
+                        {
+                            o.remove("numberingId");
+                        }
+                        validate_format(&w, ch)?;
+                        Ok(Some(w))
+                    }
+                }
+            };
+            entries.push(Entry {
+                name,
+                english,
+                character,
+                next: item["nextStyle"].as_str().map(str::to_owned),
+                char_patch: patch("character", true)?,
+                para_patch: patch("paragraph", false)?,
+                existing,
+            });
+        }
+        let new = entries.iter().filter(|e| e.existing.is_none()).count();
+        if info.styles.len() + new > 255 {
+            bail!("스타일은 255개까지 만들 수 있습니다.");
+        }
+        let base = info
+            .styles
+            .first()
+            .map(|s| (s.char_shape_id, s.para_shape_id))
+            .unwrap_or_default();
+        self.transaction_value(|s| {
+            let (mut created, mut updated) = (0, 0);
+            let mut ids = Vec::new();
+            for e in &entries {
+                let id = match e.existing {
+                    Some(id) => {
+                        let style = s.core.document().doc_info.styles[id].clone();
+                        let english = if e.english.is_empty() {
+                            style.english_name.clone()
+                        } else {
+                            e.english.clone()
+                        };
+                        let name = style.local_name.clone();
+                        let update = UpdateStyle {
+                            id,
+                            name: None,
+                            english_name: None,
+                            next_style_id: None,
+                            character: e.char_patch.clone(),
+                            paragraph: e.para_patch.clone(),
+                        };
+                        s.update_style_now(update, style, name, english)?;
+                        updated += 1;
+                        id
+                    }
+                    None => {
+                        created += 1;
+                        s.create_style_now(NewStyle {
+                            name: e.name.clone(),
+                            english: e.english.clone(),
+                            character: e.character,
+                            next: None,
+                            char_shape_id: base.0,
+                            para_shape_id: base.1,
+                            char_patch: e.char_patch.clone(),
+                            para_patch: e.para_patch.clone(),
+                        })?
+                    }
+                };
+                ids.push(id);
+            }
+            for (e, id) in entries.iter().zip(&ids) {
+                let next = e.next.as_deref().and_then(|n| {
+                    s.core
+                        .document()
+                        .doc_info
+                        .styles
+                        .iter()
+                        .position(|x| x.local_name == n)
+                });
+                if let Some(n) = next {
+                    let style = &mut s.core.document_mut().doc_info.styles[*id];
+                    style.next_style_id = n as u8;
+                    style.raw_data = None;
+                }
+            }
+            Ok(json!({"created": created, "updated": updated}))
+        })
+    }
+}
+
+// ---- 글자 겹치기 (HWP 'tcps' inline control) ----
+// RHWP parses, serializes (HWP/HWPX) and composes the control but has no insertion API,
+// so the paragraph stream is edited here the way its auto-number insertion does: an
+// inline control takes 8 code units and no placeholder character.
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CharOverlapParams {
+    chars: String,
+    #[serde(default)]
+    border: Option<u8>,
+    #[serde(default)]
+    size: Option<i8>,
+    #[serde(default)]
+    expansion: Option<u8>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CharOverlapUpdate {
+    control: usize,
+    #[serde(default)]
+    chars: Option<String>,
+    #[serde(default)]
+    border: Option<u8>,
+    #[serde(default)]
+    size: Option<i8>,
+    #[serde(default)]
+    expansion: Option<u8>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlIndex {
+    control: usize,
+}
+const CTRL_UNITS: u32 = 8;
+const CHAR_OVERLAP_CTRL_CHAR: u32 = 0x17;
+fn overlap_chars(s: &str) -> Result<Vec<char>> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() || chars.len() > 9 {
+        bail!("겹칠 글자는 1–9자입니다.");
+    }
+    if chars.iter().any(|c| c.is_control() || c.is_whitespace()) {
+        bail!("겹칠 글자에 빈칸이나 제어 문자를 쓸 수 없습니다.");
+    }
+    Ok(chars)
+}
+fn overlap_fields(
+    co: &mut CharOverlap,
+    border: Option<u8>,
+    size: Option<i8>,
+    expansion: Option<u8>,
+) -> Result<()> {
+    if let Some(b) = border {
+        if b > 6 {
+            bail!("테두리 모양은 0–6입니다.");
+        }
+        co.border_type = b;
+    }
+    if let Some(s) = size {
+        if s < 1 {
+            bail!("글자 크기 조절은 1–127 %입니다.");
+        }
+        co.inner_char_size = s;
+    }
+    if let Some(e) = expansion {
+        if e > 1 {
+            bail!("expansion은 0(펼침) 또는 1(겹침)입니다.");
+        }
+        co.expansion = e;
+    }
+    Ok(())
+}
+/// Open an 8-unit stream slot for an inline control before text character `idx` (after
+/// controls already in that gap) and return the control index to insert at.
+fn open_control_slot(para: &mut Paragraph, idx: usize) -> usize {
+    let positions = para.control_text_positions();
+    let control_index = positions
+        .iter()
+        .filter(|p| **p <= idx)
+        .count()
+        .min(para.controls.len());
+    para.char_count += CTRL_UNITS;
+    if idx >= para.char_offsets.len() {
+        return control_index;
+    }
+    let slot = para.char_offsets[idx];
+    for o in &mut para.char_offsets[idx..] {
+        *o += CTRL_UNITS;
+    }
+    let moves = |p: u32| p > slot || (p == slot && slot > 0);
+    for cs in &mut para.char_shapes {
+        if moves(cs.start_pos) {
+            cs.start_pos += CTRL_UNITS;
+        }
+    }
+    for ls in &mut para.line_segs {
+        if moves(ls.text_start) {
+            ls.text_start += CTRL_UNITS;
+        }
+    }
+    for rt in &mut para.range_tags {
+        if rt.start >= slot {
+            rt.start += CTRL_UNITS;
+        }
+        if rt.end >= slot {
+            rt.end += CTRL_UNITS;
+        }
+    }
+    for m in &mut para.markpen_marks {
+        if let Some(p) = &mut m.utf16_pos
+            && *p >= slot
+        {
+            *p += CTRL_UNITS;
+        }
+    }
+    control_index
+}
+
+impl Session {
+    fn body_paragraph_for_overlap(&self) -> Result<Cursor> {
+        let c = self.cursor;
+        if c.cell.is_some() {
+            bail!("표 안의 글자 겹치기는 아직 지원하지 않습니다.");
+        }
+        self.paragraph(c)?;
+        Ok(c)
+    }
+    /// 글자 겹치기 넣기 at the caret; the control takes the caret's character shape.
+    fn insert_char_overlap(&mut self, p: CharOverlapParams) -> Result<Value> {
+        let c = self.body_paragraph_for_overlap()?;
+        let mut co = CharOverlap {
+            chars: overlap_chars(&p.chars)?,
+            inner_char_size: 100,
+            expansion: 1,
+            ..Default::default()
+        };
+        overlap_fields(&mut co, p.border, p.size, p.expansion)?;
+        let para = self.paragraph(c)?;
+        let len = para.text.chars().count();
+        let idx = c.offset.min(len);
+        co.char_shape_ids = vec![
+            para.char_shape_id_at(idx.min(len.saturating_sub(1)))
+                .unwrap_or(0),
+        ];
+        let mut control = 0;
+        self.transaction(|s| {
+            let section = &mut s.core.document_mut().sections[c.section];
+            section.raw_stream = None;
+            let para = &mut section.paragraphs[c.paragraph];
+            control = open_control_slot(para, idx);
+            para.controls.insert(control, Control::CharOverlap(co));
+            para.control_mask |= 1 << CHAR_OVERLAP_CTRL_CHAR;
+            s.refresh_layout()?;
+            s.clear_selection();
+            Ok(())
+        })?;
+        Ok(json!({ "control": control, "position": idx }))
+    }
+    fn char_overlaps(&self) -> Result<Value> {
+        let para = self.paragraph(self.cursor)?;
+        let positions = para.control_text_positions();
+        Ok(json!(
+            para.controls
+                .iter()
+                .enumerate()
+                .filter_map(|(i, ctrl)| match ctrl {
+                    Control::CharOverlap(co) => Some(json!({
+                        "control": i,
+                        "position": positions.get(i).copied().unwrap_or(0),
+                        "chars": co.chars.iter().collect::<String>(),
+                        "border": co.border_type,
+                        "size": co.inner_char_size,
+                        "expansion": co.expansion,
+                    })),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        ))
+    }
+    fn char_overlap_at(&self, c: Cursor, control: usize) -> Result<CharOverlap> {
+        match self.paragraph(c)?.controls.get(control) {
+            Some(Control::CharOverlap(co)) => Ok(co.clone()),
+            _ => bail!("개체 {control}은 글자 겹치기가 아닙니다."),
+        }
+    }
+    fn update_char_overlap(&mut self, p: CharOverlapUpdate) -> Result<Value> {
+        let c = self.body_paragraph_for_overlap()?;
+        let mut co = self.char_overlap_at(c, p.control)?;
+        if let Some(chars) = &p.chars {
+            co.chars = overlap_chars(chars)?;
+        }
+        overlap_fields(&mut co, p.border, p.size, p.expansion)?;
+        self.transaction(|s| {
+            let section = &mut s.core.document_mut().sections[c.section];
+            section.raw_stream = None;
+            section.paragraphs[c.paragraph].controls[p.control] = Control::CharOverlap(co);
+            s.refresh_layout()
+        })?;
+        Ok(json!({ "control": p.control }))
+    }
+    fn delete_char_overlap(&mut self, p: ControlIndex) -> Result<Value> {
+        let c = self.body_paragraph_for_overlap()?;
+        self.char_overlap_at(c, p.control)?;
+        self.transaction(|s| {
+            s.core
+                .delete_control_native(c.section, c.paragraph, p.control)
+                .map_err(err)?;
+            s.refresh_layout()?;
+            s.clear_selection();
+            Ok(())
+        })?;
+        Ok(self.info())
     }
 }
 

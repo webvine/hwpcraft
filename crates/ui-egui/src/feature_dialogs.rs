@@ -2,11 +2,27 @@ use super::*;
 #[derive(Clone)]
 pub(super) enum FeatureDialog {
     Object(super::object_dialogs::ObjectDialog),
-    HeaderFooter { is_header: bool, text: String },
-    Link { uri: String, text: String },
-    Bookmarks { name: String },
-    Columns { count: u16, spacing: f64 },
-    Search { query: String },
+    /// One-line header/footer with `[쪽 번호]`·`[전체 쪽수]`·`[파일 이름]` field tokens;
+    /// `apply` is 0 both, 1 odd, 2 even.
+    HeaderFooter {
+        is_header: bool,
+        apply: usize,
+        text: String,
+    },
+    Link {
+        uri: String,
+        text: String,
+    },
+    Bookmarks {
+        name: String,
+    },
+    Columns {
+        count: u16,
+        spacing: f64,
+    },
+    Search {
+        query: String,
+    },
 }
 impl HwpApp {
     pub(super) fn feature_dialogs(&mut self, ctx: &egui::Context) {
@@ -18,17 +34,63 @@ impl HwpApp {
             ui.set_width(470.0);
             match &mut draft {
                 FeatureDialog::Object(draft) => close = self.object_dialog(ctx, draft, ui),
-                FeatureDialog::HeaderFooter { is_header, text } => {
+                FeatureDialog::HeaderFooter {
+                    is_header,
+                    apply,
+                    text,
+                } => {
                     ui.heading(if *is_header { "머리말" } else { "꼬리말" });
                     ui.separator();
-                    ui.label("현재 구역의 모든 쪽에 적용할 한 줄 텍스트");
-                    ui.text_edit_singleline(text);
+                    ui.horizontal(|ui| {
+                        ui.label("위치");
+                        for (i, label) in ["양쪽", "홀수 쪽", "짝수 쪽"].iter().enumerate() {
+                            ui.radio_value(apply, i, *label);
+                        }
+                    });
+                    ui.label("현재 구역에 적용할 한 줄 내용. 필드는 아래 단추로 넣습니다.");
+                    ui.add(egui::TextEdit::singleline(text).desired_width(440.0));
+                    ui.horizontal(|ui| {
+                        ui.label("필드 넣기");
+                        for (token, _) in super::ext_shell::HF_TOKENS {
+                            if ui.button(token.trim_matches(['[', ']'])).clicked() {
+                                text.push_str(token);
+                            }
+                        }
+                        ui.add_enabled(false, egui::Button::new("날짜"))
+                            .on_disabled_hover_text(
+                                "RHWP 머리말/꼬리말에는 날짜 필드가 없습니다. 날짜는 글자로 입력하세요.",
+                            );
+                    });
+                    ui.label(
+                        RichText::new(
+                            "쪽 번호·전체 쪽수·파일 이름은 한글이 인쇄 때 채우는 필드로 저장됩니다.",
+                        )
+                        .size(11.0)
+                        .color(Color32::from_gray(100)),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("이전").clicked() {
+                            self.step_header_footer(*is_header, *apply, false);
+                            close = true;
+                        }
+                        if ui.button("다음").clicked() {
+                            self.step_header_footer(*is_header, *apply, true);
+                            close = true;
+                        }
+                        ui.add_space(12.0);
                     if ui.button("설정").clicked() {
+                        let (plain, fields) = super::ext_shell::split_hf_tokens(text);
+                        let fields: Vec<serde_json::Value> = fields
+                            .iter()
+                            .map(|(offset, kind)| json!({"offset": offset, "kind": kind}))
+                            .collect();
+                        let apply_to = ["both", "odd", "even"][(*apply).min(2)];
                         close = self.run(
-                            "page.header_footer",
-                            json!({"is_header":is_header,"text":text}),
+                            "page.header_footer.text",
+                            json!({"header": is_header, "apply_to": apply_to, "text": plain, "fields": fields}),
                         );
                     }
+                    });
                 }
                 FeatureDialog::Link { uri, text } => {
                     ui.heading("하이퍼링크");

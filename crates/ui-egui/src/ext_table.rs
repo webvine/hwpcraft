@@ -458,7 +458,29 @@ impl HwpApp {
             "table.merge" | "table.equal_height" | "table.equal_width" => {
                 Some(in_table && self.block_range().is_some())
             }
-            _ => None,
+            "table.cell_shade.darker" | "table.cell_shade.lighter" | "table.auto_fill_user" => {
+                Some(in_table)
+            }
+            _ => id
+                .strip_prefix("table.cell_move.")
+                .filter(|m| CELL_MOTIONS.iter().any(|(k, _)| k == m))
+                .map(|_| in_table),
+        }
+    }
+    /// 표 안 셀 이동 (TableRightCell · TableColBegin · …): id suffix → engine motion.
+    fn cell_move(&mut self, motion: &str) {
+        let r = self
+            .session
+            .run("table.cell_move", json!({"motion":motion}));
+        if let Some(v) = self.result(r) {
+            self.ext.table.block = None;
+            if v["appended"] == true {
+                self.ext.table.layout = None;
+                self.message = "마지막 셀에서 Tab: 줄을 추가했습니다.".into();
+            } else if v["moved"] == false {
+                self.message = "표의 끝 셀입니다.".into();
+            }
+            self.follow_cursor();
         }
     }
     /// Return true when the command id was handled.
@@ -497,6 +519,25 @@ impl HwpApp {
                 }
             }
             "table.cell_block" => self.cell_block_key(),
+            "table.cell_shade.darker" | "table.cell_shade.lighter" => {
+                let mut p = json!({"darker":id.ends_with("darker")});
+                if let Some(r) = self.block_range() {
+                    p["range"] = r;
+                }
+                let r = self.session.run("table.cell_shade", p);
+                if let Some(v) = self.result(r) {
+                    self.ext.table.layout = None;
+                    self.message = if v["cells"] == 0 {
+                        "더 바꿀 음영이 없습니다.".into()
+                    } else {
+                        format!("{}개 셀의 음영을 바꿨습니다.", v["cells"])
+                    };
+                }
+            }
+            _ if id.starts_with("table.cell_move.") => {
+                let motion = id["table.cell_move.".len()..].to_owned();
+                self.cell_move(&motion);
+            }
             "table.merge" | "table.equal_height" | "table.equal_width" | "table.split_table" => {
                 self.run_table(id, json!({}));
             }
@@ -1097,6 +1138,7 @@ impl HwpApp {
             "table-block",
             "table-style",
             "table-sort",
+            "table-user-fill",
         ];
         // Leave other modules' view names alone.
         if !VIEWS.contains(&name) {
@@ -1135,7 +1177,13 @@ impl HwpApp {
                 self.table_ext_dispatch("table.formula", ctx);
             }
             "table-block" => self.ext_block_demo(),
+            "table-user-fill" => {
+                self.enter_first_cell();
+                self.ext_block_demo();
+                self.table_ext_dispatch("table.auto_fill_user", ctx);
+            }
             "table-style" => {
+                self.enter_first_cell();
                 self.table_ext_dispatch("table.style", ctx);
             }
             "table-sort" => {
@@ -1147,6 +1195,21 @@ impl HwpApp {
         true
     }
     /// A 2×2 (or smaller) block from the caret cell, for screenshots.
+    /// Captures: put the caret in the document's first table cell when it is in the body.
+    fn enter_first_cell(&mut self) {
+        if self.session.cursor.cell.is_some() {
+            return;
+        }
+        if let Some((c, _)) = self
+            .session
+            .entries()
+            .into_iter()
+            .find(|(c, _)| c.cell.is_some())
+        {
+            let r = self.session.select(c, false);
+            self.result(r);
+        }
+    }
     fn ext_block_demo(&mut self) {
         let Some((table, pos)) = self.cell_position(self.session.cursor) else {
             return;
@@ -1701,13 +1764,46 @@ pub(crate) enum TableTool {
         descending: bool,
     },
     Caption(String),
-    Style(usize),
+    /// 표 마당: preset index and the seven option check boxes (`STYLE_OPTIONS`).
+    Style(usize, [bool; 7]),
+    /// 사용자 정의 자동 채우기: list items, one per line or comma-separated.
+    UserFill(String),
+}
+fn default_style_options() -> [bool; 7] {
+    let mut o = [false; 7];
+    for (i, (_, _, d)) in STYLE_OPTIONS.iter().enumerate() {
+        o[i] = *d;
+    }
+    o
 }
 const DELIMITERS: &[(&str, &str)] = &[
     ("tab", "탭"),
     ("comma", "쉼표"),
     ("space", "빈칸"),
     ("semicolon", "세미콜론"),
+];
+/// Engine motions for 표 안 셀 이동 and their Hangul menu labels.
+const CELL_MOTIONS: &[(&str, &str)] = &[
+    ("left", "왼쪽 셀"),
+    ("right", "오른쪽 셀"),
+    ("up", "위 셀"),
+    ("down", "아래 셀"),
+    ("row_begin", "줄의 첫 셀"),
+    ("row_end", "줄의 끝 셀"),
+    ("col_top", "칸의 첫 셀"),
+    ("col_bottom", "칸의 끝 셀"),
+    ("next", "다음 셀 (Tab)"),
+    ("prev", "이전 셀 (Shift+Tab)"),
+];
+/// 표 마당 옵션 check boxes (ApplyTable*): engine key, label, Hangul default.
+const STYLE_OPTIONS: &[(&str, &str, bool)] = &[
+    ("header_row", "제목 줄", true),
+    ("first_column", "첫째 칸", false),
+    ("last_column", "마지막 칸", false),
+    ("last_row", "마지막 줄", false),
+    ("grayscale", "회색조", false),
+    ("borders", "테두리 적용", true),
+    ("background", "셀 배경 적용", true),
 ];
 const STYLES: &[(&str, &str)] = &[
     ("basic", "기본"),
@@ -1761,7 +1857,8 @@ impl HwpApp {
                     }
                 }
             }
-            "table.style" => TableTool::Style(1),
+            "table.style" => TableTool::Style(1, default_style_options()),
+            "table.auto_fill_user" => TableTool::UserFill(String::new()),
             "table.auto_fill" => {
                 let mut p = json!({});
                 if let Some(r) = self.block_range() {
@@ -1790,7 +1887,8 @@ impl HwpApp {
             TableTool::Convert { .. } => "표를 문자열로",
             TableTool::Sort { .. } => "정렬",
             TableTool::Caption(_) => "캡션 고치기",
-            TableTool::Style(_) => "표 마당",
+            TableTool::Style(..) => "표 마당",
+            TableTool::UserFill(_) => "사용자 정의 자동 채우기",
         };
         let r = chrome::modal("ext-table-tool").show(ctx, |ui| {
             ui.set_width(440.0);
@@ -1866,7 +1964,31 @@ impl HwpApp {
                                     .weak(),
                             );
                         }
-                        TableTool::Style(selected) => {
+                        TableTool::UserFill(text) => {
+                            chrome::section(ui, "채울 목록 (줄마다 하나, 또는 쉼표로 구분)");
+                            ui.add(
+                                egui::TextEdit::multiline(text)
+                                    .desired_rows(6)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "블록의 첫 셀 값이 목록에 있으면 그다음 항목부터, 없으면 첫 항목부터 차례로 채우고 끝에서 다시 돕니다.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
+                        TableTool::Style(selected, options) => {
+                            chrome::section(ui, "표 마당 옵션");
+                            ui.horizontal_wrapped(|ui| {
+                                for (i, (_, label, _)) in STYLE_OPTIONS.iter().enumerate() {
+                                    ui.checkbox(&mut options[i], *label);
+                                }
+                                if ui.small_button("옵션 초기화").clicked() {
+                                    *options = default_style_options();
+                                }
+                            });
                             chrome::section(ui, "표 마당 목록");
                             ui.horizontal_wrapped(|ui| {
                                 for (i, (_, label)) in STYLES.iter().enumerate() {
@@ -1936,8 +2058,36 @@ impl HwpApp {
                 TableTool::Caption(text) => {
                     self.run_table("table.caption_text", json!({"text":text}))
                 }
-                TableTool::Style(i) => {
-                    self.run_table("table.style", json!({"preset":STYLES[*i].0}))
+                TableTool::Style(i, options) => {
+                    let mut p = json!({"preset":STYLES[*i].0});
+                    for (k, (key, _, _)) in STYLE_OPTIONS.iter().enumerate() {
+                        p[*key] = json!(options[k]);
+                    }
+                    self.run_table("table.style", p)
+                }
+                TableTool::UserFill(text) => {
+                    let values: Vec<String> = text
+                        .split(['\n', ','])
+                        .map(|v| v.trim().to_owned())
+                        .filter(|v| !v.is_empty())
+                        .collect();
+                    if values.is_empty() {
+                        self.error = Some("채울 목록을 입력하세요.".into());
+                        false
+                    } else {
+                        let mut p = json!({"values":values});
+                        if let Some(r) = self.block_range() {
+                            p["range"] = r;
+                        }
+                        let r = self.session.run("table.auto_fill", p);
+                        match self.result(r) {
+                            Some(v) => {
+                                self.message = format!("{}개 셀을 채웠습니다.", v["cells"]);
+                                true
+                            }
+                            None => false,
+                        }
+                    }
                 }
             };
             self.ext.table.layout = None;

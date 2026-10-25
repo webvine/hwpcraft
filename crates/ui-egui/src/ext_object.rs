@@ -19,6 +19,72 @@ struct Selected {
     /// Page pixels (96 dpi) of the object's box.
     bbox: Rect,
     inline: bool,
+    /// 개체 보호: shown with a lock badge; no handles, moving or deleting.
+    locked: bool,
+    /// A plain straight line (not a connector): its end points in page pixels.
+    line: Option<(Pos2, Pos2)>,
+    /// 묶음 개체 (풀기 applies).
+    group: bool,
+}
+#[derive(Clone)]
+struct FieldInsert {
+    guide: String,
+    name: String,
+    memo: String,
+}
+#[derive(Clone)]
+struct FormDraft {
+    at: Value,
+    kind: String,
+    name: String,
+    text: String,
+    checked: bool,
+    caption: String,
+    original: (String, bool, String),
+}
+/// Connector tool kinds: (command id suffix, label, engine `shape.insert` kind).
+const CONNECTORS: &[(&str, &str, &str)] = &[
+    ("straight", "직선 연결선", "connector_straight"),
+    (
+        "straight_arrow",
+        "직선 화살표 연결선",
+        "connector_straight_arrow",
+    ),
+    (
+        "straight_both",
+        "직선 양쪽 화살표 연결선",
+        "connector_straight_both",
+    ),
+    ("stroke", "꺾인 연결선", "connector_stroke"),
+    (
+        "stroke_arrow",
+        "꺾인 화살표 연결선",
+        "connector_stroke_arrow",
+    ),
+    (
+        "stroke_both",
+        "꺾인 양쪽 화살표 연결선",
+        "connector_stroke_both",
+    ),
+];
+const Z_ORDERS: &[(&str, &str)] = &[
+    ("front", "맨 앞으로"),
+    ("back", "맨 뒤로"),
+    ("forward", "앞으로"),
+    ("backward", "뒤로"),
+];
+/// RHWP connection point (0 top, 1 right, 2 bottom, 3 left) nearest to `p` on `bbox`.
+fn connection_point(bbox: Rect, p: Pos2) -> u32 {
+    let c = bbox.center();
+    let dx = (p.x - c.x) / bbox.width().max(1.0);
+    let dy = (p.y - c.y) / bbox.height().max(1.0);
+    if dx.abs() > dy.abs() {
+        if dx > 0.0 { 1 } else { 3 }
+    } else if dy > 0.0 {
+        2
+    } else {
+        0
+    }
 }
 #[derive(Clone)]
 struct PictureInsert {
@@ -50,11 +116,114 @@ pub(crate) struct State {
     points_page: u32,
     /// Handle being dragged and the drag start (page pixels).
     resizing: Option<(usize, Pos2)>,
+    /// Further selected objects (Shift+click) for 묶기; `selected` is the last one.
+    multi: Vec<Selected>,
+    /// Straight line end point being dragged (0 start, 1 end) and its preview position.
+    endpoint: Option<(usize, Pos2)>,
+    /// Connector tool: the shape under the drag start and its connection point.
+    connector_start: Option<(ObjectAddress, u32)>,
+    field: Option<FieldInsert>,
+    forms: Option<Vec<FormDraft>>,
     picture: Option<PictureInsert>,
     properties: Option<Box<Properties>>,
     equation: Option<Box<EquationEditor>>,
     chart: Option<Box<ChartEditor>>,
     memos: bool,
+    /// 개체 모양 복사 (CopyShapeFormat): the look waiting to be pasted.
+    format: Option<Value>,
+    /// 각주/미주 모양 dialog.
+    note_shape: Option<Box<NoteShapeDialog>>,
+    /// Draw tool makes a 세로 글상자 (direction for the next text box).
+    draw_direction: Option<&'static str>,
+}
+
+/// 각주/미주 모양 (NoteNumShape*, NoteLine*): one section's note shape being edited.
+pub(crate) struct NoteShapeDialog {
+    endnote: bool,
+    original: Value,
+    draft: Value,
+}
+const NOTE_NUMBER_FORMATS: &[(&str, &str)] = &[
+    ("digit", "1, 2, 3"),
+    ("circledDigit", "①, ②, ③"),
+    ("upperRoman", "I, II, III"),
+    ("lowerRoman", "i, ii, iii"),
+    ("upperAlpha", "A, B, C"),
+    ("lowerAlpha", "a, b, c"),
+    ("circledUpperAlpha", "Ⓐ, Ⓑ, Ⓒ"),
+    ("circledLowerAlpha", "ⓐ, ⓑ, ⓒ"),
+    ("hangulSyllable", "가, 나, 다"),
+    ("circledHangulSyllable", "㉮, ㉯, ㉰"),
+    ("hangulJamo", "ㄱ, ㄴ, ㄷ"),
+    ("circledHangulJamo", "㉠, ㉡, ㉢"),
+    ("hangulDigit", "일, 이, 삼"),
+    ("hanjaDigit", "一, 二, 三"),
+    ("circledHanjaDigit", "㊀, ㊁, ㊂"),
+    ("hanjaGapEul", "甲, 乙, 丙"),
+    ("hanjaGapEulHanja", "갑, 을, 병"),
+    ("fourSymbol", "*, †, ‡"),
+    ("userChar", "사용자 기호"),
+];
+const SEPARATOR_WIDTHS: &[&str] = &[
+    "0.1 mm", "0.12 mm", "0.15 mm", "0.2 mm", "0.25 mm", "0.3 mm", "0.4 mm", "0.5 mm", "0.6 mm",
+    "0.7 mm", "1.0 mm", "1.5 mm", "2.0 mm", "3.0 mm", "4.0 mm", "5.0 mm",
+];
+/// Hangul 맞춤 menu (ShapeAlign*): id suffix, label, needs several objects.
+const ALIGNS: &[(&str, &str, bool)] = &[
+    ("left", "왼쪽 맞춤", false),
+    ("center", "가운데 맞춤", false),
+    ("right", "오른쪽 맞춤", false),
+    ("top", "위쪽 맞춤", false),
+    ("middle", "중간 맞춤", false),
+    ("bottom", "아래쪽 맞춤", false),
+    ("same_width", "같은 너비", true),
+    ("same_height", "같은 높이", true),
+    ("same_size", "같은 크기", true),
+    ("space_h", "가로 간격을 동일하게", true),
+    ("space_v", "세로 간격을 동일하게", true),
+];
+/// Quick fill / outline palette (ShapeFillColor*, ShapeOutlineColor*): id suffix, #rrggbb.
+const QUICK_COLORS: &[(&str, &str)] = &[
+    ("black", "#000000"),
+    ("white", "#ffffff"),
+    ("red", "#ff0000"),
+    ("orange", "#ff7f00"),
+    ("yellow", "#ffff00"),
+    ("green", "#00a000"),
+    ("blue", "#0000ff"),
+    ("purple", "#7f00ff"),
+    ("gray", "#808080"),
+];
+const PEN_WIDTHS: &[(&str, f64)] = &[
+    ("0.1", 0.1),
+    ("0.25", 0.25),
+    ("0.5", 0.5),
+    ("1", 1.0),
+    ("2", 2.0),
+    ("3", 3.0),
+];
+fn css_rgb(v: &Value) -> [u8; 3] {
+    let h = v.as_str().unwrap_or("#000000").trim_start_matches('#');
+    let n = u32::from_str_radix(h, 16).unwrap_or(0);
+    [(n >> 16) as u8, (n >> 8) as u8, n as u8]
+}
+fn css_field(ui: &mut egui::Ui, label: &str, v: &mut Value, key: &str) {
+    ui.label(label);
+    let mut c = css_rgb(&v[key]);
+    if egui::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
+        v[key] = json!(format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]));
+    }
+}
+fn text_field(ui: &mut egui::Ui, label: &str, v: &mut Value, key: &str, max: usize) {
+    let mut t = v[key].as_str().unwrap_or("").to_owned();
+    ui.label(label);
+    if ui
+        .add(egui::TextEdit::singleline(&mut t).desired_width(60.0))
+        .changed()
+    {
+        let t: String = t.chars().take(max).collect();
+        v[key] = json!(t);
+    }
 }
 
 fn bgr(v: &Value) -> [u8; 3] {
@@ -204,13 +373,130 @@ impl HwpApp {
     pub(crate) fn object_ext_enabled(&self, id: &str) -> Option<bool> {
         let body = self.session.cursor.cell.is_none();
         let selected = self.ext.object.selected.is_some();
+        let unlocked = self.ext.object.selected.is_some_and(|s| !s.locked);
+        if id == "insert.shape.connector" {
+            return Some(body);
+        }
+        if let Some(kind) = id.strip_prefix("insert.shape.connector.") {
+            return CONNECTORS
+                .iter()
+                .any(|(k, _, _)| *k == kind)
+                .then_some(body);
+        }
         if let Some(kind) = id.strip_prefix("insert.shape.") {
             return SHAPES.iter().any(|(k, _)| *k == kind).then_some(body);
         }
+        if let Some(mode) = id.strip_prefix("object.z_order.") {
+            return Z_ORDERS.iter().any(|(m, _)| *m == mode).then_some(unlocked);
+        }
+        if let Some(mode) = id.strip_prefix("object.align.") {
+            let several = !self.ext.object.multi.is_empty();
+            return ALIGNS
+                .iter()
+                .find(|(m, _, _)| *m == mode)
+                .map(|(_, _, needs_several)| {
+                    unlocked && !self.selected_inline() && (!needs_several || several)
+                });
+        }
+        if let Some(rest) = id.strip_prefix("object.style.") {
+            let ok = match rest.split_once('.') {
+                Some(("fill" | "outline", c)) => {
+                    c == "none" || QUICK_COLORS.iter().any(|(k, _)| *k == c)
+                }
+                Some(("dash", n)) => n.parse::<usize>().is_ok_and(|n| n < LINE_TYPES.len()),
+                Some(("pen", w)) => PEN_WIDTHS.iter().any(|(k, _)| *k == w),
+                Some(("arrow_end" | "arrow_start", n)) => {
+                    n.parse::<usize>().is_ok_and(|n| n < ARROWS.len())
+                }
+                _ => false,
+            };
+            return ok.then_some(unlocked);
+        }
+        if let Some(mode) = id.strip_prefix("object.shadow.") {
+            let shape = unlocked
+                && !matches!(
+                    self.object_ext_selected_kind(),
+                    Some("picture" | "equation")
+                );
+            return matches!(
+                mode,
+                "none" | "on" | "left" | "right" | "up" | "down" | "reset"
+            )
+            .then_some(shape);
+        }
+        if let Some(preset) = id.strip_prefix("object.outer_margin.") {
+            return matches!(preset, "none" | "narrow" | "normal" | "wide").then_some(unlocked);
+        }
+        if let Some(preset) = id.strip_prefix("textbox.margin.") {
+            return matches!(preset, "none" | "narrow" | "normal" | "wide")
+                .then_some(unlocked && self.object_ext_selected_kind() == Some("textbox"));
+        }
+        if let Some(dir) = id.strip_prefix("textbox.direction.") {
+            return matches!(dir, "horizontal" | "vertical" | "vertical_all")
+                .then_some(unlocked && self.object_ext_selected_kind() == Some("textbox"));
+        }
+        if let Some(rest) = id.strip_prefix("textbox.align.") {
+            let ok = rest.split_once('_').is_some_and(|(h, v)| {
+                matches!(h, "left" | "center" | "right") && matches!(v, "top" | "center" | "bottom")
+            });
+            return ok.then_some(unlocked && self.object_ext_selected_kind() == Some("textbox"));
+        }
+        if let Some(kind) = id.strip_prefix("object.connector_type.") {
+            return matches!(kind, "straight" | "stroke" | "arc")
+                .then_some(unlocked && self.selected_connector());
+        }
+        if let Some(mode) = id.strip_prefix("picture.recolor.") {
+            return matches!(mode, "original" | "grayscale" | "black_white" | "watermark")
+                .then_some(unlocked && self.object_ext_selected_kind() == Some("picture"));
+        }
+        if let Some(kind) = id.strip_prefix("insert.auto_number.") {
+            return matches!(kind, "page" | "total" | "picture" | "table" | "equation")
+                .then_some(body);
+        }
         match id {
-            "insert.picture_dialog" | "object.list" | "object.properties" | "memo.list" => {
+            "object.protect_size" | "object.format.copy" => Some(selected),
+            "object.format.paste" => Some(unlocked && self.ext.object.format.is_some()),
+            "object.next" | "object.prev" | "object.select" | "picture.save_all" => {
+                Some(self.session.objects().as_array().is_some_and(|l| {
+                    l.iter().any(|o| {
+                        matches!(
+                            o["kind"].as_str(),
+                            Some("shape" | "picture" | "textbox" | "group" | "equation")
+                        )
+                    })
+                }))
+            }
+            "picture.save" => Some(self.object_ext_selected_kind() == Some("picture")),
+            "insert.shape.vtextbox" | "insert.shape.vtextbox_all" => Some(body),
+            "note.convert" | "note.delete" => Some(self.session.note_at_caret().is_some()),
+            "note.shape" | "note.shape.footnote" | "note.shape.endnote" | "field.delete" => {
                 Some(true)
             }
+            _ => None,
+        }
+        .or_else(|| self.object_ext_enabled_legacy(id))
+    }
+    fn object_ext_enabled_legacy(&self, id: &str) -> Option<bool> {
+        let body = self.session.cursor.cell.is_none();
+        let selected = self.ext.object.selected.is_some();
+        let unlocked = self.ext.object.selected.is_some_and(|s| !s.locked);
+        let _ = body;
+        match id {
+            "insert.picture_dialog"
+            | "object.list"
+            | "object.properties"
+            | "memo.list"
+            | "object.unlock_all"
+            | "insert.field"
+            | "insert.form_object" => Some(true),
+            "object.group" => Some(selected && !self.ext.object.multi.is_empty()),
+            "object.ungroup" => Some(
+                self.ext
+                    .object
+                    .selected
+                    .is_some_and(|s| s.group && !s.locked),
+            ),
+            "object.lock" => Some(selected),
             "chart.edit" => Some(
                 self.session
                     .core
@@ -230,23 +516,133 @@ impl HwpApp {
             | "object.rotate.right"
             | "object.flip.horizontal"
             | "object.flip.vertical"
-            | "object.caption" => Some(selected),
+            | "object.caption" => Some(unlocked),
             _ => None,
         }
     }
     /// Return true when the command id was handled.
     pub(crate) fn object_ext_dispatch(&mut self, id: &str, _ctx: &egui::Context) -> bool {
+        let connector = if id == "insert.shape.connector" {
+            Some(&CONNECTORS[0])
+        } else {
+            id.strip_prefix("insert.shape.connector.")
+                .and_then(|kind| CONNECTORS.iter().find(|(k, _, _)| *k == kind))
+        };
+        if let Some((_, label, engine_kind)) = connector {
+            self.ext.object.draw = Some(engine_kind);
+            self.clear_object_selection();
+            self.message = format!(
+                "{label}: 도형 위에서 시작해 다른 도형까지 끌면 두 도형에 붙습니다. 빈 곳에 끌면 자유 연결선, Esc 취소."
+            );
+            return true;
+        }
         if let Some(kind) = id.strip_prefix("insert.shape.") {
             if let Some((k, label)) = SHAPES.iter().find(|(k, _)| *k == kind) {
                 self.ext.object.draw = Some(k);
-                self.ext.object.selected = None;
+                self.clear_object_selection();
                 self.message =
                     format!("{label}: 쪽에서 끌어 그리세요. 클릭만 하면 기본 크기, Esc 취소.");
                 return true;
             }
             return false;
         }
+        if self.object_ext_dispatch_14(id) {
+            return true;
+        }
+        if let Some(mode) = id.strip_prefix("object.z_order.") {
+            let Some((mode, label)) = Z_ORDERS.iter().find(|(m, _)| *m == mode) else {
+                return false;
+            };
+            if let Some(s) = self.ext.object.selected {
+                let r = self
+                    .session
+                    .run("object.z_order", json!({"address":s.address,"mode":mode}));
+                if let Some(v) = self.result(r) {
+                    self.ext.object.layout = None;
+                    self.message = if v["moved"] == true {
+                        format!("{label}: 개체 순서를 바꿨습니다.")
+                    } else {
+                        format!("{label}: 이미 그 자리에 있습니다.")
+                    };
+                }
+            }
+            return true;
+        }
         match id {
+            "object.group" => {
+                let Some(s) = self.ext.object.selected else {
+                    return true;
+                };
+                let mut targets: Vec<ObjectAddress> =
+                    self.ext.object.multi.iter().map(|m| m.address).collect();
+                targets.push(s.address);
+                let page = s.page;
+                if self.run("object.group", json!({"targets":targets})) {
+                    self.clear_object_selection();
+                    self.ext.object.layout = None;
+                    // Keep the new group selected so 풀기/순서 apply at once.
+                    if let Some(a) = self.session.objects().as_array().and_then(|list| {
+                        list.iter()
+                            .filter(|o| o["kind"] == "group")
+                            .filter_map(|o| {
+                                serde_json::from_value::<ObjectAddress>(o["address"].clone()).ok()
+                            })
+                            .next_back()
+                    }) {
+                        self.ext.object.selected = self.selected_from_address(page, a);
+                    }
+                    self.message = "개체를 묶었습니다.".into();
+                }
+            }
+            "object.ungroup" => {
+                if let Some(s) = self.ext.object.selected
+                    && self.run("object.ungroup", json!({"address":s.address}))
+                {
+                    self.clear_object_selection();
+                    self.ext.object.layout = None;
+                    self.message = "묶음을 풀었습니다.".into();
+                }
+            }
+            "object.lock" => {
+                let Some(s) = self.ext.object.selected else {
+                    self.message = "보호할 개체를 먼저 클릭해 선택하세요.".into();
+                    return true;
+                };
+                let r = self
+                    .session
+                    .run("object.lock", json!({"address":s.address}));
+                if let Some(v) = self.result(r) {
+                    let locked = v["locked"] == true;
+                    if let Some(sel) = self.ext.object.selected.as_mut() {
+                        sel.locked = locked;
+                    }
+                    self.message = if locked {
+                        "개체를 보호했습니다. 이동·크기 조절·지우기가 막힙니다.".into()
+                    } else {
+                        "개체 보호를 해제했습니다.".into()
+                    };
+                }
+            }
+            "object.unlock_all" => {
+                let r = self.session.run("object.unlock_all", json!({}));
+                if let Some(v) = self.result(r) {
+                    if let Some(sel) = self.ext.object.selected.as_mut() {
+                        sel.locked = false;
+                    }
+                    for m in &mut self.ext.object.multi {
+                        m.locked = false;
+                    }
+                    self.message = format!("개체 {}개의 보호를 해제했습니다.", v["unlocked"]);
+                }
+            }
+            "insert.field" => {
+                self.ext.object.field = Some(FieldInsert {
+                    guide: "이곳을 마우스로 누르고 내용을 입력하세요.".into(),
+                    name: String::new(),
+                    memo: String::new(),
+                });
+            }
+            "insert.form_object" => self.open_form_editor(),
             "chart.edit" => self.open_chart_editor(0),
             "memo.list" => self.ext.object.memos = true,
             "insert.picture_dialog" => {
@@ -288,8 +684,13 @@ impl HwpApp {
                 }
             }
             "object.delete" => {
-                if let Some(s) = self.ext.object.selected.take() {
-                    self.run("object.delete", json!(s.address));
+                if let Some(s) = self.ext.object.selected {
+                    if s.locked {
+                        self.message = "보호된 개체입니다. 개체 보호를 먼저 해제하세요.".into();
+                    } else {
+                        self.clear_object_selection();
+                        self.run("object.delete", json!(s.address));
+                    }
                 }
             }
             "object.caption" => {
@@ -315,6 +716,21 @@ impl HwpApp {
                 let Some(s) = self.ext.object.selected else {
                     return true;
                 };
+                // Shapes flip through RHWP's Hangul-measured flip (bits + matrix);
+                // pictures keep the picture property path.
+                if id.starts_with("object.flip.")
+                    && self.object_ext_selected_kind() != Some("picture")
+                {
+                    let axis = if id.ends_with("horizontal") {
+                        "horizontal"
+                    } else {
+                        "vertical"
+                    };
+                    if self.run("object.flip", json!({"address":s.address,"axis":axis})) {
+                        self.ext.object.layout = None;
+                    }
+                    return true;
+                }
                 let r = self.session.object_properties(s.address);
                 if let Some(p) = self.result(r) {
                     let p = &p["props"];
@@ -345,6 +761,92 @@ impl HwpApp {
             )
         {
             self.ext.object.layout = None;
+        }
+    }
+    fn clear_object_selection(&mut self) {
+        self.ext.object.selected = None;
+        self.ext.object.multi.clear();
+        self.ext.object.endpoint = None;
+        self.ext.object.connector_start = None;
+    }
+    /// Lock / group / plain-line facts from the model for a selection.
+    fn object_facts(&self, a: ObjectAddress) -> (bool, bool, bool) {
+        use hwpcraft_doc::model::{control::Control, shape::ShapeObject};
+        let locked = self.session.object_locked(a);
+        let ctrl = self
+            .session
+            .core
+            .document()
+            .sections
+            .get(a.section)
+            .and_then(|s| s.paragraphs.get(a.paragraph))
+            .and_then(|p| p.controls.get(a.control));
+        let (group, plain_line) = match ctrl {
+            Some(Control::Shape(s)) => (
+                matches!(s.as_ref(), ShapeObject::Group(_)),
+                matches!(s.as_ref(), ShapeObject::Line(l) if l.connector.is_none()),
+            ),
+            _ => (false, false),
+        };
+        (locked, group, plain_line)
+    }
+    /// Selection record for an object found through the page layout.
+    fn selected_from_address(&mut self, page: u32, a: ObjectAddress) -> Option<Selected> {
+        let layout = self.object_page_layout(page)?;
+        let n = |v: &Value, k: &str| v[k].as_u64().map(|x| x as usize);
+        let c = layout["controls"].as_array()?.iter().find(|c| {
+            n(c, "secIdx") == Some(a.section)
+                && n(c, "paraIdx") == Some(a.paragraph)
+                && n(c, "controlIdx") == Some(a.control)
+                && c.get("cellIdx").is_none()
+        })?;
+        Some(self.selected_from_layout(page, c.clone()))
+    }
+    fn object_page_layout(&mut self, page: u32) -> Option<Value> {
+        let generation = self.session.generation;
+        if self
+            .ext
+            .object
+            .layout
+            .as_ref()
+            .is_none_or(|(g, pg, _)| *g != generation || *pg != page)
+        {
+            let layout = self
+                .session
+                .core
+                .get_page_control_layout_native(page)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(Value::Null);
+            self.ext.object.layout = Some((generation, page, layout));
+        }
+        self.ext.object.layout.as_ref().map(|(_, _, l)| l.clone())
+    }
+    fn selected_from_layout(&self, page: u32, c: Value) -> Selected {
+        let f = |k: &str| c[k].as_f64().unwrap_or(0.0) as f32;
+        let n = |k: &str| c[k].as_u64().unwrap_or(0) as usize;
+        let bbox = Rect::from_min_size(Pos2::new(f("x"), f("y")), Vec2::new(f("w"), f("h")));
+        let address = ObjectAddress {
+            section: n("secIdx"),
+            paragraph: n("paraIdx"),
+            control: n("controlIdx"),
+        };
+        let inline = self
+            .session
+            .object_properties(address)
+            .ok()
+            .is_some_and(|v| v["props"]["treatAsChar"] == true);
+        let (locked, group, plain_line) = self.object_facts(address);
+        let line = (plain_line && c["type"] == "line" && !inline)
+            .then(|| (Pos2::new(f("x1"), f("y1")), Pos2::new(f("x2"), f("y2"))));
+        Selected {
+            address,
+            page,
+            bbox,
+            inline,
+            locked,
+            line,
+            group,
         }
     }
     /// The last drawable object anchored in the caret paragraph at or before the caret.
@@ -445,7 +947,11 @@ impl HwpApp {
             if response.drag_started()
                 && let Some(p) = response.interact_pointer_pos()
             {
-                self.ext.object.drag = Some((page, to_page(self, p)));
+                let start = to_page(self, p);
+                self.ext.object.drag = Some((page, start));
+                if kind.starts_with("connector") {
+                    self.ext.object.connector_start = self.subject_at(page, start);
+                }
             }
             if let (Some((start_page, start)), Some(p)) =
                 (self.ext.object.drag, response.interact_pointer_pos())
@@ -486,24 +992,56 @@ impl HwpApp {
                 {
                     let _ = self.session.select(c, false);
                 }
-                let line = kind == "line";
-                let params = json!({"kind":kind,
+                let connector = kind.starts_with("connector");
+                let line = kind == "line" || connector;
+                let mut params = json!({"kind":kind,
                     "width_mm":(r.width() * MM_PER_PX).max(if line {0.2} else {1.0}),
                     "height_mm":(r.height() * MM_PER_PX).max(if line {0.2} else {1.0}),
                     "x_mm":r.min.x * MM_PER_PX,"y_mm":r.min.y * MM_PER_PX,
                     "paragraphs": if kind == "textbox" {json!([""])} else {json!([])}});
+                if kind == "textbox"
+                    && let Some(d) = self.ext.object.draw_direction.take()
+                {
+                    params["direction"] = json!(d);
+                }
+                if line {
+                    // Lines keep the drag direction (start corner → end corner).
+                    params["flip_x"] = json!(end.x < start.x);
+                    params["flip_y"] = json!(end.y < start.y);
+                }
+                if connector {
+                    let begin = self.ext.object.connector_start.take();
+                    let finish = self.subject_at(page, end);
+                    if let (Some((sa, sp)), Some((ea, ep))) = (begin, finish)
+                        && sa != ea
+                    {
+                        params["start"] = json!({"address":sa,"point":sp});
+                        params["end"] = json!({"address":ea,"point":ep});
+                    }
+                }
+                let attached = params.get("start").is_some();
                 let result = self.session.run("shape.insert", params);
                 if let Some(v) = self.result(result) {
                     self.ext.object.layout = None;
                     if let Ok(a) = serde_json::from_value::<ObjectAddress>(v["address"].clone()) {
-                        self.ext.object.selected = Some(Selected {
-                            address: a,
-                            page,
-                            bbox: r,
-                            inline: false,
-                        });
+                        self.ext.object.selected =
+                            self.selected_from_address(page, a).or(Some(Selected {
+                                address: a,
+                                page,
+                                bbox: r,
+                                inline: false,
+                                locked: false,
+                                line: None,
+                                group: false,
+                            }));
                     }
-                    self.message = "도형을 넣었습니다. 두 번 클릭하면 개체 속성을 엽니다.".into();
+                    self.message = if attached {
+                        "연결선을 두 도형에 붙였습니다. 도형을 옮기면 연결선이 따라갑니다.".into()
+                    } else if connector {
+                        "자유 연결선을 넣었습니다(도형 위에서 시작·끝내면 도형에 붙습니다).".into()
+                    } else {
+                        "도형을 넣었습니다. 두 번 클릭하면 개체 속성을 엽니다.".into()
+                    };
                 }
                 self.ext.object.draw = None;
             }
@@ -515,23 +1053,70 @@ impl HwpApp {
         let pointer = response.interact_pointer_pos().map(|p| to_page(self, p));
         let hover = response.hover_pos().map(|p| to_page(self, p));
         let selected = self.ext.object.selected.filter(|s| s.page == page);
+        let shift = response.ctx.input(|i| i.modifiers.shift);
         let mut consumed = false;
+        let tol = 6.0 / self.zoom;
+        let endpoint_at = |s: &Selected, p: Pos2| -> Option<usize> {
+            let (a, b) = s.line?;
+            if a.distance(p) <= tol {
+                Some(0)
+            } else if b.distance(p) <= tol {
+                Some(1)
+            } else {
+                None
+            }
+        };
         // Hover feedback: resize/rotate cursors over the handles of the selection.
         if let (Some(s), Some(p)) = (selected, hover)
-            && let Some(h) = handle_at(s.bbox, p, self.zoom)
+            && !s.locked
         {
-            response.ctx.set_cursor_icon(handle_cursor(h));
+            if endpoint_at(&s, p).is_some() {
+                response.ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            } else if s.line.is_none()
+                && let Some(h) = handle_at(s.bbox, p, self.zoom)
+            {
+                response.ctx.set_cursor_icon(handle_cursor(h));
+            }
         }
         if response.drag_started() {
             self.ext.object.moving = None;
             self.ext.object.resizing = None;
-            if let (Some(s), Some(p)) = (selected, pointer) {
-                if let Some(h) = handle_at(s.bbox, p, self.zoom) {
+            self.ext.object.endpoint = None;
+            // 개체 보호: a locked object is only selectable.
+            if let (Some(s), Some(p)) = (selected, pointer)
+                && !s.locked
+            {
+                if let Some(e) = endpoint_at(&s, p) {
+                    self.ext.object.endpoint = Some((e, p));
+                    consumed = true;
+                } else if s.line.is_none()
+                    && let Some(h) = handle_at(s.bbox, p, self.zoom)
+                {
                     self.ext.object.resizing = Some((h, p));
                     consumed = true;
                 } else if hit.is_some_and(|h| h.address == s.address) && !s.inline {
                     self.ext.object.moving = Some(Vec2::ZERO);
                     consumed = true;
+                }
+            }
+        }
+        // Straight line end points: preview while dragging, one command on release.
+        let mut endpoint_preview: Option<(Pos2, Pos2)> = None;
+        if let (Some((e, _)), Some(s), Some(p)) = (self.ext.object.endpoint, selected, pointer)
+            && let Some((a, b)) = s.line
+        {
+            consumed = true;
+            let ends = if e == 0 { (p, b) } else { (a, p) };
+            endpoint_preview = Some(ends);
+            if response.drag_stopped() {
+                self.ext.object.endpoint = None;
+                let mm = |q: Pos2| [f64::from(q.x * MM_PER_PX), f64::from(q.y * MM_PER_PX)];
+                if self.run(
+                    "object.line_endpoint",
+                    json!({"address":s.address,"start_mm":mm(ends.0),"end_mm":mm(ends.1)}),
+                ) {
+                    self.ext.object.layout = None;
+                    self.ext.object.selected = self.selected_from_address(page, s.address);
                 }
             }
         }
@@ -594,7 +1179,28 @@ impl HwpApp {
             }
         }
         if !consumed && (response.clicked() || response.double_clicked()) {
-            self.ext.object.selected = hit;
+            if shift
+                && let (Some(cur), Some(h)) = (self.ext.object.selected, hit)
+                && h.address != cur.address
+                && h.address.section == cur.address.section
+            {
+                // Shift+click extends the selection (묶기 targets) or drops one again.
+                if let Some(i) = self
+                    .ext
+                    .object
+                    .multi
+                    .iter()
+                    .position(|m| m.address == h.address)
+                {
+                    self.ext.object.multi.remove(i);
+                } else {
+                    self.ext.object.multi.push(cur);
+                    self.ext.object.selected = Some(h);
+                }
+            } else {
+                self.ext.object.multi.clear();
+                self.ext.object.selected = hit;
+            }
             if hit.is_some() {
                 consumed = true;
                 ctx_focus(&response.ctx);
@@ -606,48 +1212,87 @@ impl HwpApp {
             self.open_object_editor(h.address);
             consumed = true;
         }
+        let to_screen = |r: Rect| {
+            Rect::from_min_max(
+                rect.min + r.min.to_vec2() * self.zoom,
+                rect.min + r.max.to_vec2() * self.zoom,
+            )
+        };
+        let to_screen_pos = |p: Pos2| rect.min + p.to_vec2() * self.zoom;
+        let stroke = Stroke::new(1.0, chrome::Tokens::ACCENT);
+        for m in self.ext.object.multi.iter().filter(|m| m.page == page) {
+            let r = to_screen(m.bbox);
+            painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Outside);
+            for p in [
+                r.left_top(),
+                r.right_top(),
+                r.left_bottom(),
+                r.right_bottom(),
+            ] {
+                painter.rect_filled(
+                    Rect::from_center_size(p, Vec2::splat(6.0)),
+                    0.0,
+                    chrome::Tokens::ACCENT,
+                );
+            }
+        }
         if let Some(s) = self.ext.object.selected.filter(|s| s.page == page) {
-            let to_screen = |r: Rect| {
-                Rect::from_min_max(
-                    rect.min + r.min.to_vec2() * self.zoom,
-                    rect.min + r.max.to_vec2() * self.zoom,
-                )
-            };
             let mut r = to_screen(preview.unwrap_or(s.bbox));
             if let Some(d) = self.ext.object.moving {
                 r = r.translate(d * self.zoom);
             }
-            let stroke = Stroke::new(1.0, chrome::Tokens::ACCENT);
-            if preview.is_some() {
-                painter.rect_stroke(
-                    to_screen(s.bbox),
-                    0.0,
-                    Stroke::new(1.0, Color32::from_gray(170)),
-                    egui::StrokeKind::Outside,
-                );
-            }
-            painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Outside);
-            for p in handle_points(r) {
-                let h = Rect::from_center_size(p, Vec2::splat(7.0));
-                painter.rect_filled(h, 0.0, Color32::WHITE);
-                painter.rect_stroke(h, 0.0, stroke, egui::StrokeKind::Inside);
-            }
-            if !s.inline {
-                let knob = r.center_top() - Vec2::new(0.0, ROTATE_GAP);
-                painter.line_segment([r.center_top(), knob], stroke);
-                painter.circle(knob, 4.5, Color32::from_rgb(120, 200, 120), stroke);
-            }
-            if let Some(a) = angle {
-                let c = r.center();
-                let dir = Vec2::angled((a - 90.0).to_radians());
-                painter.line_segment([c, c + dir * r.height().max(30.0) * 0.6], stroke);
+            if s.locked {
+                let grey = Stroke::new(1.0, Color32::from_gray(140));
+                painter.rect_stroke(r, 0.0, grey, egui::StrokeKind::Outside);
+                // Badge below the box so it never covers the text above the object.
                 painter.text(
-                    c,
-                    egui::Align2::CENTER_BOTTOM,
-                    format!("{}°", a.round() as i64 % 360),
-                    egui::FontId::proportional(12.0),
-                    chrome::Tokens::ACCENT,
+                    r.left_bottom() + Vec2::new(0.0, 3.0),
+                    egui::Align2::LEFT_TOP,
+                    "개체 보호",
+                    egui::FontId::proportional(11.0),
+                    Color32::from_gray(110),
                 );
+            } else if let Some((a, b)) = endpoint_preview.or(s.line) {
+                // A straight line shows its two end-point handles instead of a box.
+                let (sa, sb) = (to_screen_pos(a), to_screen_pos(b));
+                if endpoint_preview.is_some() {
+                    painter.line_segment([sa, sb], Stroke::new(1.0, Color32::from_gray(170)));
+                }
+                for p in [sa, sb] {
+                    painter.circle(p, 5.0, Color32::WHITE, stroke);
+                }
+            } else {
+                if preview.is_some() {
+                    painter.rect_stroke(
+                        to_screen(s.bbox),
+                        0.0,
+                        Stroke::new(1.0, Color32::from_gray(170)),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+                painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Outside);
+                for p in handle_points(r) {
+                    let h = Rect::from_center_size(p, Vec2::splat(7.0));
+                    painter.rect_filled(h, 0.0, Color32::WHITE);
+                    painter.rect_stroke(h, 0.0, stroke, egui::StrokeKind::Inside);
+                }
+                if !s.inline {
+                    let knob = r.center_top() - Vec2::new(0.0, ROTATE_GAP);
+                    painter.line_segment([r.center_top(), knob], stroke);
+                    painter.circle(knob, 4.5, Color32::from_rgb(120, 200, 120), stroke);
+                }
+                if let Some(a) = angle {
+                    let c = r.center();
+                    let dir = Vec2::angled((a - 90.0).to_radians());
+                    painter.line_segment([c, c + dir * r.height().max(30.0) * 0.6], stroke);
+                    painter.text(
+                        c,
+                        egui::Align2::CENTER_BOTTOM,
+                        format!("{}°", a.round() as i64 % 360),
+                        egui::FontId::proportional(12.0),
+                        chrome::Tokens::ACCENT,
+                    );
+                }
             }
         }
         consumed
@@ -779,12 +1424,15 @@ impl HwpApp {
         if let Some(v) = self.result(result) {
             self.ext.object.layout = None;
             if let Ok(a) = serde_json::from_value::<ObjectAddress>(v["address"].clone()) {
-                self.ext.object.selected = Some(Selected {
+                self.ext.object.selected = self.selected_from_address(page, a).or(Some(Selected {
                     address: a,
                     page,
                     bbox,
                     inline: false,
-                });
+                    locked: false,
+                    line: None,
+                    group: false,
+                }));
             }
         }
         self.ext.object.draw = None;
@@ -821,27 +1469,13 @@ impl HwpApp {
             _ => self.open_object_properties(a),
         }
     }
+    fn layout_bbox(c: &Value) -> Rect {
+        let f = |k: &str| c[k].as_f64().unwrap_or(0.0) as f32;
+        Rect::from_min_size(Pos2::new(f("x"), f("y")), Vec2::new(f("w"), f("h")))
+    }
     fn object_at(&mut self, page: u32, p: Pos2) -> Option<Selected> {
-        let generation = self.session.generation;
-        if self
-            .ext
-            .object
-            .layout
-            .as_ref()
-            .is_none_or(|(g, pg, _)| *g != generation || *pg != page)
-        {
-            let layout = self
-                .session
-                .core
-                .get_page_control_layout_native(page)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(Value::Null);
-            self.ext.object.layout = Some((generation, page, layout));
-        }
-        let (_, _, layout) = self.ext.object.layout.as_ref()?;
-        let n = |v: &Value, k: &str| v[k].as_u64().map(|x| x as usize);
-        layout["controls"]
+        let layout = self.object_page_layout(page)?;
+        let c = layout["controls"]
             .as_array()?
             .iter()
             .rev()
@@ -851,11 +1485,27 @@ impl HwpApp {
                     Some("image" | "shape" | "line" | "group" | "equation")
                 ) && c.get("cellIdx").is_none()
                     && c.get("noteRef").is_none()
+                    && c["controlIdx"].is_u64()
+            })
+            .find(|c| Self::layout_bbox(c).expand(3.0).contains(p))?
+            .clone();
+        Some(self.selected_from_layout(page, c))
+    }
+    /// A shape or picture that a connector can attach to, with its nearest connection point.
+    fn subject_at(&mut self, page: u32, p: Pos2) -> Option<(ObjectAddress, u32)> {
+        let layout = self.object_page_layout(page)?;
+        let n = |v: &Value, k: &str| v[k].as_u64().map(|x| x as usize);
+        layout["controls"]
+            .as_array()?
+            .iter()
+            .rev()
+            .filter(|c| {
+                matches!(c["type"].as_str(), Some("image" | "shape" | "group"))
+                    && c.get("cellIdx").is_none()
+                    && c.get("noteRef").is_none()
             })
             .find_map(|c| {
-                let f = |k: &str| c[k].as_f64().unwrap_or(0.0) as f32;
-                let bbox =
-                    Rect::from_min_size(Pos2::new(f("x"), f("y")), Vec2::new(f("w"), f("h")));
+                let bbox = Self::layout_bbox(c);
                 if !bbox.expand(3.0).contains(p) {
                     return None;
                 }
@@ -864,17 +1514,7 @@ impl HwpApp {
                     paragraph: n(c, "paraIdx")?,
                     control: n(c, "controlIdx")?,
                 };
-                let inline = self
-                    .session
-                    .object_properties(address)
-                    .ok()
-                    .is_some_and(|v| v["props"]["treatAsChar"] == true);
-                Some(Selected {
-                    address,
-                    page,
-                    bbox,
-                    inline,
-                })
+                Some((address, connection_point(bbox, p)))
             })
     }
 
@@ -891,21 +1531,63 @@ impl HwpApp {
             return false;
         };
         if consume(egui::Modifiers::NONE, Key::Escape) {
-            self.ext.object.selected = None;
+            self.clear_object_selection();
             return true;
         }
         if consume(egui::Modifiers::NONE, Key::Delete)
             || consume(egui::Modifiers::NONE, Key::Backspace)
         {
-            self.ext.object.selected = None;
-            self.run("object.delete", json!(s.address));
+            if s.locked {
+                self.message = "보호된 개체입니다. 개체 보호를 먼저 해제하세요.".into();
+                return true;
+            }
+            let targets: Vec<ObjectAddress> = self
+                .ext
+                .object
+                .multi
+                .iter()
+                .filter(|m| !m.locked)
+                .map(|m| m.address)
+                .chain(std::iter::once(s.address))
+                .collect();
+            self.clear_object_selection();
+            // Delete back to front so earlier control indices stay valid.
+            let mut targets = targets;
+            targets.sort_by_key(|a| (a.section, a.paragraph, std::cmp::Reverse(a.control)));
+            targets.reverse();
+            for a in targets {
+                if !self.run("object.delete", json!(a)) {
+                    break;
+                }
+            }
             return true;
         }
         if consume(egui::Modifiers::NONE, Key::Enter) {
             self.open_object_editor(s.address);
             return true;
         }
-        if !s.inline {
+        // Hangul: Tab / Shift+Tab with an object selected walk to the next / previous object.
+        if consume(egui::Modifiers::NONE, Key::Tab) {
+            self.select_neighbor(true);
+            return true;
+        }
+        if consume(egui::Modifiers::SHIFT, Key::Tab) {
+            self.select_neighbor(false);
+            return true;
+        }
+        if s.locked {
+            for key in [
+                Key::ArrowLeft,
+                Key::ArrowRight,
+                Key::ArrowUp,
+                Key::ArrowDown,
+            ] {
+                if consume(egui::Modifiers::NONE, key) {
+                    self.message = "보호된 개체는 옮길 수 없습니다.".into();
+                    return true;
+                }
+            }
+        } else if !s.inline {
             for (key, dx, dy) in [
                 (Key::ArrowLeft, -1, 0),
                 (Key::ArrowRight, 1, 0),
@@ -970,6 +1652,9 @@ impl HwpApp {
             || self.ext.object.equation.is_some()
             || self.ext.object.chart.is_some()
             || self.ext.object.memos
+            || self.ext.object.field.is_some()
+            || self.ext.object.forms.is_some()
+            || self.ext.object.note_shape.is_some()
     }
     /// Startup views for captures.
     pub(crate) fn object_ext_view(&mut self, name: &str, ctx: &egui::Context) -> bool {
@@ -1032,6 +1717,87 @@ impl HwpApp {
             "shape-draw" => {
                 self.object_ext_dispatch("insert.shape.rectangle", ctx);
             }
+            "object-group" => {
+                // Two drawing objects on page 1 selected together (Shift+click state).
+                let mut found: Vec<Selected> = Vec::new();
+                if let Some(layout) = self.object_page_layout(0) {
+                    for c in layout["controls"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|c| {
+                            matches!(c["type"].as_str(), Some("shape" | "image"))
+                                && c.get("cellIdx").is_none()
+                        })
+                        .take(2)
+                    {
+                        found.push(self.selected_from_layout(0, c.clone()));
+                    }
+                }
+                if found.len() == 2 {
+                    self.ext.object.selected = found.pop();
+                    self.ext.object.multi = found;
+                } else {
+                    self.error = Some("도형이 둘 이상 있는 문서를 열어 주세요.".into());
+                }
+            }
+            "connector-draw" => {
+                self.object_ext_dispatch("insert.shape.connector.stroke_arrow", ctx);
+            }
+            "line-handles" => {
+                // The first straight line on page 1, showing its end-point handles.
+                let line = self.object_page_layout(0).and_then(|layout| {
+                    layout["controls"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|c| c["type"] == "line" && c.get("cellIdx").is_none())
+                        .map(|c| self.selected_from_layout(0, c.clone()))
+                        .find(|s| s.line.is_some())
+                });
+                match line {
+                    Some(s) => self.ext.object.selected = Some(s),
+                    None => self.error = Some("직선이 있는 문서를 열어 주세요.".into()),
+                }
+            }
+            "field-insert" => {
+                self.object_ext_dispatch("insert.field", ctx);
+            }
+            "form-edit" => self.open_form_editor(),
+            "note-shape" => self.open_note_shape(false),
+            "object-align" => {
+                // Two floating drawing objects on page 1 selected, then 왼쪽 맞춤 applied.
+                let mut found: Vec<Selected> = Vec::new();
+                if let Some(layout) = self.object_page_layout(0) {
+                    for c in layout["controls"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|c| {
+                            matches!(c["type"].as_str(), Some("shape" | "image"))
+                                && c.get("cellIdx").is_none()
+                        })
+                    {
+                        let sel = self.selected_from_layout(0, c.clone());
+                        if !sel.inline && !sel.locked {
+                            found.push(sel);
+                        }
+                        if found.len() == 2 {
+                            break;
+                        }
+                    }
+                }
+                if found.len() == 2 {
+                    self.ext.object.selected = found.pop();
+                    self.ext.object.multi = found;
+                    self.object_ext_dispatch("object.align.left", ctx);
+                } else {
+                    self.error = Some("떠 있는 도형이 둘 이상 있는 문서를 열어 주세요.".into());
+                }
+            }
+            "object-select" => {
+                self.object_ext_dispatch("object.select", ctx);
+            }
             _ => return false,
         }
         true
@@ -1044,6 +1810,201 @@ impl HwpApp {
         self.equation_editor_dialog(ctx);
         self.chart_editor_dialog(ctx);
         self.memo_list_dialog(ctx);
+        self.field_insert_dialog(ctx);
+        self.note_shape_dialog(ctx);
+        self.form_editor_dialog(ctx);
+    }
+
+    /// 누름틀 넣기: Hangul's dialog fields (안내문·이름·도움말).
+    fn field_insert_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.ext.object.field.take() else {
+            return;
+        };
+        let (mut apply, mut close) = (false, false);
+        let r = chrome::modal("ext-field-insert").show(ctx, |ui| {
+            ui.set_width(480.0);
+            close = chrome::title(ui, "누름틀 넣기");
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(370.0);
+                    chrome::section(ui, "입력할 내용의 안내문(G)");
+                    ui.add(egui::TextEdit::singleline(&mut d.guide).desired_width(f32::INFINITY));
+                    chrome::section(ui, "누름틀 이름(N)");
+                    ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(f32::INFINITY));
+                    chrome::section(ui, "도움말(M)");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut d.memo)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "커서 위치(본문 또는 표 셀)에 빈 누름틀을 넣습니다. 값은 누름틀 자리에 입력하거나 field.set 명령으로 채웁니다.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                });
+                ui.vertical(|ui| {
+                    let (a, c) = chrome::actions(ui, true, "넣기(D)");
+                    apply = a;
+                    close |= c;
+                });
+            });
+        });
+        if apply {
+            close = self.run(
+                "insert.field",
+                json!({"guide":d.guide,"name":d.name,"memo":d.memo}),
+            );
+            if close {
+                self.message = "누름틀을 넣었습니다.".into();
+            }
+        }
+        if !(close || r.should_close()) {
+            self.ext.object.field = Some(d);
+        }
+    }
+    /// 양식 개체: value editor for the document's existing form objects.
+    pub(super) fn open_form_editor(&mut self) {
+        let forms = self.session.forms();
+        let drafts = forms
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|f| {
+                let text = f["text"].as_str().unwrap_or("").to_owned();
+                let checked = f["value"].as_i64().unwrap_or(0) != 0;
+                let caption = f["caption"].as_str().unwrap_or("").to_owned();
+                FormDraft {
+                    at: f["at"].clone(),
+                    kind: f["type"].as_str().unwrap_or("").to_owned(),
+                    name: f["name"].as_str().unwrap_or("").to_owned(),
+                    original: (text.clone(), checked, caption.clone()),
+                    text,
+                    checked,
+                    caption,
+                }
+            })
+            .collect();
+        self.ext.object.forms = Some(drafts);
+    }
+    fn form_editor_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut drafts) = self.ext.object.forms.take() else {
+            return;
+        };
+        fn kind_label(kind: &str) -> &'static str {
+            match kind {
+                "PushButton" => "명령 단추",
+                "CheckBox" => "선택 상자",
+                "ComboBox" => "목록 상자",
+                "RadioButton" => "라디오 단추",
+                "Edit" => "입력 상자",
+                _ => "양식 개체",
+            }
+        }
+        let mut close = false;
+        let mut apply: Option<usize> = None;
+        let r = chrome::modal("ext-form-editor").show(ctx, |ui| {
+            ui.set_width(580.0);
+            close = chrome::title(ui, "양식 개체");
+            ui.label(
+                RichText::new(
+                    "RHWP에 양식 개체 생성 API가 없어 새 양식 개체는 넣을 수 없습니다. 문서에 있는 양식 개체의 값·캡션을 고칩니다.",
+                )
+                .small()
+                .weak(),
+            );
+            egui::ScrollArea::vertical()
+                .max_height(380.0)
+                .show(ui, |ui| {
+                    if drafts.is_empty() {
+                        ui.label("이 문서에 양식 개체가 없습니다.");
+                    }
+                    for (i, d) in drafts.iter_mut().enumerate() {
+                        ui.push_id(i, |ui| {
+                            ui.group(|ui| {
+                                ui.set_width(540.0);
+                                ui.label(format!(
+                                    "{} · {}{}",
+                                    kind_label(&d.kind),
+                                    if d.name.is_empty() { "(이름 없음)" } else { &d.name },
+                                    if d.at["cell"].is_object() { " (표 안)" } else { "" }
+                                ));
+                                match d.kind.as_str() {
+                                    "Edit" | "ComboBox" => {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut d.text)
+                                                .desired_width(420.0),
+                                        );
+                                    }
+                                    "CheckBox" | "RadioButton" => {
+                                        ui.checkbox(&mut d.checked, "선택");
+                                        ui.horizontal(|ui| {
+                                            ui.label("캡션");
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut d.caption)
+                                                    .desired_width(320.0),
+                                            );
+                                        });
+                                    }
+                                    _ => {
+                                        ui.horizontal(|ui| {
+                                            ui.label("캡션");
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut d.caption)
+                                                    .desired_width(320.0),
+                                            );
+                                        });
+                                    }
+                                }
+                                let changed =
+                                    (d.text.as_str(), d.checked, d.caption.as_str())
+                                        != (d.original.0.as_str(), d.original.1, d.original.2.as_str());
+                                if ui.add_enabled(changed, egui::Button::new("적용")).clicked() {
+                                    apply = Some(i);
+                                }
+                            });
+                        });
+                    }
+                });
+            ui.add_space(6.0);
+            if ui.button("닫기").clicked() {
+                close = true;
+            }
+        });
+        if let Some(i) = apply
+            && let Some(d) = drafts.get_mut(i)
+        {
+            let mut params = json!({"at":d.at});
+            match d.kind.as_str() {
+                "Edit" | "ComboBox" => {
+                    if d.text != d.original.0 {
+                        params["text"] = json!(d.text);
+                    }
+                }
+                "CheckBox" | "RadioButton" => {
+                    if d.checked != d.original.1 {
+                        params["value"] = json!(i64::from(d.checked));
+                    }
+                    if d.caption != d.original.2 {
+                        params["caption"] = json!(d.caption);
+                    }
+                }
+                _ => {
+                    if d.caption != d.original.2 {
+                        params["caption"] = json!(d.caption);
+                    }
+                }
+            }
+            if self.run("form.set", params) {
+                d.original = (d.text.clone(), d.checked, d.caption.clone());
+                self.message = "양식 개체 값을 고쳤습니다.".into();
+            }
+        }
+        if !(close || r.should_close()) {
+            self.ext.object.forms = Some(drafts);
+        }
     }
 
     fn picture_insert_dialog(&mut self, ctx: &egui::Context) {
@@ -2502,6 +3463,518 @@ fn resized(b: Rect, h: usize, p: Pos2, keep_ratio: bool) -> Rect {
         }
     }
     Rect::from_min_max(Pos2::new(l, t), Pos2::new(r, bt))
+}
+
+impl HwpApp {
+    fn selected_inline(&self) -> bool {
+        self.ext.object.selected.is_some_and(|s| s.inline)
+    }
+    fn selected_connector(&self) -> bool {
+        use hwpcraft_doc::model::{control::Control, shape::ShapeObject};
+        let Some(a) = self.ext.object.selected.map(|s| s.address) else {
+            return false;
+        };
+        matches!(
+            self.session
+                .core
+                .document()
+                .sections
+                .get(a.section)
+                .and_then(|s| s.paragraphs.get(a.paragraph))
+                .and_then(|p| p.controls.get(a.control)),
+            Some(Control::Shape(sh)) if matches!(sh.as_ref(), ShapeObject::Line(l) if l.connector.is_some())
+        )
+    }
+    /// Select an object by address (any page), like a click on it.
+    fn select_address(&mut self, a: ObjectAddress) -> bool {
+        let page = self.session.page_of_object(a).unwrap_or(0);
+        match self.selected_from_address(page, a) {
+            Some(sel) => {
+                self.ext.object.multi.clear();
+                self.ext.object.endpoint = None;
+                self.ext.object.selected = Some(sel);
+                self.session.clear_selection();
+                true
+            }
+            None => {
+                self.message =
+                    "이 개체는 쪽에서 선택할 수 없습니다 (글자처럼 취급·표 안 개체).".into();
+                false
+            }
+        }
+    }
+    /// ShapeObjectNextObject / PrevObject (Tab · Shift+Tab with an object selected).
+    fn select_neighbor(&mut self, next: bool) {
+        let from = self.ext.object.selected.map(|s| s.address);
+        let mut p = json!({"direction": if next { "next" } else { "prev" }, "wrap": true});
+        if let Some(a) = from {
+            p["address"] = json!(a);
+        }
+        let r = self.session.run("object.neighbor", p);
+        let Some(v) = self.result(r) else {
+            return;
+        };
+        match serde_json::from_value::<ObjectAddress>(v["address"].clone()) {
+            Ok(a) => {
+                if self.select_address(a) {
+                    self.message = format!(
+                        "{} 개체를 선택했습니다 (Tab: 다음, Shift+Tab: 이전).",
+                        match v["kind"].as_str() {
+                            Some("picture") => "그림",
+                            Some("textbox") => "글상자",
+                            Some("group") => "묶음",
+                            Some("equation") => "수식",
+                            _ => "도형",
+                        }
+                    );
+                }
+            }
+            Err(_) => self.message = "문서에 개체가 없습니다.".into(),
+        }
+    }
+    fn selected_targets(&self) -> Vec<ObjectAddress> {
+        let mut v: Vec<ObjectAddress> = self.ext.object.multi.iter().map(|m| m.address).collect();
+        if let Some(s) = self.ext.object.selected {
+            v.push(s.address);
+        }
+        v
+    }
+    fn refresh_selection(&mut self) {
+        self.ext.object.layout = None;
+        if let Some(s) = self.ext.object.selected {
+            self.ext.object.selected = self.selected_from_address(s.page, s.address).or(Some(s));
+        }
+        let multi = std::mem::take(&mut self.ext.object.multi);
+        self.ext.object.multi = multi
+            .into_iter()
+            .map(|m| self.selected_from_address(m.page, m.address).unwrap_or(m))
+            .collect();
+    }
+    /// 0.14 table-object commands: alignment, quick styles, navigation, text boxes,
+    /// pictures, numbers and notes. True when handled.
+    fn object_ext_dispatch_14(&mut self, id: &str) -> bool {
+        let selected = self.ext.object.selected.map(|s| s.address);
+        if let Some(mode) = id.strip_prefix("object.align.") {
+            let Some((_, label, _)) = ALIGNS.iter().find(|(m, _, _)| *m == mode) else {
+                return false;
+            };
+            let targets = self.selected_targets();
+            if targets.is_empty() {
+                self.message = "맞출 개체를 먼저 클릭해 선택하세요 (여러 개는 Shift+클릭).".into();
+                return true;
+            }
+            let r = self
+                .session
+                .run("object.align", json!({"targets":targets,"mode":mode}));
+            if let Some(v) = self.result(r) {
+                self.refresh_selection();
+                self.message = format!("{label}: 개체 {}개를 옮겼습니다.", v["moved"]);
+            }
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("object.style.") {
+            let Some(a) = selected else {
+                return true;
+            };
+            let mut p = json!({"address":a});
+            match rest.split_once('.') {
+                Some((key @ ("fill" | "outline"), c)) => {
+                    let value = if c == "none" {
+                        "none".to_owned()
+                    } else {
+                        match QUICK_COLORS.iter().find(|(k, _)| *k == c) {
+                            Some((_, hex)) => (*hex).to_owned(),
+                            None => return false,
+                        }
+                    };
+                    p[key] = json!(value);
+                }
+                Some(("dash", n)) => p["line_type"] = json!(n.parse::<i64>().unwrap_or(1)),
+                Some(("pen", w)) => {
+                    let Some((_, mm)) = PEN_WIDTHS.iter().find(|(k, _)| *k == w) else {
+                        return false;
+                    };
+                    p["line_width_mm"] = json!(mm);
+                }
+                Some(("arrow_end", n)) => p["arrow_end"] = json!(n.parse::<i64>().unwrap_or(0)),
+                Some(("arrow_start", n)) => p["arrow_start"] = json!(n.parse::<i64>().unwrap_or(0)),
+                _ => return false,
+            }
+            if self.run("object.style", p) {
+                self.ext.object.layout = None;
+                self.message = "개체 스타일을 바꿨습니다.".into();
+            }
+            return true;
+        }
+        if let Some(mode) = id.strip_prefix("object.shadow.") {
+            let Some(a) = selected else {
+                return true;
+            };
+            let r = self
+                .session
+                .run("object.shadow", json!({"address":a,"mode":mode}));
+            if let Some(v) = self.result(r) {
+                self.ext.object.layout = None;
+                self.message = if v["shadowType"] == 0 {
+                    "그림자를 없앴습니다.".into()
+                } else {
+                    format!(
+                        "그림자 이동: 가로 {} %, 세로 {} %",
+                        v["shadowOffsetX"], v["shadowOffsetY"]
+                    )
+                };
+            }
+            return true;
+        }
+        if let Some(preset) = id.strip_prefix("object.outer_margin.") {
+            if let Some(a) = selected
+                && self.run("object.outer_margin", json!({"address":a,"preset":preset}))
+            {
+                self.ext.object.layout = None;
+                self.message = "바깥 여백을 바꿨습니다.".into();
+            }
+            return true;
+        }
+        if let Some(preset) = id.strip_prefix("textbox.margin.") {
+            if let Some(a) = selected
+                && self.run("textbox.margin", json!({"address":a,"preset":preset}))
+            {
+                self.ext.object.layout = None;
+                self.message = "글상자 안 여백을 바꿨습니다.".into();
+            }
+            return true;
+        }
+        if let Some(dir) = id.strip_prefix("textbox.direction.") {
+            if let Some(a) = selected
+                && self.run("textbox.direction", json!({"address":a,"direction":dir}))
+            {
+                self.ext.object.layout = None;
+                self.message = "글상자 글자 방향을 바꿨습니다.".into();
+            }
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("textbox.align.") {
+            let Some((h, v)) = rest.split_once('_') else {
+                return false;
+            };
+            if let Some(a) = selected
+                && self.run(
+                    "textbox.align",
+                    json!({"address":a,"horizontal":h,"vertical":v}),
+                )
+            {
+                self.ext.object.layout = None;
+                self.message = "글상자 정렬을 바꿨습니다.".into();
+            }
+            return true;
+        }
+        if let Some(kind) = id.strip_prefix("object.connector_type.") {
+            if let Some(a) = selected
+                && self.run("object.connector_type", json!({"address":a,"kind":kind}))
+            {
+                self.refresh_selection();
+                self.message = "연결선 종류를 바꿨습니다.".into();
+            }
+            return true;
+        }
+        if let Some(mode) = id.strip_prefix("picture.recolor.") {
+            if let Some(a) = selected
+                && self.run("picture.recolor", json!({"address":a,"mode":mode}))
+            {
+                self.ext.object.layout = None;
+                self.message = "그림 색을 조정했습니다.".into();
+            }
+            return true;
+        }
+        if let Some(kind) = id.strip_prefix("insert.auto_number.") {
+            if self.run("insert.auto_number", json!({"kind":kind})) {
+                self.message = match kind {
+                    "page" => "쪽 번호를 넣었습니다.",
+                    "total" => "전체 쪽수를 넣었습니다.",
+                    "picture" => "그림 번호를 넣었습니다.",
+                    "table" => "표 번호를 넣었습니다.",
+                    _ => "수식 번호를 넣었습니다.",
+                }
+                .into();
+            }
+            return true;
+        }
+        match id {
+            "object.protect_size" => {
+                if let Some(a) = selected {
+                    let r = self
+                        .session
+                        .run("object.protect_size", json!({"address":a}));
+                    if let Some(v) = self.result(r) {
+                        self.message = if v["protected"] == true {
+                            "크기를 고정했습니다 (손잡이로 크기를 바꿀 수 없습니다).".into()
+                        } else {
+                            "크기 고정을 풀었습니다.".into()
+                        };
+                    }
+                }
+            }
+            "object.format.copy" => {
+                if let Some(a) = selected {
+                    let r = self.session.run("object.format.get", json!({"address":a}));
+                    if let Some(v) = self.result(r) {
+                        self.ext.object.format = Some(v["format"].clone());
+                        self.message = "개체 모양을 복사했습니다. 다른 개체를 선택하고 모양 붙이기를 누르세요.".into();
+                    }
+                }
+            }
+            "object.format.paste" => {
+                let Some(f) = self.ext.object.format.clone() else {
+                    self.message = "먼저 개체 모양 복사를 하세요.".into();
+                    return true;
+                };
+                let mut n = 0;
+                for a in self.selected_targets() {
+                    if self.run("object.format", json!({"address":a,"format":f})) {
+                        n += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if n > 0 {
+                    self.ext.object.layout = None;
+                    self.message = format!("개체 {n}개에 모양을 붙였습니다.");
+                }
+            }
+            "object.next" => self.select_neighbor(true),
+            "object.prev" => self.select_neighbor(false),
+            "object.select" => {
+                // 개체 선택 단추: the object at the caret, else the first one after it.
+                if self.ext.object.selected.is_some() {
+                    self.select_neighbor(true);
+                } else if let Some(a) = self.object_near_caret() {
+                    if self.select_address(a) {
+                        self.message = "개체를 선택했습니다 (Tab: 다음 개체, Esc: 해제).".into();
+                    }
+                } else {
+                    self.select_neighbor(true);
+                }
+            }
+            "insert.shape.vtextbox" | "insert.shape.vtextbox_all" => {
+                self.ext.object.draw = Some("textbox");
+                self.ext.object.draw_direction = Some(if id.ends_with("_all") {
+                    "vertical_all"
+                } else {
+                    "vertical"
+                });
+                self.clear_object_selection();
+                self.message =
+                    "세로 글상자: 쪽에서 끌어 그리세요. 클릭만 하면 기본 크기, Esc 취소.".into();
+            }
+            "picture.save" => {
+                let Some(a) = selected else {
+                    return true;
+                };
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("그림.png")
+                    .add_filter("그림 파일", &["png", "jpg", "jpeg", "bmp", "gif"])
+                    .save_file()
+                {
+                    let r = self.session.run(
+                        "picture.save",
+                        json!({"address":a,"path":path,"overwrite":true}),
+                    );
+                    if let Some(v) = self.result(r) {
+                        self.message =
+                            format!("그림을 저장했습니다: {}", v["path"].as_str().unwrap_or(""));
+                    }
+                }
+            }
+            "picture.save_all" => {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    let r = self.session.run("picture.save_all", json!({"dir":dir}));
+                    if let Some(v) = self.result(r) {
+                        self.message = format!(
+                            "그림 {}개를 저장했습니다.",
+                            v["files"].as_array().map_or(0, Vec::len)
+                        );
+                    }
+                }
+            }
+            "note.convert" => {
+                if let Some(a) = self.session.note_at_caret() {
+                    let endnote =
+                        self.session
+                            .objects()
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|o| {
+                                o["kind"] == "endnote"
+                                    && serde_json::from_value::<ObjectAddress>(o["address"].clone())
+                                        .ok()
+                                        == Some(a)
+                            });
+                    if self.run("note.convert", json!({"address":a})) {
+                        self.message = if endnote {
+                            "미주를 각주로 바꿨습니다.".into()
+                        } else {
+                            "각주를 미주로 바꿨습니다.".into()
+                        };
+                    }
+                } else {
+                    self.message = "커서 문단에 각주·미주가 없습니다.".into();
+                }
+            }
+            "note.delete" => {
+                if self.run("note.delete", json!({})) {
+                    self.message = "각주·미주를 지웠습니다.".into();
+                }
+            }
+            "note.shape" | "note.shape.footnote" => self.open_note_shape(false),
+            "note.shape.endnote" => self.open_note_shape(true),
+            "field.delete" => {
+                let r = self.session.run("field.delete", json!({}));
+                if let Some(v) = self.result(r) {
+                    self.message = if v["removed"] == true {
+                        "누름틀을 지웠습니다.".into()
+                    } else {
+                        "커서 위치에 누름틀이 없습니다.".into()
+                    };
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn open_note_shape(&mut self, endnote: bool) {
+        let kind = if endnote { "endnote" } else { "footnote" };
+        let r = self.session.run("note.shape.get", json!({"kind":kind}));
+        if let Some(v) = self.result(r) {
+            self.ext.object.note_shape = Some(Box::new(NoteShapeDialog {
+                endnote,
+                original: v.clone(),
+                draft: v,
+            }));
+        }
+    }
+    /// 각주/미주 모양: Hangul's 주석 모양 dialog (번호 모양·구분선).
+    fn note_shape_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.ext.object.note_shape.take() else {
+            return;
+        };
+        let (mut apply, mut close, mut switch) = (false, false, None);
+        let r = chrome::modal("ext-note-shape").show(ctx, |ui| {
+            ui.set_width(520.0);
+            close = chrome::title(ui, if d.endnote { "미주 모양" } else { "각주 모양" });
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(400.0);
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(!d.endnote, "각주").clicked() && d.endnote {
+                            switch = Some(false);
+                        }
+                        if ui.selectable_label(d.endnote, "미주").clicked() && !d.endnote {
+                            switch = Some(true);
+                        }
+                    });
+                    chrome::section(ui, "번호 모양");
+                    egui::Grid::new("note-number").num_columns(4).show(ui, |ui| {
+                        ui.label("번호 모양");
+                        choice(ui, "note-format", &mut d.draft, "numberFormat", NOTE_NUMBER_FORMATS);
+                        int_field(ui, "시작 번호", &mut d.draft, "startNumber", (1, 9999), "");
+                        ui.end_row();
+                        text_field(ui, "앞 장식 문자", &mut d.draft, "prefixChar", 1);
+                        text_field(ui, "뒤 장식 문자", &mut d.draft, "suffixChar", 1);
+                        ui.end_row();
+                        if d.draft["numberFormat"] == "userChar" {
+                            text_field(ui, "사용자 기호", &mut d.draft, "userChar", 1);
+                            ui.end_row();
+                        }
+                    });
+                    check(ui, "번호 위 첨자", &mut d.draft, "numberCodeSuperscript");
+                    ui.horizontal(|ui| {
+                        ui.label("번호 매기기");
+                        for (k, l) in [("continue", "앞 구역에 이어서"), ("section", "구역마다 새로"), ("page", "쪽마다 새로")] {
+                            if ui.radio(d.draft["numbering"] == k, l).clicked() {
+                                d.draft["numbering"] = json!(k);
+                            }
+                        }
+                    });
+                    chrome::section(ui, "구분선");
+                    check(ui, "구분선 넣기", &mut d.draft, "separatorEnabled");
+                    if d.draft["separatorEnabled"] == true {
+                        egui::Grid::new("note-separator").num_columns(4).show(ui, |ui| {
+                            ui.label("길이");
+                            let mut len = d.draft["separatorLength"].as_i64().unwrap_or(0);
+                            let mut column_width = len < 0;
+                            if ui.checkbox(&mut column_width, "단 너비").changed() {
+                                len = if column_width { -1 } else { (50.0 * HU_PER_MM) as i64 };
+                                d.draft["separatorLength"] = json!(len);
+                            }
+                            if !column_width {
+                                let mut mm = len as f64 / HU_PER_MM;
+                                if ui
+                                    .add(egui::DragValue::new(&mut mm).range(0.0..=600.0).speed(0.5).fixed_decimals(1).suffix(" mm"))
+                                    .changed()
+                                {
+                                    d.draft["separatorLength"] = json!((mm * HU_PER_MM).round() as i64);
+                                }
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
+                            ui.label("종류");
+                            number_choice(ui, "note-line-type", &mut d.draft, "separatorLineType", LINE_TYPES);
+                            ui.label("굵기");
+                            number_choice(ui, "note-line-width", &mut d.draft, "separatorLineWidth", SEPARATOR_WIDTHS);
+                            ui.end_row();
+                            css_field(ui, "색", &mut d.draft, "separatorColor");
+                            ui.end_row();
+                        });
+                    }
+                    ui.label(
+                        RichText::new(if d.endnote {
+                            "현재 구역의 미주 번호와 구분선에 적용됩니다."
+                        } else {
+                            "현재 구역의 각주 번호와 구분선에 적용됩니다. 구분선 길이 -1(단 너비)은 화면에 짧게 표시될 수 있습니다."
+                        })
+                        .small()
+                        .weak(),
+                    );
+                });
+                ui.vertical(|ui| {
+                    let (a, c) = chrome::actions(ui, true, "설정(D)");
+                    apply = a;
+                    close |= c;
+                });
+            });
+        });
+        if let Some(endnote) = switch {
+            self.open_note_shape(endnote);
+            return;
+        }
+        if apply {
+            let props = changed(&d.original, &d.draft);
+            close = if props.is_empty() {
+                true
+            } else {
+                let kind = if d.endnote { "endnote" } else { "footnote" };
+                let ok = self.run(
+                    "note.shape",
+                    json!({"kind":kind,"props":Value::Object(props)}),
+                );
+                if ok {
+                    self.message = if d.endnote {
+                        "미주 모양을 바꿨습니다."
+                    } else {
+                        "각주 모양을 바꿨습니다."
+                    }
+                    .into();
+                }
+                ok
+            };
+        }
+        if !(close || r.should_close()) {
+            self.ext.object.note_shape = Some(d);
+        }
+    }
 }
 
 #[cfg(test)]

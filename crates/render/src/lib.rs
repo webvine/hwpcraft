@@ -45,6 +45,41 @@ pub fn default_korean_font() -> &'static str {
     })
 }
 
+/// Symbol and emoji fonts installed on this computer, as (file, index) pairs, for
+/// UI toolkits that need wider glyph coverage than the text font (문자표).
+pub fn symbol_font_faces() -> Vec<(std::path::PathBuf, u32)> {
+    const FAMILIES: &[&str] = &[
+        "Segoe UI Symbol",
+        "Segoe UI Emoji",
+        "Cambria Math",
+        "Apple Symbols",
+        "Noto Sans Symbols",
+        "Noto Sans Symbols 2",
+        "Noto Sans Math",
+        "Noto Sans CJK KR",
+        "Symbola",
+        "DejaVu Sans",
+    ];
+    let mut db = resvg::usvg::fontdb::Database::new();
+    db.load_system_fonts();
+    let mut out = Vec::new();
+    for family in FAMILIES {
+        let face = db
+            .faces()
+            .filter(|f| f.families.iter().any(|(n, _)| n == family))
+            .find(|f| f.style == resvg::usvg::fontdb::Style::Normal && f.weight.0 <= 500);
+        if let Some(face) = face
+            && let resvg::usvg::fontdb::Source::File(path) = &face.source
+            && !out
+                .iter()
+                .any(|(p, _): &(std::path::PathBuf, u32)| p == path)
+        {
+            out.push((path.clone(), face.index));
+        }
+    }
+    out
+}
+
 /// File and collection index of the regular face of [`default_korean_font`], for
 /// UI toolkits that load font bytes themselves (egui). `None` without a file source.
 pub fn korean_font_face() -> Option<(std::path::PathBuf, u32)> {

@@ -5,6 +5,7 @@
 use super::*;
 use hwpcraft_doc::hidden_text::HiddenTextOptions;
 use hwpcraft_doc::model::control::PageNumberPos;
+use hwpcraft_doc::model::document::Document;
 use hwpcraft_doc::pii_scan::PiiKind;
 use serde::{Deserialize, Serialize};
 
@@ -50,8 +51,194 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("page.master.list", "바탕쪽 목록", ""),
     ("file.doc_info", "문서 정보", "Ctrl+Q,I"),
     ("file.print_pdf", "인쇄용 PDF 만들기 (쪽 범위)", "Ctrl+P"),
+    (
+        "page.margins.presets",
+        "쪽 여백 사전 값 목록 (기본·좁게1·좁게2·넓게(머리말/꼬리말 포함)·좁게·넓게)",
+        "",
+    ),
+    (
+        "page.margins.preset",
+        "쪽 여백 사전 값 적용 (현재 구역)",
+        "",
+    ),
+    ("page.section.next", "이후 구역으로", ""),
+    ("page.section.prev", "이전 구역으로", ""),
+    ("page.copy", "쪽 복사하기 (쪽 클립보드)", ""),
+    ("page.paste", "쪽 붙이기 (현재 쪽 뒤에 새 쪽으로)", ""),
+    ("page.delete", "쪽 지우기", ""),
+    ("file.insert", "문서 끼워 넣기 (HWP/HWPX를 커서 위치에)", ""),
+    ("file.save_block", "블록 저장 (선택 영역만 새 파일로)", ""),
 ];
 
+/// (command id, parameter help, JSON example object) for list_commands and
+/// docs/mcp-commands.md; owner fills this for every command above.
+pub const PARAMS: &[(&str, &str, &str)] = &[
+    (
+        "view.marks.get",
+        "No parameters; paragraphMarks, controlCodes, transparentBorders (screen only).",
+        "{}",
+    ),
+    (
+        "view.marks",
+        "paragraphMarks, controlCodes, transparentBorders: bool (default false). Screen only: not saved and not part of undo.",
+        r#"{"paragraphMarks":true,"controlCodes":true,"transparentBorders":false}"#,
+    ),
+    (
+        "page.header_footer.text.get",
+        "header: bool; apply_to: both|odd|even (default both). Returns exists, text and fields [{offset, kind}].",
+        r#"{"header":true,"apply_to":"both"}"#,
+    ),
+    (
+        "page.header_footer.text",
+        "header: bool; apply_to: both|odd|even; text: one line; fields: [{offset, kind: page_number|total_pages|file_name}] inserted at text offsets.",
+        r#"{"header":true,"apply_to":"both","text":"보고서 ","fields":[{"offset":4,"kind":"page_number"}]}"#,
+    ),
+    (
+        "page.section.get",
+        "No parameters; current section: pageNum, pageNumType, pictureNum, tableNum, equationNum (0 = continue), defaultTabSpacingMm, hideHeader, hideFooter, hideMasterPage, hideBorder, hideFill, hideEmptyLine.",
+        "{}",
+    ),
+    (
+        "page.section",
+        "Optional pageNum, pageNumType, pictureNum, tableNum, equationNum (0 = continue from the previous section), defaultTabSpacingMm, hideHeader, hideFooter, hideMasterPage, hideBorder, hideFill, hideEmptyLine; wholeDocument applies to every section.",
+        r#"{"pageNum":1,"defaultTabSpacingMm":40,"hideHeader":false}"#,
+    ),
+    (
+        "security.privacy.scan",
+        "kinds: subset of ssn|card|phone|email (default all); mask: mask character(s); hiddenText: also list hidden text (default true); offPage: include text off the page.",
+        r#"{"kinds":["ssn","phone"],"mask":"*"}"#,
+    ),
+    (
+        "security.privacy.mask",
+        "items: [{raw, masked}] with equal character counts, as returned by the scan; every occurrence is replaced in one undo step.",
+        r#"{"items":[{"raw":"010-1234-5678","masked":"010-****-****"}]}"#,
+    ),
+    (
+        "file.save_hml",
+        "path ending in .hml; only documents opened from HML can be written back.",
+        r#"{"path":"out.hml"}"#,
+    ),
+    (
+        "file.save_pages",
+        "path (.hwp/.hwpx/.pdf/.txt); from, to: 1-based inclusive page range. The open document is unchanged.",
+        r#"{"path":"2-3쪽.hwpx","from":2,"to":3}"#,
+    ),
+    (
+        "page.border_fill.get",
+        "No parameters; current section border/fill with spacingMm [left, right, top, bottom].",
+        "{}",
+    ),
+    (
+        "page.border_fill",
+        "basis: paper|page; spacingMm: [left, right, top, bottom]; headerInside, footerInside: bool; applyPage: all|exceptFirst; borders: four {type, width, color #rrggbb} for left, right, top, bottom; fill: #rrggbb or null; fillArea: paper|page|border; wholeDocument: bool.",
+        r##"{"basis":"paper","spacingMm":[5,5,5,5],"headerInside":false,"footerInside":false,"applyPage":"all","borders":[{"type":1,"width":2,"color":"#000000"},{"type":1,"width":2,"color":"#000000"},{"type":1,"width":2,"color":"#000000"},{"type":1,"width":2,"color":"#000000"}],"fill":null}"##,
+    ),
+    (
+        "page.header",
+        "apply_to: both|odd|even (default both); template: 0-10 (0 none, 1-3 page number left/centre/right, 4-5 with file name, 6-10 the same bold and underlined).",
+        r#"{"apply_to":"both","template":2}"#,
+    ),
+    (
+        "page.footer",
+        "Same parameters as page.header.",
+        r#"{"apply_to":"both","template":2}"#,
+    ),
+    (
+        "page.header_footer.list",
+        "No parameters; headers and footers of the current section.",
+        "{}",
+    ),
+    (
+        "page.header_footer.delete",
+        "header: bool; apply_to: both|odd|even (default both).",
+        r#"{"header":true,"apply_to":"both"}"#,
+    ),
+    (
+        "page.number.get",
+        "No parameters; exists, position, format, dash, start.",
+        "{}",
+    ),
+    (
+        "page.number",
+        "position: none|top_left|top_center|top_right|bottom_left|bottom_center|bottom_right|outside_top|outside_bottom|inside_top|inside_bottom; format: 0 1,2,3 / 1 circled / 2 I,II,III / 3 i,ii,iii / 4 A,B,C / 5 a,b,c / 8 가,나,다 / 10 ㄱ,ㄴ,ㄷ / 12 일,이,삼 / 13 一,二,三; dash: bool; start: optional first number.",
+        r#"{"position":"bottom_center","format":0,"dash":true,"start":1}"#,
+    ),
+    (
+        "page.new_number",
+        "start: page number (1 or more) that begins at the caret page.",
+        r#"{"start":5}"#,
+    ),
+    (
+        "page.hide.get",
+        "No parameters; hide flags of the caret page.",
+        "{}",
+    ),
+    (
+        "page.hide",
+        "header, footer, master_page, border, fill, page_number: bool, for the caret page only.",
+        r#"{"header":true,"footer":false,"master_page":false,"border":false,"fill":false,"page_number":true}"#,
+    ),
+    (
+        "page.master.list",
+        "No parameters; master pages of the current section (read only).",
+        "{}",
+    ),
+    (
+        "file.doc_info",
+        "No parameters; file {path, format, bytes, modified, created}, pages, sections, paragraphs, lines, characters, words, tables, pictures, shapes, equations, notes, fonts, fontSubstitutions, binData, pictureData.",
+        "{}",
+    ),
+    (
+        "file.print_pdf",
+        "path (.pdf); pages: all|current|to_current|from_current or a list like 1,3,5-7; current: 0-based caret page used by the current* ranges.",
+        r#"{"path":"print.pdf","pages":"1,3,5-7","current":0}"#,
+    ),
+    (
+        "page.margins.presets",
+        "No parameters; the six Hangul 쪽 여백 presets with their millimetre values.",
+        "{}",
+    ),
+    (
+        "page.margins.preset",
+        "preset: default|narrow1_hf|narrow2_hf|wide_hf|narrow|wide, the Hangul gallery in order (기본, 좁게1/좁게2/넓게 with header and footer margins, 좁게, 넓게). Applies to the caret section; paper size and gutter stay.",
+        r#"{"preset":"narrow"}"#,
+    ),
+    (
+        "page.section.next",
+        "No parameters; caret to the first paragraph of the next section.",
+        "{}",
+    ),
+    (
+        "page.section.prev",
+        "No parameters; caret to the first paragraph of the previous section.",
+        "{}",
+    ),
+    (
+        "page.copy",
+        "page: optional 1-based page (default: caret page). Copies the paragraphs that start on that page to the process-wide page clipboard.",
+        r#"{"page":2}"#,
+    ),
+    (
+        "page.paste",
+        "page: optional 1-based page (default: caret page). Inserts the copied page as a new page after it; the caret ends after the pasted text.",
+        "{}",
+    ),
+    (
+        "page.delete",
+        "page: optional 1-based page (default: caret page). Removes the paragraphs of that page so later pages move up; refused for single-page documents.",
+        "{}",
+    ),
+    (
+        "file.insert",
+        "path of an HWP/HWPX/HWP3 document; password when it is protected. Its body is merged at the caret with fonts, styles and pictures remapped; one undo step.",
+        r#"{"path":"부록.hwpx"}"#,
+    ),
+    (
+        "file.save_block",
+        "path (.hwp/.hwpx/.pdf/.txt); writes only the selected body text, including whole middle paragraphs of a multi-paragraph selection.",
+        r#"{"path":"블록.hwpx"}"#,
+    ),
+];
 const HU_PER_MM: f64 = 7200.0 / 25.4;
 /// Hangul's 쪽 번호 위치 codes (HWP spec table 149) by dialog name.
 pub const NUMBER_POSITIONS: &[(&str, u8)] = &[
@@ -587,6 +774,44 @@ impl Session {
                     json!({"path": p.path, "pages": pages.iter().map(|n| n + 1).collect::<Vec<_>>(), "bytes": bytes.len()}),
                 )
             }
+            "page.margins.presets" => Ok(margin_presets_json()),
+            "page.margins.preset" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Preset {
+                    preset: String,
+                }
+                let p: Preset = serde_json::from_value(params)?;
+                self.apply_margin_preset(&p.preset)
+            }
+            "page.section.next" | "page.section.prev" => {
+                self.move_section(id == "page.section.next")
+            }
+            "page.copy" => {
+                let p: PageTarget = serde_json::from_value(params)?;
+                self.copy_page(p.page)
+            }
+            "page.paste" => {
+                let p: PageTarget = serde_json::from_value(params)?;
+                self.paste_page(p.page)
+            }
+            "page.delete" => {
+                let p: PageTarget = serde_json::from_value(params)?;
+                self.delete_page(p.page)
+            }
+            "file.insert" => {
+                let p: InsertFile = serde_json::from_value(params)?;
+                self.insert_file(&p)
+            }
+            "file.save_block" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Target {
+                    path: std::path::PathBuf,
+                }
+                let p: Target = serde_json::from_value(params)?;
+                self.save_block(&p.path)
+            }
             _ => bail!("알 수 없는 편집 명령: {id}"),
         }
     }
@@ -819,14 +1044,74 @@ impl Session {
             names.dedup();
             names
         };
+        let secs = |t: std::io::Result<std::time::SystemTime>| {
+            t.ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+        };
         let file = self.path.as_ref().and_then(|p| {
             let meta = std::fs::metadata(p).ok()?;
             Some(json!({
                 "path": p.display().to_string(),
+                "format": p.extension().and_then(|e| e.to_str()).map(str::to_ascii_uppercase),
                 "bytes": meta.len(),
-                "modified": meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()),
+                "created": secs(meta.created()),
+                "modified": secs(meta.modified()),
             }))
         });
+        // RHWP's own summary adds the fonts it had to substitute on this machine.
+        let rhwp: Value =
+            serde_json::from_str(&self.core.get_document_info()).unwrap_or(Value::Null);
+        let mut used_by = std::collections::HashMap::<u16, usize>::new();
+        let mut count_pictures = |paragraphs: &[Paragraph]| {
+            for p in paragraphs {
+                for c in &p.controls {
+                    match c {
+                        Control::Picture(pic) => {
+                            *used_by.entry(pic.image_attr.bin_data_id).or_default() += 1
+                        }
+                        Control::Table(t) => {
+                            for cell in &t.cells {
+                                for p in &cell.paragraphs {
+                                    for c in &p.controls {
+                                        if let Control::Picture(pic) = c {
+                                            *used_by
+                                                .entry(pic.image_attr.bin_data_id)
+                                                .or_default() += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        };
+        for section in &doc.sections {
+            count_pictures(&section.paragraphs);
+        }
+        let picture_data: Vec<Value> = doc
+            .doc_info
+            .bin_data_list
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let id = u16::try_from(i + 1).unwrap_or(u16::MAX);
+                let bytes = doc
+                    .bin_data_content
+                    .iter()
+                    .find(|c| c.id == b.storage_id)
+                    .map(|c| c.data.len());
+                json!({
+                    "id": id,
+                    "type": format!("{:?}", b.data_type),
+                    "extension": b.extension.clone().or_else(|| b.abs_path.clone()).or_else(|| b.rel_path.clone()),
+                    "bytes": bytes,
+                    "usedBy": used_by.get(&id).copied().unwrap_or(0),
+                })
+            })
+            .collect();
         json!({
             "file": file,
             "pages": self.core.page_count(),
@@ -843,6 +1128,10 @@ impl Session {
             "notes": notes,
             "fonts": fonts,
             "binData": doc.doc_info.bin_data_list.len(),
+            "pictureData": picture_data,
+            "fontSubstitutions": rhwp["fontSubstitutions"].clone(),
+            "fallbackFont": rhwp["fallbackFont"].clone(),
+            "formatVersion": rhwp["version"].clone(),
             "summarySupported": false,
         })
     }
@@ -956,10 +1245,71 @@ impl Session {
         let Some(p) = self.hf_paragraph(header, apply)? else {
             return Ok(json!({"exists": false, "text": "", "fields": [], "applyTo": apply}));
         };
+        use hwpcraft_doc::model::control::{AutoNumberType, FieldType};
+        // Freshly inserted fields are marker characters; after a save RHWP lowers them to
+        // AutoNumber controls (placeholder space) and a path Field wrapping the file name.
+        let positions = p.control_text_positions();
+        let chars: Vec<char> = p.text.chars().collect();
+        let mut at_control: Vec<(usize, usize, &str)> = Vec::new(); // (start, end, kind)
+        for (ci, control) in p.controls.iter().enumerate() {
+            let Some(&start) = positions.get(ci) else {
+                continue;
+            };
+            // An AutoNumber owns one placeholder space; RHWP reports a trailing one at `len`.
+            let placeholder = |start: usize| {
+                let at = start.min(chars.len().saturating_sub(1));
+                if chars.get(at) == Some(&' ') {
+                    (at, at + 1)
+                } else {
+                    (at, at)
+                }
+            };
+            match control {
+                Control::AutoNumber(a) if a.number_type == AutoNumberType::Page => {
+                    let (s, e) = placeholder(start);
+                    at_control.push((s, e, "page_number"));
+                }
+                Control::AutoNumber(a) if a.number_type == AutoNumberType::TotalPage => {
+                    let (s, e) = placeholder(start);
+                    at_control.push((s, e, "total_pages"));
+                }
+                Control::Field(f) if f.field_type == FieldType::Path => {
+                    // The field wraps the literal file name (empty for an unsaved document).
+                    let (s, e) = p
+                        .field_ranges
+                        .iter()
+                        .find(|r| r.control_idx == ci)
+                        .map_or((start, start), |r| {
+                            (r.start_char_idx, r.end_char_idx.max(r.start_char_idx))
+                        });
+                    at_control.push((s, e, "file_name"));
+                }
+                _ => {}
+            }
+        }
+        at_control.sort_by_key(|(s, e, _)| (*s, *e));
         let mut text = String::new();
         let mut fields = Vec::new();
         let mut offset = 0usize;
-        for c in p.text.chars() {
+        let mut skip_until = 0usize;
+        let mut next_control = 0usize;
+        for (i, c) in chars.iter().copied().enumerate() {
+            // Zero-width fields (empty file name) sit before the character at `i`.
+            let mut skipped = false;
+            while let Some((s, e, kind)) = at_control.get(next_control).copied()
+                && s <= i
+            {
+                fields.push(HfField {
+                    offset,
+                    kind: kind.to_owned(),
+                });
+                skip_until = skip_until.max(e);
+                next_control += 1;
+                skipped |= e > i;
+            }
+            if i < skip_until || skipped {
+                continue;
+            }
             match HF_FIELDS.iter().find(|(_, _, m)| *m == c) {
                 Some((kind, _, _)) => fields.push(HfField {
                     offset,
@@ -990,29 +1340,24 @@ impl Session {
         }
         // Insert from the end so earlier offsets stay valid. Fields sharing an offset are
         // inserted last-listed first, so the listed order is the final order.
-        fields.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+        fields.sort_by_key(|f| std::cmp::Reverse((f.0, f.1)));
         let apply = apply_code(&p.apply_to)?;
         self.require_body()?;
-        let old = self
-            .hf_paragraph(p.header, apply)?
-            .map(|q| q.text.chars().count());
+        let exists = self.hf_paragraph(p.header, apply)?.is_some();
         let header = p.header;
         let text = p.text.clone();
         self.transaction(|s| {
             let section = s.cursor.section;
-            match old {
-                None => {
-                    s.core
-                        .create_header_footer_native(section, header, apply)
-                        .map_err(err)?;
-                }
-                Some(n) if n > 0 => {
-                    s.core
-                        .delete_text_in_header_footer_native(section, header, apply, 0, 0, n)
-                        .map_err(err)?;
-                }
-                Some(_) => {}
+            // A reopened header may hold lowered AutoNumber/Field controls; rebuilding it
+            // from scratch keeps text, fields and controls consistent.
+            if exists {
+                s.core
+                    .delete_header_footer_native(section, header, apply)
+                    .map_err(err)?;
             }
+            s.core
+                .create_header_footer_native(section, header, apply)
+                .map_err(err)?;
             if !text.is_empty() {
                 s.core
                     .insert_text_in_header_footer_native(section, header, apply, 0, 0, &text)
@@ -1219,5 +1564,452 @@ impl Session {
             "paragraphsKept": report.kept,
             "paragraphsRemoved": report.removed,
         }))
+    }
+}
+
+// ----- 0.14: 쪽 여백 사전 값 · 구역 이동 · 쪽 복사/붙이기/지우기 · 문서 끼워 넣기 · 블록 저장 -----
+
+/// Hangul's 쪽 여백 gallery, in its order: id, label, [top, bottom, left, right, header,
+/// footer] in millimetres. The gutter and paper keep their current values.
+pub const MARGIN_PRESETS: &[(&str, &str, [f64; 6])] = &[
+    ("default", "기본", [20.0, 15.0, 30.0, 30.0, 15.0, 15.0]),
+    (
+        "narrow1_hf",
+        "좁게1(머리말/꼬리말 여백포함)",
+        [15.0, 15.0, 20.0, 20.0, 10.0, 10.0],
+    ),
+    (
+        "narrow2_hf",
+        "좁게2(머리말/꼬리말 여백포함)",
+        [5.0, 5.0, 10.0, 10.0, 10.0, 10.0],
+    ),
+    (
+        "wide_hf",
+        "넓게(머리말/꼬리말 여백포함)",
+        [35.0, 35.0, 40.0, 40.0, 10.0, 10.0],
+    ),
+    ("narrow", "좁게", [10.0, 10.0, 10.0, 10.0, 0.0, 0.0]),
+    ("wide", "넓게", [35.0, 35.0, 40.0, 40.0, 0.0, 0.0]),
+];
+
+fn margin_presets_json() -> Value {
+    Value::Array(
+        MARGIN_PRESETS
+            .iter()
+            .map(|(id, label, m)| {
+                json!({"preset": id, "label": label, "topMm": m[0], "bottomMm": m[1],
+                    "leftMm": m[2], "rightMm": m[3], "headerMm": m[4], "footerMm": m[5]})
+            })
+            .collect(),
+    )
+}
+
+/// 1-based page for CLI/MCP callers; `None` means the caret's page.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct PageTarget {
+    #[serde(default)]
+    page: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InsertFile {
+    path: std::path::PathBuf,
+    /// Password of the inserted document, if it is protected.
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// The copied page (Hangul puts it on the system clipboard; HwpCraft keeps it per process so
+/// the CLI, MCP and desktop sessions share one 쪽 클립보드). Never written to disk.
+static PAGE_CLIPBOARD: std::sync::Mutex<Option<Document>> = std::sync::Mutex::new(None);
+
+fn page_clipboard() -> std::sync::MutexGuard<'static, Option<Document>> {
+    match PAGE_CLIPBOARD.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// `Document` holding only `range` of section `sec` of `doc`, with the format tables kept so
+/// `paste_foreign_document_native` can remap them.
+fn excerpt(doc: &Document, sec: usize, range: std::ops::Range<usize>) -> Result<Document> {
+    let section = doc
+        .sections
+        .get(sec)
+        .ok_or_else(|| anyhow!("구역 {}이 없습니다.", sec + 1))?;
+    let paragraphs = section
+        .paragraphs
+        .get(range)
+        .ok_or_else(|| anyhow!("문단 범위를 읽지 못했습니다."))?
+        .to_vec();
+    let mut copy = section.clone();
+    copy.paragraphs = paragraphs;
+    copy.raw_stream = None;
+    copy.raw_provenance = None;
+    let mut foreign = doc.clone();
+    foreign.sections = vec![copy];
+    Ok(foreign)
+}
+
+fn usize_field(v: &Value, key: &str) -> Result<usize> {
+    v[key]
+        .as_u64()
+        .and_then(|x| usize::try_from(x).ok())
+        .ok_or_else(|| anyhow!("RHWP 응답에 {key}가 없습니다: {v}"))
+}
+
+impl Session {
+    fn apply_margin_preset(&mut self, preset: &str) -> Result<Value> {
+        let Some((_, label, m)) = MARGIN_PRESETS.iter().find(|(id, _, _)| *id == preset) else {
+            let ids: Vec<&str> = MARGIN_PRESETS.iter().map(|(id, _, _)| *id).collect();
+            bail!(
+                "쪽 여백 사전 값은 {} 중 하나입니다: {preset}",
+                ids.join(", ")
+            );
+        };
+        let mut setup = self.page_setup()?;
+        setup.top_mm = m[0];
+        setup.bottom_mm = m[1];
+        setup.left_mm = m[2];
+        setup.right_mm = m[3];
+        setup.header_mm = m[4];
+        setup.footer_mm = m[5];
+        self.execute(Command::PageSetup(setup.clone()))?;
+        Ok(json!({"preset": preset, "label": label, "setup": setup}))
+    }
+
+    /// Hangul SectionToNext/SectionToPrev: caret to the first paragraph of the neighbouring
+    /// section.
+    fn move_section(&mut self, next: bool) -> Result<Value> {
+        let count = self.core.document().sections.len();
+        let current = self.cursor.section;
+        let target = if next {
+            current + 1
+        } else {
+            current.wrapping_sub(1)
+        };
+        if target >= count {
+            bail!(if next {
+                "마지막 구역입니다."
+            } else {
+                "첫 구역입니다."
+            });
+        }
+        self.select(
+            Cursor {
+                section: target,
+                paragraph: 0,
+                offset: 0,
+                cell: None,
+            },
+            false,
+        )?;
+        Ok(json!({"section": target + 1, "sections": count}))
+    }
+
+    /// 0-based page: the caller's 1-based `page`, else the caret's page.
+    fn page_target(&self, page: Option<u32>) -> Result<u32> {
+        let count = self.core.page_count();
+        match page {
+            Some(0) => bail!("쪽 번호는 1부터입니다."),
+            Some(p) if p > count => bail!("{p}쪽은 범위(1–{count})를 벗어났습니다."),
+            Some(p) => Ok(p - 1),
+            None => {
+                let caret = self.caret()?;
+                let page = caret["pageIndex"].as_u64().unwrap_or(0);
+                Ok(u32::try_from(page)
+                    .unwrap_or(0)
+                    .min(count.saturating_sub(1)))
+            }
+        }
+    }
+
+    /// (section, first paragraph) of a 0-based page from RHWP's pagination.
+    fn page_start(&self, page: u32) -> Result<(usize, usize)> {
+        let v: Value = serde_json::from_str(
+            &self
+                .core
+                .get_position_of_page_native(page as usize)
+                .map_err(err)?,
+        )?;
+        Ok((usize_field(&v, "sec")?, usize_field(&v, "para")?))
+    }
+
+    /// Paragraphs that start on `page` and end before the next page starts, as
+    /// `(section, range)`. The range is empty when one paragraph covers the whole page.
+    fn page_paragraphs(&self, page: u32) -> Result<(usize, std::ops::Range<usize>)> {
+        let (sec, first) = self.page_start(page)?;
+        let total = self
+            .core
+            .document()
+            .sections
+            .get(sec)
+            .map_or(0, |s| s.paragraphs.len());
+        let end = if page + 1 < self.core.page_count() {
+            match self.page_start(page + 1)? {
+                (s, p) if s == sec => p.min(total),
+                _ => total,
+            }
+        } else {
+            total
+        };
+        Ok((sec, first..end.max(first)))
+    }
+
+    fn text_len(&self, section: usize, paragraph: usize) -> Result<usize> {
+        Ok(self
+            .paragraph(Cursor {
+                section,
+                paragraph,
+                offset: 0,
+                cell: None,
+            })?
+            .text
+            .chars()
+            .count())
+    }
+
+    /// Hangul CopyPage: the page's paragraphs go to the 쪽 클립보드 (paragraph granularity:
+    /// a paragraph that starts on an earlier page stays out).
+    fn copy_page(&mut self, page: Option<u32>) -> Result<Value> {
+        let page = self.page_target(page)?;
+        let (sec, range) = self.page_paragraphs(page)?;
+        let range = if range.is_empty() {
+            range.start..range.start + 1
+        } else {
+            range
+        };
+        let foreign = excerpt(self.core.document(), sec, range.clone())?;
+        *page_clipboard() = Some(foreign);
+        Ok(json!({"page": page + 1, "paragraphs": range.len()}))
+    }
+
+    /// Hangul PastePage: the copied page becomes a new page right after the current one and
+    /// the caret lands at the end of the pasted content (observed behaviour).
+    fn paste_page(&mut self, page: Option<u32>) -> Result<Value> {
+        let foreign = page_clipboard()
+            .clone()
+            .ok_or_else(|| anyhow!("복사한 쪽이 없습니다. 먼저 쪽 복사하기를 실행하세요."))?;
+        let count: usize = foreign.sections.iter().map(|s| s.paragraphs.len()).sum();
+        let page = self.page_target(page)?;
+        let (sec, range) = self.page_paragraphs(page)?;
+        let last = range.end.max(range.start + 1) - 1;
+        let len = self.text_len(sec, last)?;
+        let mut end = Cursor::default();
+        self.transaction(|s| {
+            let split = s.split_offset(Cursor {
+                section: sec,
+                paragraph: last,
+                offset: len,
+                cell: None,
+            })?;
+            s.core
+                .insert_page_break_native(sec, last, split)
+                .map_err(err)?;
+            let r: Value = serde_json::from_str(
+                &s.core
+                    .paste_foreign_document_native(sec, last + 1, 0, foreign)
+                    .map_err(err)?,
+            )?;
+            if r["ok"] != true {
+                bail!("쪽을 붙이지 못했습니다: {}", r["error"]);
+            }
+            let paragraph = usize_field(&r, "paraIdx")?;
+            let offset = usize_field(&r, "charOffset")?.min(s.text_len(sec, paragraph)?);
+            end = Cursor {
+                section: sec,
+                paragraph,
+                offset,
+                cell: None,
+            };
+            s.cursor = end;
+            s.anchor = None;
+            s.span_anchor = None;
+            Ok(())
+        })?;
+        Ok(json!({
+            "afterPage": page + 1,
+            "paragraphs": count,
+            "pages": self.core.page_count(),
+            "cursor": end,
+        }))
+    }
+
+    /// Hangul DeleteCurrentPage: remove the paragraphs of the current page so the following
+    /// pages move up. The section's first paragraph is emptied instead of removed because it
+    /// carries the section definition and RHWP keeps at least one paragraph per section.
+    fn delete_page(&mut self, page: Option<u32>) -> Result<Value> {
+        let page = self.page_target(page)?;
+        if self.core.page_count() <= 1 {
+            bail!("쪽이 하나뿐인 문서에서는 쪽을 지울 수 없습니다.");
+        }
+        let (sec, range) = self.page_paragraphs(page)?;
+        if range.is_empty() {
+            bail!(
+                "한 문단이 여러 쪽에 걸쳐 있어 이 쪽만 지울 수 없습니다. 문단 안에서 범위를 선택해 지우세요."
+            );
+        }
+        let removed = range.len();
+        self.transaction(|s| {
+            let keep_first = range.start == 0;
+            let from = if keep_first { 1 } else { range.start };
+            for i in (from..range.end).rev() {
+                if s.core.document().sections[sec].paragraphs.len() > 1 {
+                    s.core.delete_paragraph_native(sec, i).map_err(err)?;
+                }
+            }
+            if keep_first {
+                let remaining = s.core.document().sections[sec].paragraphs.len();
+                let len = s.text_len(sec, 0)?;
+                if remaining > 1 {
+                    // Merge the next page's first paragraph into the emptied first one.
+                    s.core
+                        .delete_range_native(sec, 0, 0, 1, 0, None)
+                        .map_err(err)?;
+                } else if len > 0 {
+                    s.core
+                        .delete_range_native(sec, 0, 0, 0, len, None)
+                        .map_err(err)?;
+                }
+            }
+            let remaining = s.core.document().sections[sec].paragraphs.len();
+            s.cursor = Cursor {
+                section: sec,
+                paragraph: range.start.min(remaining.saturating_sub(1)),
+                offset: 0,
+                cell: None,
+            };
+            s.anchor = None;
+            s.span_anchor = None;
+            Ok(())
+        })?;
+        Ok(json!({"page": page + 1, "paragraphsRemoved": removed, "pages": self.core.page_count()}))
+    }
+
+    /// Hangul 문서 끼워 넣기 (FileInsertionDlg): the other document's body goes in at the caret
+    /// with its fonts, styles and pictures merged into this document's tables.
+    fn insert_file(&mut self, p: &InsertFile) -> Result<Value> {
+        self.require_body()?;
+        let core = match p.password.as_deref() {
+            Some(password) => hwpcraft_formats::open_with_password(&p.path, password),
+            None => hwpcraft_formats::open(&p.path),
+        }?;
+        let foreign = core.document().clone();
+        let count: usize = foreign.sections.iter().map(|s| s.paragraphs.len()).sum();
+        let c = self.cursor;
+        let mut end = c;
+        self.transaction(|s| {
+            let split = s.split_offset(c)?;
+            let r: Value = serde_json::from_str(
+                &s.core
+                    .paste_foreign_document_native(c.section, c.paragraph, split, foreign)
+                    .map_err(err)?,
+            )?;
+            if r["ok"] != true {
+                bail!("문서를 끼워 넣지 못했습니다: {}", r["error"]);
+            }
+            let paragraph = usize_field(&r, "paraIdx")?;
+            let offset = usize_field(&r, "charOffset")?.min(s.text_len(c.section, paragraph)?);
+            end = Cursor {
+                section: c.section,
+                paragraph,
+                offset,
+                cell: None,
+            };
+            s.cursor = end;
+            s.anchor = None;
+            s.span_anchor = None;
+            Ok(())
+        })?;
+        Ok(json!({
+            "path": p.path,
+            "paragraphs": count,
+            "pages": self.core.page_count(),
+            "cursor": end,
+        }))
+    }
+
+    /// Hangul SaveBlock: only the selected body text (one or more paragraphs) goes to a new
+    /// file. The open document, cursor and history are untouched.
+    fn save_block(&mut self, path: &Path) -> Result<Value> {
+        if !self.has_selection() {
+            bail!("저장할 블록을 먼저 선택하세요.");
+        }
+        if self.cursor.cell.is_some() {
+            bail!("표 밖 본문의 블록만 저장할 수 있습니다.");
+        }
+        if !matches!(
+            path.extension()
+                .and_then(|x| x.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("hwp" | "hwpx" | "pdf" | "txt")
+        ) {
+            bail!("블록 저장 형식: HWP, HWPX, PDF, TXT");
+        }
+        let (start, end) = match self.span() {
+            Some(span) => span,
+            None => {
+                let r = self.selection();
+                (
+                    Cursor {
+                        offset: r.start,
+                        ..self.cursor
+                    },
+                    Cursor {
+                        offset: r.end,
+                        ..self.cursor
+                    },
+                )
+            }
+        };
+        let foreign = excerpt(
+            self.core.document(),
+            start.section,
+            start.paragraph..end.paragraph + 1,
+        )?;
+        let span = end.paragraph - start.paragraph;
+        let mut out = blank()?;
+        let r: Value = serde_json::from_str(
+            &out.paste_foreign_document_native(0, 0, 0, foreign)
+                .map_err(err)?,
+        )?;
+        if r["ok"] != true {
+            bail!("블록을 옮기지 못했습니다: {}", r["error"]);
+        }
+        let last = usize_field(&r, "paraIdx")?;
+        let first = last.saturating_sub(span);
+        let chars = |doc: &DocumentCore, i: usize| {
+            doc.document().sections[0]
+                .paragraphs
+                .get(i)
+                .map_or(0, |p| p.text.chars().count())
+        };
+        // Trim the tail, then the head, then drop whatever the blank document left behind.
+        let tail = chars(&out, last);
+        if end.offset < tail {
+            out.delete_range_native(0, last, end.offset, last, tail, None)
+                .map_err(err)?;
+        }
+        if start.offset > 0 {
+            out.delete_range_native(0, first, 0, first, start.offset, None)
+                .map_err(err)?;
+        }
+        while out.document().sections[0].paragraphs.len() > last + 1 {
+            out.delete_paragraph_native(0, last + 1).map_err(err)?;
+        }
+        for _ in 0..first {
+            // Leading blank paragraphs: fold them into the first kept one.
+            out.delete_range_native(0, 0, 0, 1, 0, None).map_err(err)?;
+        }
+        hwpcraft_formats::save(&out, path)?;
+        let text: Vec<String> = out.document().sections[0]
+            .paragraphs
+            .iter()
+            .map(|p| p.text.clone())
+            .collect();
+        Ok(json!({"path": path, "paragraphs": text.len(), "text": text.join("\n")}))
     }
 }

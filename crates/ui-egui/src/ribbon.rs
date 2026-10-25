@@ -137,7 +137,32 @@ const SHAPES: &[(Icon, &str, Action)] = &[
     (
         Icon::Connector,
         "직선 연결선",
-        A::Ext("insert.shape.connector"),
+        A::Ext("insert.shape.connector.straight"),
+    ),
+    (
+        Icon::Connector,
+        "직선 화살표 연결선",
+        A::Ext("insert.shape.connector.straight_arrow"),
+    ),
+    (
+        Icon::Connector,
+        "직선 양쪽 화살표 연결선",
+        A::Ext("insert.shape.connector.straight_both"),
+    ),
+    (
+        Icon::Connector,
+        "꺾인 연결선",
+        A::Ext("insert.shape.connector.stroke"),
+    ),
+    (
+        Icon::Connector,
+        "꺾인 화살표 연결선",
+        A::Ext("insert.shape.connector.stroke_arrow"),
+    ),
+    (
+        Icon::Connector,
+        "꺾인 양쪽 화살표 연결선",
+        A::Ext("insert.shape.connector.stroke_both"),
     ),
 ];
 
@@ -179,7 +204,7 @@ const EDIT: &[Item] = &[
     Sep,
     Big(Icon::Portrait, "세로", A::Portrait, false),
     Big(Icon::Landscape, "가로", A::Landscape, false),
-    Big(Icon::PageMargins, "쪽\n여백", A::Page, true),
+    Item::Menu(Icon::PageMargins, "쪽\n여백", MARGIN_MENU),
     Big(Icon::MasterPage, "바탕쪽", A::Ext("page.master"), false),
     Big(Icon::Columns, "단", A::Columns, true),
     Sep,
@@ -213,10 +238,51 @@ const EDIT: &[Item] = &[
         A::Ext("object.lock"),
         true,
     ),
+    Big(
+        Icon::ObjectProtect,
+        "보호 모두\n해제",
+        A::Ext("object.unlock_all"),
+        false,
+    ),
     Sep,
-    Big(Icon::Find, "찾기", A::Find, true),
+    Item::Menu(
+        Icon::Find,
+        "찾기",
+        &[
+            ("찾기", A::Find),
+            ("찾아 바꾸기", A::Replace),
+            ("이동", A::Ext("edit.goto")),
+        ],
+    ),
     Big(Icon::Replace, "글자\n바꾸기", A::Replace, true),
     Big(Icon::Sort, "정렬", A::Ext("edit.sort"), false),
+];
+/// Hangul 쪽 여백 gallery (measured values live in the engine's `page.margins.preset`).
+const MARGIN_MENU: &[(&str, Action)] = &[
+    ("기본", A::Ext("page.margins.default")),
+    (
+        "좁게1 (머리말/꼬리말 여백 포함)",
+        A::Ext("page.margins.narrow1_hf"),
+    ),
+    (
+        "좁게2 (머리말/꼬리말 여백 포함)",
+        A::Ext("page.margins.narrow2_hf"),
+    ),
+    (
+        "넓게 (머리말/꼬리말 여백 포함)",
+        A::Ext("page.margins.wide_hf"),
+    ),
+    ("좁게", A::Ext("page.margins.narrow")),
+    ("넓게", A::Ext("page.margins.wide")),
+    ("쪽 여백 설정(A)...", A::Page),
+];
+/// Hangul 문서 보기 색 (screen only).
+const VIEW_COLOR_MENU: &[(&str, Action)] = &[
+    ("기본", A::Ext("view.color.light")),
+    ("어둡게", A::Ext("view.color.dark")),
+    ("고대비", A::Ext("view.color.highcontrast")),
+    ("옛 한글", A::Ext("view.color.oldhwp")),
+    ("사용자 설정...", A::Ext("view.color.custom")),
 ];
 const VIEW: &[Item] = &[
     Big(
@@ -225,12 +291,7 @@ const VIEW: &[Item] = &[
         A::Ext("view.page_outline"),
         false,
     ),
-    Big(
-        Icon::ViewColor,
-        "문서\n보기 색",
-        A::Ext("view.color_mode"),
-        true,
-    ),
+    Item::Menu(Icon::ViewColor, "문서\n보기 색", VIEW_COLOR_MENU),
     Sep,
     Checks(&[
         ("문단 부호", A::Ext("view.paragraph_marks")),
@@ -333,12 +394,34 @@ const INSERT: &[Item] = &[
     ),
     Big(Icon::Field, "누름틀", A::Ext("insert.field"), false),
     Sep,
+    Item::Menu(Icon::NewNumber, "번호\n넣기", AUTO_NUMBER),
     Big(
         Icon::Footnote,
         "각주",
         A::Or("insert.footnote", &A::Note(false)),
         false,
     ),
+    Item::Menu(Icon::Footnote, "각주/미주\n모양", NOTE_SHAPE),
+    Stack(&[
+        &[T(
+            Icon::Endnote,
+            "각주↔미주 변환",
+            A::Ext("note.convert"),
+            false,
+        )],
+        &[T(
+            Icon::CtrlMarkDelete,
+            "주석 지우기",
+            A::Ext("note.delete"),
+            false,
+        )],
+        &[T(
+            Icon::Field,
+            "누름틀 지우기",
+            A::Ext("field.delete"),
+            false,
+        )],
+    ]),
     Big(
         Icon::Endnote,
         "미주",
@@ -392,6 +475,32 @@ const INSERT: &[Item] = &[
         )],
         &[T(Icon::Hanja, "한자 입력", A::Ext("insert.hanja"), true)],
     ]),
+    Big(
+        Icon::Character,
+        "글자\n겹치기",
+        A::Ext("format.char_overlap.dialog"),
+        false,
+    ),
+    Item::Menu(
+        Icon::VTextbox,
+        "세로\n글상자",
+        &[
+            ("세로 글상자 (영문 눕힘)", A::Ext("insert.shape.vtextbox")),
+            (
+                "세로 글상자 (영문 세움)",
+                A::Ext("insert.shape.vtextbox_all"),
+            ),
+        ],
+    ),
+    Item::Menu(
+        Icon::Bookmark,
+        "상용구",
+        &[
+            ("상용구 내용 (Ctrl+F3)", A::Ext("tools.autotext")),
+            ("상용구 등록", A::Ext("tools.autotext.register")),
+            ("상용구 바로 넣기 (Alt+I)", A::Ext("tools.autotext.expand")),
+        ],
+    ),
 ];
 const ALIGN_MENU: Item = Item::Menu(
     Icon::Justify,
@@ -436,6 +545,8 @@ const FORMAT: &[Item] = &[
             W("format.font_lang", 91.0),
             W("format.font_face", 118.0),
             W("format.font_size", 106.0),
+            I(Icon::Prev, "이전 글꼴", A::Ext("format.font.prev"), false),
+            I(Icon::Next, "다음 글꼴", A::Ext("format.font.next"), false),
         ],
         &[
             W("format.bold", 23.0),
@@ -454,9 +565,16 @@ const FORMAT: &[Item] = &[
                 A::Ext("format.superscript"),
                 false,
             ),
+            I(
+                Icon::Superscript,
+                "위 첨자/아래 첨자 순환",
+                A::Ext("format.superscript.cycle"),
+                false,
+            ),
             W("format.char_border", 39.0),
             W("format.highlight", 39.0),
             W("format.text_color", 39.0),
+            W("format.shade_color", 39.0),
             I(
                 Icon::SpacingNarrow,
                 "글자 자간 좁게",
@@ -513,7 +631,27 @@ const FORMAT: &[Item] = &[
                 A::Ext("format.indent.negative"),
                 false,
             ),
+            I(
+                Icon::IndentFirst,
+                "현재 위치로 들여쓰기",
+                A::Ext("format.indent.at_caret"),
+                false,
+            ),
         ],
+    ]),
+    Stack(&[
+        &[I(
+            Icon::Prev,
+            "문단 위로",
+            A::Ext("format.paragraph.up"),
+            false,
+        )],
+        &[I(
+            Icon::Next,
+            "문단 아래로",
+            A::Ext("format.paragraph.down"),
+            false,
+        )],
     ]),
     Sep,
     Item::Custom(
@@ -560,7 +698,7 @@ const PAGE: &[Item] = &[
     Big(Icon::PageSetup, "편집\n용지", A::Page, false),
     Big(Icon::Portrait, "세로", A::Portrait, false),
     Big(Icon::Landscape, "가로", A::Landscape, false),
-    Big(Icon::PageMargins, "쪽\n여백", A::Page, true),
+    Item::Menu(Icon::PageMargins, "쪽\n여백", MARGIN_MENU),
     Sep,
     Big(
         Icon::TextDirection,
@@ -818,12 +956,7 @@ const TOOLS: &[Item] = &[
         A::Ext("tools.autocorrect"),
         true,
     ),
-    Big(
-        Icon::Dictionary,
-        "사전",
-        A::Ext("tools.dictionary"),
-        false,
-    ),
+    Big(Icon::Dictionary, "사전", A::Ext("tools.dictionary"), false),
     Sep,
     Big(Icon::Translate, "번역", A::Ext("tools.translate"), true),
     Sep,
@@ -883,6 +1016,20 @@ const TABLE_DESIGN: &[Item] = &[
         A::Ext("table.cell_border_fill"),
         true,
     ),
+    Stack(&[
+        &[T(
+            Icon::Highlight,
+            "음영 어둡게",
+            A::Ext("table.cell_shade.darker"),
+            false,
+        )],
+        &[T(
+            Icon::Highlight,
+            "음영 밝게",
+            A::Ext("table.cell_shade.lighter"),
+            false,
+        )],
+    ]),
     Sep,
     Big(Icon::Table, "표마당", A::Ext("table.style"), true),
     Big(Icon::Table, "표\n그리기", A::Ext("table.draw"), false),
@@ -1083,6 +1230,7 @@ const TABLE_LAYOUT: &[Item] = &[
         A::Ext("table.cell_block"),
         false,
     ),
+    Item::Menu(Icon::CellBlock, "셀\n이동", CELL_MOVE),
     Big(
         Icon::FitTable,
         "본문 폭에\n축소",
@@ -1091,7 +1239,14 @@ const TABLE_LAYOUT: &[Item] = &[
     ),
     Sep,
     Big(Icon::Sort, "정렬", A::Ext("table.sort"), false),
-    Big(Icon::Numbering, "채우기", A::Ext("table.auto_fill"), true),
+    Item::Menu(
+        Icon::Numbering,
+        "채우기",
+        &[
+            ("자동 채우기", A::Ext("table.auto_fill")),
+            ("사용자 정의 자동 채우기", A::Ext("table.auto_fill_user")),
+        ],
+    ),
     Big(
         Icon::Paragraph,
         "표를\n문자열로",
@@ -1113,6 +1268,167 @@ const ROTATE: &[(&str, Action)] = &[
     ("좌우 대칭", A::Ext("object.flip.horizontal")),
     ("상하 대칭", A::Ext("object.flip.vertical")),
 ];
+/// 표 레이아웃 셀 이동 (table-object area).
+const CELL_MOVE: &[(&str, Action)] = &[
+    ("왼쪽 셀", A::Ext("table.cell_move.left")),
+    ("오른쪽 셀", A::Ext("table.cell_move.right")),
+    ("위 셀", A::Ext("table.cell_move.up")),
+    ("아래 셀", A::Ext("table.cell_move.down")),
+    ("줄의 첫 셀", A::Ext("table.cell_move.row_begin")),
+    ("줄의 끝 셀", A::Ext("table.cell_move.row_end")),
+    ("칸의 첫 셀", A::Ext("table.cell_move.col_top")),
+    ("칸의 끝 셀", A::Ext("table.cell_move.col_bottom")),
+];
+const OBJECT_ALIGN: &[(&str, Action)] = &[
+    ("왼쪽 맞춤", A::Ext("object.align.left")),
+    ("가운데 맞춤", A::Ext("object.align.center")),
+    ("오른쪽 맞춤", A::Ext("object.align.right")),
+    ("위쪽 맞춤", A::Ext("object.align.top")),
+    ("중간 맞춤", A::Ext("object.align.middle")),
+    ("아래쪽 맞춤", A::Ext("object.align.bottom")),
+    ("같은 너비", A::Ext("object.align.same_width")),
+    ("같은 높이", A::Ext("object.align.same_height")),
+    ("같은 크기", A::Ext("object.align.same_size")),
+    ("가로 간격을 동일하게", A::Ext("object.align.space_h")),
+    ("세로 간격을 동일하게", A::Ext("object.align.space_v")),
+];
+const OUTER_MARGIN: &[(&str, Action)] = &[
+    ("없음", A::Ext("object.outer_margin.none")),
+    ("좁게", A::Ext("object.outer_margin.narrow")),
+    ("보통", A::Ext("object.outer_margin.normal")),
+    ("넓게", A::Ext("object.outer_margin.wide")),
+];
+const FILL_COLORS: &[(&str, Action)] = &[
+    ("검정", A::Ext("object.style.fill.black")),
+    ("흰색", A::Ext("object.style.fill.white")),
+    ("빨강", A::Ext("object.style.fill.red")),
+    ("주황", A::Ext("object.style.fill.orange")),
+    ("노랑", A::Ext("object.style.fill.yellow")),
+    ("초록", A::Ext("object.style.fill.green")),
+    ("파랑", A::Ext("object.style.fill.blue")),
+    ("보라", A::Ext("object.style.fill.purple")),
+    ("회색", A::Ext("object.style.fill.gray")),
+    ("채우기 없음", A::Ext("object.style.fill.none")),
+];
+const OUTLINE_COLORS: &[(&str, Action)] = &[
+    ("검정", A::Ext("object.style.outline.black")),
+    ("흰색", A::Ext("object.style.outline.white")),
+    ("빨강", A::Ext("object.style.outline.red")),
+    ("주황", A::Ext("object.style.outline.orange")),
+    ("노랑", A::Ext("object.style.outline.yellow")),
+    ("초록", A::Ext("object.style.outline.green")),
+    ("파랑", A::Ext("object.style.outline.blue")),
+    ("보라", A::Ext("object.style.outline.purple")),
+    ("회색", A::Ext("object.style.outline.gray")),
+    ("선 없음", A::Ext("object.style.outline.none")),
+];
+const DASHES: &[(&str, Action)] = &[
+    ("없음", A::Ext("object.style.dash.0")),
+    ("실선", A::Ext("object.style.dash.1")),
+    ("긴 점선", A::Ext("object.style.dash.2")),
+    ("점선", A::Ext("object.style.dash.3")),
+    ("일점 쇄선", A::Ext("object.style.dash.4")),
+    ("이점 쇄선", A::Ext("object.style.dash.5")),
+    ("긴 파선", A::Ext("object.style.dash.6")),
+    ("원형 점선", A::Ext("object.style.dash.7")),
+    ("이중 실선", A::Ext("object.style.dash.8")),
+    ("얇고 굵은 이중선", A::Ext("object.style.dash.9")),
+    ("굵고 얇은 이중선", A::Ext("object.style.dash.10")),
+    ("삼중선", A::Ext("object.style.dash.11")),
+    ("물결", A::Ext("object.style.dash.12")),
+    ("이중 물결", A::Ext("object.style.dash.13")),
+    ("두꺼운 3D", A::Ext("object.style.dash.14")),
+    ("두꺼운 3D(역)", A::Ext("object.style.dash.15")),
+    ("3D 단선", A::Ext("object.style.dash.16")),
+    ("3D 단선(역)", A::Ext("object.style.dash.17")),
+];
+const PEN_WIDTHS: &[(&str, Action)] = &[
+    ("0.1 mm", A::Ext("object.style.pen.0.1")),
+    ("0.25 mm", A::Ext("object.style.pen.0.25")),
+    ("0.5 mm", A::Ext("object.style.pen.0.5")),
+    ("1 mm", A::Ext("object.style.pen.1")),
+    ("2 mm", A::Ext("object.style.pen.2")),
+    ("3 mm", A::Ext("object.style.pen.3")),
+];
+const ARROW_END: &[(&str, Action)] = &[
+    ("모양 없음", A::Ext("object.style.arrow_end.0")),
+    ("화살", A::Ext("object.style.arrow_end.1")),
+    ("오목 화살", A::Ext("object.style.arrow_end.2")),
+    ("속 빈 다이아몬드", A::Ext("object.style.arrow_end.3")),
+    ("속 빈 원", A::Ext("object.style.arrow_end.4")),
+    ("속 빈 사각", A::Ext("object.style.arrow_end.5")),
+    ("다이아몬드", A::Ext("object.style.arrow_end.6")),
+    ("원", A::Ext("object.style.arrow_end.7")),
+    ("사각", A::Ext("object.style.arrow_end.8")),
+];
+const ARROW_START: &[(&str, Action)] = &[
+    ("모양 없음", A::Ext("object.style.arrow_start.0")),
+    ("화살", A::Ext("object.style.arrow_start.1")),
+    ("오목 화살", A::Ext("object.style.arrow_start.2")),
+    ("속 빈 다이아몬드", A::Ext("object.style.arrow_start.3")),
+    ("속 빈 원", A::Ext("object.style.arrow_start.4")),
+    ("속 빈 사각", A::Ext("object.style.arrow_start.5")),
+    ("다이아몬드", A::Ext("object.style.arrow_start.6")),
+    ("원", A::Ext("object.style.arrow_start.7")),
+    ("사각", A::Ext("object.style.arrow_start.8")),
+];
+const SHADOW: &[(&str, Action)] = &[
+    ("그림자 넣기", A::Ext("object.shadow.on")),
+    ("없음", A::Ext("object.shadow.none")),
+    ("왼쪽으로 이동", A::Ext("object.shadow.left")),
+    ("오른쪽으로 이동", A::Ext("object.shadow.right")),
+    ("위로 이동", A::Ext("object.shadow.up")),
+    ("아래로 이동", A::Ext("object.shadow.down")),
+    ("원래대로", A::Ext("object.shadow.reset")),
+];
+const CONNECTOR_TYPE: &[(&str, Action)] = &[
+    ("직선", A::Ext("object.connector_type.straight")),
+    ("꺾인 선", A::Ext("object.connector_type.stroke")),
+    ("곡선", A::Ext("object.connector_type.arc")),
+];
+const TEXTBOX_ALIGN: &[(&str, Action)] = &[
+    ("왼쪽 위", A::Ext("textbox.align.left_top")),
+    ("가운데 위", A::Ext("textbox.align.center_top")),
+    ("오른쪽 위", A::Ext("textbox.align.right_top")),
+    ("왼쪽 중간", A::Ext("textbox.align.left_center")),
+    ("가운데 중간", A::Ext("textbox.align.center_center")),
+    ("오른쪽 중간", A::Ext("textbox.align.right_center")),
+    ("왼쪽 아래", A::Ext("textbox.align.left_bottom")),
+    ("가운데 아래", A::Ext("textbox.align.center_bottom")),
+    ("오른쪽 아래", A::Ext("textbox.align.right_bottom")),
+];
+const TEXTBOX_DIRECTION: &[(&str, Action)] = &[
+    ("가로쓰기", A::Ext("textbox.direction.horizontal")),
+    ("세로쓰기 (영문 눕힘)", A::Ext("textbox.direction.vertical")),
+    (
+        "세로쓰기 (영문 세움)",
+        A::Ext("textbox.direction.vertical_all"),
+    ),
+];
+const TEXTBOX_MARGIN: &[(&str, Action)] = &[
+    ("없음", A::Ext("textbox.margin.none")),
+    ("좁게", A::Ext("textbox.margin.narrow")),
+    ("보통", A::Ext("textbox.margin.normal")),
+    ("넓게", A::Ext("textbox.margin.wide")),
+];
+const RECOLOR: &[(&str, Action)] = &[
+    ("원래 색", A::Ext("picture.recolor.original")),
+    ("회색조", A::Ext("picture.recolor.grayscale")),
+    ("흑백", A::Ext("picture.recolor.black_white")),
+    ("워터마크", A::Ext("picture.recolor.watermark")),
+];
+const AUTO_NUMBER: &[(&str, Action)] = &[
+    ("쪽 번호", A::Ext("insert.auto_number.page")),
+    ("전체 쪽수", A::Ext("insert.auto_number.total")),
+    ("그림 번호", A::Ext("insert.auto_number.picture")),
+    ("표 번호", A::Ext("insert.auto_number.table")),
+    ("수식 번호", A::Ext("insert.auto_number.equation")),
+];
+const NOTE_SHAPE: &[(&str, Action)] = &[
+    ("각주/미주 모양", A::Ext("note.shape")),
+    ("각주 모양", A::Ext("note.shape.footnote")),
+    ("미주 모양", A::Ext("note.shape.endnote")),
+];
 const PICTURE: &[Item] = &[
     Big(
         Icon::Image,
@@ -1132,11 +1448,53 @@ const PICTURE: &[Item] = &[
     Item::Menu(Icon::Shape, "배치", PLACEMENT),
     Item::Menu(Icon::Windows, "회전", ROTATE),
     Sep,
+    Stack(&[
+        &[T(
+            Icon::Image,
+            "그림 파일로 저장",
+            A::Ext("picture.save"),
+            false,
+        )],
+        &[T(
+            Icon::Image,
+            "모든 그림 저장",
+            A::Ext("picture.save_all"),
+            false,
+        )],
+    ]),
+    Item::Menu(Icon::ViewColor, "색\n조정", RECOLOR),
+    Sep,
+    Item::Menu(Icon::AlignLeft, "맞춤", OBJECT_ALIGN),
+    Big(
+        Icon::ObjectProtect,
+        "크기\n고정",
+        A::Ext("object.protect_size"),
+        false,
+    ),
+    Item::Menu(Icon::PageMargins, "바깥\n여백", OUTER_MARGIN),
+    Stack(&[
+        &[T(
+            Icon::FormatCopy,
+            "모양 복사",
+            A::Ext("object.format.copy"),
+            false,
+        )],
+        &[T(
+            Icon::Paste,
+            "모양 붙이기",
+            A::Ext("object.format.paste"),
+            false,
+        )],
+    ]),
+    Stack(&[
+        &[T(Icon::Next, "다음 개체", A::Ext("object.next"), false)],
+        &[T(Icon::Prev, "이전 개체", A::Ext("object.prev"), false)],
+    ]),
+    Sep,
     Big(Icon::Reject, "지우기", A::Ext("object.delete"), false),
     Big(
         Icon::ObjectSelect,
-        "개체
-목록",
+        "개체\n목록",
         A::Or("object.list", &A::Objects),
         false,
     ),
@@ -1160,6 +1518,79 @@ const SHAPE: &[Item] = &[
     Item::Menu(Icon::Shape, "배치", PLACEMENT),
     Item::Menu(Icon::Windows, "회전", ROTATE),
     Sep,
+    Big(Icon::ObjectSelect, "묶기", A::Ext("object.group"), false),
+    Big(Icon::ObjectSelect, "풀기", A::Ext("object.ungroup"), false),
+    Stack(&[
+        &[
+            T(
+                Icon::LevelUp,
+                "맨 앞으로",
+                A::Ext("object.z_order.front"),
+                false,
+            ),
+            T(
+                Icon::LevelUp,
+                "앞으로",
+                A::Ext("object.z_order.forward"),
+                false,
+            ),
+        ],
+        &[
+            T(
+                Icon::LevelDown,
+                "맨 뒤로",
+                A::Ext("object.z_order.back"),
+                false,
+            ),
+            T(
+                Icon::LevelDown,
+                "뒤로",
+                A::Ext("object.z_order.backward"),
+                false,
+            ),
+        ],
+    ]),
+    Sep,
+    Item::Menu(Icon::Highlight, "채우기\n색", FILL_COLORS),
+    Item::Menu(Icon::TextColor, "선 색", OUTLINE_COLORS),
+    Item::Menu(Icon::Line, "선\n종류", DASHES),
+    Item::Menu(Icon::Line, "선\n굵기", PEN_WIDTHS),
+    Item::Menu(Icon::Arc, "끝\n화살표", ARROW_END),
+    Item::Menu(Icon::Arc, "시작\n화살표", ARROW_START),
+    Item::Menu(Icon::Shape, "그림자", SHADOW),
+    Item::Menu(Icon::Connector, "연결선\n종류", CONNECTOR_TYPE),
+    Sep,
+    Item::Menu(Icon::AlignCenter, "글상자\n정렬", TEXTBOX_ALIGN),
+    Item::Menu(Icon::TextDirection, "글자\n방향", TEXTBOX_DIRECTION),
+    Item::Menu(Icon::PageMargins, "글상자\n여백", TEXTBOX_MARGIN),
+    Sep,
+    Item::Menu(Icon::AlignLeft, "맞춤", OBJECT_ALIGN),
+    Big(
+        Icon::ObjectProtect,
+        "크기\n고정",
+        A::Ext("object.protect_size"),
+        false,
+    ),
+    Item::Menu(Icon::PageMargins, "바깥\n여백", OUTER_MARGIN),
+    Stack(&[
+        &[T(
+            Icon::FormatCopy,
+            "모양 복사",
+            A::Ext("object.format.copy"),
+            false,
+        )],
+        &[T(
+            Icon::Paste,
+            "모양 붙이기",
+            A::Ext("object.format.paste"),
+            false,
+        )],
+    ]),
+    Stack(&[
+        &[T(Icon::Next, "다음 개체", A::Ext("object.next"), false)],
+        &[T(Icon::Prev, "이전 개체", A::Ext("object.prev"), false)],
+    ]),
+    Sep,
     Big(Icon::Reject, "지우기", A::Ext("object.delete"), false),
     Big(
         Icon::ObjectSelect,
@@ -1174,10 +1605,15 @@ const FILE_MENU: &[Option<(&str, &str, Action)>] = &[
     Some(("새 문서", "Alt+N", A::New)),
     Some(("문서마당", "Ctrl+Alt+N", A::Ext("file.template"))),
     Some(("불러오기", "Alt+O", A::Open)),
+    Some(("끼워 넣기", "", A::Ext("file.insert"))),
     None,
     Some(("저장하기", "Alt+S", A::Save)),
     Some(("다른 이름으로 저장하기", "Alt+V", A::SaveAs)),
+    Some(("블록 저장하기", "", A::Ext("file.save_block"))),
     Some(("PDF로 저장하기", "", A::Pdf)),
+    Some(("그림 파일로 저장하기", "", A::Ext("file.save_picture"))),
+    Some(("HML로 저장하기", "", A::Ext("file.save_hml"))),
+    Some(("현재 쪽만 저장하기", "", A::Ext("file.save_pages"))),
     Some(("텍스트로 내보내기", "", A::Text)),
     None,
     Some(("문서 정보", "Ctrl+Q,I", A::Ext("file.doc_info"))),
@@ -1185,6 +1621,8 @@ const FILE_MENU: &[Option<(&str, &str, Action)>] = &[
     Some(("편집 용지", "F7", A::Page)),
     Some(("미리 보기", "", A::Ext("file.preview"))),
     Some(("인쇄", "Alt+P", A::Ext("file.print"))),
+    None,
+    Some(("최근 문서", "", A::Ext("file.recent"))),
     None,
     Some(("문서 닫기", "Ctrl+F4", A::New)),
     Some(("끝", "Alt+X", A::Ext("file.exit"))),
@@ -1233,6 +1671,9 @@ impl HwpApp {
             ("스타일", A::Or("format.style.dialog", &A::Styles)),
             ("하이퍼링크", A::Link),
             ("개체 목록", A::Or("object.list", &A::Objects)),
+            ("쪽 복사하기", A::Ext("page.copy")),
+            ("쪽 붙이기", A::Ext("page.paste")),
+            ("쪽 지우기", A::Ext("page.delete")),
         ];
         if self.session.cursor.cell.is_some() {
             items.extend([
@@ -1363,18 +1804,8 @@ impl HwpApp {
             }
             A::Objects => self.feature_dialog = Some(FeatureDialog::Object(ObjectDialog::Objects)),
             A::Styles => self.feature_dialog = Some(FeatureDialog::Object(ObjectDialog::Styles)),
-            A::Symbols => {
-                self.feature_dialog = Some(FeatureDialog::Object(ObjectDialog::Symbols {
-                    category: 0,
-                    text: String::new(),
-                }))
-            }
-            A::HeaderFooter(is_header) => {
-                let r = self.session.header_footer_text(is_header);
-                if let Some(text) = self.result(r) {
-                    self.feature_dialog = Some(FeatureDialog::HeaderFooter { is_header, text });
-                }
-            }
+            A::Symbols => self.open_symbol_dialog(),
+            A::HeaderFooter(is_header) => self.open_header_footer_editor(is_header, 0),
             A::PageNumber => {
                 self.run("insert.page_number", json!({}));
             }
@@ -1651,6 +2082,10 @@ impl HwpApp {
                 ui.separator();
                 continue;
             };
+            if matches!(action, A::Ext("file.recent")) {
+                self.recent_menu(ui, &ctx);
+                continue;
+            }
             let enabled = self.enabled(*action);
             let response = ui.add_enabled(
                 enabled,
@@ -1664,6 +2099,125 @@ impl HwpApp {
                 self.dispatch(*action, &ctx);
             }
         }
+    }
+    /// 최근 문서 (한글 파일 메뉴의 최근 문서 목록, 최대 9개).
+    fn recent_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let recent = self.ext.shell.recent.clone();
+        ui.add_enabled_ui(!recent.is_empty(), |ui| {
+            ui.menu_button("최근 문서", |ui| {
+                ui.set_min_width(320.0);
+                let mut open = None;
+                for (i, path) in recent.iter().enumerate() {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let label = format!("{} {name}", i + 1);
+                    if ui
+                        .add(
+                            egui::Button::new(label)
+                                .frame(false)
+                                .min_size(Vec2::new(300.0, 26.0)),
+                        )
+                        .on_hover_text(path.display().to_string())
+                        .clicked()
+                    {
+                        open = Some(i);
+                    }
+                }
+                if let Some(i) = open {
+                    ui.close();
+                    self.open_recent(i, ctx);
+                }
+            });
+        });
+    }
+    /// Run the ribbon item of the current tab that owns `id` (Alt key tips).
+    pub(crate) fn ribbon_keytip(&mut self, id: &str, ctx: &egui::Context) {
+        let Some((_, _, items)) = TABS.get(self.tab) else {
+            return;
+        };
+        let found = Self::tools(items)
+            .into_iter()
+            .map(|(_, _, action)| action)
+            .chain(SHAPES.iter().map(|(_, _, a)| *a))
+            .find(|action| Self::action_id(*action) == Some(id));
+        match found {
+            Some(action) if self.enabled(action) => self.dispatch(action, ctx),
+            Some(_) => self.message = format!("{id}: 지금은 쓸 수 없는 명령입니다."),
+            None => self.message = format!("{id}: 이 탭에 없는 명령입니다."),
+        }
+    }
+    /// Command id of a ribbon action, for Alt key tips and coverage mapping.
+    fn action_id(action: Action) -> Option<&'static str> {
+        Some(match action {
+            A::Ext(id) | A::Or(id, _) => id,
+            A::New => "file.new",
+            A::Open => "file.open",
+            A::Save => "file.save",
+            A::SaveAs => "file.save_as",
+            A::Pdf => "file.save_pdf",
+            A::Text => "file.save_text",
+            A::Undo => "edit.undo",
+            A::Redo => "edit.redo",
+            A::Cut => "edit.cut",
+            A::Copy => "edit.copy",
+            A::Paste => "edit.paste",
+            A::Character => "format.character_dialog",
+            A::Paragraph => "format.paragraph_dialog",
+            A::Page => "page.setup_dialog",
+            A::Portrait => "page.portrait",
+            A::Landscape => "page.landscape",
+            A::Table => "table.create",
+            A::Break => "insert.page_break",
+            A::Find => "edit.find",
+            A::Replace => "edit.replace",
+            A::Navigation => "view.task_pane",
+            A::Editor => "view.editor",
+            A::Rulers => "view.rulers",
+            A::ZoomIn => "view.zoom_in",
+            A::ZoomOut => "view.zoom_out",
+            A::Fit => "view.zoom_fit_page",
+            A::Help => "help",
+            A::Link => "insert.hyperlink",
+            A::Bookmarks => "insert.bookmark",
+            A::Columns => "page.columns",
+            A::ColumnBreak => "insert.column_break",
+            A::Picture => "insert.picture_dialog",
+            A::CopyFormat => "format.copy_shape",
+            A::PasteFormat => "format.paste_shape",
+            A::Search => "help.search",
+            A::HeaderFooter(true) => "page.header",
+            A::HeaderFooter(false) => "page.footer",
+            A::PageNumber => "page.number",
+            A::Equation => "insert.equation",
+            A::Note(false) => "insert.footnote",
+            A::Note(true) => "insert.endnote",
+            A::Objects => "object.list",
+            A::Styles => "format.style.dialog",
+            A::Symbols => "insert.symbol",
+            A::Char("bold") => "format.bold",
+            A::Char("italic") => "format.italic",
+            A::Char("underline") => "format.underline",
+            A::Char("strikethrough") => "format.strikethrough",
+            A::Shape(_) | A::TableEdit(_) | A::Char(_) | A::Align(_) => return None,
+        })
+    }
+    /// Draw the Alt key tip for an action over its widget when tips are showing.
+    fn keytip_badge(&self, ui: &egui::Ui, rect: Rect, action: Action) {
+        if self.ext.shell.keytips != super::ext_shell::KeyTips::Items {
+            return;
+        }
+        let Some(letter) =
+            Self::action_id(action).and_then(|id| super::ext_shell::alt_letter(self.tab, id))
+        else {
+            return;
+        };
+        keytip(
+            ui,
+            Pos2::new(rect.left() + 2.0, rect.bottom() - 16.0),
+            letter,
+        );
     }
     fn tab_menu(&mut self, ui: &mut egui::Ui, index: usize) {
         let ctx = ui.ctx().clone();
@@ -1754,6 +2308,13 @@ impl HwpApp {
                     );
                 }
                 let response = response.on_hover_text(format!("{name} (Alt+{key})"));
+                if self.ext.shell.keytips != super::ext_shell::KeyTips::Off && index <= 8 {
+                    keytip(
+                        ui,
+                        Pos2::new(label_rect.center().x - 7.0, rect.bottom() - 15.0),
+                        *key,
+                    );
+                }
                 let pointer = response.interact_pointer_pos();
                 let on_menu_part = pointer.is_some_and(|p| p.x > label_rect.right());
                 let popup = egui::Id::new(("hwp-tab-menu", index));
@@ -1989,6 +2550,7 @@ impl HwpApp {
                     })
                     .inner
                 };
+                self.keytip_badge(ui, response.rect, action);
                 if response.clicked() {
                     self.dispatch(action, &ctx);
                 }
@@ -2044,6 +2606,11 @@ impl HwpApp {
                         let mut on = self.checked(*action);
                         let response =
                             ui.add_enabled(enabled, egui::Checkbox::new(&mut on, *label));
+                        self.keytip_badge(
+                            ui,
+                            response.rect.translate(Vec2::new(-4.0, 6.0)),
+                            *action,
+                        );
                         if response.clicked() {
                             self.dispatch(*action, &ctx);
                         }
@@ -2077,19 +2644,17 @@ impl HwpApp {
             }
         };
         let enabled = self.enabled(action);
-        if self
-            .icons
-            .small(
-                ui,
-                icon,
-                label,
-                tooltip,
-                enabled,
-                menu,
-                self.checked(action),
-            )
-            .clicked()
-        {
+        let response = self.icons.small(
+            ui,
+            icon,
+            label,
+            tooltip,
+            enabled,
+            menu,
+            self.checked(action),
+        );
+        self.keytip_badge(ui, response.rect, action);
+        if response.clicked() {
             self.dispatch(action, &ctx);
         }
     }
@@ -2414,6 +2979,7 @@ impl HwpApp {
                         ("format.underline", 40.0),
                         ("format.strikethrough", 40.0),
                         ("format.text_color", 40.0),
+                        ("format.shade_color", 40.0),
                         ("format.align.justify", 24.0),
                         ("format.align.left", 24.0),
                         ("format.align.center", 24.0),
@@ -2529,4 +3095,18 @@ fn widget_fallback(id: &str) -> Option<(Icon, &'static str, Action)> {
         ),
         _ => return None,
     })
+}
+
+/// Alt key tip badge: 14 px dark square with one letter, like Hangul's key tips.
+fn keytip(ui: &egui::Ui, at: Pos2, letter: char) {
+    let rect = Rect::from_min_size(at, Vec2::splat(14.0));
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, Color32::from_rgb(60, 60, 60));
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        letter,
+        egui::FontId::proportional(10.0),
+        Color32::WHITE,
+    );
 }

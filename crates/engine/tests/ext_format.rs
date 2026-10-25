@@ -124,8 +124,8 @@ fn paragraph_alignment_spacing_indent_and_margins() -> anyhow::Result<()> {
     s.run("format.margin_left.decrease", json!({}))?;
     assert_eq!(
         para(&mut s)?["marginLeft"],
-        0,
-        "left margin never goes negative"
+        -step,
+        "Hangul lets 여백 줄이기 go below zero (text into the page margin)"
     );
     for _ in 0..6 {
         s.execute(Command::Undo)?;
@@ -280,10 +280,464 @@ fn styles_create_update_delete_and_shortcuts() -> anyhow::Result<()> {
         ),
         ("format.style.delete", json!({"id": 0})),
         ("format.style.delete", json!({"id": id, "replacement": id})),
-        ("format.style.shortcut", json!({"number": 10})),
+        ("format.style.shortcut", json!({"number": 21})),
         ("format.style.detail", json!({"id": 999})),
     ] {
         rejected(&mut s, cmd, params);
+    }
+    // Ctrl+0 and "10" both mean the tenth style; 11–20 reach Hangul's StyleShortcut11–20.
+    s.run("format.style.shortcut", json!({"number": 10}))?;
+    assert_eq!(s.run("format.style.list", json!({}))?[9]["current"], true);
+    s.run("format.style.shortcut", json!({"number": 0}))?;
+    assert_eq!(s.run("format.style.list", json!({}))?[9]["current"], true);
+    s.run("format.style.shortcut", json!({"number": 11}))?;
+    assert_eq!(s.run("format.style.list", json!({}))?[10]["current"], true);
+    Ok(())
+}
+
+#[test]
+fn script_cycle_indent_at_caret_fonts_colors_and_border() -> anyhow::Result<()> {
+    let mut s = doc("둘째 문단 abc def")?;
+    // 보통 → 위 첨자 → 아래 첨자 → 보통, as Hangul's CharShapeSuperSubscript cycles.
+    let script = |s: &mut Session| -> anyhow::Result<(Value, Value)> {
+        let p = chars(s)?;
+        Ok((p["superscript"].clone(), p["subscript"].clone()))
+    };
+    s.run("format.superscript.cycle", json!({}))?;
+    assert_eq!(script(&mut s)?, (json!(true), json!(false)));
+    s.run("format.superscript.cycle", json!({}))?;
+    assert_eq!(script(&mut s)?, (json!(false), json!(true)));
+    s.run("format.superscript.cycle", json!({}))?;
+    assert_eq!(script(&mut s)?, (json!(false), json!(false)));
+    // 현재 위치로 내어쓰기: the caret after "둘째 문단" gives a hanging indent of its x.
+    s.select(
+        Cursor {
+            offset: 5,
+            ..s.cursor
+        },
+        false,
+    )?;
+    s.run("format.indent.at_caret", json!({}))?;
+    let indent = para(&mut s)?["indent"].as_i64().unwrap();
+    assert!(
+        (-10000..-7000).contains(&indent),
+        "four 10 pt Hangul characters and a space ≈ −8776 raw units, got {indent}"
+    );
+    s.select(
+        Cursor {
+            offset: 0,
+            ..s.cursor
+        },
+        false,
+    )?;
+    s.run("format.indent.at_caret", json!({}))?;
+    assert_eq!(para(&mut s)?["indent"], 0);
+    // 다음/이전 글꼴 through a given list, wrapping; all languages take the font.
+    let current = chars(&mut s)?["fontFamily"].as_str().unwrap().to_owned();
+    let fonts = json!([current, "맑은 고딕", "Arial"]);
+    s.run("format.font.next", json!({"fonts": fonts}))?;
+    assert_eq!(chars(&mut s)?["fontFamily"], "맑은 고딕");
+    s.run("format.font.prev", json!({"fonts": fonts}))?;
+    s.run("format.font.prev", json!({"fonts": fonts}))?;
+    let p = chars(&mut s)?;
+    assert_eq!(p["fontFamily"], "Arial");
+    assert_eq!(p["fontFamilies"][1], "Arial");
+    for ext in ["hwp", "hwpx"] {
+        let mut r = reopen(&mut s, ext)?;
+        assert_eq!(chars(&mut r)?["fontFamily"], "Arial", "{ext}");
+    }
+    s.run("format.font.next", json!({}))?;
+    let cycled = chars(&mut s)?["fontFamily"].clone();
+    assert!(
+        cycled
+            .as_str()
+            .is_some_and(|f| !f.is_empty() && f != "Arial"),
+        "without a list the document's fonts are cycled: {cycled}"
+    );
+    // Preset colors measured from Hangul's TextColor* buttons.
+    s.run("format.text_color", json!({"name": "red"}))?;
+    assert_eq!(chars(&mut s)?["textColor"], "#ff0000");
+    s.run("format.text_color", json!({"name": "bluish"}))?;
+    assert_eq!(chars(&mut s)?["textColor"], "#008080");
+    s.run("format.text_color", json!({"color": "#123456"}))?;
+    assert_eq!(chars(&mut s)?["textColor"], "#123456");
+    s.run("format.shade_color", json!({"name": "yellow"}))?;
+    assert_eq!(chars(&mut s)?["shadeColor"], "#ffff00");
+    s.run("format.shade_color", json!({}))?;
+    assert_eq!(chars(&mut s)?["shadeColor"], "#ffffff", "음영 없음");
+    s.run("format.highlight", json!({"name": "green"}))?;
+    assert_eq!(
+        s.run("format.highlight.get", json!({}))?["color"],
+        "#008000"
+    );
+    // 글자 테두리: toggle, explicit line, off.
+    s.run("format.char_border", json!({}))?;
+    let p = chars(&mut s)?;
+    assert_eq!(p["borderLeft"]["type"], 1);
+    assert_eq!(p["borderBottom"]["type"], 1);
+    s.run("format.char_border", json!({}))?;
+    assert_eq!(chars(&mut s)?["borderLeft"]["type"], 0);
+    s.run(
+        "format.char_border",
+        json!({"type": 8, "width": 3, "color": "#FF0000"}),
+    )?;
+    let p = chars(&mut s)?;
+    assert_eq!(p["borderRight"]["type"], 8);
+    assert_eq!(p["borderRight"]["color"], "#ff0000");
+    s.run("format.char_border", json!({"value": false}))?;
+    assert_eq!(chars(&mut s)?["borderTop"]["type"], 0);
+    for ext in ["hwp", "hwpx"] {
+        let mut r = reopen(&mut s, ext)?;
+        assert_eq!(chars(&mut r)?["textColor"], "#123456", "{ext}");
+    }
+    for (id, params) in [
+        ("format.superscript.cycle", json!({"value": true})),
+        ("format.indent.at_caret", json!({"x": 1})),
+        ("format.font.next", json!({"fonts": []})),
+        ("format.font.prev", json!({"fonts": [""]})),
+        ("format.text_color", json!({})),
+        ("format.text_color", json!({"name": "pink"})),
+        (
+            "format.text_color",
+            json!({"name": "red", "color": "#ff0000"}),
+        ),
+        ("format.shade_color", json!({"color": "yellow"})),
+        ("format.highlight", json!({"name": "rose"})),
+        ("format.char_border", json!({"type": 30})),
+        ("format.char_border", json!({"color": "red"})),
+    ] {
+        rejected(&mut s, id, params);
+    }
+    Ok(())
+}
+
+#[test]
+fn paragraph_move_swaps_neighbours_and_keeps_section_definitions() -> anyhow::Result<()> {
+    let mut s = doc("첫째\n둘째\n셋째")?;
+    let texts = |s: &Session| -> Vec<String> { s.entries().into_iter().map(|(_, t)| t).collect() };
+    s.select(
+        Cursor {
+            paragraph: 1,
+            offset: 1,
+            ..Cursor::default()
+        },
+        false,
+    )?;
+    s.run("format.align.center", json!({}))?;
+    // Up past the first paragraph, which carries the 구역 정의: the definitions stay first.
+    s.run("format.paragraph.up", json!({}))?;
+    assert_eq!(texts(&s), ["둘째", "첫째", "셋째"]);
+    assert_eq!(s.cursor.paragraph, 0);
+    assert_eq!(
+        para(&mut s)?["alignment"],
+        "center",
+        "the moved paragraph keeps its shape"
+    );
+    rejected(&mut s, "format.paragraph.up", json!({}));
+    s.run("format.paragraph.down", json!({}))?;
+    s.run("format.paragraph.down", json!({}))?;
+    assert_eq!(texts(&s), ["첫째", "셋째", "둘째"]);
+    assert_eq!(s.cursor.paragraph, 2);
+    rejected(&mut s, "format.paragraph.down", json!({}));
+    for ext in ["hwp", "hwpx"] {
+        let r = reopen(&mut s, ext)?;
+        assert_eq!(texts(&r), ["첫째", "셋째", "둘째"], "{ext}");
+    }
+    for _ in 0..3 {
+        s.execute(Command::Undo)?;
+    }
+    assert_eq!(
+        texts(&s),
+        ["첫째", "둘째", "셋째"],
+        "each move is one undo step"
+    );
+    rejected(&mut s, "format.paragraph.up", json!({"x": 1}));
+    // Inside a table cell the swap stays within the cell.
+    let mut s = Session::new()?;
+    s.execute(Command::Table {
+        rows: 1,
+        columns: 1,
+    })?;
+    let cell = s
+        .entries()
+        .into_iter()
+        .find(|(c, _)| c.cell.is_some())
+        .unwrap()
+        .0;
+    s.select(cell, false)?;
+    s.execute(Command::Insert("가\n나".into()))?;
+    s.run("format.paragraph.up", json!({}))?;
+    // Cell entries are listed as "[row,col] text".
+    let cell_texts: Vec<String> = s
+        .entries()
+        .into_iter()
+        .filter(|(c, _)| c.cell.is_some())
+        .map(|(_, t)| t.rsplit(' ').next().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(cell_texts, ["나", "가"]);
+    Ok(())
+}
+
+#[test]
+fn char_overlap_inserts_updates_deletes_and_roundtrips() -> anyhow::Result<()> {
+    let mut s = doc("겹치기 앞 뒤")?;
+    s.run("format.bold", json!({}))?;
+    s.select(
+        Cursor {
+            offset: 4,
+            ..s.cursor
+        },
+        false,
+    )?;
+    let r = s.run("format.char_overlap", json!({"chars": "주의", "border": 1}))?;
+    assert_eq!(r["position"], 4);
+    let control = r["control"].as_u64().unwrap() as usize;
+    let list = s.run("format.char_overlap.get", json!({}))?;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["chars"], "주의");
+    assert_eq!(list[0]["border"], 1);
+    assert_eq!(list[0]["size"], 100);
+    assert_eq!(list[0]["expansion"], 1);
+    assert_eq!(list[0]["position"], 4);
+    assert_eq!(
+        s.paragraph(s.cursor)?.text,
+        "겹치기 앞 뒤",
+        "the control adds no placeholder character"
+    );
+    // Typing after the control keeps the control in place and the text intact.
+    s.select(
+        Cursor {
+            offset: 7,
+            ..s.cursor
+        },
+        false,
+    )?;
+    s.execute(Command::Insert("끝".into()))?;
+    assert_eq!(s.paragraph(s.cursor)?.text, "겹치기 앞 뒤끝");
+    assert_eq!(
+        s.run("format.char_overlap.get", json!({}))?[0]["position"],
+        4
+    );
+    s.run(
+        "format.char_overlap.update",
+        json!({"control": control, "chars": "참고", "border": 3, "size": 80, "expansion": 0}),
+    )?;
+    let got = s.run("format.char_overlap.get", json!({}))?[0].clone();
+    assert_eq!(got["chars"], "참고");
+    assert_eq!(got["border"], 3);
+    assert_eq!(got["size"], 80);
+    for ext in ["hwp", "hwpx"] {
+        let mut r = reopen(&mut s, ext)?;
+        assert_eq!(r.paragraph(r.cursor)?.text, "겹치기 앞 뒤끝", "{ext}");
+        let list = r.run("format.char_overlap.get", json!({}))?;
+        assert_eq!(list[0]["chars"], "참고", "{ext}");
+        assert_eq!(list[0]["border"], 3, "{ext}");
+        assert_eq!(list[0]["position"], 4, "{ext}");
+        assert_eq!(chars(&mut r)?["bold"], true, "{ext}");
+    }
+    s.run("format.char_overlap.delete", json!({"control": control}))?;
+    assert_eq!(
+        s.run("format.char_overlap.get", json!({}))?
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(s.paragraph(s.cursor)?.text, "겹치기 앞 뒤끝");
+    s.execute(Command::Undo)?;
+    assert_eq!(
+        s.run("format.char_overlap.get", json!({}))?[0]["chars"],
+        "참고",
+        "delete is one undo step"
+    );
+    for (id, params) in [
+        ("format.char_overlap", json!({"chars": ""})),
+        (
+            "format.char_overlap",
+            json!({"chars": "열글자가넘는문자열입니다"}),
+        ),
+        ("format.char_overlap", json!({"chars": "가 나"})),
+        ("format.char_overlap", json!({"chars": "가", "border": 7})),
+        ("format.char_overlap", json!({"chars": "가", "size": 0})),
+        (
+            "format.char_overlap",
+            json!({"chars": "가", "expansion": 2}),
+        ),
+        ("format.char_overlap.update", json!({"control": 99})),
+        ("format.char_overlap.delete", json!({"control": 99})),
+        ("format.char_overlap.get", json!({"x": 1})),
+    ] {
+        rejected(&mut s, id, params);
+    }
+    Ok(())
+}
+
+#[test]
+fn style_tools_clear_char_update_from_caret_move_export_import() -> anyhow::Result<()> {
+    let mut s = doc("스타일 도구 검사")?;
+    // 글자 스타일 해제: direct bold on a run goes back to the style's shape.
+    select_range(&mut s, 0, 3)?;
+    s.run("format.bold", json!({}))?;
+    s.run("format.text_color", json!({"name": "red"}))?;
+    assert_eq!(chars(&mut s)?["bold"], true);
+    s.run("format.style.clear_char", json!({}))?;
+    let p = chars(&mut s)?;
+    assert_eq!(p["bold"], false);
+    assert_eq!(p["textColor"], "#000000");
+    s.execute(Command::Undo)?;
+    assert_eq!(chars(&mut s)?["bold"], true, "one undo step");
+    // 현재 모양으로 스타일 바꾸기: the caret's shapes become the style's.
+    s.run("format.align.right", json!({}))?;
+    let id = s.run(
+        "format.style.create",
+        json!({"name": "본문 강조", "character": {"italic": true}}),
+    )?["id"]
+        .as_u64()
+        .unwrap() as usize;
+    s.run("style.apply", json!({"id": id}))?;
+    let size = chars(&mut s)?["fontSize"].as_i64().unwrap();
+    s.run("format.font_size.increase", json!({}))?;
+    s.run("format.align.center", json!({}))?;
+    s.select(
+        Cursor {
+            offset: 1,
+            ..s.cursor
+        },
+        false,
+    )?;
+    s.run("format.style.update_from_caret", json!({}))?;
+    let d = s.run("format.style.detail", json!({"id": id}))?;
+    assert_eq!(d["character"]["fontSize"], size + 100);
+    assert_eq!(d["paragraph"]["alignment"], "center");
+    rejected(&mut s, "format.style.update_from_caret", json!({"id": 999}));
+    // 목록 위/아래로: positions swap, paragraphs follow their style.
+    let moved = s.run("format.style.move", json!({"id": id, "direction": "up"}))?;
+    assert_eq!(moved["id"], id - 1);
+    let list = s.run("format.style.list", json!({}))?;
+    assert_eq!(list[id - 1]["name"], "본문 강조");
+    assert_eq!(list[id - 1]["current"], true);
+    rejected(
+        &mut s,
+        "format.style.move",
+        json!({"id": 0, "direction": "down"}),
+    );
+    rejected(
+        &mut s,
+        "format.style.move",
+        json!({"id": 1, "direction": "up"}),
+    );
+    rejected(
+        &mut s,
+        "format.style.move",
+        json!({"id": id, "direction": "left"}),
+    );
+    s.run(
+        "format.style.move",
+        json!({"id": id - 1, "direction": "down"}),
+    )?;
+    assert_eq!(
+        s.run("format.style.list", json!({}))?[id]["name"],
+        "본문 강조"
+    );
+    // 내보내기 → 새 문서에 가져오기 (파일과 JSON 둘 다).
+    let exported = s.run("format.style.export", json!({}))?;
+    assert_eq!(exported["styles"][id]["name"], "본문 강조");
+    assert_eq!(exported["styles"][id]["character"]["fontSize"], size + 100);
+    assert_eq!(exported["styles"][id]["paragraph"]["alignment"], "center");
+    assert!(
+        exported["styles"][0]["character"]
+            .get("borderFillId")
+            .is_none()
+    );
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("styles.json");
+    let written = s.run(
+        "format.style.export",
+        json!({"path": path.to_string_lossy()}),
+    )?;
+    assert_eq!(
+        written["count"],
+        exported["styles"].as_array().unwrap().len()
+    );
+    let mut t = doc("가져오기 대상")?;
+    let before = t
+        .run("format.style.list", json!({}))?
+        .as_array()
+        .unwrap()
+        .len();
+    let r = t.run(
+        "format.style.import",
+        json!({"path": path.to_string_lossy()}),
+    )?;
+    assert_eq!(r["created"], 1);
+    assert_eq!(r["updated"], before);
+    let list = t.run("format.style.list", json!({}))?;
+    assert_eq!(list.as_array().unwrap().len(), before + 1);
+    let d = t.run("format.style.detail", json!({"id": before}))?;
+    assert_eq!(d["character"]["fontSize"], size + 100);
+    assert_eq!(d["paragraph"]["alignment"], "center");
+    let r = t.run(
+        "format.style.import",
+        json!({"styles": [
+            {"name": "본문 강조", "character": {"underline": true}, "nextStyle": "바탕글"},
+            {"name": "새 글자", "type": "character", "character": {"bold": true}}
+        ]}),
+    )?;
+    assert_eq!(
+        (r["created"].clone(), r["updated"].clone()),
+        (json!(1), json!(1))
+    );
+    let d = t.run("format.style.detail", json!({"id": before}))?;
+    assert_eq!(d["character"]["underline"], true);
+    assert_eq!(d["nextStyleId"], 0);
+    assert_eq!(
+        t.run("format.style.detail", json!({"id": before + 1}))?["type"],
+        "character"
+    );
+    t.execute(Command::Undo)?;
+    assert_eq!(
+        t.run("format.style.list", json!({}))?
+            .as_array()
+            .unwrap()
+            .len(),
+        before + 1,
+        "an import is one undo step"
+    );
+    for ext in ["hwp", "hwpx"] {
+        let mut r = reopen(&mut t, ext)?;
+        assert_eq!(
+            r.run("format.style.list", json!({}))?[before]["name"],
+            "본문 강조",
+            "{ext}"
+        );
+    }
+    for (id, params) in [
+        ("format.style.import", json!({})),
+        ("format.style.import", json!({"styles": []})),
+        (
+            "format.style.import",
+            json!({"styles": [{"englishName": "x"}]}),
+        ),
+        (
+            "format.style.import",
+            json!({"styles": [{"name": "a"}, {"name": "a"}]}),
+        ),
+        (
+            "format.style.import",
+            json!({"styles": [{"name": "a", "type": "table"}]}),
+        ),
+        (
+            "format.style.import",
+            json!({"styles": [{"name": "a", "character": {"bold": "yes"}}]}),
+        ),
+        (
+            "format.style.import",
+            json!({"path": dir.path().join("missing.json").to_string_lossy()}),
+        ),
+        ("format.style.export", json!({"path": ""})),
+        ("format.style.clear_char", json!({"x": 1})),
+    ] {
+        rejected(&mut t, id, params);
     }
     Ok(())
 }

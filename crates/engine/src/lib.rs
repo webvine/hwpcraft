@@ -9,14 +9,29 @@ mod ext_page;
 mod ext_table;
 mod extensions;
 mod table_drawing;
-pub use extensions::extension_commands;
+pub use autotext::set_config_dir;
+pub use ext_format::COLOR_PRESETS;
+pub use extensions::{command_help, command_help_entries, extension_commands};
+mod autotext;
+mod caret;
 mod editing;
+mod hanja;
+mod review;
 pub use editing::Motion;
+mod hwp_actions;
+pub use hwp_actions::{HWP_ACTIONS, hwp_action};
 mod features;
 mod find;
 pub use find::{FindDirection, FindOptions};
 mod links;
 pub use links::HyperlinkEdit;
+mod highlights;
+pub use highlights::{HighlightRect, markpen_ranges};
+mod symbols;
+pub use symbols::{
+    SpecialChar, SymbolGroup, SymbolInsert, SymbolSearch, SymbolSet, block_of, ks_code,
+    special_chars, symbol_chars, symbol_search, symbol_sets,
+};
 mod formatting;
 pub use formatting::validate_format;
 mod objects;
@@ -84,7 +99,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("file.save_as", "다른 이름으로 저장", "Ctrl+Shift+S"),
     ("file.pdf", "PDF 내보내기", ""),
     ("edit.undo", "실행 취소", "Ctrl+Z"),
-    ("edit.redo", "다시 실행", "Ctrl+Y"),
+    ("edit.redo", "다시 실행", "Ctrl+Shift+Z"),
     ("edit.find", "찾기 / 바꾸기", "Ctrl+F"),
     ("edit.replace", "바꾸기 (선택한 찾은 내용)", "Ctrl+H"),
     ("edit.replace_all", "모두 바꾸기", ""),
@@ -116,6 +131,19 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("hyperlink.remove", "하이퍼링크 지우기 (글자 유지)", ""),
     ("edit.paste_html", "HTML 서식 붙이기", ""),
     ("file.password", "문서 암호 설정·해제 (저장 시 적용)", ""),
+    (
+        "insert.symbol",
+        "문자표: 문자 넣기 (글꼴 지정 가능)",
+        "Ctrl+F10",
+    ),
+    (
+        "symbol.sets",
+        "문자표 영역 목록 (HNC·KS·유니코드·이모지·특수 문자)",
+        "",
+    ),
+    ("symbol.list", "문자표 영역의 문자 목록", ""),
+    ("symbol.search", "문자표 검색 (코드·이름·키워드)", ""),
+    ("symbol.special", "이름 있는 특수 문자 목록", ""),
 ];
 #[derive(Clone)]
 struct Snapshot {
@@ -124,6 +152,16 @@ struct Snapshot {
     anchor: Option<usize>,
     span_anchor: Option<Cursor>,
     revision: u64,
+}
+/// See [`Session::checkpoint`].
+pub struct Checkpoint {
+    id: u32,
+    cursor: Cursor,
+    anchor: Option<usize>,
+    span_anchor: Option<Cursor>,
+    revision: u64,
+    undo_len: usize,
+    overwrite: bool,
 }
 pub struct Session {
     pub core: DocumentCore,
@@ -344,40 +382,32 @@ impl Session {
         };
         Ok(serde_json::from_str(&r.map_err(err)?)?)
     }
-    pub fn entries(&self) -> Vec<(Cursor, String)> {
+    /// Every editable paragraph address in document order: body paragraphs and
+    /// first-level table-cell paragraphs. No text is copied, so commands that
+    /// only need addresses (search, navigation, counts) stay cheap on long documents.
+    pub fn cursors(&self) -> Vec<Cursor> {
         let mut out = Vec::new();
         for (s, section) in self.core.document().sections.iter().enumerate() {
             for (p, para) in section.paragraphs.iter().enumerate() {
-                out.push((
-                    Cursor {
-                        section: s,
-                        paragraph: p,
-                        ..Default::default()
-                    },
-                    para.text.chars().take(64).collect(),
-                ));
+                out.push(Cursor {
+                    section: s,
+                    paragraph: p,
+                    ..Default::default()
+                });
                 for (i, ctrl) in para.controls.iter().enumerate() {
                     if let Control::Table(t) = ctrl {
                         for (j, cell) in t.cells.iter().enumerate() {
-                            for (k, cp) in cell.paragraphs.iter().enumerate() {
-                                out.push((
-                                    Cursor {
-                                        section: s,
-                                        paragraph: p,
-                                        offset: 0,
-                                        cell: Some(Cell {
-                                            control: i,
-                                            index: j,
-                                            paragraph: k,
-                                        }),
-                                    },
-                                    format!(
-                                        "[{},{}] {}",
-                                        cell.row + 1,
-                                        cell.col + 1,
-                                        cp.text.chars().take(48).collect::<String>()
-                                    ),
-                                ));
+                            for k in 0..cell.paragraphs.len() {
+                                out.push(Cursor {
+                                    section: s,
+                                    paragraph: p,
+                                    offset: 0,
+                                    cell: Some(Cell {
+                                        control: i,
+                                        index: j,
+                                        paragraph: k,
+                                    }),
+                                });
                             }
                         }
                     }
@@ -385,6 +415,58 @@ impl Session {
             }
         }
         out
+    }
+    /// Number of editable paragraphs (body and first-level cells).
+    pub fn paragraph_total(&self) -> usize {
+        self.core
+            .document()
+            .sections
+            .iter()
+            .flat_map(|s| s.paragraphs.iter())
+            .map(|para| {
+                1 + para
+                    .controls
+                    .iter()
+                    .filter_map(|c| match c {
+                        Control::Table(t) => {
+                            Some(t.cells.iter().map(|c| c.paragraphs.len()).sum::<usize>())
+                        }
+                        _ => None,
+                    })
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+    /// `cursors()` with a short text preview per paragraph, for list views.
+    pub fn entries(&self) -> Vec<(Cursor, String)> {
+        self.cursors()
+            .into_iter()
+            .map(|c| {
+                let preview = match (self.paragraph(c), c.cell) {
+                    (Ok(p), None) => p.text.chars().take(64).collect(),
+                    (Ok(p), Some(cell)) => {
+                        let (row, col) = self
+                            .core
+                            .document()
+                            .sections
+                            .get(c.section)
+                            .and_then(|s| s.paragraphs.get(c.paragraph))
+                            .and_then(|para| match para.controls.get(cell.control) {
+                                Some(Control::Table(t)) => t.cells.get(cell.index),
+                                _ => None,
+                            })
+                            .map(|cell| (cell.row + 1, cell.col + 1))
+                            .unwrap_or((0, 0));
+                        format!(
+                            "[{row},{col}] {}",
+                            p.text.chars().take(48).collect::<String>()
+                        )
+                    }
+                    (Err(_), _) => String::new(),
+                };
+                (c, preview)
+            })
+            .collect()
     }
     fn snapshot(&mut self) -> Snapshot {
         Snapshot {
@@ -394,6 +476,46 @@ impl Session {
             span_anchor: self.span_anchor,
             revision: self.revision,
         }
+    }
+    /// Mark a point several commands can be rolled back to as one unit, for an
+    /// atomic MCP batch. Each command still records its own undo step; `rollback`
+    /// drops those steps again. The redo stack is not restored.
+    pub fn checkpoint(&mut self) -> Checkpoint {
+        let snapshot = self.snapshot();
+        Checkpoint {
+            id: snapshot.id,
+            cursor: snapshot.cursor,
+            anchor: snapshot.anchor,
+            span_anchor: snapshot.span_anchor,
+            revision: snapshot.revision,
+            undo_len: self.undo.len(),
+            overwrite: self.overwrite,
+        }
+    }
+    /// Restore the document and caret to a checkpoint and forget the undo steps
+    /// recorded since. The checkpoint is consumed.
+    pub fn rollback(&mut self, checkpoint: Checkpoint) -> Result<()> {
+        self.core
+            .restore_snapshot_native(checkpoint.id)
+            .map_err(err)?;
+        self.core.discard_snapshot_native(checkpoint.id);
+        while self.undo.len() > checkpoint.undo_len {
+            if let Some(s) = self.undo.pop() {
+                self.core.discard_snapshot_native(s.id);
+            }
+        }
+        self.cursor = checkpoint.cursor;
+        self.anchor = checkpoint.anchor;
+        self.span_anchor = checkpoint.span_anchor;
+        self.revision = checkpoint.revision;
+        self.overwrite = checkpoint.overwrite;
+        self.typing = None;
+        self.generation += 1;
+        Ok(())
+    }
+    /// Keep the work done since a checkpoint and free its snapshot.
+    pub fn release(&mut self, checkpoint: Checkpoint) {
+        self.core.discard_snapshot_native(checkpoint.id);
     }
     fn transaction(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
         let snapshot = self.snapshot();
@@ -551,6 +673,7 @@ impl Session {
                 continue;
             }
             let c = self.cursor;
+            let old_len = self.len();
             let r = if let Some(t) = c.cell {
                 self.core.insert_text_in_cell_native(
                     c.section,
@@ -566,6 +689,7 @@ impl Session {
                     .insert_text_native(c.section, c.paragraph, c.offset, line)
             };
             r.map_err(err)?;
+            self.repair_trailing_number_stride(c, old_len);
             self.cursor.offset += line.chars().count();
         }
         self.anchor = None;
@@ -825,17 +949,17 @@ impl Session {
         if query.is_empty() {
             return Ok(false);
         }
-        let entries = self.entries();
+        let entries = self.cursors();
         let current = entries
             .iter()
-            .position(|(c, _)| {
+            .position(|c| {
                 c.section == self.cursor.section
                     && c.paragraph == self.cursor.paragraph
                     && c.cell == self.cursor.cell
             })
             .unwrap_or(0);
         for step in 0..=entries.len() {
-            let Some((c, _)) = entries.get((current + step) % entries.len().max(1)) else {
+            let Some(c) = entries.get((current + step) % entries.len().max(1)) else {
                 break;
             };
             let text = &self.paragraph(*c)?.text;
@@ -919,7 +1043,7 @@ impl Session {
         let mut matches = Vec::new();
         let mut work_bytes = 0usize;
         let length = query.chars().count();
-        for (cursor, _) in self.entries() {
+        for cursor in self.cursors() {
             if self.cell_protected(cursor) {
                 continue;
             }
@@ -957,6 +1081,6 @@ impl Session {
         Ok(count)
     }
     pub fn info(&self) -> Value {
-        json!({"pages":self.core.page_count(),"sections":self.core.document().sections.len(),"paragraphs":self.entries().len(),"dirty":self.dirty(),"path":self.path})
+        json!({"pages":self.core.page_count(),"sections":self.core.document().sections.len(),"paragraphs":self.paragraph_total(),"dirty":self.dirty(),"path":self.path})
     }
 }

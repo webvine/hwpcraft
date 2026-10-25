@@ -44,7 +44,158 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("table.auto_fill", "자동 채우기", ""),
     ("table.caption_text.get", "캡션 내용 조회", ""),
     ("table.caption_text", "캡션 내용 고치기", ""),
-    ("table.style", "표 마당 (기본 모양)", ""),
+    (
+        "table.style",
+        "표 마당 (기본 모양 + 제목 줄·첫/마지막 칸·마지막 줄 옵션)",
+        "",
+    ),
+    ("table.cell_shade", "셀 음영 어둡게 / 밝게", ""),
+    (
+        "table.cell_move",
+        "표 안 셀 이동 (left·right·up·down·row_begin·row_end·col_top·col_bottom·next·prev)",
+        "Tab / Shift+Tab",
+    ),
+];
+
+/// (command id, parameter help, JSON example object) for list_commands and
+/// docs/mcp-commands.md; owner fills this for every command above.
+pub const PARAMS: &[(&str, &str, &str)] = &[
+    (
+        "table.create",
+        "rows·columns(1–200줄·1–64칸·4,096셀), treat_as_char(글자처럼 취급), width_mm(없으면 단 폭), height_mm(없으면 자동), column_widths_mm[]",
+        r##"{"rows":3,"columns":4,"width_mm":120.0}"##,
+    ),
+    (
+        "table.info",
+        "table(개체 주소, 없으면 커서 표), range(셀 블록) → 줄·칸 수, 칸 너비, 셀 목록",
+        r##"{"range":{"start_row":0,"start_col":0,"end_row":1,"end_col":1}}"##,
+    ),
+    (
+        "table.properties.get",
+        "table(없으면 커서 표) → 표 속성 JSON",
+        r##"{}"##,
+    ),
+    (
+        "table.properties",
+        "table, props{cellSpacing, padding*, pageBreak 0–2, repeatHeader, treatAsChar, textWrap, vertRelTo, horzAlign, *Offset, outerMargin*, hasCaption, caption*…} (HWPUNIT)",
+        r##"{"props":{"repeatHeader":true,"hasCaption":true,"captionDirection":3}}"##,
+    ),
+    (
+        "table.cell_properties.get",
+        "table, range(없으면 커서 셀) → 셀 속성 JSON",
+        r##"{}"##,
+    ),
+    (
+        "table.cell_properties",
+        "table, range, props{width, height, padding*, applyInnerMargin, verticalAlign 0–2, textDirection, isHeader, cellProtect, fieldName, fillType none|solid, fillColor #rrggbb, diagonal*…}, borders{left|right|top|bottom|inner_vertical|inner_horizontal: {type,width,color}}",
+        r##"{"props":{"fillType":"solid","fillColor":"#dbe5f1"},"borders":{"bottom":{"type":1,"width":4,"color":"#4f81bd"}}}"##,
+    ),
+    (
+        "table.merge",
+        "table, range(2셀 이상; 합친 셀이 걸치면 블록이 넓어짐)",
+        r##"{"range":{"start_row":0,"start_col":0,"end_row":1,"end_col":1}}"##,
+    ),
+    (
+        "table.split",
+        "table, range, rows·columns(나눌 수), equal_height, merge_first(합친 후 나누기)",
+        r##"{"rows":2,"columns":2}"##,
+    ),
+    (
+        "table.equal_height",
+        "table, range → 블록 줄 높이를 같게",
+        r##"{}"##,
+    ),
+    (
+        "table.equal_width",
+        "table, range → 블록 칸 너비를 같게",
+        r##"{}"##,
+    ),
+    (
+        "table.resize",
+        "table, range, vertical(true: 줄 높이), delta_mm(±; Ctrl+방향키는 1 mm)",
+        r##"{"vertical":false,"delta_mm":1.0}"##,
+    ),
+    (
+        "table.formula",
+        "table, formula(SUM·AVG·PRODUCT·MIN·MAX·COUNT·ABS·SQRT·INT·ROUND·MOD·IF, A1:B3·LEFT·ABOVE), row·col(없으면 커서 셀)",
+        r##"{"formula":"=SUM(LEFT)"}"##,
+    ),
+    (
+        "table.block_calc",
+        "table, range, op sum|average|product → 블록 끝 빈 줄/칸에 결과",
+        r##"{"op":"sum"}"##,
+    ),
+    ("table.delete", "table(없으면 커서 표)", r##"{}"##),
+    (
+        "table.transpose",
+        "table → 줄/칸 바꾸기 (합친 셀 없는 표)",
+        r##"{}"##,
+    ),
+    (
+        "table.split_table",
+        "table, range(없으면 커서 줄) → 그 줄 위에서 표 나누기",
+        r##"{}"##,
+    ),
+    (
+        "table.merge_table",
+        "table → 다음 문단의 표와 붙이기",
+        r##"{}"##,
+    ),
+    (
+        "table.thousands",
+        "table, range, remove(true: 쉼표 빼기)",
+        r##"{"remove":false}"##,
+    ),
+    (
+        "table.move_border",
+        "table, vertical(true: 세로 경계선), boundary(경계선 번호), delta_mm",
+        r##"{"vertical":true,"boundary":1,"delta_mm":5.0}"##,
+    ),
+    (
+        "table.from_text",
+        "delimiter(탭·쉼표 등 구분 문자열); 선택 문단을 표로",
+        r##"{"delimiter":"\t"}"##,
+    ),
+    (
+        "table.to_text",
+        "table, delimiter → 표를 문자열로",
+        r##"{"delimiter":"\t"}"##,
+    ),
+    (
+        "table.sort",
+        "table, range(정렬할 줄), column(기준 칸), descending",
+        r##"{"column":0,"descending":false}"##,
+    ),
+    (
+        "table.auto_fill",
+        "table, range(2셀 이상), values[](사용자 목록; 없으면 숫자·요일·월·분기·간지 등 자동 인식)",
+        r##"{"values":["상","중","하"]}"##,
+    ),
+    (
+        "table.caption_text.get",
+        "table → 캡션의 번호 뒤 문자열",
+        r##"{}"##,
+    ),
+    (
+        "table.caption_text",
+        "table, text(캡션 번호 뒤 문자열)",
+        r##"{"text":"분기별 판매 현황"}"##,
+    ),
+    (
+        "table.style",
+        "table, preset basic|blue_header|gray_grid|striped, header_row(기본 true), first_column, last_column, last_row, grayscale, borders(기본 true), background(기본 true)",
+        r##"{"preset":"blue_header","first_column":true}"##,
+    ),
+    (
+        "table.cell_shade",
+        "table, range(없으면 커서 셀), darker(true: 어둡게, false: 밝게) → 바뀐 셀 수",
+        r##"{"darker":true}"##,
+    ),
+    (
+        "table.cell_move",
+        "table, motion left|right|up|down|row_begin|row_end|col_top|col_bottom|next|prev → moved, row, col, appended(next가 마지막 셀에서 줄 추가)",
+        r##"{"motion":"next"}"##,
+    ),
 ];
 
 pub(crate) const MAX_ROWS: usize = 200;
@@ -60,6 +211,70 @@ pub struct CellRange {
     pub start_col: u16,
     pub end_row: u16,
     pub end_col: u16,
+}
+
+/// Hangul 표 디자인 탭 "표 마당 옵션": which parts a preset decorates.
+/// Defaults follow Hangul: 제목 줄·테두리·셀 배경 on, the rest off.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct TableStyleOptions {
+    pub header_row: bool,
+    pub first_column: bool,
+    pub last_column: bool,
+    pub last_row: bool,
+    /// 회색조: colors collapse to their luminance.
+    pub grayscale: bool,
+    pub borders: bool,
+    pub background: bool,
+}
+impl Default for TableStyleOptions {
+    fn default() -> Self {
+        Self {
+            header_row: true,
+            first_column: false,
+            last_column: false,
+            last_row: false,
+            grayscale: false,
+            borders: true,
+            background: true,
+        }
+    }
+}
+fn parse_rgb(s: &str) -> Option<[u8; 3]> {
+    let hex = s.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let v = u32::from_str_radix(hex, 16).ok()?;
+    Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+}
+fn rgb_hex(c: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
+/// Luminance gray of a color, for the 회색조 option.
+fn gray_of(c: [u8; 3]) -> [u8; 3] {
+    let y =
+        (0.299 * f64::from(c[0]) + 0.587 * f64::from(c[1]) + 0.114 * f64::from(c[2])).round() as u8;
+    [y, y, y]
+}
+/// Hangul's 셀 음영 어둡게/밝게 (measured): the "ink" (255 − channel) grows ×1.54 or
+/// shrinks ×0.54; a white cell becomes #f2f2f2 and anything that light goes back to no
+/// fill. `None` means "no fill".
+fn shade(c: Option<[u8; 3]>, darker: bool) -> Option<[u8; 3]> {
+    let c = c.unwrap_or([255, 255, 255]);
+    let ink = c.map(|v| f64::from(255 - v));
+    if darker {
+        if ink.iter().all(|i| *i == 0.0) {
+            return Some([0xf2, 0xf2, 0xf2]);
+        }
+        Some(ink.map(|i| 255 - (i * 1.54).round().min(255.0) as u8))
+    } else {
+        let next = ink.map(|i| (i * 0.54).round());
+        if next.iter().all(|i| *i <= 13.0) {
+            return None;
+        }
+        Some(next.map(|i| 255 - i as u8))
+    }
 }
 
 #[derive(Deserialize)]
@@ -539,9 +754,36 @@ impl Session {
                 Ok(self.info())
             }
             "table.auto_fill" => {
-                let t: Target = serde_json::from_value(params)?;
-                let a = self.table_target(t.table)?;
-                Ok(json!({"cells":self.auto_fill(a, t.range)?}))
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Fill {
+                    #[serde(default)]
+                    table: Option<ObjectAddress>,
+                    #[serde(default)]
+                    range: Option<CellRange>,
+                    #[serde(default)]
+                    values: Option<Vec<String>>,
+                }
+                let p: Fill = serde_json::from_value(params)?;
+                let a = self.table_target(p.table)?;
+                Ok(json!({"cells":match p.values {
+                    Some(values) => self.auto_fill_values(a, p.range, &values)?,
+                    None => self.auto_fill(a, p.range)?,
+                }}))
+            }
+            "table.cell_shade" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Shade {
+                    #[serde(default)]
+                    table: Option<ObjectAddress>,
+                    #[serde(default)]
+                    range: Option<CellRange>,
+                    darker: bool,
+                }
+                let p: Shade = serde_json::from_value(params)?;
+                let a = self.table_target(p.table)?;
+                Ok(json!({"cells":self.cell_shade(a, p.range, p.darker)?}))
             }
             "table.caption_text.get" => {
                 let t: Target = serde_json::from_value(params)?;
@@ -568,11 +810,25 @@ impl Session {
                     #[serde(default)]
                     table: Option<ObjectAddress>,
                     preset: String,
+                    #[serde(flatten)]
+                    options: TableStyleOptions,
                 }
                 let p: Style = serde_json::from_value(params)?;
                 let a = self.table_target(p.table)?;
-                self.apply_table_style(a, &p.preset)?;
+                self.apply_table_style_with(a, &p.preset, &p.options)?;
                 Ok(self.info())
+            }
+            "table.cell_move" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Move {
+                    #[serde(default)]
+                    table: Option<ObjectAddress>,
+                    motion: String,
+                }
+                let p: Move = serde_json::from_value(params)?;
+                let a = self.table_target(p.table)?;
+                self.move_in_table(a, &p.motion)
             }
             "table.move_border" => {
                 #[derive(Deserialize)]
@@ -722,6 +978,122 @@ impl Session {
                 return Ok(r);
             }
         }
+    }
+    /// Index of the cell covering grid position (row, col), merged cells included.
+    fn cell_covering(t: &Table, row: u16, col: u16) -> Option<usize> {
+        t.cells.iter().position(|v| {
+            v.row <= row
+                && row < v.row.saturating_add(v.row_span.max(1))
+                && v.col <= col
+                && col < v.col.saturating_add(v.col_span.max(1))
+        })
+    }
+    /// Hangul cell navigation (TableRightCell, TableColBegin, TableRightCellAppend, …).
+    ///
+    /// `left`/`up` land at the end of the neighbour's text, the other motions at its
+    /// start. `row_begin`/`row_end` are the first/last cell of the caret row,
+    /// `col_top`/`col_bottom` the first/last row of the caret column. `next` (Tab) walks
+    /// cells in reading order and appends a row after the last cell; `prev` (Shift+Tab)
+    /// walks back and stops at the first cell. Returns `moved:false` at an edge.
+    pub fn move_in_table(&mut self, a: ObjectAddress, motion: &str) -> Result<Value> {
+        let index = self
+            .cursor_in(a)
+            .ok_or_else(|| anyhow!("표 셀 안에 커서를 놓으세요."))?;
+        let t = self.table_at(a)?;
+        let cell = t
+            .cells
+            .get(index)
+            .ok_or_else(|| anyhow!("셀 범위를 벗어났습니다."))?;
+        let (row, col) = (cell.row, cell.col);
+        let (rows, cols) = (t.row_count, t.col_count);
+        let (last_row, last_col) = (
+            row.saturating_add(cell.row_span.max(1)),
+            col.saturating_add(cell.col_span.max(1)),
+        );
+        let mut order: Vec<(u16, u16, usize)> = t
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.row, c.col, i))
+            .collect();
+        order.sort_unstable();
+        let pos = order
+            .iter()
+            .position(|x| x.2 == index)
+            .ok_or_else(|| anyhow!("표 셀을 찾지 못했습니다."))?;
+        let at_end = matches!(motion, "left" | "up");
+        let target = match motion {
+            "left" => (col > 0)
+                .then(|| Self::cell_covering(t, row, col - 1))
+                .flatten(),
+            "right" => (last_col < cols)
+                .then(|| Self::cell_covering(t, row, last_col))
+                .flatten(),
+            "up" => (row > 0)
+                .then(|| Self::cell_covering(t, row - 1, col))
+                .flatten(),
+            "down" => (last_row < rows)
+                .then(|| Self::cell_covering(t, last_row, col))
+                .flatten(),
+            "row_begin" => Self::cell_covering(t, row, 0),
+            "row_end" => Self::cell_covering(t, row, cols.saturating_sub(1)),
+            "col_top" => Self::cell_covering(t, 0, col),
+            "col_bottom" => Self::cell_covering(t, rows.saturating_sub(1), col),
+            "next" => order.get(pos + 1).map(|x| x.2),
+            "prev" => pos.checked_sub(1).and_then(|p| order.get(p)).map(|x| x.2),
+            _ => bail!(
+                "모르는 셀 이동: {motion} (left·right·up·down·row_begin·row_end·col_top·col_bottom·next·prev)"
+            ),
+        };
+        let mut appended = false;
+        let target = match target {
+            Some(i) => i,
+            None if motion == "next" => {
+                // Tab in the last cell: Hangul adds a row and moves to its first cell.
+                let origin = self.cursor;
+                self.reseat(a, rows.saturating_sub(1), 0)?;
+                if let Err(e) = self.edit_table(TableEdit::RowBelow) {
+                    self.cursor = origin;
+                    return Err(e);
+                }
+                appended = true;
+                let t = self.table_at(a)?;
+                Self::cell_covering(t, t.row_count.saturating_sub(1), 0)
+                    .ok_or_else(|| anyhow!("새 줄을 찾지 못했습니다."))?
+            }
+            None => {
+                return Ok(json!({"moved":false,"row":row,"col":col,"appended":false}));
+            }
+        };
+        let t = self.table_at(a)?;
+        let dest = t
+            .cells
+            .get(target)
+            .ok_or_else(|| anyhow!("셀 범위를 벗어났습니다."))?;
+        let (dest_row, dest_col) = (dest.row, dest.col);
+        let (paragraph, offset) = if at_end {
+            let last = dest.paragraphs.len().saturating_sub(1);
+            (
+                last,
+                dest.paragraphs
+                    .get(last)
+                    .map_or(0, |p| p.text.chars().count()),
+            )
+        } else {
+            (0, 0)
+        };
+        let cursor = Cursor {
+            section: a.section,
+            paragraph: a.paragraph,
+            offset,
+            cell: Some(Cell {
+                control: a.control,
+                index: target,
+                paragraph,
+            }),
+        };
+        self.select(cursor, false)?;
+        Ok(json!({"moved":true,"row":dest_row,"col":dest_col,"appended":appended}))
     }
     fn block_cells(t: &Table, r: CellRange) -> Vec<usize> {
         t.cells
@@ -2319,47 +2691,65 @@ impl Session {
 
     /// 표 마당: a few presets expressed only as cell borders and fills (portable to HWP/HWPX).
     pub fn apply_table_style(&mut self, a: ObjectAddress, preset: &str) -> Result<()> {
+        self.apply_table_style_with(a, preset, &TableStyleOptions::default())
+    }
+    /// 표 마당: borders and fills of a preset, decorated per the Hangul option
+    /// check boxes (제목 줄·첫째 칸·마지막 칸·마지막 줄·회색조·테두리·셀 배경).
+    pub fn apply_table_style_with(
+        &mut self,
+        a: ObjectAddress,
+        preset: &str,
+        o: &TableStyleOptions,
+    ) -> Result<()> {
         let t = self.table_at(a)?;
+        let (rows, cols) = (t.row_count, t.col_count);
         let all = CellRange {
             start_row: 0,
             start_col: 0,
-            end_row: t.row_count - 1,
-            end_col: t.col_count - 1,
+            end_row: rows - 1,
+            end_col: cols - 1,
         };
-        let header = CellRange { end_row: 0, ..all };
-        let line = |ty: u8, w: u8, color: &str| json!({"type":ty,"width":w,"color":color});
+        let gray = |hex: &str| -> String {
+            if o.grayscale {
+                parse_rgb(hex)
+                    .map(gray_of)
+                    .map(rgb_hex)
+                    .unwrap_or_else(|| hex.to_owned())
+            } else {
+                hex.to_owned()
+            }
+        };
+        let line = |ty: u8, w: u8, color: &str| json!({"type":ty,"width":w,"color":gray(color)});
+        let fill = |color: &str| json!({"fillType":"solid","fillColor":gray(color)});
         let thin = line(1, 1, "#000000");
-        let (all_props, all_borders, header_props, header_bottom, stripe) = match preset {
+        // (outer/inner borders, accent fill, accent edge line, stripe fill)
+        let (all_borders, accent_fill, accent_edge, stripe) = match preset {
             "basic" => (
-                json!({"fillType":"none"}),
                 json!({"left":thin,"right":thin,"top":thin,"bottom":thin,"inner_vertical":thin,"inner_horizontal":thin}),
-                json!({}),
+                None,
                 None,
                 None,
             ),
             "blue_header" => (
-                json!({"fillType":"none"}),
                 json!({"left":line(1, 1, "#4f81bd"),"right":line(1, 1, "#4f81bd"),"top":line(1, 4, "#4f81bd"),
                     "bottom":line(1, 4, "#4f81bd"),"inner_vertical":line(1, 1, "#95b3d7"),"inner_horizontal":line(1, 1, "#95b3d7")}),
-                json!({"fillType":"solid","fillColor":"#dbe5f1"}),
+                Some(fill("#dbe5f1")),
                 Some(line(1, 4, "#4f81bd")),
                 None,
             ),
             "gray_grid" => (
-                json!({"fillType":"none"}),
                 json!({"left":line(1, 1, "#808080"),"right":line(1, 1, "#808080"),"top":line(1, 1, "#808080"),
                     "bottom":line(1, 1, "#808080"),"inner_vertical":line(1, 1, "#bfbfbf"),"inner_horizontal":line(1, 1, "#bfbfbf")}),
-                json!({"fillType":"solid","fillColor":"#d9d9d9"}),
+                Some(fill("#d9d9d9")),
                 Some(line(8, 3, "#595959")),
                 None,
             ),
             "striped" => (
-                json!({"fillType":"none"}),
                 json!({"left":line(0, 0, "#000000"),"right":line(0, 0, "#000000"),"top":line(1, 4, "#000000"),
                     "bottom":line(1, 4, "#000000"),"inner_vertical":line(0, 0, "#000000"),"inner_horizontal":line(1, 1, "#bfbfbf")}),
-                json!({}),
+                None,
                 Some(line(1, 3, "#000000")),
-                Some(json!({"fillType":"solid","fillColor":"#f2f2f2"})),
+                Some(fill("#f2f2f2")),
             ),
             _ => bail!("표 마당 preset은 basic, blue_header, gray_grid, striped 중 하나입니다."),
         };
@@ -2367,28 +2757,194 @@ impl Session {
             .as_object()
             .cloned()
             .ok_or_else(|| anyhow!("표 마당 정의 오류"))?;
+        let header = CellRange { end_row: 0, ..all };
+        let footer = CellRange {
+            start_row: rows - 1,
+            ..all
+        };
+        let first = CellRange { end_col: 0, ..all };
+        let last = CellRange {
+            start_col: cols - 1,
+            ..all
+        };
+        // Accent bands: fill (when 셀 배경) plus a heavy edge line (when 테두리).
+        let mut bands: Vec<(CellRange, &str)> = Vec::new();
+        if o.header_row {
+            bands.push((header, "bottom"));
+        }
+        if o.last_row && rows > 1 {
+            bands.push((footer, "top"));
+        }
+        if o.first_column {
+            bands.push((first, "right"));
+        }
+        if o.last_column && cols > 1 {
+            bands.push((last, "left"));
+        }
+        let (background, borders) = (o.background, o.borders);
+        if !background && !borders {
+            bail!("테두리와 셀 배경을 모두 끄면 적용할 것이 없습니다.");
+        }
         self.transaction(|s| {
-            s.cell_properties_raw(a, all, &all_props, Some(&all_borders))?;
-            if header_props.as_object().is_some_and(|o| !o.is_empty()) || header_bottom.is_some() {
-                let mut b = Map::new();
-                if let Some(l) = &header_bottom {
-                    b.insert("bottom".into(), l.clone());
-                }
-                s.cell_properties_raw(a, header, &header_props, Some(&b))?;
-            }
-            if let Some(fill) = &stripe {
-                let rows = s.table_at(a)?.row_count;
+            let base = if background {
+                json!({"fillType":"none"})
+            } else {
+                Value::Null
+            };
+            s.cell_properties_raw(a, all, &base, borders.then_some(&all_borders))?;
+            if background && let Some(f) = &stripe {
                 for row in (2..rows).step_by(2) {
                     let r = CellRange {
                         start_row: row,
                         end_row: row,
                         ..all
                     };
-                    s.cell_properties_raw(a, r, fill, None)?;
+                    s.cell_properties_raw(a, r, f, None)?;
                 }
+            }
+            for (range, edge) in &bands {
+                let props = match (&accent_fill, background) {
+                    (Some(f), true) => f.clone(),
+                    _ => Value::Null,
+                };
+                let mut b = Map::new();
+                if borders && let Some(l) = &accent_edge {
+                    b.insert((*edge).into(), l.clone());
+                }
+                if props.is_null() && b.is_empty() {
+                    continue;
+                }
+                s.cell_properties_raw(a, *range, &props, (!b.is_empty()).then_some(&b))?;
             }
             Ok(())
         })
+    }
+
+    /// Current solid fill of one cell as RGB, `None` for no fill.
+    fn cell_fill_rgb(&self, a: ObjectAddress, index: usize) -> Result<Option<[u8; 3]>> {
+        let v: Value = serde_json::from_str(
+            &self
+                .core
+                .get_cell_properties_by_cell_path_native(
+                    a.section,
+                    a.paragraph,
+                    &[(a.control, index, 0)],
+                    index,
+                )
+                .map_err(err)?,
+        )?;
+        if v["fillType"]
+            .as_str()
+            .is_some_and(|t| t.eq_ignore_ascii_case("solid"))
+        {
+            Ok(v["fillColor"].as_str().and_then(parse_rgb))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// 셀 음영 어둡게/밝게 for every cell of the block; returns the number of cells changed.
+    pub fn cell_shade(
+        &mut self,
+        a: ObjectAddress,
+        range: Option<CellRange>,
+        darker: bool,
+    ) -> Result<usize> {
+        let r = self.block(a, range)?;
+        let t = self.table_at(a)?;
+        let targets: Vec<(usize, u16, u16)> = Self::block_cells(t, r)
+            .into_iter()
+            .map(|i| (i, t.cells[i].row, t.cells[i].col))
+            .collect();
+        let mut edits: Vec<(CellRange, Value)> = Vec::new();
+        for (i, row, col) in targets {
+            let current = self.cell_fill_rgb(a, i)?;
+            let next = shade(current, darker);
+            if next == current {
+                continue;
+            }
+            let props = match next {
+                Some(rgb) => json!({"fillType":"solid","fillColor":rgb_hex(rgb)}),
+                None => json!({"fillType":"none"}),
+            };
+            edits.push((
+                CellRange {
+                    start_row: row,
+                    start_col: col,
+                    end_row: row,
+                    end_col: col,
+                },
+                props,
+            ));
+        }
+        if edits.is_empty() {
+            return Ok(0);
+        }
+        let count = edits.len();
+        self.transaction(|s| {
+            for (range, props) in &edits {
+                s.cell_properties_raw(a, *range, props, None)?;
+            }
+            Ok(())
+        })?;
+        Ok(count)
+    }
+
+    /// 사용자 정의 자동 채우기: cycle `values` through the block in reading order,
+    /// starting after the entry that matches the first cell (or from the first value).
+    pub fn auto_fill_values(
+        &mut self,
+        a: ObjectAddress,
+        range: Option<CellRange>,
+        values: &[String],
+    ) -> Result<usize> {
+        if values.is_empty() || values.len() > 200 {
+            bail!("사용자 목록은 1–200개 항목입니다.");
+        }
+        if values
+            .iter()
+            .any(|v| v.chars().count() > 200 || v.chars().any(char::is_control))
+        {
+            bail!("목록 항목은 제어 문자 없이 200자 이하로 입력하세요.");
+        }
+        let r = self.block(a, range)?;
+        let t = self.table_at(a)?;
+        let cells = Self::block_cells(t, r);
+        if cells.len() < 2 {
+            bail!("채울 셀 블록을 두 칸 이상 선택하세요.");
+        }
+        let simple = |i: usize| -> Option<String> {
+            let c = t.cells.get(i)?;
+            (c.paragraphs.len() == 1 && c.paragraphs[0].controls.is_empty())
+                .then(|| c.paragraphs[0].text.clone())
+        };
+        let first =
+            simple(cells[0]).ok_or_else(|| anyhow!("첫 셀은 한 문단의 글자만 담아야 합니다."))?;
+        let start = values
+            .iter()
+            .position(|v| v.trim() == first.trim())
+            .map_or(0, |p| p + 1);
+        let mut edits = Vec::new();
+        for (k, cell) in cells.iter().enumerate().skip(1) {
+            let Some(old) = simple(*cell) else {
+                continue;
+            };
+            let next = &values[(start + k - 1) % values.len()];
+            if *next != old {
+                edits.push((*cell, old.chars().count(), next.clone()));
+            }
+        }
+        if edits.is_empty() {
+            return Ok(0);
+        }
+        let count = edits.len();
+        self.transaction(|s| {
+            for (cell, old, text) in &edits {
+                s.replace_cell_text(a, *cell, *old, text)?;
+            }
+            s.reseat_if_inside(a, r)
+        })?;
+        Ok(count)
     }
 
     pub fn delete_table(&mut self, a: ObjectAddress) -> Result<()> {

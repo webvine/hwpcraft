@@ -36,9 +36,9 @@ pub fn tool_definitions() -> Value {
         ),
         tool(
             "batch",
-            "Run 1–1000 commands sequentially. Prior successes remain on failure. Stops at first failure unless keepGoing=true; any failure sets isError=true. Not a transaction.",
+            "Run 1–1000 commands sequentially. Stops at first failure unless keepGoing=true; any failure sets isError=true. atomic=true rolls every document change back when any command fails (keepGoing is then ignored); otherwise prior successes remain.",
             object(
-                json!({"commands":{"type":"array","minItems":1,"maxItems":1000,"items":command},"keepGoing":boolean}),
+                json!({"commands":{"type":"array","minItems":1,"maxItems":1000,"items":command},"keepGoing":boolean,"atomic":boolean}),
                 &["commands"]
             ),
             false
@@ -89,6 +89,21 @@ pub fn tool_definitions() -> Value {
             true
         ),
         tool(
+            "hwp_action",
+            "Run a Hangul automation action by its public name (e.g. MoveLineEnd, CharShapeBold, DeleteWord). Default parameters from the mapping table are merged under params. Omit id to list actions (query filters).",
+            object(
+                json!({"id":text,"params":{"type":"object","default":{}},"query":text}),
+                &[]
+            ),
+            false
+        ),
+        tool(
+            "get_selection",
+            "Read the caret, anchor and selected text (cursor section/paragraph/offset/cell, Unicode scalar offsets).",
+            object(json!({}), &[]),
+            true
+        ),
+        tool(
             "render_page",
             "Return a page as inline PNG, with no temporary file. Page is 1-based. Scale is pixels per SVG unit, 0.25–2.0.",
             object(
@@ -112,6 +127,8 @@ pub(crate) fn known_tool(name: &str) -> bool {
             | "select_text"
             | "get_text"
             | "inspect_document"
+            | "hwp_action"
+            | "get_selection"
             | "render_page"
     )
 }
@@ -157,6 +174,8 @@ fn answer(b: &mut Headless, name: &str, args: Value) -> Result<Value> {
                 commands: Vec<Execute>,
                 #[serde(default, rename = "keepGoing")]
                 keep_going: bool,
+                #[serde(default)]
+                atomic: bool,
             }
             let p: Batch = serde_json::from_value(args)?;
             if p.commands.is_empty() || p.commands.len() > 1000 {
@@ -168,6 +187,24 @@ fn answer(b: &mut Headless, name: &str, args: Value) -> Result<Value> {
             {
                 bail!("각 명령에는 command와 객체 params가 필요합니다.");
             }
+            if p.atomic
+                && p.commands.iter().any(|c| {
+                    matches!(
+                        c.command.as_str(),
+                        "file.new"
+                            | "file.open"
+                            | "file.save"
+                            | "file.save_as"
+                            | "file.pdf"
+                            | "file.save_hml"
+                            | "file.save_pages"
+                            | "file.print_pdf"
+                    )
+                })
+            {
+                bail!("atomic batch에는 파일 명령을 넣을 수 없습니다.");
+            }
+            let checkpoint = p.atomic.then(|| b.session.checkpoint());
             let mut results = Vec::new();
             let mut failed = false;
             for c in p.commands {
@@ -179,14 +216,61 @@ fn answer(b: &mut Headless, name: &str, args: Value) -> Result<Value> {
                         failed = true;
                         results
                             .push(json!({"command":c.command,"ok":false,"error":format!("{e:#}")}));
-                        if !p.keep_going {
+                        if !p.keep_going || p.atomic {
                             break;
                         }
                     }
                 }
             }
-            return Ok(result(json!({"results":results}), failed));
+            let mut rolled_back = false;
+            if let Some(checkpoint) = checkpoint {
+                if failed {
+                    b.session.rollback(checkpoint)?;
+                    rolled_back = true;
+                } else {
+                    b.session.release(checkpoint);
+                }
+            }
+            return Ok(result(
+                json!({"results":results,"rolledBack":rolled_back}),
+                failed,
+            ));
         }
+        "hwp_action" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Action {
+                #[serde(default)]
+                id: Option<String>,
+                #[serde(default = "empty")]
+                params: Value,
+                #[serde(default)]
+                query: String,
+            }
+            let p: Action = serde_json::from_value(args)?;
+            let Some(id) = p.id else {
+                return Ok(result(catalog::actions(&p.query), false));
+            };
+            let (command, defaults, mapping) = hwpcraft_engine::hwp_action(&id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "대응하는 HwpCraft 명령이 없는 한글 동작: {id}. hwp_action {{query}}로 목록을 보세요."
+                )
+            })?;
+            let mut merged: serde_json::Map<String, Value> =
+                serde_json::from_str::<Value>(defaults)?
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+            let Some(given) = p.params.as_object() else {
+                bail!("params는 JSON 객체여야 합니다.");
+            };
+            for (k, v) in given {
+                merged.insert(k.clone(), v.clone());
+            }
+            let value = b.execute(command, Value::Object(merged))?;
+            json!({"action":id,"command":command,"mapping":mapping,"result":value})
+        }
+        "get_selection" => b.execute("select.get", args)?,
         "new_document" => b.execute("file.new", args)?,
         "open_document" => b.execute("file.open", args)?,
         "save_document" => b.execute("file.save", args)?,
