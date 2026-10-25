@@ -171,7 +171,7 @@ HwpCraft는 **MIT 라이선스**로 배포합니다. 전문은 [LICENSE](LICENSE
 
 **MIT 라이선스가 적용되는 범위** — 이 저장소에 들어 있는 HwpCraft의 모든 산출물입니다.
 
-- 소스 코드: `crates/`, `apps/`의 Rust 코드와 `tools/`, 빌드·패키징 스크립트(`HwpCraft.ps1`).
+- 소스 코드: `crates/`, `apps/`의 Rust 코드와 빌드·패키징 스크립트(`HwpCraft.ps1`).
 - 문서와 예제: `README.md`, `docs/`, `CONTRIBUTING.md`, `samples/`의 HWP/HWPX/PDF 예제 문서.
 - HwpCraft가 직접 만든 자산: 앱 아이콘 `assets/icon.svg`, 리본 아이콘 아틀라스 `assets/toolbar-icons.png`(Lucide 아이콘을 조합한 결과물).
 - 기여물: 풀 리퀘스트로 들어오는 모든 변경은 MIT로 제공되며 DCO 서명을 요구합니다([CONTRIBUTING.md](CONTRIBUTING.md)).
@@ -376,7 +376,7 @@ HwpCraft is released under the **MIT License**. The full text is in [LICENSE](LI
 
 **What the MIT License covers** — everything HwpCraft itself produces in this repository.
 
-- Source code: the Rust code in `crates/` and `apps/`, plus `tools/` and the build / packaging script (`HwpCraft.ps1`).
+- Source code: the Rust code in `crates/` and `apps/`, plus the build / packaging script (`HwpCraft.ps1`).
 - Documentation and samples: `README.md`, `docs/`, `CONTRIBUTING.md`, and the HWP / HWPX / PDF documents in `samples/`.
 - Assets made by HwpCraft: the application icon `assets/icon.svg` and the ribbon icon atlas `assets/toolbar-icons.png` (a composition of Lucide icons).
 - Contributions: every change submitted by pull request is provided under MIT and requires a DCO sign-off ([CONTRIBUTING.md](CONTRIBUTING.md)).
