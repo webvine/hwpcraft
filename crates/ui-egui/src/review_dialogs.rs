@@ -64,7 +64,7 @@ impl HwpApp {
             self.open_hanja_dialog();
             return true;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::F3)) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F3)) {
             self.open_autotext_contents();
             return true;
         }
@@ -145,10 +145,9 @@ impl HwpApp {
         let Some(window) = self.ext.tools.compare.as_mut() else {
             return;
         };
-        let findings = window.result["findings"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let Some(findings) = window.result["findings"].as_array() else {
+            return;
+        };
         if findings.is_empty() {
             return;
         }
@@ -161,7 +160,8 @@ impl HwpApp {
             i = (i + delta).rem_euclid(n);
             if !findings[i as usize]["cursor"].is_null() {
                 window.selected = Some(i as usize);
-                self.goto_finding(&findings[i as usize]);
+                let finding = findings[i as usize].clone();
+                self.goto_finding(&finding);
                 return;
             }
         }
@@ -178,12 +178,13 @@ impl HwpApp {
     }
 
     fn compare_window(&mut self, ctx: &egui::Context) {
-        let Some(window) = self.ext.tools.compare.as_ref() else {
+        // Taken for the frame and put back below, so the result is drawn by reference.
+        let Some(window) = self.ext.tools.compare.take() else {
             return;
         };
         let path = window.path.clone();
         let mut ignore_whitespace = window.ignore_whitespace;
-        let result = window.result.clone();
+        let result = &window.result;
         let mut selected = window.selected;
         let mut close = false;
         let mut rerun = false;
@@ -195,7 +196,8 @@ impl HwpApp {
             .collapsible(false)
             .resizable(true)
             .default_size(Vec2::new(520.0, 420.0))
-            .default_pos(ctx.content_rect().right_top() + Vec2::new(-560.0, 120.0))
+            // Below the ribbon, format bar and ruler, clear of the vertical scroll bar.
+            .default_pos(ctx.content_rect().right_top() + Vec2::new(-560.0, 190.0))
             .frame(
                 egui::Frame::window(&ctx.global_style())
                     .fill(chrome::Tokens::PANEL)
@@ -242,62 +244,93 @@ impl HwpApp {
                 } else {
                     format!("차이 {total}건 — {}", summary.join(", "))
                 };
-                ui.label(RichText::new(status).small().color(Color32::DARK_GRAY));
+                ui.label(RichText::new(status).size(12.5).color(Color32::DARK_GRAY));
                 ui.add_space(4.0);
-                let findings = result["findings"].as_array().cloned().unwrap_or_default();
+                let findings: &[Value] = result["findings"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let navigable = findings.iter().any(|f| !f["cursor"].is_null());
+                // Fixed column widths keep the header over its column; only the
+                // visible rows are laid out, however many findings there are.
+                const PLACE: f32 = 96.0;
+                const KIND: f32 = 196.0;
+                let row_height = ui.spacing().interact_size.y + 2.0;
+                // A left-aligned cell of fixed width.
+                let column = |ui: &mut egui::Ui, width: f32, widget: egui::Label| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(width, row_height),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_width(width);
+                            ui.add(widget)
+                        },
+                    )
+                    .inner
+                };
+                ui.horizontal(|ui| {
+                    column(ui, PLACE, egui::Label::new(RichText::new("위치").strong()));
+                    column(ui, KIND, egui::Label::new(RichText::new("종류").strong()));
+                    ui.label(RichText::new("내용").strong());
+                });
                 egui::ScrollArea::vertical()
                     .max_height(260.0)
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        egui::Grid::new("compare-findings")
-                            .num_columns(3)
-                            .striped(true)
-                            .spacing([10.0, 4.0])
-                            .show(ui, |ui| {
-                                ui.strong("위치");
-                                ui.strong("종류");
-                                ui.strong("내용");
-                                ui.end_row();
-                                for (i, f) in findings.iter().enumerate() {
-                                    let has_cursor = !f["cursor"].is_null();
-                                    let is_selected = selected == Some(i);
-                                    let place = match (f["section"].as_u64(), f["paragraph"].as_u64()) {
-                                        (Some(s), Some(p)) => format!("{}구역 {}문단", s + 1, p + 1),
-                                        (Some(s), None) => format!("{}구역", s + 1),
-                                        _ => "문서".to_owned(),
-                                    };
-                                    let r = ui.selectable_label(is_selected, place);
-                                    ui.label(f["label"].as_str().unwrap_or(""));
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(f["detail"].as_str().unwrap_or(""))
-                                                .small(),
-                                        )
-                                        .truncate(),
-                                    );
-                                    ui.end_row();
-                                    if r.clicked() {
-                                        selected = Some(i);
-                                        if has_cursor {
-                                            goto = Some(f.clone());
-                                        }
+                    .show_rows(ui, row_height, findings.len(), |ui, rows| {
+                        for (i, f) in findings.iter().enumerate().skip(rows.start).take(rows.len()) {
+                            let has_cursor = !f["cursor"].is_null();
+                            let place = match (f["section"].as_u64(), f["paragraph"].as_u64()) {
+                                (Some(s), Some(p)) => format!("{}구역 {}문단", s + 1, p + 1),
+                                (Some(s), None) => format!("{}구역", s + 1),
+                                _ => "문서".to_owned(),
+                            };
+                            ui.horizontal(|ui| {
+                                let r = ui.add_sized(
+                                    [PLACE, row_height],
+                                    egui::Button::selectable(selected == Some(i), place),
+                                );
+                                column(
+                                    ui,
+                                    KIND,
+                                    egui::Label::new(f["label"].as_str().unwrap_or("")).truncate(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(f["detail"].as_str().unwrap_or("")).size(12.0),
+                                    )
+                                    .truncate(),
+                                );
+                                if r.clicked() {
+                                    selected = Some(i);
+                                    if has_cursor {
+                                        goto = Some(f.clone());
                                     }
                                 }
                             });
+                        }
                     });
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(
                         "현재 문서를 수정본, 선택한 파일을 원본으로 봅니다. 본문·표 셀의 문단과 표·개체·스타일을 비교하며 글상자·각주·머리말 안은 비교하지 않습니다.",
                     )
-                    .small()
+                    .size(12.0)
                     .color(Color32::GRAY),
                 );
                 ui.horizontal(|ui| {
-                    if ui.button("이전 차이").clicked() {
+                    let reason = "현재 문서 안을 가리키는 차이가 없습니다(비교 파일에만 있는 문단 등).";
+                    if ui
+                        .add_enabled(navigable, egui::Button::new("이전 차이"))
+                        .on_disabled_hover_text(reason)
+                        .clicked()
+                    {
                         step = -1;
                     }
-                    if ui.button("다음 차이").clicked() {
+                    if ui
+                        .add_enabled(navigable, egui::Button::new("다음 차이"))
+                        .on_disabled_hover_text(reason)
+                        .clicked()
+                    {
                         step = 1;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -310,10 +343,11 @@ impl HwpApp {
                     close = true;
                 }
             });
-        if let Some(window) = self.ext.tools.compare.as_mut() {
-            window.selected = selected;
-            window.ignore_whitespace = ignore_whitespace;
-        }
+        self.ext.tools.compare = Some(CompareWindow {
+            selected,
+            ignore_whitespace,
+            ..window
+        });
         if let Some(f) = goto {
             self.goto_finding(&f);
         }

@@ -99,3 +99,29 @@ fn compare_ignores_whitespace_when_asked() -> anyhow::Result<()> {
     assert_eq!(loose["identical"], true);
     Ok(())
 }
+
+#[test]
+fn compare_outside_the_read_root_is_refused_without_probing() -> anyhow::Result<()> {
+    use hwpcraft_formats::file_access::{self, AutomationRoots};
+    let temp = tempfile::tempdir()?;
+    let allowed = temp.path().join("allowed");
+    std::fs::create_dir(&allowed)?;
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("본문".into()))?;
+    let outside = temp.path().join("outside.hwpx");
+    s.save(&outside)?;
+    let missing = temp.path().join("missing.hwpx");
+    let roots = AutomationRoots::new(Some(&allowed), None).map_err(anyhow::Error::msg)?;
+    file_access::confine(roots.as_ref(), || {
+        // An existing and a missing file outside the root fail the same way.
+        for path in [&outside, &missing] {
+            let e = s
+                .run("review.compare", json!({"path": path}))
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_default();
+            assert!(e.contains("outside the read root"), "{e}");
+        }
+    });
+    Ok(())
+}

@@ -2,7 +2,7 @@
 
 - This is a native Rust / egui desktop project. Keep all new HwpCraft source in this folder.
 - Reference WordCraft's layering, but preserve RHWP's document model instead of converting it to a DOCX DOM.
-- Do not edit the sibling `rhwp` or `wordcraft` projects as part of routine app work.
+- Do not edit the sibling `rhwp` or `wordcraft` projects as part of routine app work. A user-approved RHWP change is kept as a numbered patch in `patches/rhwp/` and recorded in its README; `scripts/rhwp-patches.ps1` checks/applies it and `scripts/sync-siblings.ps1` re-applies it after updating RHWP.
 - Do not run `cargo fmt --all`: it follows path dependencies into RHWP. Format the seven HwpCraft packages with explicit `-p` arguments.
 - Editing commands belong in `crates/engine`, reused by UI and CLI. Offsets count Unicode scalar values.
 - Keep failed document loads, commands and saves from destroying the current document or an existing file.

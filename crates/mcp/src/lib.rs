@@ -1,9 +1,16 @@
-//! HwpCraft MCP: stdio JSON-RPC over the shared RHWP editing session.
-//! Architecture follows WordCraft; no DOCX model or desktop dependency is used.
+//! Current MCP over isolated shared-engine document workers, using stdio or HTTP.
+//! Each document operation carries an explicit handle; no desktop is required.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod catalog;
-mod server;
+mod document_subscriptions;
+mod document_workers;
+mod protected_open;
+mod sdk_catalog;
+mod sdk_http;
+mod sdk_runtime;
+mod sdk_service;
+mod strict_stdio;
 mod tools;
 
 use anyhow::{Context, Result, bail};
@@ -11,11 +18,7 @@ use hwpcraft_engine::Session;
 use hwpcraft_formats::file_access::{self, AutomationRoots};
 use serde::Deserialize;
 use serde_json::{Value, json};
-pub use server::Server;
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 pub use tools::tool_definitions;
 
 pub struct Headless {
@@ -78,6 +81,7 @@ impl Headless {
                     self.require_discard(p.force)?;
                     self.session.open(&p.path)?;
                 }
+                "file.open_protected" => return protected_open::open(self, params),
                 "file.save" | "file.save_as" | "file.pdf" => {
                     let p: Save = serde_json::from_value(params)?;
                     let path = p
@@ -106,14 +110,15 @@ impl Headless {
     fn render(&mut self, page: u32, scale: f32) -> Result<Value> {
         use base64::Engine;
         use image::ImageEncoder;
-        if page == 0 || page > self.session.core.page_count() {
+        let count = self.session.page_count()?;
+        if page == 0 || page > count {
             bail!("쪽 범위를 벗어났습니다.");
         }
         if !scale.is_finite() || !(0.25..=2.0).contains(&scale) {
             bail!("scale은 0.25–2.0이어야 합니다.");
         }
         let renderer = self.renderer.get_or_insert_with(Default::default);
-        let image = renderer.page(&self.session.core, page - 1, scale)?;
+        let image = renderer.svg(&self.session.render_page_svg(page - 1)?, scale)?;
         let mut png = Vec::new();
         image::codecs::png::PngEncoder::new(&mut png).write_image(
             &image.rgba,
@@ -123,54 +128,29 @@ impl Headless {
         )?;
         Ok(json!({"content":[
             {"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(png)},
-            {"type":"text","text":json!({"page":page,"pages":self.session.core.page_count(),"width":image.width,"height":image.height}).to_string()}
+            {"type":"text","text":json!({"page":page,"pages":count,"width":image.width,"height":image.height}).to_string()}
         ],"isError":false}))
     }
 }
 
 /// Parse only MCP options. Unknown/repeated flags fail before stdin is consumed.
 pub fn run_stdio(args: &[String]) -> Result<()> {
-    if args == ["--help"] || args == ["-h"] {
-        println!(
-            "hwpcraft-cli mcp [--automation-read-root DIR] [--automation-write-root DIR]\nHeadless MCP over stdio. HWP/HWPX editing; no --connect or desktop UI tools."
-        );
-        return Ok(());
-    }
-    let mut read = None;
-    let mut write = None;
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        let (flag, inline) = arg
-            .split_once('=')
-            .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
-        let slot = match flag {
-            "--automation-read-root" => &mut read,
-            "--automation-write-root" => &mut write,
-            _ => bail!("지원하지 않는 MCP 옵션: {flag}. hwpcraft-cli mcp --help"),
-        };
-        if slot.is_some() {
-            bail!("중복 옵션: {flag}");
-        }
-        let value = inline
-            .or_else(|| args.next().map(String::as_str))
-            .context("옵션 뒤에 폴더가 필요합니다.")?;
-        if value.is_empty() || value.starts_with("--") {
-            bail!("{flag} 뒤에 폴더가 필요합니다.");
-        }
-        *slot = Some(PathBuf::from(value));
-    }
-    let roots = AutomationRoots::new(
-        read.as_deref().map(Path::as_ref),
-        write.as_deref().map(Path::as_ref),
-    )
-    .map_err(anyhow::Error::msg)?;
-    // Covers any worker threads added by the engine in the future as well.
-    if let Some(roots) = &roots {
-        file_access::confine_process(roots.clone());
-    }
-    let mut server = Server::new(Headless::new(roots)?);
-    match server.serve(std::io::stdin().lock(), std::io::stdout().lock()) {
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-        result => result.map_err(Into::into),
-    }
+    sdk_runtime::run(args)
+}
+
+/// Serve current MCP over an owned JSONL stream. Every document request carries
+/// its handle; roots are applied on each engine worker, never process-globally.
+pub async fn serve_stream<R, W>(
+    roots: Option<Arc<AutomationRoots>>,
+    read: R,
+    write: W,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    let service =
+        sdk_service::HwpService::new(Arc::new(document_workers::DocumentWorkers::new(roots)))?;
+    sdk_runtime::run_stream(service, read, write).await?;
+    Ok(())
 }

@@ -475,7 +475,7 @@ impl Session {
     /// 한자→한글 for every hanja run in body and table paragraphs; one undo step.
     fn hanja_to_hangul_document(&mut self) -> Result<Value> {
         let mut planned: Vec<(Cursor, Range<usize>, String)> = Vec::new();
-        for (cursor, _) in self.entries() {
+        for cursor in self.cursors() {
             if self.cell_protected(cursor) {
                 continue;
             }
@@ -509,15 +509,18 @@ impl Session {
         }
         let caret = self.cursor;
         self.transaction(|s| {
-            for (cursor, range, text) in planned.into_iter().rev() {
-                s.clear_selection();
-                s.cursor = Cursor {
-                    offset: range.end,
-                    ..cursor
-                };
-                s.anchor = Some(range.start);
-                s.insert(&text)?;
-            }
+            s.with_deferred_layout(|s| {
+                for (cursor, range, text) in planned.into_iter().rev() {
+                    s.clear_selection();
+                    s.cursor = Cursor {
+                        offset: range.end,
+                        ..cursor
+                    };
+                    s.anchor = Some(range.start);
+                    s.insert(&text)?;
+                }
+                Ok(())
+            })?;
             s.cursor = caret;
             s.clear_selection();
             Ok(())

@@ -245,6 +245,14 @@ fn replace_preserves_unaffected_style() -> anyhow::Result<()> {
         },
         false,
     )?;
+    // Inspect the preserved character, rather than the insertion shape to its left.
+    s.select(
+        Cursor {
+            offset: 8,
+            ..s.cursor
+        },
+        true,
+    )?;
     assert_eq!(s.character_properties()?["bold"], true);
     assert_eq!(s.text(), "앞 한글문서 뒤");
     Ok(())

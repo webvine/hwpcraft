@@ -139,6 +139,7 @@ fn paragraph_alignment_spacing_indent_and_margins() -> anyhow::Result<()> {
 #[test]
 fn character_and_paragraph_borders_keep_unspecified_sides() -> anyhow::Result<()> {
     let mut s = doc("테두리 글자")?;
+    s.select_all()?; // This fixture formats existing text, not future input.
     let line = json!({"type": 1, "width": 2, "color": "#ff0000"});
     s.run("format.character", json!({"borderLeft": line}))?;
     let p = chars(&mut s)?;
@@ -481,6 +482,7 @@ fn paragraph_move_swaps_neighbours_and_keeps_section_definitions() -> anyhow::Re
 #[test]
 fn char_overlap_inserts_updates_deletes_and_roundtrips() -> anyhow::Result<()> {
     let mut s = doc("겹치기 앞 뒤")?;
+    s.select_all()?; // This fixture formats existing text, not future input.
     s.run("format.bold", json!({}))?;
     s.select(
         Cursor {

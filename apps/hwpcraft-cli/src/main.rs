@@ -24,7 +24,7 @@ fn main() -> Result<()> {
         return hwpcraft_mcp::run_stdio(&args[1..]);
     }
     if command == "--version" {
-        println!("HwpCraft {} / RHWP 0.8.7", hwpcraft_engine::VERSION);
+        println!("HwpCraft {} / RHWP 0.8.7", hwpcraft_engine::VERSION.trim());
         return Ok(());
     }
     if command == "--help" {
@@ -131,11 +131,11 @@ fn main() -> Result<()> {
                         .map(|v| v.parse::<u32>())
                         .transpose()?
                         .unwrap_or(1);
-                    if page == 0 || page > session.core.page_count() {
+                    if page == 0 || page > session.page_count()? {
                         bail!("쪽 범위를 벗어났습니다.");
                     }
-                    let p =
-                        hwpcraft_render::Renderer::default().page(&session.core, page - 1, 1.25)?;
+                    let p = hwpcraft_render::Renderer::default()
+                        .svg(&session.render_page_svg(page - 1)?, 1.25)?;
                     image::save_buffer(
                         argument(&args, 2)?,
                         &p.rgba,
@@ -154,19 +154,19 @@ fn main() -> Result<()> {
 fn demo(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let mut s = Session::new()?;
-    s.execute(Command::Insert("HwpCraft · 한글 문서 작업실".into()))?;
     s.execute(Command::Character(
         json!({"fontFamily":"Noto Sans KR","bold":true,"fontSize":2400,"textColor":"#234c7d"}),
     ))?;
+    s.execute(Command::Insert("HwpCraft · 한글 문서 작업실".into()))?;
     s.execute(Command::Paragraph(
         json!({"alignment":"center","spacingAfter":1600}),
     ))?;
     s.execute(Command::Split)?;
-    s.execute(Command::Insert(
-        "문서를 내 컴퓨터에서 만들고, 편집하고, 보관합니다.".into(),
-    ))?;
     s.execute(Command::Character(
         json!({"fontFamily":"Noto Sans KR","bold":false,"fontSize":1200,"textColor":"#263445"}),
+    ))?;
+    s.execute(Command::Insert(
+        "문서를 내 컴퓨터에서 만들고, 편집하고, 보관합니다.".into(),
     ))?;
     s.execute(Command::Paragraph(
         json!({"alignment":"left","spacingAfter":1000}),
@@ -195,16 +195,16 @@ fn demo(dir: &Path) -> Result<()> {
         "지원",
     ]) {
         s.select(c, false)?;
-        s.execute(Command::Insert(text.into()))?;
         s.execute(Command::Character(
             json!({"fontFamily":"Noto Sans KR","fontSize":1000,"bold":false}),
         ))?;
+        s.execute(Command::Insert(text.into()))?;
     }
     s.select(Cursor::default(), false)?;
     for extension in ["hwpx", "hwp", "pdf"] {
         s.save(&dir.join(format!("HwpCraft-시작하기.{extension}")))?;
     }
-    let p = hwpcraft_render::Renderer::default().page(&s.core, 0, 1.25)?;
+    let p = hwpcraft_render::Renderer::default().svg(&s.render_page_svg(0)?, 1.25)?;
     image::save_buffer(
         dir.join("sample-page.png"),
         &p.rgba,

@@ -176,3 +176,37 @@ fn inserted_autotext_survives_hwpx_roundtrip() -> anyhow::Result<()> {
     drop(guard);
     Ok(())
 }
+
+#[test]
+fn overwrite_cannot_take_another_entrys_abbreviation() -> anyhow::Result<()> {
+    let guard = store();
+    let mut s = Session::new()?;
+    s.run(
+        "tools.autotext.add",
+        json!({"name":"주소","abbreviation":"주","text":"서울시"}),
+    )?;
+    s.run(
+        "tools.autotext.add",
+        json!({"name":"전화","abbreviation":"전","text":"02-000-0000"}),
+    )?;
+    assert!(
+        s.run(
+            "tools.autotext.add",
+            json!({"name":"전화","abbreviation":"주","text":"x","overwrite":true})
+        )
+        .is_err()
+    );
+    // Keeping its own abbreviation on overwrite is fine.
+    s.run(
+        "tools.autotext.add",
+        json!({"name":"전화","abbreviation":"전","text":"02-111-1111","overwrite":true}),
+    )?;
+    let list = s.run("tools.autotext.list", json!({}))?;
+    let entries = list["entries"].as_array().cloned().unwrap_or_default();
+    let with_ju = entries.iter().filter(|e| e["abbreviation"] == "주").count();
+    assert_eq!(with_ju, 1);
+    s.run("tools.autotext.delete", json!({"name":"주소"}))?;
+    s.run("tools.autotext.delete", json!({"name":"전화"}))?;
+    drop(guard);
+    Ok(())
+}

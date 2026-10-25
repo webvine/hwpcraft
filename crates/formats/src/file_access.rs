@@ -22,7 +22,7 @@
 //! a link) can still win that race. The roots keep an agent to the files it was given; they don't
 //! guard against other programs on the computer.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -213,8 +213,32 @@ pub fn check_read(path: &str) -> Result<(), String> {
     current().map_or(Ok(()), |r| r.check(path, Access::Read))
 }
 
-/// May `path` be written here? Always, without roots in force.
+thread_local! {
+    /// Nesting depth of [`forbid_writes`] guards alive on this thread.
+    static WRITES_FORBIDDEN: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Refuses every write on this thread, whatever roots are in force, until dropped.
+pub struct ForbidWrites(());
+
+impl Drop for ForbidWrites {
+    fn drop(&mut self) {
+        WRITES_FORBIDDEN.with(|n| n.set(n.get().saturating_sub(1)));
+    }
+}
+
+/// Refuse file and settings writes while the guard lives: an atomic batch can roll back
+/// document changes, never what it already wrote to disk.
+pub fn forbid_writes() -> ForbidWrites {
+    WRITES_FORBIDDEN.with(|n| n.set(n.get() + 1));
+    ForbidWrites(())
+}
+
+/// May `path` be written here? Always, without roots in force, unless writes are forbidden.
 pub fn check_write(path: &str) -> Result<(), String> {
+    if WRITES_FORBIDDEN.with(Cell::get) > 0 {
+        return Err("automation path rejected: writes are not allowed here (atomic batch)".into());
+    }
     current().map_or(Ok(()), |r| r.check(path, Access::Write))
 }
 

@@ -95,6 +95,9 @@ impl HwpApp {
                 ui.add_enabled(
                     false,
                     egui::Checkbox::new(&mut false, "현재 설정 값을 새 문서에 적용"),
+                )
+                .on_disabled_hover_text(
+                    "새 문서의 기본 용지 설정은 아직 저장하지 않습니다. 지금 문서의 현재 구역에만 적용됩니다.",
                 );
             });
             if let Err(e) = &valid {

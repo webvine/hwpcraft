@@ -14,6 +14,14 @@ pub fn extension_commands()
         .chain(hanja::COMMANDS)
         .chain(review::COMMANDS)
         .chain(autotext::COMMANDS)
+        .chain(body_autotext::COMMANDS)
+        .chain(automation_context::COMMANDS)
+        .chain(contexts::COMMANDS)
+        .chain(contexts_v2::COMMANDS)
+        .chain(comments::COMMANDS)
+        .chain(hwp_parameters::COMMANDS)
+        .chain(hwp_action_defaults::COMMANDS)
+        .chain(chart_creation::COMMANDS)
 }
 
 /// Every documented command: (id, parameter help, JSON example).
@@ -29,6 +37,14 @@ pub fn command_help_entries() -> impl Iterator<Item = (&'static str, &'static st
         .chain(hanja::PARAMS)
         .chain(review::PARAMS)
         .chain(autotext::PARAMS)
+        .chain(body_autotext::PARAMS)
+        .chain(automation_context::PARAMS)
+        .chain(contexts::PARAMS)
+        .chain(contexts_v2::PARAMS)
+        .chain(comments::PARAMS)
+        .chain(hwp_parameters::PARAMS)
+        .chain(hwp_action_defaults::PARAMS)
+        .chain(chart_creation::PARAMS)
         .map(|(id, help, example)| {
             (
                 *id,
@@ -50,16 +66,24 @@ type Handler = fn(&mut Session, &str, &Value) -> Option<Result<Value>>;
 
 impl Session {
     pub(crate) fn run_extension(&mut self, id: &str, params: Value) -> Result<Value> {
-        let handlers: [Handler; 9] = [
+        let handlers: [Handler; 17] = [
             Self::run_caret_ext,
             Self::run_format_ext,
             Self::run_table_ext,
             Self::run_drawing_ext,
+            Self::run_comments_ext,
             Self::run_object_ext,
             Self::run_page_ext,
             Self::run_hanja_ext,
             Self::run_review_ext,
             Self::run_autotext_ext,
+            Self::run_body_autotext_ext,
+            Self::run_automation_context_ext,
+            Self::run_context_ext,
+            Self::run_context_v2_ext,
+            Self::run_hwp_parameter_ext,
+            Self::run_hwp_action_defaults_ext,
+            Self::run_chart_creation,
         ];
         for handler in handlers {
             if let Some(result) = handler(self, id, &params) {

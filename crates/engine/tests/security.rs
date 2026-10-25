@@ -88,8 +88,10 @@ fn html_paste_keeps_formatting_and_is_atomic() -> anyhow::Result<()> {
     s.paste_html("<p><b>굵게</b> 보통</p>")?;
     assert_eq!(s.text(), "앞굵게 보통");
     s.cursor.offset = 1;
+    s.anchor = Some(2); // Inspect the first pasted character, not left-affinity insertion shape.
     assert_eq!(s.character_properties()?["bold"], true);
     s.cursor.offset = 5;
+    s.anchor = Some(6);
     assert_eq!(s.character_properties()?["bold"], false);
     s.execute(Command::Undo)?;
     assert_eq!(s.text(), "앞");

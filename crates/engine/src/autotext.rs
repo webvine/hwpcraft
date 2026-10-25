@@ -78,8 +78,10 @@ static CONFIG_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::
 pub fn set_config_dir(dir: PathBuf) -> bool {
     CONFIG_DIR_OVERRIDE.set(dir).is_ok()
 }
-/// Settings folder shared with the desktop app (`%APPDATA%/HwpCraft`, `$XDG_CONFIG_HOME/HwpCraft`
-/// or `~/.config/HwpCraft`). `set_config_dir` or `HWPCRAFT_CONFIG_DIR` overrides it.
+/// Settings folder shared by the desktop app, CLI and MCP: `%APPDATA%\HwpCraft` on
+/// Windows, `~/Library/Application Support/HwpCraft` on macOS, and
+/// `$XDG_CONFIG_HOME/HwpCraft` (default `~/.config/HwpCraft`) on Linux and other
+/// Unix systems. `set_config_dir` or `HWPCRAFT_CONFIG_DIR` overrides it.
 pub fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
         return Some(dir.clone());
@@ -87,10 +89,34 @@ pub fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("HWPCRAFT_CONFIG_DIR") {
         return Some(PathBuf::from(dir));
     }
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    default_config_dir(std::env::consts::OS, &|name| std::env::var_os(name), &|p| {
+        p.is_dir()
+    })
+}
+
+/// The platform settings folder for `os` (`std::env::consts::OS`), reading the
+/// environment through `var` so every platform's rule is testable anywhere.
+fn default_config_dir(
+    os: &str,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    is_dir: &dyn Fn(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    let non_empty = |name: &str| var(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let home = non_empty("HOME");
+    let base = match os {
+        "windows" => non_empty("APPDATA")
+            .or_else(|| non_empty("USERPROFILE").map(|h| h.join("AppData").join("Roaming")))?,
+        "macos" => {
+            let home = home?;
+            // Builds before 0.17 used ~/.config on macOS too; keep using it if it exists.
+            let legacy = home.join(".config").join("HwpCraft");
+            if is_dir(&legacy) {
+                return Some(legacy);
+            }
+            home.join("Library").join("Application Support")
+        }
+        _ => non_empty("XDG_CONFIG_HOME").or_else(|| home.map(|h| h.join(".config")))?,
+    };
     Some(base.join("HwpCraft"))
 }
 fn store_path() -> Result<PathBuf> {
@@ -99,7 +125,17 @@ fn store_path() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("설정 폴더를 찾지 못해 상용구를 저장할 수 없습니다."))
 }
 fn load() -> Result<(PathBuf, Vec<AutoText>)> {
+    load_path(store_path()?)
+}
+/// Updates need both authorities before even reading an existing store.
+fn load_for_update() -> Result<(PathBuf, Vec<AutoText>)> {
     let path = store_path()?;
+    check_store_write(&path)?;
+    load_path(path)
+}
+fn load_path(path: PathBuf) -> Result<(PathBuf, Vec<AutoText>)> {
+    hwpcraft_formats::file_access::check_read(&path.to_string_lossy())
+        .map_err(anyhow::Error::msg)?;
     let entries = match std::fs::read(&path) {
         Ok(bytes) => {
             serde_json::from_slice::<Store>(&bytes)
@@ -111,8 +147,16 @@ fn load() -> Result<(PathBuf, Vec<AutoText>)> {
     };
     Ok((path, entries))
 }
+fn check_store_write(path: &Path) -> Result<()> {
+    hwpcraft_formats::file_access::check_write(&path.to_string_lossy())
+        .map_err(anyhow::Error::msg)?;
+    // An existing temporary-file link must not redirect the write outside the root.
+    hwpcraft_formats::file_access::check_write(&path.with_extension("json.tmp").to_string_lossy())
+        .map_err(anyhow::Error::msg)
+}
 /// Write through a temporary file so a failed save never truncates the store.
 fn save(path: &Path, entries: &[AutoText]) -> Result<()> {
+    check_store_write(path)?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("설정 폴더를 만들지 못했습니다: {}", dir.display()))?;
@@ -222,8 +266,17 @@ impl Session {
                     bail!("상용구 내용은 100 KB 이하입니다.");
                 }
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                let (path, mut entries) = load()?;
+                let (path, mut entries) = load_for_update()?;
                 let name = p.name.trim().to_owned();
+                // One 준말 per entry, also when an overwrite changes it: Alt+I would
+                // otherwise silently pick whichever entry comes first.
+                if !p.abbreviation.is_empty()
+                    && entries
+                        .iter()
+                        .any(|e| e.name != name && e.abbreviation == p.abbreviation)
+                {
+                    bail!("이미 쓰고 있는 준말입니다: {}", p.abbreviation);
+                }
                 if let Some(e) = entries.iter_mut().find(|e| e.name == name) {
                     if !p.overwrite {
                         bail!(
@@ -236,11 +289,6 @@ impl Session {
                     if entries.len() >= MAX_ENTRIES {
                         bail!("상용구는 {MAX_ENTRIES}개까지 등록할 수 있습니다.");
                     }
-                    if !p.abbreviation.is_empty()
-                        && entries.iter().any(|e| e.abbreviation == p.abbreviation)
-                    {
-                        bail!("이미 쓰고 있는 준말입니다: {}", p.abbreviation);
-                    }
                     entries.push(AutoText {
                         name,
                         abbreviation: p.abbreviation,
@@ -252,7 +300,7 @@ impl Session {
             }
             "tools.autotext.delete" => {
                 let p: Named = serde_json::from_value(params)?;
-                let (path, mut entries) = load()?;
+                let (path, mut entries) = load_for_update()?;
                 let before = entries.len();
                 entries.retain(|e| e.name != p.name);
                 if entries.len() == before {
@@ -313,6 +361,53 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_folder_follows_each_platform_convention() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| std::ffi::OsString::from(*v))
+            }
+        };
+        let none = |_: &std::path::Path| false;
+        let p = |s: &str| Some(PathBuf::from(s));
+        let win = env(&[("APPDATA", "C:/Users/u/AppData/Roaming"), ("HOME", "/h")]);
+        assert_eq!(
+            default_config_dir("windows", &win, &none),
+            p("C:/Users/u/AppData/Roaming/HwpCraft")
+        );
+        let win_profile = env(&[("USERPROFILE", "C:/Users/u")]);
+        assert_eq!(
+            default_config_dir("windows", &win_profile, &none),
+            p("C:/Users/u/AppData/Roaming/HwpCraft")
+        );
+        let mac = env(&[("HOME", "/Users/u"), ("XDG_CONFIG_HOME", "/x")]);
+        assert_eq!(
+            default_config_dir("macos", &mac, &none),
+            p("/Users/u/Library/Application Support/HwpCraft")
+        );
+        let legacy = |d: &std::path::Path| d == std::path::Path::new("/Users/u/.config/HwpCraft");
+        assert_eq!(
+            default_config_dir("macos", &mac, &legacy),
+            p("/Users/u/.config/HwpCraft"),
+            "an existing pre-0.17 macOS folder keeps being used"
+        );
+        let linux = env(&[("HOME", "/home/u"), ("XDG_CONFIG_HOME", "/home/u/.cfg")]);
+        assert_eq!(
+            default_config_dir("linux", &linux, &none),
+            p("/home/u/.cfg/HwpCraft")
+        );
+        let linux_home = env(&[("HOME", "/home/u"), ("XDG_CONFIG_HOME", "")]);
+        assert_eq!(
+            default_config_dir("linux", &linux_home, &none),
+            p("/home/u/.config/HwpCraft")
+        );
+        assert_eq!(default_config_dir("linux", &env(&[]), &none), None);
+        assert_eq!(default_config_dir("macos", &env(&[]), &none), None);
+    }
 
     #[test]
     fn word_before_stops_at_spaces_and_punctuation() {

@@ -120,7 +120,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "file.save_pages",
-        "path (.hwp/.hwpx/.pdf/.txt); from, to: 1-based inclusive page range. The open document is unchanged.",
+        "path (.hwp/.hwpx/.pdf/.txt); from, to: 1-based inclusive displayed pages. The open document is unchanged. PDF follows display pagination; all pages preserve the complete source. Partial editable/text extraction requires whole paragraphs/tables and matching source/display boundaries; unsupported cuts fail before writing.",
         r#"{"path":"2-3쪽.hwpx","from":2,"to":3}"#,
     ),
     (
@@ -762,13 +762,9 @@ impl Session {
                     current: u32,
                 }
                 let p: Print = serde_json::from_value(params)?;
-                let count = self.core.page_count();
+                let count = self.page_count()?;
                 let pages = print_pages(&p.pages, p.current, count)?;
-                let options = hwpcraft_formats::pdf_options();
-                let bytes = self
-                    .core
-                    .render_pages_pdf_native_with_options(&pages, &options)
-                    .map_err(err)?;
+                let bytes = self.render_pdf(&pages)?;
                 hwpcraft_formats::atomic_write(&p.path, &bytes)?;
                 Ok(
                     json!({"path": p.path, "pages": pages.iter().map(|n| n + 1).collect::<Vec<_>>(), "bytes": bytes.len()}),
@@ -1005,6 +1001,7 @@ impl Session {
 
     /// 문서 정보: statistics, fonts and pictures (RHWP keeps no summary properties).
     fn document_statistics(&self) -> Value {
+        let pages = self.page_count();
         let doc = self.core.document();
         let mut paragraphs = 0usize;
         let mut chars = 0usize;
@@ -1114,7 +1111,8 @@ impl Session {
             .collect();
         json!({
             "file": file,
-            "pages": self.core.page_count(),
+            "pages": pages.as_ref().ok(),
+            "layoutError": pages.as_ref().err().map(ToString::to_string),
             "sections": doc.sections.len(),
             "paragraphs": paragraphs,
             "lines": lines,
@@ -1199,7 +1197,9 @@ impl Session {
         });
         if changed {
             self.generation += 1;
+            self.rebase_visual_hint(self.generation - 1);
         }
+        self.projection_view_marks = marks;
         marks
     }
 
@@ -1527,9 +1527,9 @@ impl Session {
     }
 
     /// Save only `from..=to` pages (1-based). The open document, cursor, path and undo
-    /// history stay unchanged: the extraction runs on a snapshot that is restored afterwards.
+    /// history stay unchanged: partial extraction runs on a private model clone.
     fn save_pages(&mut self, p: &SavePages) -> Result<Value> {
-        let count = self.core.page_count();
+        let count = self.page_count()?;
         if p.from == 0 || p.to < p.from || p.to > count {
             bail!(
                 "쪽 범위는 1–{count} 안에서 작은 번호부터 적으세요: {}–{}",
@@ -1547,16 +1547,170 @@ impl Session {
         ) {
             bail!("쪽 범위 저장 형식: HWP, HWPX, PDF, TXT");
         }
-        let id = self.core.save_snapshot_native();
-        let extracted = self
+        if p.path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        {
+            let bytes = self.render_pdf(&((p.from - 1)..p.to).collect::<Vec<_>>())?;
+            hwpcraft_formats::atomic_write(&p.path, &bytes)?;
+            return Ok(json!({"path":p.path,"pagesBefore":count,"pagesAfter":p.to-p.from+1}));
+        }
+        // Selecting every displayed page means preserving the whole document,
+        // including sections, hidden/structural paragraphs and opaque resources.
+        // Do not call the native reproducer extractor, which prunes resources.
+        if p.from == 1 && p.to == count {
+            self.save_with_tab_widths(&p.path)?;
+            let kept: usize = self
+                .core
+                .document()
+                .sections
+                .iter()
+                .map(|s| s.paragraphs.len())
+                .sum();
+            return Ok(json!({"path":p.path,"pagesBefore":count,"pagesAfter":count,
+                "paragraphsKept":kept,"paragraphsRemoved":0}));
+        }
+        // Native extraction keeps entire touching paragraphs, not page slices.
+        // Its page-start query always reports scalar zero, including a partial
+        // paragraph/table. Check coverage as well as its coarse start addresses.
+        let layout = self.page_field_layout()?;
+        if let Some(layout) = &layout {
+            let mut same = count == self.core.page_count();
+            if same {
+                for page in 0..count {
+                    if self
+                        .core
+                        .get_position_of_page_native(page as usize)
+                        .map_err(err)?
+                        != layout
+                            .core
+                            .get_position_of_page_native(page as usize)
+                            .map_err(err)?
+                    {
+                        same = false;
+                        break;
+                    }
+                }
+            }
+            if !same {
+                bail!(
+                    "표시 조판과 원본의 쪽 경계가 달라 HWP/HWPX/TXT의 일부 쪽을 정확히 추출할 수 없습니다. PDF 쪽 저장을 사용하세요."
+                );
+            }
+        }
+        let boundary = |core: &DocumentCore, page: u32| -> Result<(usize, usize)> {
+            let value: Value = serde_json::from_str(
+                &core
+                    .get_position_of_page_native(page as usize)
+                    .map_err(err)?,
+            )?;
+            Ok((usize_field(&value, "sec")?, usize_field(&value, "para")?))
+        };
+        let check_cuts = |core: &mut DocumentCore| -> Result<()> {
+            let start = boundary(core, p.from - 1)?;
+            let pages = core.pages_covering_paragraphs(&[start]).ok_or_else(|| {
+                anyhow!("시작 문단의 쪽 범위를 확인하지 못했습니다. PDF 쪽 저장을 사용하세요.")
+            })?;
+            if pages.iter().any(|page| *page < p.from - 1 || *page >= p.to) {
+                bail!(
+                    "선택한 쪽 경계가 문단 또는 표의 중간에 걸립니다. 해당 문단·표의 모든 쪽을 선택하거나 PDF 쪽 저장을 사용하세요."
+                );
+            }
+            if p.to < count {
+                let next = boundary(core, p.to)?;
+                let pages = core.pages_covering_paragraphs(&[next]).ok_or_else(|| {
+                    anyhow!("끝 문단의 쪽 범위를 확인하지 못했습니다. PDF 쪽 저장을 사용하세요.")
+                })?;
+                if pages.iter().any(|page| *page >= p.from - 1 && *page < p.to) {
+                    bail!(
+                        "선택한 쪽 경계가 문단 또는 표의 중간에 걸립니다. 해당 문단·표의 모든 쪽을 선택하거나 PDF 쪽 저장을 사용하세요."
+                    );
+                }
+            }
+            Ok(())
+        };
+        let dpi = crate::nested_presentation::source_dpi(&self.core)?;
+        let mut output = Self::with_core(
+            crate::nested_presentation::clone_core(&self.core, dpi)?,
+            None,
+        );
+        output.password = self.password.clone();
+        if output.core.page_count() != count {
+            bail!("쪽 경계를 동일하게 복제하지 못했습니다. PDF 쪽 저장을 사용하세요.");
+        }
+        check_cuts(&mut output.core)?;
+        if let Some(layout) = layout {
+            let dpi = crate::nested_presentation::source_dpi(&layout.core)?;
+            let mut displayed = crate::nested_presentation::clone_core(&layout.core, dpi)?;
+            check_cuts(&mut displayed)?;
+        }
+        let first = boundary(&output.core, p.from - 1)?;
+        let end = if p.to < count {
+            Some(boundary(&output.core, p.to)?)
+        } else {
+            None
+        };
+        let signature = |paragraph: &Paragraph| -> Result<Value> {
+            let controls = paragraph
+                .controls
+                .iter()
+                .filter(|control| {
+                    !matches!(control, Control::SectionDef(_) | Control::ColumnDef(_))
+                })
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            // Structural section controls may move to the first kept paragraph,
+            // shifting UTF-16 offsets. Compare scalar styles and full nested
+            // control payloads rather than their parent paragraph's raw offsets.
+            let shapes: Vec<_> = (0..paragraph.text.chars().count())
+                .map(|offset| paragraph.char_shape_id_at(offset))
+                .collect();
+            Ok(
+                json!({"text":paragraph.text,"paragraphStyle":paragraph.para_shape_id,
+                "style":paragraph.style_id,"characters":shapes,
+                "emptyShape":paragraph.text.is_empty().then(|| paragraph.char_shape_id_at(0)),
+                "markpen":crate::markpen_ranges(paragraph),"controls":controls}),
+            )
+        };
+        let expected: Vec<Vec<Value>> = output
             .core
-            .extract_page_range(p.from, p.to)
-            .map_err(err)
-            .and_then(|report| self.save_with_tab_widths(&p.path).map(|()| report));
-        let restored = self.core.restore_snapshot_native(id).map_err(err);
-        self.core.discard_snapshot_native(id);
-        restored?;
-        let report = extracted?;
+            .document()
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(si, section)| {
+                section
+                    .paragraphs
+                    .iter()
+                    .enumerate()
+                    .filter(|(pi, _)| (si, *pi) >= first && end.is_none_or(|end| (si, *pi) < end))
+                    .map(|(_, paragraph)| signature(paragraph))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let report = output.core.extract_page_range(p.from, p.to).map_err(err)?;
+        // The native extractor intentionally retains an excluded section's last
+        // paragraph, and may retain paragraphs it cannot delete. Do not silently
+        // write excluded text or omit selected text in a user-facing export.
+        let actual: Vec<Vec<Value>> = output
+            .core
+            .document()
+            .sections
+            .iter()
+            .map(|section| {
+                section
+                    .paragraphs
+                    .iter()
+                    .map(&signature)
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if actual != expected {
+            bail!(
+                "선택 밖의 구역·문단을 정확히 제외하지 못했습니다. 원본과 출력 파일은 변경하지 않았습니다. PDF 쪽 저장을 사용하세요."
+            );
+        }
+        output.save_with_tab_widths(&p.path)?;
         Ok(json!({
             "path": p.path,
             "pagesBefore": report.pages_before,
@@ -1711,7 +1865,7 @@ impl Session {
 
     /// 0-based page: the caller's 1-based `page`, else the caret's page.
     fn page_target(&self, page: Option<u32>) -> Result<u32> {
-        let count = self.core.page_count();
+        let count = self.page_count()?;
         match page {
             Some(0) => bail!("쪽 번호는 1부터입니다."),
             Some(p) if p > count => bail!("{p}쪽은 범위(1–{count})를 벗어났습니다."),
@@ -1728,9 +1882,10 @@ impl Session {
 
     /// (section, first paragraph) of a 0-based page from RHWP's pagination.
     fn page_start(&self, page: u32) -> Result<(usize, usize)> {
+        let layout = self.page_field_layout()?;
+        let core = layout.as_ref().map_or(&self.core, |layout| &layout.core);
         let v: Value = serde_json::from_str(
-            &self
-                .core
+            &core
                 .get_position_of_page_native(page as usize)
                 .map_err(err)?,
         )?;
@@ -1747,7 +1902,7 @@ impl Session {
             .sections
             .get(sec)
             .map_or(0, |s| s.paragraphs.len());
-        let end = if page + 1 < self.core.page_count() {
+        let end = if page + 1 < self.page_count()? {
             match self.page_start(page + 1)? {
                 (s, p) if s == sec => p.min(total),
                 _ => total,
@@ -1832,7 +1987,7 @@ impl Session {
         Ok(json!({
             "afterPage": page + 1,
             "paragraphs": count,
-            "pages": self.core.page_count(),
+            "pages": self.page_count()?,
             "cursor": end,
         }))
     }
@@ -1842,7 +1997,7 @@ impl Session {
     /// carries the section definition and RHWP keeps at least one paragraph per section.
     fn delete_page(&mut self, page: Option<u32>) -> Result<Value> {
         let page = self.page_target(page)?;
-        if self.core.page_count() <= 1 {
+        if self.page_count()? <= 1 {
             bail!("쪽이 하나뿐인 문서에서는 쪽을 지울 수 없습니다.");
         }
         let (sec, range) = self.page_paragraphs(page)?;
@@ -1885,7 +2040,7 @@ impl Session {
             s.span_anchor = None;
             Ok(())
         })?;
-        Ok(json!({"page": page + 1, "paragraphsRemoved": removed, "pages": self.core.page_count()}))
+        Ok(json!({"page": page + 1, "paragraphsRemoved": removed, "pages": self.page_count()?}))
     }
 
     /// Hangul 문서 끼워 넣기 (FileInsertionDlg): the other document's body goes in at the caret
@@ -1926,7 +2081,7 @@ impl Session {
         Ok(json!({
             "path": p.path,
             "paragraphs": count,
-            "pages": self.core.page_count(),
+            "pages": self.page_count()?,
             "cursor": end,
         }))
     }
@@ -1934,12 +2089,6 @@ impl Session {
     /// Hangul SaveBlock: only the selected body text (one or more paragraphs) goes to a new
     /// file. The open document, cursor and history are untouched.
     fn save_block(&mut self, path: &Path) -> Result<Value> {
-        if !self.has_selection() {
-            bail!("저장할 블록을 먼저 선택하세요.");
-        }
-        if self.cursor.cell.is_some() {
-            bail!("표 밖 본문의 블록만 저장할 수 있습니다.");
-        }
         if !matches!(
             path.extension()
                 .and_then(|x| x.to_str())
@@ -1948,6 +2097,39 @@ impl Session {
             Some("hwp" | "hwpx" | "pdf" | "txt")
         ) {
             bail!("블록 저장 형식: HWP, HWPX, PDF, TXT");
+        }
+        let (mut block, text) = self.block_session()?;
+        block.save(path)?;
+        Ok(json!({"path": path, "paragraphs": text.len(), "text": text.join("\n")}))
+    }
+
+    /// PDF of the selected block, prepared here and converted by the caller (the desktop
+    /// runs `convert` on a worker thread so a long block does not freeze the window).
+    pub fn save_block_pdf_job(&self) -> Result<crate::rendering::PdfJob> {
+        let (block, _) = self.block_session()?;
+        let pages = block.page_count()?;
+        block.pdf_job(&(0..pages).collect::<Vec<_>>())
+    }
+
+    /// PDF of a Hangul 인쇄 범위 (`print_pages` names), prepared for a background
+    /// conversion; also returns the 0-based pages it covers.
+    pub fn print_pdf_job(
+        &self,
+        range: &str,
+        current: u32,
+    ) -> Result<(Vec<u32>, crate::rendering::PdfJob)> {
+        let pages = print_pages(range, current, self.page_count()?)?;
+        let job = self.pdf_job(&pages)?;
+        Ok((pages, job))
+    }
+
+    /// The selected body text as a separate document session, plus its paragraph texts.
+    fn block_session(&self) -> Result<(Session, Vec<String>)> {
+        if !self.has_selection() {
+            bail!("저장할 블록을 먼저 선택하세요.");
+        }
+        if self.cursor.cell.is_some() {
+            bail!("표 밖 본문의 블록만 저장할 수 있습니다.");
         }
         let (start, end) = match self.span() {
             Some(span) => span,
@@ -2004,12 +2186,61 @@ impl Session {
             // Leading blank paragraphs: fold them into the first kept one.
             out.delete_range_native(0, 0, 0, 1, 0, None).map_err(err)?;
         }
-        hwpcraft_formats::save(&out, path)?;
+        // Native trimming can discard a closing mark at the cut boundary.
+        // Rebuild clipped markpen intervals from the untouched source so a
+        // highlighted selection keeps its formatting in every block format.
+        for (index, source_index) in (start.paragraph..=end.paragraph).enumerate() {
+            let source = &self.core.document().sections[start.section].paragraphs[source_index];
+            let from = if source_index == start.paragraph {
+                start.offset
+            } else {
+                0
+            };
+            let to = if source_index == end.paragraph {
+                end.offset
+            } else {
+                source.text.chars().count()
+            };
+            let marks = crate::markpen_ranges(source)
+                .into_iter()
+                .flat_map(|(range, color)| {
+                    let a = range.start.max(from);
+                    let b = range.end.min(to);
+                    (a < b)
+                        .then(|| {
+                            [
+                                hwpcraft_doc::model::paragraph::MarkpenMark {
+                                    char_idx: a - from,
+                                    color: Some(color),
+                                    utf16_pos: None,
+                                },
+                                hwpcraft_doc::model::paragraph::MarkpenMark {
+                                    char_idx: b - from,
+                                    color: None,
+                                    utf16_pos: None,
+                                },
+                            ]
+                        })
+                        .into_iter()
+                        .flatten()
+                })
+                .collect();
+            let section = &mut out.document_mut().sections[0];
+            let target = section
+                .paragraphs
+                .get_mut(index)
+                .ok_or_else(|| anyhow!("블록 문단의 형광펜을 복원하지 못했습니다."))?;
+            target.markpen_marks = marks;
+            crate::highlights::resolve_markpen_positions(target);
+            target.range_tags.retain(|tag| tag.tag >> 24 != 2);
+            section.raw_stream = None;
+        }
         let text: Vec<String> = out.document().sections[0]
             .paragraphs
             .iter()
             .map(|p| p.text.clone())
             .collect();
-        Ok(json!({"path": path, "paragraphs": text.len(), "text": text.join("\n")}))
+        out.set_document(out.document().clone());
+        Ok((Self::with_core(out, None), text))
     }
 }

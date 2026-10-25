@@ -281,10 +281,33 @@ impl Session {
             })
         };
         if let Some(names) = names {
-            let mut ids = Vec::new();
+            // Resolve only requested resources. RHWP's language font helper
+            // adds placeholders to all other languages on every append.
+            let mut faces = self.core.document().doc_info.font_faces.clone();
+            faces.resize_with(7, Vec::new);
+            let mut ids = Vec::with_capacity(7);
+            let mut changed = false;
             for (language, name) in names.iter().enumerate() {
-                let id = self.core.find_or_create_font_id_for_lang(language, name);
-                ids.push(u16::try_from(id).map_err(|_| anyhow!("글꼴을 등록할 수 없습니다."))?);
+                let list = &mut faces[language];
+                let index = match list.iter().position(|font| font.name == *name) {
+                    Some(index) => index,
+                    None => {
+                        let index = list.len();
+                        u16::try_from(index)
+                            .map_err(|_| anyhow!("언어별 글꼴 ID 공간이 소진되었습니다."))?;
+                        list.push(hwpcraft_doc::model::style::Font {
+                            name: name.clone(),
+                            ..Default::default()
+                        });
+                        changed = true;
+                        index
+                    }
+                };
+                ids.push(u16::try_from(index).map_err(|_| anyhow!("글꼴을 등록할 수 없습니다."))?);
+            }
+            if changed {
+                self.core.document_mut().doc_info.font_faces = faces;
+                self.core.document_mut().doc_info.raw_stream_dirty = true;
             }
             value["fontIds"] = json!(ids);
         }

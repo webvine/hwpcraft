@@ -65,7 +65,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "caret.move",
-        "motion: left|right|word_left|word_right|word_start|word_end|line_start|line_end|up|down|page_up|page_down|page_start|page_end|paragraph_start|paragraph_end|prev_paragraph_start|next_paragraph_start|list_start|list_end|document_start|document_end; extend keeps the anchor (Shift). Covers Hangul Move*/MoveSel*.",
+        "motion: left|right|word_left|word_right|word_start|word_end|line_start|line_end|up|down|page_up|page_down|page_start|page_end|paragraph_start|paragraph_end|prev_paragraph_start|prev_paragraph_end|next_paragraph_start|list_start|list_end|document_start|document_end; extend keeps the anchor (Shift). Covers Hangul Move*/MoveSel*.",
         r#"{"motion":"word_right","extend":false}"#,
     ),
     (
@@ -507,9 +507,10 @@ impl Session {
         self.guard_protected()?;
         self.transaction(|s| {
             s.delete_selection()?;
+            let ticket = s.insertion_shape.capture_insert(s)?;
             let c = s.cursor;
             let text = ch.to_string();
-            let r = if let Some(t) = c.cell {
+            if let Some(t) = c.cell {
                 s.core.insert_text_in_cell_native(
                     c.section,
                     c.paragraph,
@@ -522,10 +523,12 @@ impl Session {
             } else {
                 s.core
                     .insert_text_native(c.section, c.paragraph, c.offset, &text)
-            };
-            r.map_err(err)?;
+            }
+            .map_err(err)?;
+            ticket.apply_range(&mut s.core, c, c.offset..c.offset + 1)?;
             s.cursor.offset += 1;
             s.anchor = None;
+            ticket.finish(&mut s.insertion_shape, s.cursor);
             Ok(())
         })
     }
@@ -574,19 +577,7 @@ impl Session {
                     continue;
                 }
                 let c = s.cursor;
-                let (list_para, pos) = s.root_stream_position(c)?;
-                let raw = s
-                    .core
-                    .insert_auto_number_at_cursor(0, list_para, pos, k)
-                    .map_err(err)?;
-                let v: Value = serde_json::from_str(&raw)?;
-                if v["ok"] == false {
-                    bail!(
-                        "쪽 번호를 넣지 못했습니다: {}",
-                        v["reason"].as_str().unwrap_or("")
-                    );
-                }
-                s.fix_number_stride(c)?;
+                s.insert_native_auto_number(c, k)?;
                 s.cursor.offset += 1;
                 s.anchor = None;
             }
@@ -594,6 +585,101 @@ impl Session {
             Ok(())
         })?;
         Ok(kind.to_owned())
+    }
+    /// Insert one saved native control while keeping the source control order.
+    /// Native trailing-number positions fall back to text.len(), even though
+    /// their placeholder is the preceding scalar. Resolve that boundary before
+    /// computing the new index, then repair both old and new slot strides.
+    pub(crate) fn insert_native_auto_number(&mut self, c: Cursor, kind: &str) -> Result<usize> {
+        let before = self.paragraph(c)?.clone();
+        let positions = before.control_text_positions();
+        let len = before.text.chars().count();
+        let actual: Vec<_> = before
+            .controls
+            .iter()
+            .zip(&positions)
+            .enumerate()
+            .map(|(ci, (ctrl, pos))| {
+                if matches!(ctrl, Control::Field(_)) {
+                    before
+                        .field_ranges
+                        .iter()
+                        .find(|r| r.control_idx == ci)
+                        .map_or(*pos, |r| r.start_char_idx)
+                } else if matches!(ctrl, Control::AutoNumber(_))
+                    && *pos == len
+                    && len > 0
+                    && before.text.ends_with(' ')
+                {
+                    len - 1
+                } else {
+                    *pos
+                }
+            })
+            .collect();
+        let native_index = positions.iter().filter(|p| **p < c.offset).count();
+        let index = before
+            .controls
+            .iter()
+            .zip(&actual)
+            .filter(|(ctrl, pos)| {
+                **pos < c.offset
+                    || **pos == c.offset
+                        && matches!(ctrl, Control::SectionDef(_) | Control::ColumnDef(_))
+            })
+            .count();
+        let (list, stream) = self.root_stream_position(c)?;
+        let response = self
+            .core
+            .insert_auto_number_at_cursor(0, list, stream, kind)
+            .map_err(err)?;
+        let result: Value = serde_json::from_str(&response)?;
+        if result["ok"] == false {
+            bail!(
+                "쪽 번호를 넣지 못했습니다: {}",
+                result["reason"].as_str().unwrap_or("")
+            );
+        }
+        let mut expected: Vec<char> = before.text.chars().collect();
+        expected.insert(c.offset, ' ');
+        let para = &mut self.core.document_mut().sections[c.section].paragraphs[c.paragraph];
+        if para.text != expected.into_iter().collect::<String>()
+            || para.controls.len() != before.controls.len() + 1
+            || !matches!(
+                para.controls.get(native_index),
+                Some(Control::AutoNumber(_))
+            )
+        {
+            bail!("자동 번호가 요청한 본문 위치에 삽입되지 않았습니다.");
+        }
+        let inserted = para.controls.remove(native_index);
+        para.controls.insert(index, inserted);
+        let mut data = before.ctrl_data_records.clone();
+        if data.len() < before.controls.len() {
+            data.resize(before.controls.len(), None);
+        }
+        data.insert(index, None);
+        para.ctrl_data_records = data;
+        if para.field_ranges.len() != before.field_ranges.len() {
+            bail!("번호 삽입 중 필드 범위의 개수가 바뀌었습니다.");
+        }
+        // Text insertion updates scalar ranges, but the native control insert
+        // does not update their control indices. Derive indices from the saved
+        // source association so this is never a second shift of a native index.
+        for (range, old) in para.field_ranges.iter_mut().zip(&before.field_ranges) {
+            range.control_idx = old.control_idx + usize::from(old.control_idx >= index);
+        }
+        for (ctrl, pos) in before.controls.iter().zip(actual) {
+            if matches!(ctrl, Control::AutoNumber(_)) {
+                self.fix_number_stride(Cursor {
+                    offset: pos + usize::from(pos >= c.offset),
+                    ..c
+                })?;
+            }
+        }
+        self.fix_number_stride(c)?;
+        self.relayout_after_marker()?;
+        Ok(index)
     }
     /// RHWP leaves a plain space as the placeholder of a freshly inserted auto
     /// number but records a one-unit stride for it in `char_offsets`, while its
@@ -617,9 +703,36 @@ impl Session {
             let stride = offsets[idx + 1].saturating_sub(offsets[idx]);
             if stride < 8 {
                 let add = 8 - stride;
+                let boundary = offsets[idx + 1];
                 for o in offsets.iter_mut().skip(idx + 1) {
                     *o += add;
                 }
+                for shape in &mut para.char_shapes {
+                    if shape.start_pos >= boundary {
+                        shape.start_pos += add;
+                    }
+                }
+                for tag in &mut para.range_tags {
+                    if tag.start >= boundary {
+                        tag.start += add;
+                    }
+                    if tag.end >= boundary {
+                        tag.end += add;
+                    }
+                }
+                for mark in &mut para.markpen_marks {
+                    if let Some(pos) = &mut mark.utf16_pos
+                        && *pos >= boundary
+                    {
+                        *pos += add;
+                    }
+                }
+                for line in &mut para.line_segs {
+                    if line.text_start >= boundary {
+                        line.text_start += add;
+                    }
+                }
+                para.stored_text_partition_dirty = true;
             }
         }
         Ok(())
@@ -731,8 +844,9 @@ impl Session {
             return self.goto_bookmark(&name);
         }
         let target = if let Some(page) = g.page {
-            if page == 0 || page > self.core.page_count() as usize {
-                bail!("쪽 번호는 1–{} 사이여야 합니다.", self.core.page_count());
+            let pages = self.page_count()?;
+            if page == 0 || page > pages as usize {
+                bail!("쪽 번호는 1–{pages} 사이여야 합니다.");
             }
             self.page_first_position(page - 1)
                 .ok_or_else(|| anyhow!("{page}쪽의 위치를 찾지 못했습니다."))?
@@ -749,7 +863,11 @@ impl Session {
                 cell: None,
             }
         };
-        self.select(target, false)
+        self.select(target, false)?;
+        if let Some(page) = g.page {
+            self.set_visual_hint(self.cursor, (page - 1) as u32, Affinity::Downstream);
+        }
+        Ok(())
     }
     /// Links of any body/cell paragraph, in text order.
     fn hyperlinks_at(&self, c: Cursor) -> Vec<hwpcraft_doc::HyperlinkInfo> {
@@ -886,6 +1004,7 @@ impl Session {
     }
     /// Hangul 문서 정보 → 문서 통계. Text counts include table cells at any depth.
     pub fn statistics(&self) -> Value {
+        let pages = self.page_count();
         let mut st = Stats::default();
         let doc = self.core.document();
         let mut body_paragraphs = 0usize;
@@ -898,7 +1017,8 @@ impl Session {
         json!({
             "characters": st.characters, "charactersNoSpaces": st.characters_no_spaces,
             "words": st.words, "lines": st.lines, "paragraphs": st.paragraphs,
-            "bodyParagraphs": body_paragraphs, "pages": self.core.page_count(),
+            "bodyParagraphs": body_paragraphs, "pages": pages.as_ref().ok(),
+            "layoutError": pages.as_ref().err().map(ToString::to_string),
             "sections": doc.sections.len(), "tables": st.tables, "pictures": st.pictures,
             "shapes": st.shapes, "equations": st.equations, "footnotes": st.footnotes,
             "endnotes": st.endnotes, "memos": st.memos,

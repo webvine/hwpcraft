@@ -24,6 +24,8 @@ pub enum Motion {
     WordEnd,
     /// Start of the previous paragraph, or of this one when not at its start.
     PrevParagraphStart,
+    /// End of the previous paragraph; at the first paragraph, its start.
+    PrevParagraphEnd,
     NextParagraphStart,
     PageStart,
     PageEnd,
@@ -156,6 +158,7 @@ impl Session {
     /// Move the caret, extending the selection across paragraphs of one container.
     pub fn select(&mut self, cursor: Cursor, extend: bool) -> Result<()> {
         self.paragraph(cursor)?;
+        self.insertion_shape.explicit_selection();
         let anchor = self.anchor_cursor().unwrap_or(self.cursor);
         self.clear_selection();
         if extend && same_container(&anchor, &cursor) {
@@ -167,6 +170,7 @@ impl Session {
         }
         self.cursor = cursor;
         self.cursor.offset = self.cursor.offset.min(self.len());
+        self.accept_visual_hit(self.cursor);
         self.typing = None;
         Ok(())
     }
@@ -292,17 +296,15 @@ impl Session {
     }
     /// Zero-based global page of a position (body paragraph of a cell caret).
     pub fn page_of(&self, c: Cursor) -> Option<usize> {
-        let raw = self
-            .core
-            .get_page_of_position_native(c.section, c.paragraph)
-            .ok()?;
-        serde_json::from_str::<Value>(&raw).ok()?["page"]
+        self.caret_at(c).ok()?["pageIndex"]
             .as_u64()
             .map(|p| p as usize)
     }
     /// First body position of a zero-based global page; `None` past the last page.
     pub fn page_first_position(&self, page: usize) -> Option<Cursor> {
-        let raw = self.core.get_position_of_page_native(page).ok()?;
+        let layout = self.page_field_layout().ok()?;
+        let core = layout.as_ref().map_or(&self.core, |layout| &layout.core);
+        let raw = core.get_position_of_page_native(page).ok()?;
         let v: Value = serde_json::from_str(&raw).ok()?;
         let n = |k: &str| v[k].as_u64().map(|x| x as usize);
         let c = Cursor {
@@ -311,6 +313,22 @@ impl Session {
             offset: n("charOffset").unwrap_or(0),
             cell: None,
         };
+        // Native partial-paragraph page queries return offset zero. Keep that
+        // address when it is really on this page (including leading empty
+        // paragraphs), otherwise use the rendered body's actual first scalar.
+        if self.caret_at(c).ok()?["pageIndex"].as_u64() != Some(page as u64) {
+            let first = if let Some(layout) = layout.as_ref() {
+                layout.first_position(page as u32).ok()?
+            } else {
+                self.geometry_cache
+                    .first_body_position(core, self.generation, page as u32)
+                    .ok()?
+                    .and_then(|position| position.legacy_cursor())
+            };
+            if let Some(first) = first {
+                return self.paragraph(first).ok().map(|_| first);
+            }
+        }
         self.paragraph(c).ok().map(|_| c)
     }
     /// The last position before a body paragraph start (end of the previous paragraph).
@@ -442,7 +460,7 @@ impl Session {
                     Motion::Up => self.hit_test(page, x, y - h * 0.7),
                     Motion::Down => self.hit_test(page, x, y + h * 1.7),
                     Motion::PageUp if page > 0 => self.hit_test(page - 1, x, y),
-                    Motion::PageDown if page + 1 < self.core.page_count() => {
+                    Motion::PageDown if page + 1 < self.page_count()? => {
                         self.hit_test(page + 1, x, y)
                     }
                     _ => Ok(c),
@@ -503,6 +521,13 @@ impl Session {
                     with_index(c, i - 1, 0)
                 }
             }
+            Motion::PrevParagraphEnd => {
+                if i > 0 {
+                    previous_end()?
+                } else {
+                    Cursor { offset: 0, ..c }
+                }
+            }
             Motion::NextParagraphStart => {
                 if i + 1 < count {
                     with_index(c, i + 1, 0)
@@ -519,6 +544,7 @@ impl Session {
                 .page_of(c)
                 .and_then(|p| self.page_first_position(p + 1))
             {
+                Some(next) if next.offset > 0 => next,
                 Some(next) => self.position_before(next)?,
                 None => self.motion_target(Motion::DocumentEnd)?,
             },
@@ -561,6 +587,7 @@ impl Session {
         })
     }
     pub fn move_caret(&mut self, motion: Motion, extend: bool) -> Result<()> {
+        self.hit_hint.set(None);
         if !extend && self.has_selection() && matches!(motion, Motion::Left | Motion::Right) {
             // Like Hangul, an arrow collapses a selection to its matching edge.
             let edges = self.selected_paragraphs()?;
@@ -579,8 +606,36 @@ impl Session {
                 return self.select(t, false);
             }
         }
+        let visual_page = if matches!(
+            motion,
+            Motion::LineStart | Motion::LineEnd | Motion::PageStart | Motion::PageEnd
+        ) {
+            self.caret()
+                .ok()
+                .and_then(|v| v["pageIndex"].as_u64())
+                .map(|p| p as u32)
+        } else {
+            None
+        };
         let target = self.motion_target(motion)?;
-        self.select(target, extend)
+        let previous = self.insertion_shape.clone();
+        let from = self.cursor;
+        self.select(target, extend)?;
+        self.insertion_shape = previous;
+        self.insertion_shape
+            .motion(from, self.cursor, motion, extend);
+        if let Some(page) = visual_page {
+            self.set_visual_hint(
+                self.cursor,
+                page,
+                if matches!(motion, Motion::LineEnd | Motion::PageEnd) {
+                    Affinity::Upstream
+                } else {
+                    Affinity::Downstream
+                },
+            );
+        }
+        Ok(())
     }
     /// Copy to RHWP's internal clipboard (formats, tables and objects) and return plain text.
     pub fn copy(&mut self) -> Result<String> {

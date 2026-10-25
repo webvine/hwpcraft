@@ -1,12 +1,20 @@
 # Keep the sibling reference sources (RHWP and the ArtCraft family) current so
 # HwpCraft work always reads the latest upstream code. Fast-forward only: a
 # sibling with local changes or a diverged branch is reported, never reset.
+# HwpCraft's own RHWP patches are reverted before and re-applied after the pull.
 # Usage: pwsh -NoProfile -File scripts/sync-siblings.ps1 [-Only rhwp,wordcraft]
 param([string[]]$Only = @())
 $ErrorActionPreference = 'Continue'
 $Parent = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $Self = Split-Path (Split-Path $PSScriptRoot -Parent) -Leaf
 $rows = @()
+# Local RHWP patches (patches/rhwp) come off before the pull and go back on after it.
+$patchScript = Join-Path $PSScriptRoot 'rhwp-patches.ps1'
+$withRhwp = (Test-Path (Join-Path $Parent 'rhwp/.git')) -and ($Only.Count -eq 0 -or $Only -contains 'rhwp')
+if ($withRhwp) {
+    & pwsh -NoProfile -File $patchScript -Mode Revert | Out-Host
+    if ($LASTEXITCODE -ne 0) { Write-Warning 'RHWP patches could not be reverted; RHWP will be reported as having local changes.' }
+}
 foreach ($dir in Get-ChildItem -Path $Parent -Directory) {
     if ($dir.Name -eq $Self -or -not (Test-Path (Join-Path $dir.FullName '.git'))) { continue }
     if ($Only.Count -gt 0 -and $Only -notcontains $dir.Name) { continue }
@@ -27,6 +35,10 @@ foreach ($dir in Get-ChildItem -Path $Parent -Directory) {
     $rows += [pscustomobject]@{ repo = $dir.Name; before = $before; after = $after; result = $result }
 }
 $rows | Format-Table -AutoSize
+if ($withRhwp) {
+    & pwsh -NoProfile -File $patchScript -Mode Apply | Out-Host
+    if ($LASTEXITCODE -ne 0) { Write-Warning 'RHWP patches need a manual rebase before building HwpCraft (patches/rhwp/README.md).' }
+}
 $rhwp = Join-Path $Parent 'rhwp/Cargo.toml'
 if (Test-Path $rhwp) {
     $v = (Select-String -Path $rhwp -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value

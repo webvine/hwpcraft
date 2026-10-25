@@ -7,7 +7,9 @@ license.workspace = true
 resvg.workspace = true
 anyhow.workspace = true
 hwpcraft-doc.workspace = true
-[lints]
-workspace = true
+# The workspace forbids unsafe code; this crate alone may memory-map system
+# font files once (user decision 2026-10-26), each use marked `allow(unsafe_code)`.
+[lints.rust]
+unsafe_code = "deny"
 [dev-dependencies]
 hwpcraft-formats.workspace = true

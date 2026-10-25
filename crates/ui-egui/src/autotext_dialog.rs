@@ -111,13 +111,32 @@ impl HwpApp {
         selected: &mut Option<usize>,
         status: &mut String,
     ) -> bool {
+        // Enter or a double-click inserts the selected entry, like 넣기.
+        let mut activate = false;
         let button = ext_shell::dialog(
             ctx,
             "상용구 내용",
             620.0,
-            &["넣기(D)", "등록...", "지우기", "닫기"],
+            &["넣기(D)", "등록...", "지우기", "본문 상용구...", "닫기"],
             |ui| {
-                ext_shell::group(ui, "상용구 목록");
+                ext_shell::group(ui, &format!("상용구 목록 ({}개)", entries.len()));
+                if !entries.is_empty() {
+                    let (up, down, enter) = ui.input(|i| {
+                        (
+                            i.key_pressed(Key::ArrowUp),
+                            i.key_pressed(Key::ArrowDown),
+                            i.key_pressed(Key::Enter),
+                        )
+                    });
+                    let last = entries.len() - 1;
+                    if up {
+                        *selected = Some(selected.map_or(0, |i| i.saturating_sub(1)));
+                    }
+                    if down {
+                        *selected = Some(selected.map_or(0, |i| (i + 1).min(last)));
+                    }
+                    activate |= enter && selected.is_some();
+                }
                 egui::ScrollArea::vertical()
                     .id_salt("autotext-list")
                     .max_height(180.0)
@@ -133,15 +152,21 @@ impl HwpApp {
                                 ui.end_row();
                                 if entries.is_empty() {
                                     ui.label(
-                                        RichText::new("등록된 상용구가 없습니다.")
-                                            .color(Color32::GRAY),
+                                        RichText::new(
+                                            "등록된 상용구가 없습니다. 글을 선택하고 [등록...]을 누르세요.",
+                                        )
+                                        .color(Color32::GRAY),
                                     );
                                     ui.end_row();
                                 }
                                 for (i, e) in entries.iter().enumerate() {
-                                    if ui.selectable_label(*selected == Some(i), &e.name).clicked()
-                                    {
+                                    let r = ui.selectable_label(*selected == Some(i), &e.name);
+                                    if r.clicked() {
                                         *selected = Some(i);
+                                    }
+                                    if r.double_clicked() {
+                                        *selected = Some(i);
+                                        activate = true;
                                     }
                                     ui.label(&e.abbreviation);
                                     ui.end_row();
@@ -162,7 +187,7 @@ impl HwpApp {
                     });
                 ext_shell::note(
                     ui,
-                    "글 상용구만 저장합니다(서식·표·개체 제외). 준말을 입력한 뒤 Alt+I로 바로 넣을 수 있습니다.",
+                    "글 상용구만 저장합니다(서식·표·개체 제외). 준말을 입력한 뒤 Alt+I로 바로 넣을 수 있습니다. ↑↓로 고르고 Enter나 두 번 눌러 넣습니다.",
                 );
                 if !status.is_empty() {
                     ui.label(
@@ -173,6 +198,7 @@ impl HwpApp {
                 }
             },
         );
+        let button = if activate { Some(0) } else { button };
         match button {
             Some(0) => {
                 let Some(e) = selected.and_then(|i| entries.get(i)) else {
@@ -205,6 +231,10 @@ impl HwpApp {
                 }
                 true
             }
+            Some(3) => {
+                self.open_body_autotext();
+                false
+            }
             Some(_) => false,
             None => true,
         }
@@ -218,6 +248,11 @@ impl HwpApp {
         text: &mut String,
         status: &mut String,
     ) -> bool {
+        let mut submit = false;
+        let abbreviation_ok = abbreviation.chars().count() <= 32
+            && !abbreviation
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control());
         let button = ext_shell::dialog(
             ctx,
             "상용구 등록",
@@ -229,20 +264,23 @@ impl HwpApp {
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
                         ui.label("이름");
-                        ui.add(
+                        let n = ui.add(
                             egui::TextEdit::singleline(name)
                                 .id(egui::Id::new("autotext-name"))
                                 .desired_width(260.0),
                         );
                         ui.end_row();
                         ui.label("준말");
-                        ui.add(
+                        let a = ui.add(
                             egui::TextEdit::singleline(abbreviation)
                                 .id(egui::Id::new("autotext-abbr"))
                                 .desired_width(160.0)
                                 .hint_text("Alt+I로 넣을 때 쓸 짧은 말 (선택)"),
                         );
                         ui.end_row();
+                        // Enter in either one-line field registers, as 등록(D) does.
+                        submit = (n.lost_focus() || a.lost_focus())
+                            && ui.input(|i| i.key_pressed(Key::Enter));
                     });
                 ext_shell::group(ui, "내용");
                 egui::ScrollArea::vertical()
@@ -257,6 +295,12 @@ impl HwpApp {
                                 .desired_rows(5),
                         );
                     });
+                if !abbreviation_ok {
+                    ui.label(
+                        RichText::new("준말은 공백 없이 32자 이하로 입력하세요.")
+                            .color(Color32::DARK_RED),
+                    );
+                }
                 ext_shell::note(
                     ui,
                     "선택한 글이 내용으로 들어갑니다. 줄 바꿈은 넣을 때 문단 나누기가 됩니다.",
@@ -270,6 +314,7 @@ impl HwpApp {
                 }
             },
         );
+        let button = if submit { Some(0) } else { button };
         match button {
             Some(0) => {
                 if name.trim().is_empty() {

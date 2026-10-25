@@ -469,6 +469,7 @@ impl HwpApp {
                                 st.selected.is_some(),
                                 egui::Button::new(if registered { "등록 해제" } else { "등록" }),
                             )
+                            .on_disabled_hover_text("사용자 문자표에 넣을 문자를 표에서 먼저 고르세요.")
                             .clicked()
                             && let Some(c) = st.selected
                         {

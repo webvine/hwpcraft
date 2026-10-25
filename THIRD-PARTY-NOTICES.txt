@@ -15,6 +15,9 @@ into THIRD-PARTY-DEPENDENCIES.md from Cargo.lock.
    notices. License text: assets/licenses/LICENSE-RHWP-MIT.txt.
    RHWP's PDF export may embed its bundled fallback font Noto Sans KR
    (SIL Open Font License 1.1) into exported documents.
+   HwpCraft builds RHWP with small local modifications kept as patch files in
+   patches/rhwp/ (listed in patches/rhwp/README.md); the modified RHWP code
+   remains under RHWP's MIT license.
 
 2. Lucide Icons — https://lucide.dev
    Copyright (c) 2026 Lucide Icons and Contributors. ISC License.
@@ -48,6 +51,11 @@ into THIRD-PARTY-DEPENDENCIES.md from Cargo.lock.
    in THIRD-PARTY-DEPENDENCIES.md. Crates offered under a choice of licenses
    are used under the MIT license where available, otherwise under
    Apache-2.0; no GPL-only or AGPL code is included.
+   Crates that ship additional notice files have them reproduced in
+   assets/licenses/: subsetter (code adapted from ttf-parser, MIT —
+   NOTICE-subsetter.txt), svg2pdf (bundled ICC profiles, CC0 1.0 —
+   NOTICE-svg2pdf.txt) and cfg_aliases (build-time macro adapted from
+   tectonic, MIT — NOTICE-cfg_aliases.txt).
 
 7. Unicode Character Database — Unihan (https://www.unicode.org/charts/unihan.html)
    Copyright (c) 1991-2026 Unicode, Inc. Unicode License v3.

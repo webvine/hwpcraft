@@ -7,10 +7,30 @@ pub use rhwp::document_core::hyperlink::{HyperlinkInfo, HyperlinkTarget};
 /// Privacy scan option/result types for `DocumentCore::scan_pii` / `detect_hidden_text`.
 pub use rhwp::document_core::queries::{hidden_text, pii_scan};
 pub use rhwp::model;
+pub use rhwp::paint::RenderProfile;
+pub use rhwp::paint::{LayerNode, LayerNodeKind, PaintOp};
+pub use rhwp::parser::body_text::parse_paragraph_list as parse_hwp_paragraph_list;
+pub use rhwp::parser::record::Record as HwpRecord;
+pub use rhwp::password_crypto;
 pub use rhwp::renderer::pdf::PdfExportOptions;
+pub use rhwp::renderer::pdf::svgs_to_pdf_with_links;
+pub use rhwp::renderer::render_tree::{PageRenderTree, RenderNode, RenderNodeType};
+pub use rhwp::renderer::svg::SvgRenderer;
+pub use rhwp::renderer::{
+    layer_renderer::LayerRenderer, svg::FontEmbedMode, svg_layer::SvgLayerRenderer,
+};
+pub use rhwp::serializer::record_writer::write_records as write_hwp_records;
 /// RHWP view-flag setters (paragraph marks, control codes, transparent borders)
 /// live on this wrapper; it derefs to `DocumentCore` and compiles natively.
 pub use rhwp::wasm_api::HwpDocument;
+
+/// Public chart/compound-file primitives used by HwpCraft's own chart authoring.
+pub mod chart_io {
+    pub use rhwp::ooxml_chart::{OoxmlChart, data::scan_chart_values};
+    pub use rhwp::parser::ole_container::{all_ole_streams, ole_root_clsid};
+    pub use rhwp::serializer::mini_cfb::build_cfb_with_root_clsid;
+    pub use rhwp::serializer::ole_container::replace_ole_stream;
+}
 use serde::{Deserialize, Serialize};
 
 /// Korean fonts that ship with each operating system. Callers that can probe

@@ -1,5 +1,11 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+pub mod auto_number_formats;
 pub mod file_access;
+mod memo_formats;
+mod page_counter_formats;
+mod page_number_formats;
+mod table_repair;
+mod textbox_formats;
 use anyhow::{Context, Result, bail};
 use hwpcraft_doc::DocumentCore;
 use std::{
@@ -39,11 +45,12 @@ fn open_inner(path: &Path, password: Option<&[u8]>) -> Result<DocumentCore> {
     if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
         bail!("문서가 128 MB 제한을 초과했습니다.");
     }
-    let mut core = match password {
-        Some(password) => DocumentCore::from_bytes_with_password(&bytes, password),
-        None => DocumentCore::from_bytes(&bytes),
-    }
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = match page_counter_formats::open(&bytes, password)? {
+        Some(core) => core,
+        None => page_number_formats::open(&bytes, password)?,
+    };
+    // Damaged row/column counts would otherwise panic inside RHWP rendering.
+    table_repair::repair(&mut core);
     // HWPX may intentionally omit generated line caches. Ask RHWP to repair
     // only layouts identified by its validation report before the first render.
     core.reflow_linesegs_on_demand();
@@ -103,19 +110,12 @@ fn save_inner(core: &DocumentCore, path: &Path, password: Option<&[u8]>) -> Resu
         bail!("문서 암호는 HWP, HWPX 저장에만 적용됩니다.");
     }
     let bytes = match (extension.as_str(), password) {
-        ("hwp", Some(password)) => core
-            .export_hwp_with_adapter_snapshot_with_password_and_report(password)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .into_bytes(),
-        ("hwp", None) => core
-            .export_hwp_with_adapter_snapshot()
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
-        ("hwpx", Some(password)) => core
-            .export_hwpx_native_with_password(password)
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
-        ("hwpx", None) => core
-            .export_hwpx_native()
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ("hwp", password) => {
+            let prepared = auto_number_formats::prepare_hwp(core)?;
+            let baseline = memo_formats::export_hwp(prepared.as_ref().unwrap_or(core), password)?;
+            textbox_formats::repair_hwp(baseline, password)?
+        }
+        ("hwpx", password) => page_number_formats::export(core, password)?,
         ("pdf", _) => {
             let options = pdf_options();
             core.render_document_pdf_native_with_options(&options)

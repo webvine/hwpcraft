@@ -67,7 +67,7 @@ impl HwpApp {
                     (
                         1,
                         "다음 쪽",
-                        (self.page + 1).min(self.session.core.page_count().saturating_sub(1)),
+                        (self.page + 1).min(self.layout_page_count().saturating_sub(1)),
                     ),
                 ] {
                     let r = Rect::from_min_size(

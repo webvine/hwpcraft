@@ -50,8 +50,21 @@ switch ($Action) {
         Write-Host "Tests passed: $Logs/test.log"
     }
     'Install' {
+        # Refuse a stale or partly rebuilt release before touching installation
+        # files or the Launcher manifest.
+        foreach ($name in @('hwpcraft-cli.exe','hwpcraft.exe')) {
+            $built = Join-Path $Target "release/$name"
+            if (!(Test-Path -LiteralPath $built)) {throw "Build first: ./HwpCraft.ps1 Build (missing $built)"}
+            $reported = (& $built --version 2>&1 | Out-String).Trim()
+            $buildMatch = [regex]::Match($reported, '^HwpCraft\s+(\d+\.\d{2})(?:\s|$)')
+            if ($LASTEXITCODE -ne 0 -or !$buildMatch.Success -or $buildMatch.Groups[1].Value -ne $Version) {
+                throw "Release build version mismatch for $name (expected $Version). Run ./HwpCraft.ps1 Build first."
+            }
+        }
         $Data = Join-Path $Workspace 'runtime/launcher/ArtCraftLauncherData/data'
-        $InstalledDir = Join-Path $Data 'apps/hwpcraft'
+        # Versioned installs let the launcher switch to a new release while an
+        # older window keeps its executable and unsaved document open.
+        $InstalledDir = Join-Path $Data "apps/hwpcraft/$Version"
         New-Item -ItemType Directory -Force -Path $InstalledDir | Out-Null
         foreach ($name in @('hwpcraft.exe','hwpcraft-cli.exe')) {
             $source = Join-Path $Target "release/$name"

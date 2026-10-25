@@ -13,6 +13,7 @@ fn reopen(s: &mut Session, ext: &str) -> anyhow::Result<Session> {
 fn named_fonts_are_applied_to_each_language_and_survive_roundtrip() -> anyhow::Result<()> {
     let mut s = Session::new()?;
     s.execute(Command::Insert("한글 English 😀".into()))?;
+    s.select_all()?; // Roundtrip the existing formatted text.
     let old = s.character_properties()?;
     s.run("format.character", json!({"fontFamily":"Arial"}))?;
     let p = s.character_properties()?;
@@ -32,6 +33,7 @@ fn named_fonts_are_applied_to_each_language_and_survive_roundtrip() -> anyhow::R
 fn language_metrics_and_effects_survive_save_and_undo() -> anyhow::Result<()> {
     let mut s = Session::new()?;
     s.execute(Command::Insert("한글 English".into()))?;
+    s.select_all()?; // Roundtrip the existing formatted text.
     s.run("format.character",json!({"ratios":[90,100,100,100,100,100,100],"spacings":[-5,2,0,0,0,0,0],"relativeSizes":[100,95,100,100,100,100,100],"charOffsets":[0,10,0,0,0,0,0],"strikethrough":true,"textColor":"#123456","shadeColor":"#fffacd"}))?;
     for ext in ["hwp", "hwpx"] {
         let r = reopen(&mut s, ext)?;
@@ -89,6 +91,7 @@ fn formatting_selection_and_table_cells_use_same_engine() -> anyhow::Result<()> 
         .0;
     s.select(cursor, false)?;
     s.execute(Command::Insert("표 셀".into()))?;
+    s.select_all()?; // Existing cell text, rather than future typing.
     s.run(
         "format.character",
         json!({"fontFamily":"Malgun Gothic","strikethrough":true}),
@@ -131,6 +134,7 @@ fn malformed_formatting_does_not_mutate_document_or_history() -> anyhow::Result<
 fn separate_language_fonts_and_float_arrays_roundtrip() -> anyhow::Result<()> {
     let mut s = Session::new()?;
     s.execute(Command::Insert("한글 English 漢字".into()))?;
+    s.select_all()?; // Roundtrip the existing formatted text.
     let fonts = json!([
         "Arial",
         "Times New Roman",

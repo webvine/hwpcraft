@@ -40,6 +40,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             exe: ""
     steps:
+      # Windows runners convert checkouts to CRLF; the RHWP patches are LF and
+      # `git apply` needs both sides to match, so keep every checkout byte-exact.
+      - name: Keep checkouts byte-exact
+        shell: bash
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
         with:
           path: hwpcraft
@@ -48,6 +53,12 @@ jobs:
           repository: edwardkim/rhwp
           ref: ${{ env.RHWP_TAG }}
           path: rhwp
+      - name: Apply local RHWP patches (patches/rhwp/README.md)
+        shell: bash
+        run: |
+          for p in hwpcraft/patches/rhwp/*.patch; do
+            git -C rhwp apply --whitespace=nowarn "../$p"
+          done
       - name: Rust toolchain
         run: |
           rustup toolchain install 1.98.1 --profile minimal --no-self-update
@@ -57,16 +68,16 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev libfontconfig1-dev libssl-dev pkg-config
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev libfontconfig1-dev libssl-dev pkg-config fonts-noto-cjk
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: hwpcraft
       - name: Build
         working-directory: hwpcraft
         run: cargo build --release --locked --target ${{ matrix.target }} -p hwpcraft -p hwpcraft-cli
-      - name: Test (CLI and engine)
+      - name: Test (whole workspace)
         working-directory: hwpcraft
-        run: cargo test --release --locked --target ${{ matrix.target }} -p hwpcraft-engine -p hwpcraft-mcp -p hwpcraft-cli
+        run: cargo test --release --locked --target ${{ matrix.target }} --workspace
       - name: Package
         shell: bash
         working-directory: hwpcraft
@@ -79,6 +90,29 @@ jobs:
           cp assets/licenses/* dist/$NAME/licenses/
           cp assets/icons/lucide/LICENSE.txt dist/$NAME/licenses/LICENSE-Lucide-ISC.txt
           cp ../rhwp/LICENSE dist/$NAME/licenses/LICENSE-RHWP.txt
+          BIN=target/${{ matrix.target }}/release
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # HwpCraft.app: double-click to start (the plain binaries stay alongside).
+            APP=dist/$NAME/HwpCraft.app
+            mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
+            cp $BIN/hwpcraft $APP/Contents/MacOS/hwpcraft
+            sed "s/@VERSION@/$VERSION/g" packaging/macos/Info.plist > $APP/Contents/Info.plist
+            ICONSET=$(mktemp -d)/HwpCraft.iconset
+            mkdir -p $ICONSET
+            if (for s in 16 32 128 256 512; do
+                  $BIN/hwpcraft --write-icon $ICONSET/icon_${s}x${s}.png $s &&
+                  $BIN/hwpcraft --write-icon $ICONSET/icon_${s}x${s}@2x.png $((s * 2)) || exit 1
+                done); then
+              iconutil -c icns $ICONSET -o $APP/Contents/Resources/HwpCraft.icns
+            else
+              echo "App icon skipped (the $NAME binary cannot run on this runner)."
+            fi
+          fi
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cp packaging/linux/hwpcraft.desktop packaging/linux/install.sh dist/$NAME/
+            chmod +x dist/$NAME/install.sh
+            $BIN/hwpcraft --write-icon dist/$NAME/hwpcraft.png 256
+          fi
           cd dist
           if [ "${{ runner.os }}" = "Windows" ]; then 7z a -tzip $NAME.zip $NAME; else tar czf $NAME.tar.gz $NAME; fi
           ls -la

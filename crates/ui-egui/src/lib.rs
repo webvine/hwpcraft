@@ -3,8 +3,12 @@ use anyhow::Result;
 use egui::{Color32, Event, ImeEvent, Key, Pos2, Rect, RichText, Stroke, Vec2};
 use hwpcraft_engine::{Command, Cursor, PageSetup, Session};
 mod autotext_dialog;
+mod body_autotext_editor;
 mod chrome;
 mod clipboard;
+mod comments_editor;
+mod context_editor;
+mod context_editor_v2;
 mod document_scroll;
 mod ext_core;
 mod ext_format;
@@ -17,9 +21,14 @@ mod find_dialog;
 mod format_dialogs;
 mod hanja_dialog;
 mod icons;
+#[cfg(test)]
+mod input_format_tests;
 mod margin_guides;
 mod object_dialogs;
 mod page_setup;
+mod pdf_export;
+mod platform;
+pub use platform::{app_icon, write_icon_png};
 mod review_dialogs;
 mod ribbon;
 mod ribbon_layout;
@@ -64,14 +73,12 @@ pub struct HwpApp {
     /// 문자표 (Ctrl+F10).
     symbol_dialog: Option<symbol_dialog::State>,
     /// 형광펜 overlay rectangles for the current document generation.
-    highlights: (u64, Vec<hwpcraft_engine::HighlightRect>),
     equation_preview: Option<(String, egui::TextureHandle, Vec2)>,
     font_family: String,
     line_spacing: f32,
     line_spacing_type: String,
     alignment: String,
     pub(crate) pages: BTreeMap<u32, (egui::TextureHandle, Vec2)>,
-    cache_generation: u64,
     zoom: f32,
     wheel_zoom: wheel_zoom::State,
     margin_guides: margin_guides::State,
@@ -82,6 +89,8 @@ pub struct HwpApp {
     error: Option<String>,
     pending: Option<Pending>,
     allow_close: bool,
+    /// Background PDF export (see `pdf_export`).
+    pdf: pdf_export::PdfSlot,
     find: String,
     replacement: String,
     show_find: bool,
@@ -113,16 +122,6 @@ pub struct HwpApp {
     /// Screen rectangle of the top visible page, for rulers and overlays.
     view_page_rect: Option<Rect>,
 }
-/// `#rrggbb` markpen colour as a translucent overlay (Hangul paints it behind glyphs).
-fn markpen_color(hex: &str) -> Color32 {
-    let v = hex.trim_start_matches('#');
-    let channel = |i: usize| u8::from_str_radix(v.get(i..i + 2).unwrap_or("ff"), 16).unwrap_or(255);
-    if v.len() == 6 {
-        Color32::from_rgba_unmultiplied(channel(0), channel(2), channel(4), 110)
-    } else {
-        Color32::from_rgba_unmultiplied(255, 255, 0, 110)
-    }
-}
 /// Gap between pages in the continuous view, matching Hangul's page spacing.
 const PAGE_GAP: f32 = 14.0;
 impl HwpApp {
@@ -132,6 +131,7 @@ impl HwpApp {
         match name {
             "character" => self.show_character = true,
             "paragraph" => self.show_paragraph = true,
+            "body-autotext" => self.open_body_autotext(),
             "table-create" => {
                 let ctx = self.ctx.clone();
                 self.ext_dispatch("table.create", &ctx);
@@ -300,7 +300,6 @@ impl HwpApp {
                 password: String::new(),
                 error: None,
             }),
-            highlights: (u64::MAX, Vec::new()),
             symbol_dialog: None,
             equation_preview: None,
             font_family: hwpcraft_render::default_korean_font().into(),
@@ -308,7 +307,6 @@ impl HwpApp {
             line_spacing_type: "Percent".into(),
             alignment: "justify".into(),
             pages: BTreeMap::new(),
-            cache_generation: u64::MAX,
             zoom: 0.9,
             wheel_zoom: Default::default(),
             margin_guides: Default::default(),
@@ -319,6 +317,7 @@ impl HwpApp {
             error: None,
             pending: None,
             allow_close: false,
+            pdf: pdf_export::PdfSlot::default(),
             find: String::new(),
             replacement: String::new(),
             show_find: false,
@@ -480,6 +479,13 @@ impl HwpApp {
         if path.extension().is_none() {
             path.set_extension(extension.unwrap_or("hwpx"));
         }
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+        {
+            // Conversion takes minutes on long documents; keep the window live.
+            return self.start_pdf_export(path);
+        }
         let r = self.session.save(&path);
         if self.result(r).is_some() {
             self.message = format!("저장 완료 · {}", path.display());
@@ -499,7 +505,7 @@ impl HwpApp {
                 ui.heading("문서 탐색");
                 ui.label(format!(
                     "{}쪽 · {}개 문단/셀",
-                    self.session.core.page_count(),
+                    self.layout_page_count(),
                     self.session.entries().len()
                 ));
                 ui.separator();
@@ -599,15 +605,24 @@ impl HwpApp {
             });
     }
     /// Page sizes in layout pixels, refreshed when the document changes.
+    fn layout_page_count(&self) -> u32 {
+        self.session.page_count().unwrap_or_default()
+    }
+
     fn page_sizes(&mut self) -> Vec<Vec2> {
         if self.page_sizes.0 != self.session.generation {
-            let sizes = (0..self.session.core.page_count())
+            let count = match self.session.page_count() {
+                Ok(count) => count,
+                Err(error) => {
+                    self.message = format!("쪽 조판 실패: {error}");
+                    return Vec::new();
+                }
+            };
+            let sizes = (0..count)
                 .map(|i| {
                     self.session
-                        .core
-                        .get_page_info_native(i)
+                        .page_info(i)
                         .ok()
-                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                         .and_then(|v| {
                             Some(Vec2::new(
                                 v["width"].as_f64()? as f32,
@@ -623,29 +638,8 @@ impl HwpApp {
     }
     /// Render a page on demand; only visible pages are rasterized and cached.
     fn page_texture(&mut self, ctx: &egui::Context, index: u32) -> Result<egui::TextureHandle> {
-        if self.cache_generation != self.session.generation {
-            self.pages.clear();
-            self.cache_generation = self.session.generation;
-        }
-        if let Some((texture, _)) = self.pages.get(&index) {
-            return Ok(texture.clone());
-        }
-        // The shell-page area applies the document view colour and picture
-        // placeholder options on top of the renderer's bitmap.
-        let image = self.shell_page_image(index, 1.25)?;
-        let size = Vec2::new(image.size[0] as f32 / 1.25, image.size[1] as f32 / 1.25);
-        let texture = ctx.load_texture(
-            format!("page-{index}-{}", self.cache_generation),
-            image,
-            egui::TextureOptions::LINEAR,
-        );
-        if self.pages.len() >= 8
-            && let Some(far) = self.pages.keys().copied().max_by_key(|k| k.abs_diff(index))
-        {
-            self.pages.remove(&far);
-        }
-        self.pages.insert(index, (texture.clone(), size));
-        Ok(texture)
+        // Stale pages stay on screen; the shell-page queue redraws one per pass.
+        self.shell_page_texture(ctx, index)
     }
     /// Hangul-style continuous view: every page stacked vertically on a grey desk.
     fn page_view(&mut self, ui: &mut egui::Ui) {
@@ -812,58 +806,13 @@ impl HwpApp {
             ctx.memory_mut(|m| m.request_focus(canvas));
         }
         let focused = ctx.memory(|m| m.has_focus(canvas));
-        // 형광펜: RHWP saves markpen marks but does not paint them; overlay them here.
-        if self.highlights.0 != self.session.generation {
-            self.highlights = (self.session.generation, self.session.highlight_rects());
-        }
-        for h in self.highlights.1.iter().filter(|h| h.page == page) {
+        // Selection rectangles are computed per line and cached per page.
+        for r in self.selection_rects(page) {
             ui.painter().rect_filled(
-                Rect::from_min_size(
-                    rect.min + Vec2::new(h.x as f32, h.y as f32) * self.zoom,
-                    Vec2::new(h.width as f32, h.height as f32) * self.zoom,
-                ),
+                Rect::from_min_size(rect.min + r.min.to_vec2() * self.zoom, r.size() * self.zoom),
                 0.0,
-                markpen_color(&h.color),
+                Color32::from_rgba_unmultiplied(66, 133, 244, 65),
             );
-        }
-        // Highlight every selected paragraph, bounded for very large spans.
-        let selected = if self.session.has_selection() {
-            self.session.selected_paragraphs().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        for (at, offset) in selected
-            .iter()
-            .flat_map(|(c, r)| r.clone().map(move |offset| (*c, offset)))
-            .take(6000)
-        {
-            let a = self.session.caret_at(Cursor { offset, ..at });
-            let b = self.session.caret_at(Cursor {
-                offset: offset + 1,
-                ..at
-            });
-            if let (Ok(a), Ok(b)) = (a, b)
-                && a["pageIndex"].as_u64() == Some(page as u64)
-            {
-                let x = a["x"].as_f64().unwrap_or(0.0) as f32;
-                let y = a["y"].as_f64().unwrap_or(0.0) as f32;
-                let h = a["height"].as_f64().unwrap_or(16.0) as f32;
-                let bx = b["x"].as_f64().unwrap_or(x as f64) as f32;
-                let same_line = (b["y"].as_f64().unwrap_or(y as f64) - y as f64).abs() < 1.0;
-                let w = if same_line {
-                    (bx - x).max(2.0)
-                } else {
-                    h * 0.6
-                };
-                ui.painter().rect_filled(
-                    Rect::from_min_size(
-                        rect.min + Vec2::new(x, y) * self.zoom,
-                        Vec2::new(w, h) * self.zoom,
-                    ),
-                    0.0,
-                    Color32::from_rgba_unmultiplied(66, 133, 244, 65),
-                );
-            }
         }
         // Module canvas modes (e.g. table cell blocks) may take over pointer input.
         if !self.ext_canvas(page, &response, rect) {
@@ -1181,7 +1130,7 @@ impl HwpApp {
             return;
         }
         // Hangul: Ctrl+F10 opens 문자표.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::F10)) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F10)) {
             self.open_symbol_dialog();
             return;
         }
@@ -1210,7 +1159,7 @@ impl HwpApp {
             let second = ctx.input_mut(|i| {
                 [Key::H, Key::N, Key::O, Key::Escape].into_iter().find(|k| {
                     i.consume_key(egui::Modifiers::NONE, *k)
-                        || i.consume_key(egui::Modifiers::CTRL, *k)
+                        || i.consume_key(egui::Modifiers::COMMAND, *k)
                 })
             });
             let other = ctx.input(|i| {
@@ -1240,7 +1189,8 @@ impl HwpApp {
                 return;
             }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::K)) {
+        // COMMAND is Ctrl on Windows/Linux and Cmd on macOS.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::K)) {
             self.chord_k = true;
             self.message = "Ctrl+K, (H 하이퍼링크 · N 문단 번호 · O 개요 번호)".into();
             return;
@@ -1422,7 +1372,7 @@ impl HwpApp {
         }
         if self.show_help {
             egui::Window::new("HwpCraft · 사용 안내").open(&mut self.show_help).default_width(580.0).show(ctx,|ui| {
-            ui.heading(format!("HwpCraft {}", hwpcraft_doc::VERSION));ui.label("Ctrl+마우스 휠: 문서 확대·축소 (10–500%)");ui.label("HWP / HWPX 문서를 로컬에서 편집합니다.");ui.label("문서를 열고 흰 쪽을 클릭해 입력하세요. 아래 문단 편집 패널에서도 한글을 입력하고 텍스트를 선택할 수 있습니다. 왼쪽 목록에서 문단과 표 셀을 선택합니다.");
+            ui.heading(format!("HwpCraft {}", hwpcraft_doc::VERSION.trim()));ui.label("Ctrl+마우스 휠: 문서 확대·축소 (10–500%)");ui.label("HWP / HWPX 문서를 로컬에서 편집합니다.");ui.label("문서를 열고 흰 쪽을 클릭해 입력하세요. 아래 문단 편집 패널에서도 한글을 입력하고 텍스트를 선택할 수 있습니다. 왼쪽 목록에서 문단과 표 셀을 선택합니다.");
             ui.separator();ui.label("서식은 선택한 글자에 적용됩니다. 선택 영역이 없으면 현재 문단 전체에 적용됩니다. Ctrl+A는 현재 문단을 선택합니다. 여러 문단에 걸친 선택은 아직 지원하지 않습니다.");
             for (_,label,key) in hwpcraft_engine::COMMANDS.iter().chain(hwpcraft_engine::extension_commands()) {ui.label(format!("{label}    {key}"));}
             ui.separator();ui.label("독립적인 초기 편집기이며 한컴오피스의 모든 기능이나 문서 배치의 완전한 일치를 보장하지 않습니다. 본문 수식·기본 도형·단순 주석과 글상자는 개체 목록에서 편집할 수 있습니다. 중첩 표와 고급 개체 편집에는 한계가 있습니다. 중요한 원본은 다른 이름으로 저장한 뒤 확인하세요.");
@@ -1433,7 +1383,10 @@ impl HwpApp {
 }
 impl eframe::App for HwpApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.viewport().close_requested())
+        self.poll_pdf_export(ctx);
+        if self.hold_close_for_pdf(ctx) {
+            // Closing waits for the running PDF export; the dirty check runs then.
+        } else if ctx.input(|i| i.viewport().close_requested())
             && self.session.dirty()
             && !self.allow_close
         {
@@ -1502,7 +1455,7 @@ impl eframe::App for HwpApp {
             "{}{} — HwpCraft {}",
             if self.session.dirty() { "● " } else { "" },
             name,
-            hwpcraft_doc::VERSION
+            hwpcraft_doc::VERSION.trim()
         )));
     }
 }

@@ -355,6 +355,7 @@ pub(super) fn preview_image(
     if let (Some(values), None) = (chars, para) {
         s.execute(Command::Insert("한글Eng123漢字あいう※⊙".into()))?;
         s.run("format.paragraph", json!({"alignment":"left"}))?;
+        s.run("select.all", json!({}))?;
         s.run("format.character", writable(values, true))?;
     } else {
         let before = "이전 문단 ".repeat(18);
@@ -368,6 +369,14 @@ pub(super) fn preview_image(
                     ..Default::default()
                 },
                 false,
+            )?;
+            s.select(
+                Cursor {
+                    paragraph,
+                    offset: s.len(),
+                    ..Default::default()
+                },
+                true,
             )?;
             let mut v = match chars {
                 Some(c) if paragraph == 1 => writable(c, true),
@@ -390,7 +399,7 @@ pub(super) fn preview_image(
             s.run("format.paragraph", writable(values, false))?;
         }
     }
-    let page = renderer.page(&s.core, 0, 1.5)?;
+    let page = renderer.svg(&s.render_page_svg(0)?, 1.5)?;
     let (w, h) = (page.width as usize, page.height as usize);
     let dark = |x: usize, y: usize| {
         let i = (y * w + x) * 4;
@@ -2151,6 +2160,51 @@ fn border_spacing(ui: &mut egui::Ui, v: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn character_preview_applies_color_and_size_to_existing_sample() -> anyhow::Result<()> {
+        let renderer = hwpcraft_render::Renderer::default();
+        let small = preview_image(&renderer, Some(&json!({"fontSize":1000})), None)?;
+        let large = preview_image(
+            &renderer,
+            Some(&json!({"fontSize":2200,"textColor":"#ff0000"})),
+            None,
+        )?;
+        let red_pixels = large
+            .pixels
+            .iter()
+            .filter(|c| c.r() > 150 && c.g() < 100 && c.b() < 100)
+            .count();
+        assert!(
+            red_pixels > 20,
+            "preview must render the requested red text"
+        );
+        assert!(
+            large.size[1] > small.size[1],
+            "preview must apply the requested size"
+        );
+        Ok(())
+    }
+    #[test]
+    fn paragraph_preview_keeps_middle_sample_and_context_colors() -> anyhow::Result<()> {
+        let image = preview_image(
+            &hwpcraft_render::Renderer::default(),
+            Some(&json!({"textColor":"#ff0000"})),
+            Some(&json!({"alignment":"left"})),
+        )?;
+        assert!(
+            image
+                .pixels
+                .iter()
+                .any(|c| c.r() > 150 && c.g() < 100 && c.b() < 100)
+        );
+        assert!(
+            image
+                .pixels
+                .iter()
+                .any(|c| c.r() == 160 && c.g() == 160 && c.b() == 160)
+        );
+        Ok(())
+    }
     #[test]
     fn unchanged_dialog_and_single_field_preserve_mixed_fonts() -> anyhow::Result<()> {
         let mut s = Session::new()?;

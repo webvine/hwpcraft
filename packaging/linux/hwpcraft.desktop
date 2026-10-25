@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=HwpCraft
+Comment=HWP and HWPX word processor
+Comment[ko]=HWP·HWPX 문서 편집기
+Exec=hwpcraft %f
+Icon=hwpcraft
+Terminal=false
+Categories=Office;WordProcessor;
+MimeType=application/x-hwp;application/haansofthwp;application/vnd.hancom.hwp;application/hwp+zip;application/vnd.hancom.hwpx;
+StartupWMClass=hwpcraft

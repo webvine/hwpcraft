@@ -8,8 +8,13 @@ pub(crate) struct FindState {
     pub replace: bool,
     pub options: FindOptions,
     pub status: String,
+    /// The status line reports a result (gray) rather than a problem (red).
+    pub status_ok: bool,
     pub focus: bool,
 }
+
+/// Counting stops here so a very common query stays responsive.
+const COUNT_LIMIT: usize = 10_000;
 
 impl HwpApp {
     /// Open 찾기 or 찾아 바꾸기, seeding the query from a short single-paragraph selection.
@@ -17,6 +22,7 @@ impl HwpApp {
         self.show_find = true;
         self.find_state.replace = replace;
         self.find_state.status.clear();
+        self.find_state.status_ok = false;
         self.find_state.focus = true;
         if self.session.span_anchor.is_none() {
             let selected = self.session.selected_text();
@@ -24,6 +30,23 @@ impl HwpApp {
                 self.find = selected;
             }
         }
+    }
+    /// Status line after a hit: how many matches the document has in all.
+    fn found_status(&mut self) {
+        let count = self
+            .session
+            .count_matches(&self.find, self.find_state.options, COUNT_LIMIT)
+            .unwrap_or(0);
+        self.find_state.status = if count >= COUNT_LIMIT {
+            format!("찾았습니다. 문서에 {COUNT_LIMIT}곳 이상 있습니다.")
+        } else {
+            format!("찾았습니다. 문서에 모두 {count}곳 있습니다.")
+        };
+        self.find_state.status_ok = true;
+    }
+    fn not_found_status(&mut self) {
+        self.find_state.status = "찾는 내용이 없습니다.".into();
+        self.find_state.status_ok = false;
     }
     fn find_step(&mut self) {
         let o = self.find_state.options;
@@ -33,11 +56,11 @@ impl HwpApp {
             self.session.find(&self.find, o)
         };
         if let Some(found) = self.result(r) {
-            self.find_state.status = if found {
-                String::new()
+            if found {
+                self.found_status();
             } else {
-                "찾는 내용이 없습니다.".into()
-            };
+                self.not_found_status();
+            }
             self.sync_formatting();
             self.follow_cursor();
         }
@@ -64,7 +87,8 @@ impl HwpApp {
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .default_pos(ctx.content_rect().right_top() + Vec2::new(-470.0, 150.0))
+        // Below the ribbon, format bar and ruler, clear of the vertical scroll bar.
+        .default_pos(ctx.content_rect().right_top() + Vec2::new(-500.0, 190.0))
         .frame(
             egui::Frame::window(&ctx.global_style())
                 .fill(chrome::Tokens::PANEL)
@@ -109,11 +133,15 @@ impl HwpApp {
                             ui.end_row();
                             if replace {
                                 ui.label("바꿀 내용");
-                                ui.add(
+                                let with = ui.add(
                                     egui::TextEdit::singleline(&mut self.replacement)
                                         .id(egui::Id::new("find-replacement"))
                                         .desired_width(220.0),
                                 );
+                                // Enter in 바꿀 내용 runs 바꾸기, as Enter in 찾을 내용 does.
+                                if with.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                    next = true;
+                                }
                                 ui.end_row();
                             }
                         });
@@ -128,6 +156,9 @@ impl HwpApp {
                         ui.add_enabled(
                             !o.regex,
                             egui::Checkbox::new(&mut o.wildcards, "아무개 문자(?, *)"),
+                        )
+                        .on_disabled_hover_text(
+                            "조건식(정규식)을 쓰는 동안에는 ?와 *가 정규식 문법입니다.",
                         );
                         ui.checkbox(&mut o.regex, "조건식(정규식)");
                         ui.checkbox(&mut o.any_word, "여러 단어 찾기");
@@ -176,19 +207,17 @@ impl HwpApp {
                         ui.radio_value(&mut o.direction, FindDirection::All, "문서 전체");
                     });
                     ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(if self.find_state.status.is_empty() {
-                            "본문과 표 셀에서 찾습니다. 바꿀 내용은 문자 그대로 넣습니다."
-                        } else {
-                            self.find_state.status.as_str()
-                        })
-                        .small()
-                        .color(if self.find_state.status.is_empty() {
-                            Color32::GRAY
-                        } else {
-                            Color32::DARK_RED
-                        }),
-                    );
+                    let (status, color) = if self.find_state.status.is_empty() {
+                        (
+                            "본문과 표 셀에서 찾습니다. 바꿀 내용은 문자 그대로 넣습니다.",
+                            Color32::GRAY,
+                        )
+                    } else if self.find_state.status_ok {
+                        (self.find_state.status.as_str(), Color32::DARK_GRAY)
+                    } else {
+                        (self.find_state.status.as_str(), Color32::DARK_RED)
+                    };
+                    ui.add(egui::Label::new(RichText::new(status).size(12.5).color(color)).wrap());
                 });
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
@@ -197,6 +226,7 @@ impl HwpApp {
                             enabled,
                             egui::Button::new(label).min_size(Vec2::new(92.0, 26.0)),
                         )
+                        .on_disabled_hover_text("찾을 내용을 먼저 입력하세요.")
                         .clicked()
                     };
                     let has_query = !self.find.is_empty();
@@ -204,8 +234,10 @@ impl HwpApp {
                         next |= button(ui, "바꾸기", has_query);
                         if button(ui, "다음 찾기", has_query) {
                             let r = self.session.find(&self.find, self.find_state.options);
-                            if self.result(r) == Some(false) {
-                                self.find_state.status = "찾는 내용이 없습니다.".into();
+                            match self.result(r) {
+                                Some(true) => self.found_status(),
+                                Some(false) => self.not_found_status(),
+                                None => {}
                             }
                             self.follow_cursor();
                         }
@@ -234,10 +266,11 @@ impl HwpApp {
                 self.find_state.options,
             );
             if let Some(count) = self.result(r) {
+                self.find_state.status_ok = count > 0;
                 self.find_state.status = if count == 0 {
                     "찾는 내용이 없습니다.".into()
                 } else {
-                    format!("{count}번 바꿨습니다. Ctrl+Z로 한 번에 되돌립니다.")
+                    format!("{count}곳을 바꿨습니다. Ctrl+Z로 한 번에 되돌립니다.")
                 };
                 self.message = self.find_state.status.clone();
                 self.sync_formatting();

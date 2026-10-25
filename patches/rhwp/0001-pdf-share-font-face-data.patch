@@ -1,0 +1,37 @@
+diff --git a/src/renderer/pdf.rs b/src/renderer/pdf.rs
+index 463fb85e6..045c49000 100644
+--- a/src/renderer/pdf.rs
++++ b/src/renderer/pdf.rs
+@@ -524,6 +524,24 @@ fn default_mono_family() -> &'static str {
+     "Noto Sans Mono CJK KR"
+ }
+ 
++/// 파일 글꼴을 한 번만 메모리 매핑해 모든 면이 공유하게 한다.
++///
++/// usvg는 글리프마다 `with_face_data`를 부르고, `Source::File` 면은 그때마다
++/// 파일을 다시 매핑·파싱한다. 큰 문서(텍스트 20만 개)에서는 PDF 내보내기 시간의
++/// 대부분이 여기에 든다. 매핑에 실패한 면은 기존처럼 파일 면으로 남는다.
++#[cfg(not(target_arch = "wasm32"))]
++fn share_face_data(fontdb: &mut usvg::fontdb::Database) {
++    let ids: Vec<_> = fontdb.faces().map(|face| face.id).collect();
++    for id in ids {
++        // SAFETY: 매핑은 내보내기 동안만 쓰이는 이 DB가 소유한다. 내보내기 도중
++        // 다른 프로세스가 같은 글꼴 파일을 바꾸거나 지우면 잘못된 데이터를 읽을 수
++        // 있다는 위험은 fontdb 문서에 적힌 그대로 받아들인다(시스템 글꼴 폴더).
++        unsafe {
++            fontdb.make_shared_face_data(id);
++        }
++    }
++}
++
+ /// 폰트 데이터베이스를 초기화 (시스템 폰트 + 프로젝트 폰트 로드)
+ #[cfg(not(target_arch = "wasm32"))]
+ fn create_fontdb(options: &PdfExportOptions) -> usvg::fontdb::Database {
+@@ -533,6 +551,7 @@ fn create_fontdb(options: &PdfExportOptions) -> usvg::fontdb::Database {
+     // 종전의 ttfs/hwp·ttfs/windows(로컬 전용)와 /mnt/c/Windows/Fonts(WSL2 전용)는
+     // 제거했다 — 서버·컨테이너에서 무의미하고 /mnt/c 는 #2268 간헐 행의 원인이었다.
+     crate::renderer::font_paths::load_into_fontdb(&mut fontdb, &options.font_paths);
++    share_face_data(&mut fontdb);
+     fontdb.set_serif_family(options.fallback_serif.as_str());
+     fontdb.set_sans_serif_family(options.fallback_sans.as_str());
+     fontdb.set_monospace_family(options.fallback_mono.as_str());

@@ -204,6 +204,22 @@ pub(crate) struct State {
     pub mirror_pages: bool,
     /// Header/footer editor to open next frame (이전/다음 inside the editor).
     pub hf_next: Option<(bool, usize)>,
+    /// Selection highlight rectangles per page, for one document generation and selection.
+    selection: Option<SelectionHighlight>,
+    /// Page redraw queue: the document generation each cached page texture shows.
+    pub page_drawn: std::collections::BTreeMap<u32, u64>,
+    /// Pass in which a stale page was last redrawn (one stale page per pass).
+    redraw_pass: Option<u64>,
+    /// Pages the view asked for in the current and the previous pass.
+    requested: (
+        u64,
+        std::collections::BTreeSet<u32>,
+        std::collections::BTreeSet<u32>,
+    ),
+    /// Caret page for one generation, so the queue starts where the user types.
+    caret_page: Option<(u64, u32)>,
+    /// Print request waiting for its background PDF: file, copies, page count.
+    print_after: Option<(PathBuf, u32, usize)>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -228,6 +244,12 @@ impl Default for State {
             show_pictures: true,
             mirror_pages: false,
             hf_next: None,
+            selection: None,
+            page_drawn: Default::default(),
+            redraw_pass: None,
+            requested: (u64::MAX, Default::default(), Default::default()),
+            caret_page: None,
+            print_after: None,
         }
     }
 }
@@ -282,7 +304,7 @@ impl HwpApp {
             | "view.mirror_pages"
             | "page.header_footer.next"
             | "page.header_footer.prev" => true,
-            "page.delete" => self.session.core.page_count() > 1,
+            "page.delete" => self.layout_page_count() > 1,
             "page.section.next" => {
                 self.session.cursor.section + 1 < self.session.core.document().sections.len()
             }
@@ -608,7 +630,8 @@ impl HwpApp {
     /// Hangul two-key shortcuts and file/view keys; true when consumed.
     pub(crate) fn shell_ext_shortcuts(&mut self, ctx: &egui::Context) -> bool {
         use egui::{Key, Modifiers};
-        let ctrl = Modifiers::CTRL;
+        // COMMAND is Ctrl on Windows/Linux and Cmd on macOS.
+        let ctrl = Modifiers::COMMAND;
         if self.keytip_shortcuts(ctx) {
             return true;
         }
@@ -1149,7 +1172,7 @@ impl HwpApp {
         copies: &mut u32,
         to_file: &mut bool,
     ) -> bool {
-        let count = self.session.core.page_count();
+        let count = self.layout_page_count();
         let button = dialog(ctx, "인쇄", 600.0, &["인쇄(D)", "취소"], |ui| {
             chrome::tabs(ui, &mut 0, &["기본"]);
             ui.label("프린터 선택");
@@ -1217,39 +1240,63 @@ impl HwpApp {
                 None => return true,
             }
         } else {
-            std::env::temp_dir().join(format!("hwpcraft-print-{}.pdf", std::process::id()))
+            // Unique per request: an older print file must never be sent by mistake.
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            std::env::temp_dir().join(format!("hwpcraft-print-{}-{stamp}.pdf", std::process::id()))
         };
-        let r = self.session.run(
-            "file.print_pdf",
-            json!({"path": target, "pages": range_name, "current": self.page}),
-        );
-        let Some(done) = self.result(r) else {
-            return true;
-        };
-        let count = done["pages"].as_array().map_or(0, Vec::len);
-        if to_file {
-            self.message = format!("{count}쪽을 PDF로 저장했습니다 · {}", target.display());
+        !self.start_print_pdf(target, range_name, copies, to_file)
+    }
+    /// Prepare the printed pages and convert them in the background PDF slot. Printing
+    /// to paper waits for the file (`shell_print_when_ready`). True when started.
+    pub(crate) fn start_print_pdf(
+        &mut self,
+        target: PathBuf,
+        range: &str,
+        copies: u32,
+        to_file: bool,
+    ) -> bool {
+        let job = self.session.print_pdf_job(range, self.page);
+        let count = job.as_ref().map_or(0, |(pages, _)| pages.len());
+        let prepared = job
+            .map(|(_, job)| -> PreparedPdf { (job.page_count(), Box::new(move || job.convert())) });
+        if !self.start_shell_pdf(target.clone(), prepared) {
             return false;
         }
-        let mut sent = 0;
-        for _ in 0..copies {
-            if send_pdf_to_printer(&target) {
-                sent += 1;
+        if !to_file {
+            self.ext.shell.print_after = Some((target, copies, count));
+        }
+        true
+    }
+    /// After the background PDF for a print request is written, hand it to the printer.
+    fn shell_print_when_ready(&mut self) {
+        if self.pdf.busy() {
+            return;
+        }
+        let Some((target, copies, count)) = self.ext.shell.print_after.take() else {
+            return;
+        };
+        if !target.is_file() {
+            // The PDF slot has already reported why the file was not written.
+            return;
+        }
+        match crate::platform::print_pdf(&target, copies) {
+            crate::platform::PrintOutcome::Printed => {
+                self.message = format!("{count}쪽을 {copies}부 기본 프린터로 보냈습니다.");
+            }
+            crate::platform::PrintOutcome::Opened => {
+                self.message = format!(
+                    "{count}쪽 PDF를 기본 보기 프로그램으로 열었습니다. 거기서 인쇄하세요."
+                );
+            }
+            crate::platform::PrintOutcome::Failed => {
+                self.error = Some(
+                    "PDF 인쇄 프로그램을 찾지 못해 인쇄하지 못했습니다. 'PDF 저장'으로 저장한 뒤 인쇄하세요."
+                        .into(),
+                );
             }
         }
-        if sent == 0 {
-            self.error = Some(
-                "PDF 인쇄 프로그램을 찾지 못해 인쇄하지 못했습니다. 'PDF 저장'으로 저장한 뒤 인쇄하세요."
-                    .into(),
-            );
-            return true;
-        }
-        self.message = if cfg!(target_os = "windows") {
-            format!("{count}쪽을 {sent}부 인쇄로 보냈습니다.")
-        } else {
-            format!("{count}쪽 PDF를 기본 보기 프로그램으로 열었습니다. 거기서 인쇄하세요.")
-        };
-        false
     }
 
     // ----- 새 번호로 시작 / 현재 쪽만 감추기 -----
@@ -1842,14 +1889,11 @@ pub(crate) fn join_hf_tokens(text: &str, fields: &[(usize, String)]) -> String {
     out
 }
 
-/// Settings folder: `%APPDATA%\HwpCraft`, else `$XDG_CONFIG_HOME/HwpCraft`, else
-/// `$HOME/.config/HwpCraft`. `None` means settings are not persisted.
+/// Settings folder shared with the engine (`hwpcraft_engine::config_dir`: Windows
+/// `%APPDATA%`, macOS `~/Library/Application Support`, Linux `$XDG_CONFIG_HOME`).
+/// `None` means settings are not persisted.
 pub(crate) fn config_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("HwpCraft"))
+    hwpcraft_engine::config_dir()
 }
 fn recent_file() -> Option<PathBuf> {
     config_dir().map(|d| d.join("recent.txt"))
@@ -1874,28 +1918,6 @@ pub(crate) fn serialize_recent(list: &[PathBuf]) -> String {
         .map(|p| p.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Hand a PDF to the OS print path: Windows shell `Print` verb, otherwise the default
-/// PDF viewer (`open` / `xdg-open`) where the user prints.
-fn send_pdf_to_printer(target: &std::path::Path) -> bool {
-    let status = if cfg!(target_os = "windows") {
-        std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                "Start-Process -FilePath $args[0] -Verb Print",
-            ])
-            .arg(target)
-            .status()
-    } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(target).status()
-    } else {
-        std::process::Command::new("xdg-open").arg(target).status()
-    };
-    status.is_ok_and(|s| s.success())
 }
 
 /// Alt key tips per tab (Hangul-style Alt letters): (tab, letter, command id).
@@ -2087,6 +2109,7 @@ impl HwpApp {
         {
             self.apply_marks();
         }
+        self.shell_print_when_ready();
         if let Some((header, apply)) = self.ext.shell.hf_next.take() {
             self.open_header_footer_editor(header, apply);
         }
@@ -2603,7 +2626,7 @@ impl HwpApp {
         page: &mut u32,
         texture: &mut Option<(u32, u64, egui::TextureHandle, Vec2)>,
     ) -> bool {
-        let count = self.session.core.page_count().max(1);
+        let count = self.layout_page_count().max(1);
         *page = (*page).min(count - 1);
         let sizes = self.page_sizes();
         let size = sizes
@@ -2616,7 +2639,11 @@ impl HwpApp {
             .as_ref()
             .is_none_or(|(p, g, _, _)| *p != *page || *g != generation)
         {
-            match self.renderer.page(&self.session.core, *page, scale) {
+            match self
+                .session
+                .render_page_svg(*page)
+                .and_then(|svg| self.renderer.svg(&svg, scale))
+            {
                 Ok(p) => {
                     let image = egui::ColorImage::from_rgba_premultiplied(
                         [p.width as usize, p.height as usize],
@@ -2809,7 +2836,7 @@ impl HwpApp {
         from: &mut u32,
         to: &mut u32,
     ) -> bool {
-        let count = self.session.core.page_count().max(1);
+        let count = self.layout_page_count().max(1);
         let current = self.page + 1;
         let button = dialog(
             ctx,
@@ -2859,6 +2886,12 @@ impl HwpApp {
                 };
                 if path.extension().is_none() {
                     path.set_extension("hwpx");
+                }
+                if path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+                {
+                    return !self.start_pages_pdf(path, a, b);
                 }
                 let r = self
                     .session
@@ -3110,11 +3143,7 @@ impl HwpApp {
         index: u32,
         scale: f32,
     ) -> anyhow::Result<egui::ColorImage> {
-        let mut svg = self
-            .session
-            .core
-            .render_page_svg_native(index)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut svg = self.session.render_page_svg(index)?;
         if !self.ext.shell.show_pictures {
             svg = picture_placeholders(&svg);
         }
@@ -3178,7 +3207,7 @@ impl HwpApp {
         all_pages: &mut bool,
         scale: &mut f32,
     ) -> bool {
-        let count = self.session.core.page_count().max(1);
+        let count = self.layout_page_count().max(1);
         let current = self.page + 1;
         let button = dialog(
             ctx,
@@ -3224,7 +3253,7 @@ impl HwpApp {
             return false;
         };
         let pages: Vec<u32> = if all_pages {
-            (0..self.session.core.page_count()).collect()
+            (0..self.layout_page_count()).collect()
         } else {
             vec![self.page]
         };
@@ -3236,8 +3265,9 @@ impl HwpApp {
                 with_page_suffix(&path, n + 1)
             };
             let r = self
-                .renderer
-                .page(&self.session.core, *index, scale.clamp(0.25, 2.0))
+                .session
+                .render_page_svg(*index)
+                .and_then(|svg| self.renderer.svg(&svg, scale.clamp(0.25, 2.0)))
                 .and_then(|p| {
                     image::save_buffer(&target, &p.rgba, p.width, p.height, image::ColorType::Rgba8)
                         .map_err(|e| anyhow::anyhow!("{}: {e}", target.display()))
@@ -3281,6 +3311,13 @@ impl HwpApp {
         else {
             return;
         };
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        {
+            self.start_block_pdf(path);
+            return;
+        }
         let r = self.session.run("file.save_block", json!({"path": path}));
         if let Some(v) = self.result(r) {
             self.message = format!(
@@ -3321,5 +3358,648 @@ impl HwpApp {
             None => 0,
         };
         self.ext.shell.hf_next = Some(items[next]);
+    }
+}
+
+// ----- 선택 영역 강조: 줄 단위로 합친 사각형, 문서 세대·선택·쪽마다 한 번 계산 -----
+
+/// Caret probes allowed for one page's highlight. Each probe costs a caret query
+/// in RHWP (about 1.4 ms on a 20-page exam paper), so a page stays well under a second.
+const SELECTION_PROBES_PER_PAGE: usize = 600;
+
+type SelectionKey = (u64, Cursor, Option<usize>, Option<Cursor>);
+
+/// Selection highlight cache: one entry per page, valid for one generation and selection.
+pub(crate) struct SelectionHighlight {
+    key: SelectionKey,
+    pages: std::collections::HashMap<u32, Vec<Rect>>,
+}
+
+#[derive(Clone, Copy)]
+struct Probe {
+    page: u32,
+    x: f32,
+    y: f32,
+    height: f32,
+}
+
+fn probe(session: &Session, at: Cursor, offset: usize) -> Option<Probe> {
+    let v = session.caret_at(Cursor { offset, ..at }).ok()?;
+    Some(Probe {
+        page: u32::try_from(v["pageIndex"].as_u64()?).ok()?,
+        x: v["x"].as_f64()? as f32,
+        y: v["y"].as_f64()? as f32,
+        height: v["height"].as_f64().unwrap_or(16.0) as f32,
+    })
+}
+
+/// Rectangles (page coordinates, unzoomed) covering `start..end` of one paragraph on
+/// `page`. Each laid-out line becomes one rectangle; lines are found by bisection, so a
+/// line costs a few caret queries instead of two per character. A character whose end
+/// caret moves to the next line gets the same short tail the per-character drawing used.
+fn paragraph_selection_rects(
+    session: &Session,
+    at: Cursor,
+    range: std::ops::Range<usize>,
+    page: u32,
+    budget: &mut usize,
+    out: &mut Vec<Rect>,
+) {
+    let mut memo: std::collections::HashMap<usize, Option<Probe>> = Default::default();
+    let mut caret = |offset: usize, budget: &mut usize| -> Option<Probe> {
+        if let Some(p) = memo.get(&offset) {
+            return *p;
+        }
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        let p = probe(session, at, offset);
+        memo.insert(offset, p);
+        p
+    };
+    let mut stack = vec![(range.start, range.end)];
+    while let Some((s, e)) = stack.pop() {
+        if s >= e {
+            continue;
+        }
+        let (Some(a), b) = (caret(s, budget), caret(e, budget)) else {
+            continue;
+        };
+        if let Some(b) = b
+            && a.page == b.page
+            && (b.y - a.y).abs() < 1.0
+        {
+            if a.page == page {
+                out.push(Rect::from_min_size(
+                    Pos2::new(a.x, a.y),
+                    Vec2::new((b.x - a.x).max(2.0), a.height),
+                ));
+            }
+            continue;
+        }
+        if e - s == 1 {
+            if a.page == page {
+                out.push(Rect::from_min_size(
+                    Pos2::new(a.x, a.y),
+                    Vec2::new(a.height * 0.6, a.height),
+                ));
+            }
+            continue;
+        }
+        // Whole span on other pages: nothing of it can land on `page`.
+        if let Some(b) = b
+            && (a.page.max(b.page) < page || a.page.min(b.page) > page)
+        {
+            continue;
+        }
+        let mid = s + (e - s) / 2;
+        stack.push((mid, e));
+        stack.push((s, mid));
+    }
+}
+
+/// Whether paragraph `at` can draw on `page`: RHWP's pagination gives the first page
+/// of each paragraph, so a paragraph spans from its first page to the next one's.
+fn paragraph_may_touch(session: &Session, at: Cursor, next: Option<Cursor>, page: u32) -> bool {
+    let first = |c: Cursor| -> Option<u32> {
+        let v: serde_json::Value = serde_json::from_str(
+            &session
+                .core
+                .get_page_of_position_native(c.section, c.paragraph)
+                .ok()?,
+        )
+        .ok()?;
+        u32::try_from(v["page"].as_u64()?).ok()
+    };
+    let Some(start) = first(at) else {
+        return true;
+    };
+    let end = next.and_then(first).unwrap_or(u32::MAX).max(start);
+    // One page of slack: the canvas may show a projected layout (page fields,
+    // nested tables) whose page breaks differ slightly from the stored pagination.
+    start.saturating_sub(1) <= page && page <= end.saturating_add(1)
+}
+
+pub(crate) fn selection_rects_for_page(session: &Session, page: u32) -> Vec<Rect> {
+    let Ok(parts) = session.selected_paragraphs() else {
+        return Vec::new();
+    };
+    let mut budget = SELECTION_PROBES_PER_PAGE;
+    let mut out = Vec::new();
+    for (i, (at, range)) in parts.iter().enumerate() {
+        if range.is_empty() || budget == 0 {
+            continue;
+        }
+        let next = parts.get(i + 1).map(|(c, _)| *c);
+        if at.cell.is_none() && !paragraph_may_touch(session, *at, next, page) {
+            continue;
+        }
+        paragraph_selection_rects(session, *at, range.clone(), page, &mut budget, &mut out);
+    }
+    merge_line_rects(out)
+}
+
+/// Join touching pieces of one line: bisection splits a line at midpoints, not at its ends.
+fn merge_line_rects(mut rects: Vec<Rect>) -> Vec<Rect> {
+    rects.sort_by(|a, b| {
+        (a.min.y, a.min.x)
+            .partial_cmp(&(b.min.y, b.min.x))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut out: Vec<Rect> = Vec::with_capacity(rects.len());
+    for r in rects {
+        if let Some(last) = out.last_mut()
+            && (last.min.y - r.min.y).abs() < 0.5
+            && (last.height() - r.height()).abs() < 0.5
+            && r.min.x <= last.max.x + 0.5
+        {
+            *last = last.union(r);
+            continue;
+        }
+        out.push(r);
+    }
+    out
+}
+
+impl HwpApp {
+    /// Selection highlight for one page in page coordinates (multiply by zoom).
+    /// Computed once per document generation, selection and page.
+    pub(crate) fn selection_rects(&mut self, page: u32) -> Vec<Rect> {
+        if !self.session.has_selection() {
+            self.ext.shell.selection = None;
+            return Vec::new();
+        }
+        let key = (
+            self.session.generation,
+            self.session.cursor,
+            self.session.anchor,
+            self.session.span_anchor,
+        );
+        let cache = match &mut self.ext.shell.selection {
+            Some(cache) if cache.key == key => cache,
+            slot => slot.insert(SelectionHighlight {
+                key,
+                pages: Default::default(),
+            }),
+        };
+        cache
+            .pages
+            .entry(page)
+            .or_insert_with(|| selection_rects_for_page(&self.session, page))
+            .clone()
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn per_character(session: &Session, page: u32) -> Vec<Rect> {
+        let mut out = Vec::new();
+        for (at, range) in session.selected_paragraphs().unwrap() {
+            for offset in range {
+                let (Some(a), b) = (probe(session, at, offset), probe(session, at, offset + 1))
+                else {
+                    continue;
+                };
+                if a.page != page {
+                    continue;
+                }
+                let same = b.is_some_and(|b| (b.y - a.y).abs() < 1.0);
+                let w = if same {
+                    (b.map_or(a.x, |b| b.x) - a.x).max(2.0)
+                } else {
+                    a.height * 0.6
+                };
+                out.push(Rect::from_min_size(
+                    Pos2::new(a.x, a.y),
+                    Vec2::new(w, a.height),
+                ));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn merged_selection_covers_every_character_with_few_rectangles() -> anyhow::Result<()> {
+        let mut s = Session::new()?;
+        let long = "가나다라마바사아자차카타파하 ".repeat(12);
+        for i in 0..3 {
+            s.execute(Command::Insert(format!("{i}번 문단 {long}")))?;
+            s.execute(Command::Split)?;
+        }
+        s.execute(Command::PageBreak)?;
+        s.execute(Command::Insert("둘째 쪽".into()))?;
+        s.select_all()?;
+        let naive = per_character(&s, 0);
+        let merged = selection_rects_for_page(&s, 0);
+        assert!(naive.len() > 400, "{}", naive.len());
+        assert!(
+            merged.len() < naive.len() / 20,
+            "{} vs {}",
+            merged.len(),
+            naive.len()
+        );
+        for r in &naive {
+            assert!(
+                merged.iter().any(|m| m.expand(0.6).contains_rect(*r)),
+                "{r:?} not covered"
+            );
+        }
+        // Second page: only its own paragraph, nothing from page one.
+        let second = selection_rects_for_page(&s, 1);
+        assert_eq!(second.len(), 1, "{second:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn selection_cache_follows_generation_and_selection() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        a.session.execute(Command::Insert("하나 둘 셋".into()))?;
+        assert!(a.selection_rects(0).is_empty());
+        a.session.select_all()?;
+        let all = a.selection_rects(0);
+        assert_eq!(all.len(), 1);
+        a.session.select(
+            Cursor {
+                offset: 2,
+                ..Default::default()
+            },
+            false,
+        )?;
+        a.session.select(
+            Cursor {
+                offset: 4,
+                ..Default::default()
+            },
+            true,
+        )?;
+        let part = a.selection_rects(0);
+        assert_eq!(part.len(), 1);
+        assert!(part[0].width() < all[0].width());
+        Ok(())
+    }
+}
+
+// ----- 쪽 다시 그리기 대기열: 편집 뒤 이전 그림을 두고 한 프레임에 한 쪽씩 -----
+
+impl HwpApp {
+    /// Texture for page `index`, used by the canvas instead of clearing every page on
+    /// each edit. A page drawn for an older document generation stays on screen and at
+    /// most one such page is redrawn per pass, the caret's page first; the rest follow
+    /// on the next passes (a repaint is requested). A page that has no texture yet, for
+    /// example one scrolled into view, is always drawn at once.
+    pub(crate) fn shell_page_texture(
+        &mut self,
+        ctx: &egui::Context,
+        index: u32,
+    ) -> anyhow::Result<egui::TextureHandle> {
+        let generation = self.session.generation;
+        let pass = ctx.cumulative_pass_nr();
+        let requested = &mut self.ext.shell.requested;
+        if requested.0 != pass {
+            requested.2 = std::mem::take(&mut requested.1);
+            requested.0 = pass;
+        }
+        requested.1.insert(index);
+        let drawn = self.ext.shell.page_drawn.get(&index).copied();
+        let cached = self.pages.get(&index).map(|(texture, _)| texture.clone());
+        let stale = match (&cached, drawn) {
+            (Some(texture), Some(at)) if at == generation => return Ok(texture.clone()),
+            (Some(texture), Some(_)) => {
+                if !self.may_redraw_page(pass, index, generation) {
+                    ctx.request_repaint();
+                    return Ok(texture.clone());
+                }
+                true
+            }
+            _ => false,
+        };
+        // The shell-page area applies the document view colour and picture
+        // placeholder options on top of the renderer's bitmap.
+        let image = self.shell_page_image(index, 1.25)?;
+        let size = Vec2::new(image.size[0] as f32 / 1.25, image.size[1] as f32 / 1.25);
+        let texture = ctx.load_texture(
+            format!("page-{index}-{generation}"),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        if !self.pages.contains_key(&index)
+            && self.pages.len() >= 8
+            && let Some(far) = self.pages.keys().copied().max_by_key(|k| k.abs_diff(index))
+        {
+            self.pages.remove(&far);
+            self.ext.shell.page_drawn.remove(&far);
+        }
+        self.pages.insert(index, (texture.clone(), size));
+        self.ext.shell.page_drawn.insert(index, generation);
+        if stale {
+            self.ext.shell.redraw_pass = Some(pass);
+            if self
+                .pages
+                .iter()
+                .any(|(page, _)| self.ext.shell.page_drawn.get(page) != Some(&generation))
+            {
+                ctx.request_repaint();
+            }
+        }
+        Ok(texture)
+    }
+
+    /// One stale page per pass; while the caret's page is visible and stale, it goes first.
+    fn may_redraw_page(&mut self, pass: u64, index: u32, generation: u64) -> bool {
+        if self.ext.shell.redraw_pass == Some(pass) {
+            return false;
+        }
+        let Some(caret) = self.redraw_caret_page(generation) else {
+            return true;
+        };
+        if caret == index {
+            return true;
+        }
+        let caret_stale = self.pages.contains_key(&caret)
+            && self.ext.shell.page_drawn.get(&caret) != Some(&generation);
+        let (_, now, before) = &self.ext.shell.requested;
+        let caret_visible = now.contains(&caret) || before.contains(&caret);
+        !(caret_stale && caret_visible)
+    }
+
+    fn redraw_caret_page(&mut self, generation: u64) -> Option<u32> {
+        if let Some((at, page)) = self.ext.shell.caret_page
+            && at == generation
+        {
+            return Some(page);
+        }
+        let page = u32::try_from(self.session.caret().ok()?["pageIndex"].as_u64()?).ok()?;
+        self.ext.shell.caret_page = Some((generation, page));
+        Some(page)
+    }
+}
+
+#[cfg(test)]
+mod redraw_tests {
+    use super::*;
+
+    fn app_with_pages(n: usize) -> anyhow::Result<HwpApp> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        for i in 0..n {
+            if i > 0 {
+                a.session.execute(Command::PageBreak)?;
+            }
+            a.session
+                .execute(Command::Insert(format!("{}쪽 본문", i + 1)))?;
+        }
+        Ok(a)
+    }
+
+    /// One pass of the view asking for `pages` in order, as the canvas does.
+    fn pass(a: &mut HwpApp, pages: &[u32]) {
+        let ctx = a.ctx.clone();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+            for page in pages {
+                let _ = a.shell_page_texture(&ctx, *page).unwrap();
+            }
+        });
+        output.textures_delta.clear();
+    }
+
+    fn current(a: &HwpApp) -> Vec<bool> {
+        let g = a.session.generation;
+        (0..4)
+            .map(|p| a.ext.shell.page_drawn.get(&p) == Some(&g))
+            .collect()
+    }
+
+    #[test]
+    fn edit_redraws_the_caret_page_first_then_one_page_per_pass() -> anyhow::Result<()> {
+        let mut a = app_with_pages(4)?;
+        let visible = [0, 1, 2, 3];
+        pass(&mut a, &visible);
+        assert_eq!(
+            current(&a),
+            [true; 4],
+            "first view draws every page at once"
+        );
+        // Type on the third page.
+        let at = a
+            .session
+            .cursors()
+            .into_iter()
+            .find(|c| {
+                a.session
+                    .paragraph(*c)
+                    .is_ok_and(|p| p.text.starts_with("3쪽"))
+            })
+            .ok_or_else(|| anyhow::anyhow!("third page paragraph"))?;
+        a.session.select(at, false)?;
+        a.session.execute(Command::Insert("가".into()))?;
+        pass(&mut a, &visible);
+        assert_eq!(current(&a), [false, false, true, false], "caret page first");
+        pass(&mut a, &visible);
+        assert_eq!(current(&a).iter().filter(|c| **c).count(), 2);
+        pass(&mut a, &visible);
+        pass(&mut a, &visible);
+        assert_eq!(
+            current(&a),
+            [true; 4],
+            "every page current within the visible count"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_without_a_texture_is_drawn_immediately() -> anyhow::Result<()> {
+        let mut a = app_with_pages(4)?;
+        pass(&mut a, &[0, 1, 2]);
+        a.session.select(Cursor::default(), false)?;
+        a.session.execute(Command::Insert("가".into()))?;
+        // Page 3 scrolls into view in the same pass that redraws the caret page.
+        pass(&mut a, &[0, 1, 2, 3]);
+        let now = current(&a);
+        assert!(now[0], "caret page redrawn");
+        assert!(now[3], "newly visible page drawn at once");
+        assert!(!now[1] && !now[2], "other stale pages wait: {now:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_caret_page_out_of_view_does_not_block_the_others() -> anyhow::Result<()> {
+        let mut a = app_with_pages(4)?;
+        pass(&mut a, &[0, 1, 2, 3]);
+        a.session.select(Cursor::default(), false)?;
+        a.session.execute(Command::Insert("가".into()))?;
+        // The view has moved away from the caret's first page.
+        pass(&mut a, &[2, 3]);
+        pass(&mut a, &[2, 3]);
+        pass(&mut a, &[2, 3]);
+        let now = current(&a);
+        assert!(now[2] && now[3], "{now:?}");
+        assert!(
+            !now[0],
+            "the caret page is redrawn only when it is shown again"
+        );
+        Ok(())
+    }
+}
+
+// ----- PDF 저장을 백그라운드로: 인쇄 → PDF·쪽 범위 저장·블록 저장 (파일 메뉴와 같은 PdfSlot) -----
+
+/// Pages and the conversion of a prepared PDF (`Session::pdf_job` and friends).
+type PreparedPdf = (usize, Box<dyn FnOnce() -> anyhow::Result<Vec<u8>> + Send>);
+
+impl HwpApp {
+    /// Hand a prepared PDF to the shared background slot (one export at a time), so the
+    /// slow font layout and embedding never run on the UI thread. True when started.
+    fn start_shell_pdf(&mut self, path: PathBuf, prepared: anyhow::Result<PreparedPdf>) -> bool {
+        // Checked before `prepared` is used: a busy slot should not cost the page
+        // preparation (seconds on long documents) only to be refused afterwards.
+        if self.pdf.busy() {
+            self.error =
+                Some("이전 PDF 저장이 아직 진행 중입니다. 끝난 뒤 다시 저장해 주세요.".into());
+            return false;
+        }
+        let Some((pages, convert)) = self.result(prepared) else {
+            return false;
+        };
+        // Same status line as the file menu, refreshed with the elapsed seconds.
+        self.begin_pdf_export(pages, path, convert)
+    }
+    /// 쪽 범위 저장 as PDF (1-based, inclusive), in the background. True when started.
+    pub(crate) fn start_pages_pdf(&mut self, path: PathBuf, from: u32, to: u32) -> bool {
+        let prepared = self.session.page_count().and_then(|count| {
+            if from == 0 || to < from || to > count {
+                anyhow::bail!("쪽 범위는 1–{count} 안에서 작은 번호부터 적으세요: {from}–{to}");
+            }
+            let job = self
+                .session
+                .pdf_job(&((from - 1)..to).collect::<Vec<_>>())?;
+            Ok((job.page_count(), Box::new(move || job.convert()) as Box<_>))
+        });
+        self.start_shell_pdf(path, prepared)
+    }
+    /// 블록 저장 as PDF, in the background. True when started.
+    pub(crate) fn start_block_pdf(&mut self, path: PathBuf) -> bool {
+        let prepared = self
+            .session
+            .save_block_pdf_job()
+            .map(|job| -> PreparedPdf { (job.page_count(), Box::new(move || job.convert())) });
+        self.start_shell_pdf(path, prepared)
+    }
+}
+
+#[cfg(test)]
+mod pdf_tests {
+    use super::*;
+
+    fn three_pages() -> anyhow::Result<HwpApp> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        a.session.execute(Command::Insert("1쪽".into()))?;
+        a.session.execute(Command::PageBreak)?;
+        a.session.execute(Command::Insert("2쪽 블록".into()))?;
+        a.session.execute(Command::PageBreak)?;
+        a.session.execute(Command::Insert("3쪽".into()))?;
+        Ok(a)
+    }
+
+    /// Frames keep running while the worker converts; returns once it has finished.
+    fn wait(a: &mut HwpApp) {
+        let ctx = a.ctx.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while a.pdf.busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PDF export did not finish"
+            );
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+                a.poll_pdf_export(&ctx);
+                a.shell_print_when_ready();
+            });
+            output.textures_delta.clear();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn is_pdf(path: &std::path::Path) -> bool {
+        std::fs::read(path).is_ok_and(|b| b.starts_with(b"%PDF"))
+    }
+
+    #[test]
+    fn print_page_range_and_block_pdfs_are_written_in_the_background() -> anyhow::Result<()> {
+        let dir = tempfile_dir("bg-pdf")?;
+        let mut a = three_pages()?;
+        let print = dir.join("print.pdf");
+        assert!(a.start_print_pdf(print.clone(), "2-3", 1, true));
+        assert!(
+            a.message.contains("초 경과"),
+            "shared live progress line: {}",
+            a.message
+        );
+        wait(&mut a);
+        assert!(is_pdf(&print));
+        assert!(a.message.contains("PDF 저장 완료"), "{}", a.message);
+        let pages = dir.join("pages.pdf");
+        assert!(a.start_pages_pdf(pages.clone(), 1, 2));
+        wait(&mut a);
+        assert!(is_pdf(&pages));
+        assert!(
+            !a.start_pages_pdf(dir.join("bad.pdf"), 2, 9),
+            "bad range refused"
+        );
+        a.error = None;
+        let at = a
+            .session
+            .cursors()
+            .into_iter()
+            .find(|c| {
+                a.session
+                    .paragraph(*c)
+                    .is_ok_and(|p| p.text.contains("블록"))
+            })
+            .ok_or_else(|| anyhow::anyhow!("block"))?;
+        a.session.select(Cursor { offset: 3, ..at }, false)?;
+        a.session.select(Cursor { offset: 5, ..at }, true)?;
+        let block = dir.join("block.pdf");
+        assert!(a.start_block_pdf(block.clone()));
+        wait(&mut a);
+        assert!(is_pdf(&block));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_pdf_waits_for_the_first_and_printing_waits_for_its_file() -> anyhow::Result<()> {
+        let dir = tempfile_dir("bg-pdf-busy")?;
+        let mut a = three_pages()?;
+        // A slow export holds the single slot.
+        let slow = dir.join("slow.pdf");
+        a.pdf.start(1, slow.clone(), || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Ok(b"%PDF-1.7 slow".to_vec())
+        })?;
+        assert!(!a.start_pages_pdf(dir.join("second.pdf"), 1, 1));
+        assert!(a.error.as_deref().is_some_and(|e| e.contains("진행 중")));
+        a.error = None;
+        // A print request whose file never appears is dropped, never sent.
+        a.ext.shell.print_after = Some((dir.join("missing.pdf"), 1, 1));
+        a.shell_print_when_ready();
+        assert!(
+            a.ext.shell.print_after.is_some(),
+            "held while the slot is busy"
+        );
+        wait(&mut a);
+        assert!(is_pdf(&slow));
+        assert!(
+            a.ext.shell.print_after.is_none(),
+            "dropped once the slot is free"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn tempfile_dir(name: &str) -> anyhow::Result<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("hwpcraft-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
     }
 }

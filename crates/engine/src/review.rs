@@ -113,6 +113,10 @@ impl Session {
     }
 
     fn compare_with_file(&mut self, p: Compare) -> Result<Value> {
+        // Under automation roots, refuse before probing: a missing-file message must
+        // not tell an agent what exists outside its read root.
+        hwpcraft_formats::file_access::check_read(&p.path.to_string_lossy())
+            .map_err(anyhow::Error::msg)?;
         if !p.path.is_file() {
             bail!("비교할 파일이 없습니다: {}", p.path.display());
         }

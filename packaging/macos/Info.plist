@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- HwpCraft.app bundle description. @VERSION@ is replaced by the release
+     workflow. The identifier is a local placeholder; replace it with a
+     reverse-DNS name you own before signing or notarizing the app.
+     No document types are declared: Finder delivers double-clicked files as
+     Apple Events, which the app does not handle yet (open files from the app). -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>HwpCraft</string>
+  <key>CFBundleDisplayName</key>
+  <string>HwpCraft</string>
+  <key>CFBundleIdentifier</key>
+  <string>local.hwpcraft.HwpCraft</string>
+  <key>CFBundleExecutable</key>
+  <string>hwpcraft</string>
+  <key>CFBundleIconFile</key>
+  <string>HwpCraft</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@VERSION@</string>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>ko</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.productivity</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>

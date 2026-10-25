@@ -20,3 +20,9 @@
 /tools/hwp_probe.py
 /output/reference/
 /tools/gen_hwp_actions.py
+/docs/REA-*.md
+/tools/rea_*
+/tools/hwp_*
+/tools/__pycache__/
+/docs/CODEX-ACTIVE-WORK.md
+/tools/test_gen_hwp_actions.py

@@ -31,7 +31,6 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("chart.list", "차트 목록", ""),
     ("chart.data.get", "차트 데이터 조회", ""),
     ("chart.data", "차트 데이터 고치기 (값·계열 이름)", ""),
-    ("memo.list", "메모 목록 (읽기)", ""),
     ("object.group", "개체 묶기 (도형·그림 2개 이상)", ""),
     ("object.ungroup", "개체 풀기", ""),
     (
@@ -166,7 +165,6 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
         "index, series[{name, values[]}]",
         r##"{"index":0,"series":[{"name":"1분기","values":[1,2,3]}]}"##,
     ),
-    ("memo.list", "(없음) → 메모 목록(읽기)", r##"{}"##),
     (
         "object.group",
         "targets[address…](같은 구역의 떠 있는 도형·그림 2–256개) → address",
@@ -2514,35 +2512,6 @@ impl Session {
 /// Hangul stream position of a character index: extended controls take 8 code units
 /// (automatic numbers 7 beside their placeholder), tabs 8, click-here fields 8 + 8
 /// (+ the guide text while empty). Mirrors RHWP's cursor arithmetic for body paragraphs.
-fn stream_pos_of(p: &Paragraph, char_idx: usize) -> usize {
-    let positions = p.control_text_positions();
-    let mut units = char_idx + p.text.chars().take(char_idx).filter(|c| *c == '\t').count() * 7;
-    for (ci, ctrl) in p.controls.iter().enumerate() {
-        if matches!(ctrl, Control::Field(_)) {
-            continue;
-        }
-        if positions.get(ci).is_some_and(|pos| *pos <= char_idx) {
-            units += match ctrl {
-                Control::AutoNumber(_) | Control::NewNumber(_) => 7,
-                _ => 8,
-            };
-        }
-    }
-    for fr in &p.field_ranges {
-        if fr.start_char_idx <= char_idx {
-            units += 8;
-        }
-        if fr.end_char_idx <= char_idx {
-            units += 8;
-            if fr.start_char_idx == fr.end_char_idx
-                && let Some(Control::Field(f)) = p.controls.get(fr.control_idx)
-            {
-                units += f.guide_text().map(|g| g.chars().count()).unwrap_or(0);
-            }
-        }
-    }
-    units
-}
 /// Hangul 바깥 여백 / 글상자 안 여백 사전 값 (mm): 없음·좁게·보통·넓게.
 fn margin_hu(preset: Option<&str>, mm: Option<f64>) -> Result<i64> {
     let mm = match (preset, mm) {
@@ -2636,12 +2605,7 @@ impl Session {
     /// Page-pixel box (96 dpi) of a floating object from the page layout, with its page.
     fn object_box(&self, a: ObjectAddress) -> Result<(u32, [f64; 4])> {
         let page = self.page_of_object(a)?;
-        let layout: Value = serde_json::from_str(
-            &self
-                .core
-                .get_page_control_layout_native(page)
-                .map_err(err)?,
-        )?;
+        let layout: Value = serde_json::from_str(&self.page_control_layout(page)?)?;
         let n = |v: &Value, k: &str| v[k].as_u64().map(|x| x as usize);
         let c = layout["controls"]
             .as_array()
@@ -2659,9 +2623,10 @@ impl Session {
     }
     /// Zero-based page that shows the object's anchor paragraph.
     pub fn page_of_object(&self, a: ObjectAddress) -> Result<u32> {
+        let layout = self.page_field_layout()?;
+        let core = layout.as_ref().map_or(&self.core, |layout| &layout.core);
         let v: Value = serde_json::from_str(
-            &self
-                .core
+            &core
                 .get_page_of_position_native(a.section, a.paragraph)
                 .map_err(err)?,
         )?;
@@ -3317,6 +3282,8 @@ impl Session {
         Ok((ext, bytes))
     }
     fn write_new_file(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
+        hwpcraft_formats::file_access::check_write(&path.to_string_lossy())
+            .map_err(anyhow::Error::msg)?;
         if path.exists() && !overwrite {
             bail!(
                 "이미 있는 파일입니다: {} (overwrite:true로 덮어쓰기)",
@@ -3329,13 +3296,7 @@ impl Session {
         {
             bail!("폴더가 없습니다: {}", dir.display());
         }
-        // Write beside the target and rename so a failure never leaves a torn file.
-        let tmp = path.with_extension("hwpcraft-tmp");
-        std::fs::write(&tmp, bytes)?;
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
-        }
+        hwpcraft_formats::atomic_write(path, bytes)?;
         Ok(())
     }
     /// PictureSaveSelected: the original bytes of one picture, extension corrected.
@@ -3375,6 +3336,14 @@ impl Session {
         for (i, a) in pictures.iter().enumerate() {
             let (ext, bytes) = self.picture_bytes(*a)?;
             let target = dir.join(format!("{prefix}{}.{ext}", i + 1));
+            hwpcraft_formats::file_access::check_write(&target.to_string_lossy())
+                .map_err(anyhow::Error::msg)?;
+            if target.exists() && !target.is_file() {
+                bail!(
+                    "그림 저장 대상이 일반 파일이 아닙니다: {}",
+                    target.display()
+                );
+            }
             if target.exists() && !overwrite {
                 bail!(
                     "이미 있는 파일입니다: {} (overwrite:true로 덮어쓰기)",
@@ -3404,82 +3373,16 @@ impl Session {
         };
         self.body_insert()?;
         let c = self.cursor;
-        let (para_in_list, stream_pos) = {
-            let doc = self.core.document();
-            let p = doc
-                .sections
-                .get(c.section)
-                .and_then(|s| s.paragraphs.get(c.paragraph))
-                .ok_or_else(|| anyhow!("문단이 없습니다."))?;
-            // RHWP's root list counts body paragraphs across sections, in stream units.
-            let before: usize = doc
-                .sections
-                .iter()
-                .take(c.section)
-                .map(|x| x.paragraphs.len())
-                .sum();
-            (before + c.paragraph, stream_pos_of(p, c.offset))
-        };
         let mut inserted = None;
         self.transaction(|s| {
-            let response = s
-                .core
-                .insert_auto_number_at_cursor(
-                    0,
-                    para_in_list,
-                    stream_pos,
-                    if number_type == AutoNumberType::TotalPage {
-                        "total"
-                    } else {
-                        "page"
-                    },
-                )
-                .map_err(err)?;
-            ok_value(&response)?;
-            // RHWP records a one-unit stride for the new placeholder; give it the
-            // eight units of a control slot so position lookups and saves keep it
-            // where it was inserted (same repair as the core area's page numbers).
-            {
-                let para = s
-                    .core
-                    .document_mut()
-                    .sections
-                    .get_mut(c.section)
-                    .and_then(|x| x.paragraphs.get_mut(c.paragraph))
-                    .ok_or_else(|| anyhow!("문단이 없습니다."))?;
-                if para.text.chars().nth(c.offset) != Some(' ') {
-                    bail!("번호 자리표를 찾지 못했습니다.");
-                }
-                let offsets = &mut para.char_offsets;
-                if c.offset + 1 < offsets.len() {
-                    let stride = offsets[c.offset + 1].saturating_sub(offsets[c.offset]);
-                    if stride < 8 {
-                        let add = 8 - stride;
-                        for o in offsets.iter_mut().skip(c.offset + 1) {
-                            *o += add;
-                        }
-                    }
-                }
-            }
-            let p = s
-                .core
-                .document()
-                .sections
-                .get(c.section)
-                .and_then(|x| x.paragraphs.get(c.paragraph))
-                .ok_or_else(|| anyhow!("문단이 없습니다."))?;
-            let positions = p.control_text_positions();
-            let control = p
-                .controls
-                .iter()
-                .zip(&positions)
-                .position(|(ctrl, pos)| matches!(ctrl, Control::AutoNumber(_)) && *pos == c.offset)
-                .or_else(|| {
-                    // RHWP puts the control after every control anchored before the caret.
-                    let i = positions.iter().filter(|pos| **pos < c.offset).count();
-                    matches!(p.controls.get(i), Some(Control::AutoNumber(_))).then_some(i)
-                })
-                .ok_or_else(|| anyhow!("번호 컨트롤 위치를 찾지 못했습니다."))?;
+            let control = s.insert_native_auto_number(
+                c,
+                if number_type == AutoNumberType::TotalPage {
+                    "total"
+                } else {
+                    "page"
+                },
+            )?;
             let a = ObjectAddress {
                 section: c.section,
                 paragraph: c.paragraph,
@@ -3694,9 +3597,12 @@ impl Session {
                 "numberFormat" => v
                     .as_str()
                     .is_some_and(|f| note_number_format_from(f).is_some()),
-                "userChar" | "prefixChar" | "suffixChar" => v
-                    .as_str()
-                    .is_some_and(|c| c.chars().count() <= 1 && !c.chars().any(char::is_control)),
+                // HWP keeps each decoration character in one UTF-16 unit (WCHAR).
+                "userChar" | "prefixChar" | "suffixChar" => v.as_str().is_some_and(|c| {
+                    c.chars().count() <= 1
+                        && c.chars()
+                            .all(|ch| !ch.is_control() && u32::from(ch) <= 0xFFFF)
+                }),
                 "startNumber" => v.as_u64().is_some_and(|n| (1..=9999).contains(&n)),
                 "separatorLength" => v.as_i64().is_some_and(|n| (-1..=170_079).contains(&n)),
                 "separatorMarginTop" | "separatorMarginBottom" | "noteSpacing" => {

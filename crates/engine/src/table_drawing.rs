@@ -126,8 +126,7 @@ impl Session {
         }
         let a = p.table;
         let find = |s: &Self| -> Result<Value> {
-            let layout: Value =
-                serde_json::from_str(&s.core.get_page_control_layout_native(p.page).map_err(err)?)?;
+            let layout: Value = serde_json::from_str(&s.page_control_layout(p.page)?)?;
             layout["controls"]
                 .as_array()
                 .into_iter()
@@ -143,16 +142,11 @@ impl Session {
         };
         let before = find(self)?;
         // A split table cannot be moved as if its fragment were the entire object.
-        for page in 0..self.core.page_count() {
+        for page in 0..self.page_count()? {
             if page == p.page {
                 continue;
             }
-            let l: Value = serde_json::from_str(
-                &self
-                    .core
-                    .get_page_control_layout_native(page)
-                    .map_err(err)?,
-            )?;
+            let l: Value = serde_json::from_str(&self.page_control_layout(page)?)?;
             if l["controls"].as_array().into_iter().flatten().any(|t| {
                 t["type"] == "table"
                     && t["secIdx"] == a.section
@@ -170,8 +164,7 @@ impl Session {
             .as_f64()
             .ok_or_else(|| anyhow!("표 위치 오류"))?
             + p.dy_mm * 96.0 / 25.4;
-        let paper: Value =
-            serde_json::from_str(&self.core.get_page_info_native(p.page).map_err(err)?)?;
+        let paper = self.page_info(p.page)?;
         if x < -0.1
             || y < -0.1
             || x + before["w"].as_f64().unwrap_or(0.0)
@@ -191,6 +184,7 @@ impl Session {
             if inline { props["textWrap"] = json!("TopAndBottom"); }
             s.core.set_table_properties_native(a.section,a.paragraph,a.control,&props.to_string()).map_err(err)?;
             // Account for outer margins/anchor layout instead of jumping at the first drag.
+            *s.page_field_cache.borrow_mut() = None;
             let placed = find(s)?;
             props["horzOffset"] = json!((x*75.0).round() as i64 + ((x-placed["x"].as_f64().unwrap_or(x))*75.0).round() as i64);
             props["vertOffset"] = json!((y*75.0).round() as i64 + ((y-placed["y"].as_f64().unwrap_or(y))*75.0).round() as i64);

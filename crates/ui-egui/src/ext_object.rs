@@ -107,7 +107,8 @@ struct Properties {
 #[derive(Default)]
 pub(crate) struct State {
     selected: Option<Selected>,
-    layout: Option<(u64, u32, Value)>,
+    /// Page control layouts per page for one document generation (see ext_table).
+    layout: Option<super::ext_table::PageLayouts>,
     draw: Option<&'static str>,
     drag: Option<(u32, Pos2)>,
     moving: Option<Vec2>,
@@ -135,6 +136,9 @@ pub(crate) struct State {
     note_shape: Option<Box<NoteShapeDialog>>,
     /// Draw tool makes a 세로 글상자 (direction for the next text box).
     draw_direction: Option<&'static str>,
+    /// (document generation, has drawable objects, has charts): ribbon enabled
+    /// checks run every frame, so the whole-document scans are cached per edit.
+    doc_facts: std::cell::Cell<Option<(u64, bool, bool)>>,
 }
 
 /// 각주/미주 모양 (NoteNumShape*, NoteLine*): one section's note shape being edited.
@@ -383,6 +387,10 @@ impl HwpApp {
                 .any(|(k, _, _)| *k == kind)
                 .then_some(body);
         }
+        // 세로 글상자 shares the `insert.shape.` prefix but is not in `SHAPES`.
+        if matches!(id, "insert.shape.vtextbox" | "insert.shape.vtextbox_all") {
+            return Some(body);
+        }
         if let Some(kind) = id.strip_prefix("insert.shape.") {
             return SHAPES.iter().any(|(k, _)| *k == kind).then_some(body);
         }
@@ -457,17 +465,9 @@ impl HwpApp {
             "object.protect_size" | "object.format.copy" => Some(selected),
             "object.format.paste" => Some(unlocked && self.ext.object.format.is_some()),
             "object.next" | "object.prev" | "object.select" | "picture.save_all" => {
-                Some(self.session.objects().as_array().is_some_and(|l| {
-                    l.iter().any(|o| {
-                        matches!(
-                            o["kind"].as_str(),
-                            Some("shape" | "picture" | "textbox" | "group" | "equation")
-                        )
-                    })
-                }))
+                Some(self.doc_facts().0)
             }
             "picture.save" => Some(self.object_ext_selected_kind() == Some("picture")),
-            "insert.shape.vtextbox" | "insert.shape.vtextbox_all" => Some(body),
             "note.convert" | "note.delete" => Some(self.session.note_at_caret().is_some()),
             "note.shape" | "note.shape.footnote" | "note.shape.endnote" | "field.delete" => {
                 Some(true)
@@ -497,15 +497,7 @@ impl HwpApp {
                     .is_some_and(|s| s.group && !s.locked),
             ),
             "object.lock" => Some(selected),
-            "chart.edit" => Some(
-                self.session
-                    .core
-                    .list_charts_native()
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                    .and_then(|v| v.as_array().map(|a| !a.is_empty()))
-                    .unwrap_or(false),
-            ),
+            "chart.edit" => Some(self.doc_facts().1),
             "object.delete"
             | "object.placement.inline"
             | "object.placement.square"
@@ -535,6 +527,9 @@ impl HwpApp {
                 "{label}: 도형 위에서 시작해 다른 도형까지 끌면 두 도형에 붙습니다. 빈 곳에 끌면 자유 연결선, Esc 취소."
             );
             return true;
+        }
+        if matches!(id, "insert.shape.vtextbox" | "insert.shape.vtextbox_all") {
+            return self.object_ext_dispatch_14(id);
         }
         if let Some(kind) = id.strip_prefix("insert.shape.") {
             if let Some((k, label)) = SHAPES.iter().find(|(k, _)| *k == kind) {
@@ -802,25 +797,12 @@ impl HwpApp {
         })?;
         Some(self.selected_from_layout(page, c.clone()))
     }
-    fn object_page_layout(&mut self, page: u32) -> Option<Value> {
-        let generation = self.session.generation;
-        if self
-            .ext
-            .object
-            .layout
-            .as_ref()
-            .is_none_or(|(g, pg, _)| *g != generation || *pg != page)
-        {
-            let layout = self
-                .session
-                .core
-                .get_page_control_layout_native(page)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(Value::Null);
-            self.ext.object.layout = Some((generation, page, layout));
-        }
-        self.ext.object.layout.as_ref().map(|(_, _, l)| l.clone())
+    fn object_page_layout(&mut self, page: u32) -> Option<std::sync::Arc<Value>> {
+        Some(super::ext_table::cached_page_layout(
+            &mut self.ext.object.layout,
+            &self.session,
+            page,
+        ))
     }
     fn selected_from_layout(&self, page: u32, c: Value) -> Selected {
         let f = |k: &str| c[k].as_f64().unwrap_or(0.0) as f32;
@@ -1688,8 +1670,7 @@ impl HwpApp {
                 // Select the first drawing object on page 1 to show handles and the rotation knob.
                 let layout = self
                     .session
-                    .core
-                    .get_page_control_layout_native(0)
+                    .page_control_layout(0)
                     .ok()
                     .and_then(|s| serde_json::from_str::<Value>(&s).ok())
                     .unwrap_or(Value::Null);
@@ -2033,6 +2014,7 @@ impl HwpApp {
                             d.custom_width,
                             egui::DragValue::new(&mut d.width_mm)
                                 .range(1.0..=600.0)
+                                .fixed_decimals(2)
                                 .suffix(" mm"),
                         );
                     });
@@ -3109,6 +3091,11 @@ impl HwpApp {
                             .stroke(Stroke::new(1.5, chrome::Tokens::ACCENT))
                             .min_size(Vec2::new(120.0, 28.0)),
                         )
+                        .on_disabled_hover_text(if d.script.trim().is_empty() {
+                            "수식 스크립트를 입력하세요."
+                        } else {
+                            "수식 스크립트의 오류를 먼저 고치세요."
+                        })
                         .clicked();
                 });
             });
@@ -3466,6 +3453,36 @@ fn resized(b: Rect, h: usize, p: Pos2, keep_ratio: bool) -> Rect {
 }
 
 impl HwpApp {
+    /// (has drawable objects, has charts) for the current document generation.
+    fn doc_facts(&self) -> (bool, bool) {
+        let generation = self.session.generation;
+        if let Some((g, objects, charts)) = self.ext.object.doc_facts.get()
+            && g == generation
+        {
+            return (objects, charts);
+        }
+        let objects = self.session.objects().as_array().is_some_and(|l| {
+            l.iter().any(|o| {
+                matches!(
+                    o["kind"].as_str(),
+                    Some("shape" | "picture" | "textbox" | "group" | "equation")
+                )
+            })
+        });
+        let charts = self
+            .session
+            .core
+            .list_charts_native()
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v.as_array().map(|a| !a.is_empty()))
+            .unwrap_or(false);
+        self.ext
+            .object
+            .doc_facts
+            .set(Some((generation, objects, charts)));
+        (objects, charts)
+    }
     fn selected_inline(&self) -> bool {
         self.ext.object.selected.is_some_and(|s| s.inline)
     }
@@ -3980,6 +3997,55 @@ impl HwpApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertical_text_box_tools_are_enabled_in_the_body_and_start_drawing() {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        let ctx = egui::Context::default();
+        for (id, direction) in [
+            ("insert.shape.vtextbox", "vertical"),
+            ("insert.shape.vtextbox_all", "vertical_all"),
+        ] {
+            assert_eq!(a.object_ext_enabled(id), Some(true), "{id}");
+            assert!(a.object_ext_dispatch(id, &ctx), "{id}");
+            assert_eq!(a.ext.object.draw, Some("textbox"), "{id}");
+            assert_eq!(a.ext.object.draw_direction, Some(direction), "{id}");
+        }
+        // Inside a table cell the body-only tools are disabled.
+        a.session
+            .run("table.create", json!({"rows":1,"columns":1}))
+            .unwrap();
+        assert_eq!(a.object_ext_enabled("insert.shape.vtextbox"), Some(false));
+        // Unknown shape kinds still belong to no module.
+        assert_eq!(a.object_ext_enabled("insert.shape.zigzag"), None);
+    }
+
+    #[test]
+    fn object_ribbon_checks_scan_the_document_once_per_generation() {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        assert_eq!(a.object_ext_enabled("object.next"), Some(false));
+        assert_eq!(a.object_ext_enabled("chart.edit"), Some(false));
+        let cached = a.ext.object.doc_facts.get();
+        assert_eq!(cached, Some((a.session.generation, false, false)));
+        // Repeated frame checks reuse the cached scan.
+        a.object_ext_enabled("object.select");
+        assert_eq!(a.ext.object.doc_facts.get(), cached);
+        // An edit bumps the generation and the next check rescans.
+        a.session
+            .run(
+                "shape.insert",
+                json!({"kind":"rectangle","width_mm":20.0,"height_mm":10.0}),
+            )
+            .unwrap();
+        assert_eq!(a.object_ext_enabled("object.next"), Some(true));
+        assert_eq!(
+            a.ext.object.doc_facts.get(),
+            Some((a.session.generation, true, false))
+        );
+        // Undo restores an object-free document; the cache follows.
+        a.session.execute(hwpcraft_engine::Command::Undo).unwrap();
+        assert_eq!(a.object_ext_enabled("picture.save_all"), Some(false));
+    }
 
     #[test]
     fn handles_resize_from_the_dragged_side_and_keep_ratio_with_shift() {

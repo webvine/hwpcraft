@@ -72,6 +72,52 @@ fn word_paragraph_and_list_motions_match_hangul() -> anyhow::Result<()> {
 }
 
 #[test]
+fn previous_paragraph_end_preserves_boundaries_and_selection() -> anyhow::Result<()> {
+    let mut s = session("앞😀 문단\n\n뒤 문단")?;
+    let original = texts(&s);
+    for (start, expected, selected) in [
+        (at(0, 0), at(0, 0), ""),
+        (at(0, 3), at(0, 0), "앞😀 "),
+        (at(1, 0), at(0, 5), "\n"),
+        (at(2, 0), at(1, 0), "\n"),
+        (at(2, 2), at(1, 0), "\n뒤 "),
+    ] {
+        s.select(start, false)?;
+        s.move_caret(Motion::PrevParagraphEnd, false)?;
+        assert_eq!(s.cursor, expected, "start={start:?}");
+        assert!(!s.has_selection());
+        s.select(start, false)?;
+        s.run(
+            "caret.move",
+            json!({"motion":"prev_paragraph_end","extend":true}),
+        )?;
+        assert_eq!(s.cursor, expected, "extended start={start:?}");
+        assert_eq!(s.selected_text(), selected);
+    }
+    assert_eq!(texts(&s), original);
+    // Navigation must not add an edit to history.
+    s.execute(Command::Undo)?;
+    assert_eq!(texts(&s), [""]);
+
+    let mut s = Session::new()?;
+    s.run("table.create", json!({"rows":1,"columns":2}))?;
+    s.execute(Command::Insert("셀 첫째\n둘째".into()))?;
+    let second = s.cursor;
+    assert!(second.cell.is_some());
+    let mut first_end = second;
+    first_end.cell.as_mut().unwrap().paragraph = 0;
+    first_end.offset = 4;
+    s.move_caret(Motion::PrevParagraphEnd, true)?;
+    assert_eq!(s.cursor, first_end);
+    assert_eq!(s.selected_text(), "\n둘째");
+    s.move_caret(Motion::PrevParagraphEnd, false)?;
+    assert_eq!(s.cursor.cell, first_end.cell);
+    assert_eq!(s.cursor.offset, 0); // never leaves the first paragraph of a cell
+    assert!(!s.has_selection());
+    Ok(())
+}
+
+#[test]
 fn delete_word_and_line_follow_hangul_probe() -> anyhow::Result<()> {
     let mut s = session("둘째 문단 alpha beta gamma\n셋째")?;
     s.select(at(0, 10), false)?; // "alph|a beta"

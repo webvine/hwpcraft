@@ -25,7 +25,13 @@ pub(crate) struct State {
     size_draft: Option<(u64, f64, f64)>,
     resize: Option<(u32, usize, Pos2, Rect, f64, f64, u64)>,
     moving: Option<(u32, Pos2, Rect, u64)>,
+    /// Editable top-level tables per page (address, page-space box, cell count on
+    /// that page) for the current document generation. The selection canvas runs
+    /// every frame for every visible page; rebuilding the page layout JSON there
+    /// cost ~10 ms per page in debug builds on a 381-page sample.
+    selection_tables: Option<(u64, std::collections::HashMap<u32, Vec<SelectionTable>>)>,
 }
+type SelectionTable = (ObjectAddress, Rect, usize);
 impl HwpApp {
     pub(crate) fn pen_checked(&self, id: &str) -> bool {
         matches!(
@@ -148,11 +154,7 @@ impl HwpApp {
         }
     }
     fn pen_target(&self, page: u32, p: Pos2) -> Option<Target> {
-        let raw = self
-            .session
-            .core
-            .get_page_control_layout_native(page)
-            .ok()?;
+        let raw = self.session.page_control_layout(page).ok()?;
         let layout: Value = serde_json::from_str(&raw).ok()?;
         for t in layout["controls"].as_array()?.iter().rev() {
             if t["type"] != "table" {
@@ -306,6 +308,24 @@ impl HwpApp {
     }
 }
 
+/// Size keys the selection panel must send: only dimensions the user changed.
+/// Re-sending an unchanged size redistributed row heights (282 → 283 HWPUNIT)
+/// and added an undo step for a no-op.
+fn changed_table_size(
+    props: &Value,
+    width_mm: f64,
+    height_mm: f64,
+) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    for (key, mm) in [("tableWidth", width_mm), ("tableHeight", height_mm)] {
+        let hu = (mm * 7200.0 / 25.4).round();
+        if (hu - props[key].as_f64().unwrap_or(0.0)).abs() >= 1.0 {
+            out.insert(key.into(), json!(hu as u32));
+        }
+    }
+    out
+}
+
 impl HwpApp {
     fn table_selection_tools(&mut self, ctx: &egui::Context) {
         let Some(a) = self.ext.pen.selected else {
@@ -341,6 +361,7 @@ impl HwpApp {
                         egui::DragValue::new(&mut w)
                             .range(1.0..=600.0)
                             .speed(0.1)
+                            .fixed_decimals(2)
                             .suffix(" mm"),
                     );
                     ui.label("높이");
@@ -348,6 +369,7 @@ impl HwpApp {
                         egui::DragValue::new(&mut h)
                             .range(1.0..=600.0)
                             .speed(0.1)
+                            .fixed_decimals(2)
                             .suffix(" mm"),
                     );
                     apply = ui.button("적용").clicked();
@@ -368,7 +390,15 @@ impl HwpApp {
             });
         self.ext.pen.size_draft = Some((self.session.generation, w, h));
         if apply {
-            self.run("table.properties",json!({"table":a,"props":{"tableWidth":(w*7200.0/25.4).round()as u32,"tableHeight":(h*7200.0/25.4).round()as u32}}));
+            let changed = changed_table_size(&props, w, h);
+            if changed.is_empty() {
+                self.message = "바뀐 크기가 없습니다.".into();
+            } else {
+                self.run(
+                    "table.properties",
+                    json!({"table":a,"props":Value::Object(changed)}),
+                );
+            }
         }
         if let Some(id) = action {
             self.select_whole_table(a);
@@ -393,25 +423,25 @@ impl HwpApp {
         self.ext.pen.size_draft = None;
         self.session.clear_selection();
     }
-    fn table_selection_canvas(
-        &mut self,
-        page: u32,
-        response: &egui::Response,
-        page_rect: Rect,
-    ) -> bool {
-        if self.ext_modal_open() {
-            return false;
+    /// Cached editable tables on `page` (page-space boxes); rebuilt after edits.
+    fn selection_tables(&mut self, page: u32) -> Vec<SelectionTable> {
+        let generation = self.session.generation;
+        if self
+            .ext
+            .pen
+            .selection_tables
+            .as_ref()
+            .is_none_or(|(g, _)| *g != generation)
+        {
+            self.ext.pen.selection_tables = Some((generation, Default::default()));
         }
-        let Ok(raw) = self.session.core.get_page_control_layout_native(page) else {
-            return false;
-        };
-        let Ok(layout) = serde_json::from_str::<Value>(&raw) else {
-            return false;
-        };
-        let pointer = response.ctx.input(|i| i.pointer.interact_pos());
-        let origin = page_press(response);
-        let painter = response.ctx.layer_painter(response.layer_id);
-        let controls: Vec<_> = layout["controls"]
+        if let Some((_, pages)) = &self.ext.pen.selection_tables
+            && let Some(list) = pages.get(&page)
+        {
+            return list.clone();
+        }
+        let layout = self.page_layout(page);
+        let list: Vec<SelectionTable> = layout["controls"]
             .as_array()
             .into_iter()
             .flatten()
@@ -425,18 +455,42 @@ impl HwpApp {
                     control: t["controlIdx"].as_u64()? as usize,
                 };
                 // Nested controls do not share the top-level editing address space.
-                if self.session.table_layout(a, None).is_err() {
-                    return None;
-                }
+                self.session.table_layout(a, None).ok()?;
                 let f = |k: &str| t[k].as_f64().unwrap_or(0.0) as f32;
                 Some((
                     a,
-                    Rect::from_min_size(
-                        page_rect.min + Vec2::new(f("x"), f("y")) * self.zoom,
-                        Vec2::new(f("w"), f("h")) * self.zoom,
-                    ),
-                    t,
+                    Rect::from_min_size(Pos2::new(f("x"), f("y")), Vec2::new(f("w"), f("h"))),
+                    t["cells"].as_array().map_or(0, Vec::len),
                 ))
+            })
+            .collect();
+        if let Some((_, pages)) = self.ext.pen.selection_tables.as_mut() {
+            pages.insert(page, list.clone());
+        }
+        list
+    }
+    fn table_selection_canvas(
+        &mut self,
+        page: u32,
+        response: &egui::Response,
+        page_rect: Rect,
+    ) -> bool {
+        if self.ext_modal_open() {
+            return false;
+        }
+        let pointer = response.ctx.input(|i| i.pointer.interact_pos());
+        let origin = page_press(response);
+        let painter = response.ctx.layer_painter(response.layer_id);
+        let zoom = self.zoom;
+        let controls: Vec<SelectionTable> = self
+            .selection_tables(page)
+            .into_iter()
+            .map(|(a, r, cells)| {
+                (
+                    a,
+                    Rect::from_min_size(page_rect.min + r.min.to_vec2() * zoom, r.size() * zoom),
+                    cells,
+                )
             })
             .collect();
         for (a, rect, _) in controls.iter().rev() {
@@ -485,7 +539,8 @@ impl HwpApp {
         let Some(a) = self.ext.pen.selected else {
             return false;
         };
-        let Some((_, rect, t)) = controls.iter().find(|(address, _, _)| *address == a) else {
+        let Some((_, rect, page_cells)) = controls.iter().find(|(address, _, _)| *address == a)
+        else {
             if response.clicked() {
                 self.ext.pen.selected = None;
             }
@@ -529,7 +584,7 @@ impl HwpApp {
                 let Ok(info) = self.session.table_layout(a, None) else {
                     return true;
                 };
-                if t["cells"].as_array().map(Vec::len) != info["cells"].as_array().map(Vec::len) {
+                if Some(*page_cells) != info["cells"].as_array().map(Vec::len) {
                     self.error = Some("쪽에 나뉜 표의 크기는 표/셀 속성에서 조절하세요.".into());
                     return true;
                 }
@@ -691,6 +746,22 @@ fn axis_coordinate(points: &[(f32, f64)], p: f32) -> f64 {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selection_panel_sends_only_changed_table_dimensions() {
+        let props = json!({"tableWidth":42520,"tableHeight":1128});
+        let mm = |hu: f64| hu * 25.4 / 7200.0;
+        // Unchanged values (as displayed, rounded to 0.01 mm) send nothing.
+        assert!(changed_table_size(&props, mm(42520.0), mm(1128.0)).is_empty());
+        assert!(changed_table_size(&props, 150.0, 3.98).is_empty());
+        let only_width = changed_table_size(&props, 120.0, mm(1128.0));
+        assert_eq!(Value::Object(only_width), json!({"tableWidth":34016}));
+        let both = changed_table_size(&props, 120.0, 20.0);
+        assert_eq!(
+            Value::Object(both),
+            json!({"tableWidth":34016,"tableHeight":5669})
+        );
+    }
+
     use super::*;
 
     fn fixture() -> HwpApp {
@@ -704,9 +775,7 @@ mod tests {
         app
     }
     fn bounds(app: &HwpApp) -> Rect {
-        let v: Value =
-            serde_json::from_str(&app.session.core.get_page_control_layout_native(0).unwrap())
-                .unwrap();
+        let v: Value = serde_json::from_str(&app.session.page_control_layout(0).unwrap()).unwrap();
         let t = v["controls"]
             .as_array()
             .unwrap()

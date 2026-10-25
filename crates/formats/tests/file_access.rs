@@ -77,3 +77,24 @@ fn links_outside_roots_are_rejected_when_platform_allows_links() {
             .is_err()
     );
 }
+
+#[test]
+fn forbidden_writes_override_any_scope_and_end_with_the_guard() {
+    use hwpcraft_formats::file_access::{forbid_writes, unconfined};
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("out.txt");
+    let path = target.to_string_lossy().into_owned();
+    {
+        let _outer = forbid_writes();
+        {
+            let _inner = forbid_writes();
+            assert!(unconfined(|| check_write(&path)).is_err());
+        }
+        assert!(check_write(&path).is_err());
+        assert!(check_read(&path).is_ok());
+        assert!(hwpcraft_formats::atomic_write(&target, b"x").is_err());
+        assert!(!target.exists());
+    }
+    assert!(check_write(&path).is_ok());
+    hwpcraft_formats::atomic_write(&target, b"x").unwrap();
+}

@@ -138,7 +138,8 @@ impl HwpApp {
                     ui.label("글상자 내용");
                     ui.add(egui::TextEdit::singleline(&mut p.text).desired_width(f32::INFINITY));
                 }
-                ui.label("본문에 글자처럼 취급하는 개체로 넣습니다.");
+                ui.label("커서 위치에 글자처럼 취급하는 개체로 넣습니다.");
+                ui.weak("쪽의 원하는 자리에 그리려면 입력 탭의 도형 단추로 끌어 그리세요.");
                 if ui.button("넣기").clicked() {
                     close = self.run("insert.shape", json!(p));
                 }
@@ -210,56 +211,72 @@ impl HwpApp {
                 egui::ScrollArea::vertical()
                     .max_height(380.0)
                     .show(ui, |ui| {
-                        for (i, item) in objects.as_array().into_iter().flatten().enumerate() {
-                            let Ok(address) =
-                                serde_json::from_value::<ObjectAddress>(item["address"].clone())
-                            else {
-                                continue;
-                            };
-                            let kind = item["kind"].as_str().unwrap_or("");
-                            ui.push_id(i, |ui| {
-                                ui.group(|ui| {
-                                    ui.label(format!(
-                                        "{} · {}구역 {}문단",
-                                        match kind {
-                                            "equation" => "수식",
-                                            "footnote" => "각주",
-                                            "endnote" => "미주",
-                                            "textbox" => "글상자",
-                                            "picture" => "그림",
-                                            "table" => "표",
-                                            "group" => "묶음 개체",
-                                            "form" => "양식 개체",
-                                            _ => "도형",
-                                        },
+                        egui::Grid::new("object-list")
+                            .striped(true)
+                            .num_columns(4)
+                            .spacing([12.0, 6.0])
+                            .show(ui, |ui| {
+                                for (i, item) in
+                                    objects.as_array().into_iter().flatten().enumerate()
+                                {
+                                    let Ok(address) = serde_json::from_value::<ObjectAddress>(
+                                        item["address"].clone(),
+                                    ) else {
+                                        continue;
+                                    };
+                                    let kind = item["kind"].as_str().unwrap_or("");
+                                    let kind_label = match kind {
+                                        "equation" => "수식",
+                                        "footnote" => "각주",
+                                        "endnote" => "미주",
+                                        "textbox" => "글상자",
+                                        "picture" => "그림",
+                                        "table" => "표",
+                                        "group" => "묶음 개체",
+                                        "form" => "양식 개체",
+                                        _ => "도형",
+                                    };
+                                    ui.strong(kind_label);
+                                    ui.weak(format!(
+                                        "{}구역 {}문단",
                                         address.section + 1,
                                         address.paragraph + 1
                                     ));
-                                    ui.label(item["label"].as_str().unwrap_or(""));
-                                    ui.horizontal(|ui| {
-                                        if matches!(
-                                            kind,
-                                            "picture" | "shape" | "textbox" | "equation"
-                                        ) && ui.button("속성").clicked()
-                                        {
-                                            self.open_object_properties(address);
-                                            close = true;
-                                        }
-                                        if kind == "group" && ui.button("풀기").clicked() {
-                                            close = self
-                                                .run("object.ungroup", json!({"address":address}));
-                                        }
-                                        if kind == "form" && ui.button("값 고치기").clicked() {
-                                            self.open_form_editor();
-                                            close = true;
-                                        }
-                                        if !matches!(
-                                            kind,
-                                            "shape" | "picture" | "table" | "group" | "form"
-                                        ) && ui.button("내용 고치기").clicked()
-                                        {
-                                            let next =
-                                                match kind {
+                                    let full = item["label"].as_str().unwrap_or("");
+                                    let short: String = full.chars().take(24).collect();
+                                    let shown = if full.chars().count() > 24 {
+                                        format!("{short}…")
+                                    } else {
+                                        short
+                                    };
+                                    ui.label(shown).on_hover_text(full);
+                                    ui.push_id(i, |ui| {
+                                        ui.horizontal(|ui| {
+                                            if matches!(
+                                                kind,
+                                                "picture" | "shape" | "textbox" | "equation"
+                                            ) && ui.button("속성").clicked()
+                                            {
+                                                self.open_object_properties(address);
+                                                close = true;
+                                            }
+                                            if kind == "group" && ui.button("풀기").clicked() {
+                                                close = self.run(
+                                                    "object.ungroup",
+                                                    json!({"address":address}),
+                                                );
+                                            }
+                                            if kind == "form" && ui.button("값 고치기").clicked()
+                                            {
+                                                self.open_form_editor();
+                                                close = true;
+                                            }
+                                            if !matches!(
+                                                kind,
+                                                "shape" | "picture" | "table" | "group" | "form"
+                                            ) && ui.button("내용 고치기").clicked()
+                                            {
+                                                let next = match kind {
                                                     "equation" => Ok(ObjectDialog::Equation {
                                                         address: Some(address),
                                                     }),
@@ -278,39 +295,43 @@ impl HwpApp {
                                                         },
                                                     ),
                                                 };
-                                            if let Some(next) = self.result(next) {
-                                                self.feature_dialog = Some(
-                                                    feature_dialogs::FeatureDialog::Object(next),
-                                                );
-                                                close = true;
+                                                if let Some(next) = self.result(next) {
+                                                    self.feature_dialog = Some(
+                                                        feature_dialogs::FeatureDialog::Object(
+                                                            next,
+                                                        ),
+                                                    );
+                                                    close = true;
+                                                }
                                             }
-                                        }
-                                        if matches!(kind, "shape" | "textbox")
-                                            && ui.button("크기").clicked()
-                                        {
-                                            let r = self.session.shape_size(address);
-                                            if let Some((width, height)) = self.result(r) {
-                                                self.feature_dialog =
-                                                    Some(feature_dialogs::FeatureDialog::Object(
-                                                        ObjectDialog::Resize {
-                                                            address,
-                                                            width,
-                                                            height,
-                                                        },
-                                                    ));
-                                                close = true;
+                                            if matches!(kind, "shape" | "textbox")
+                                                && ui.button("크기").clicked()
+                                            {
+                                                let r = self.session.shape_size(address);
+                                                if let Some((width, height)) = self.result(r) {
+                                                    self.feature_dialog = Some(
+                                                        feature_dialogs::FeatureDialog::Object(
+                                                            ObjectDialog::Resize {
+                                                                address,
+                                                                width,
+                                                                height,
+                                                            },
+                                                        ),
+                                                    );
+                                                    close = true;
+                                                }
                                             }
-                                        }
-                                        if ui.button("지우기").clicked() {
-                                            close = self.run("object.delete", json!(address));
-                                        }
+                                            if ui.button("지우기").clicked() {
+                                                close = self.run("object.delete", json!(address));
+                                            }
+                                        });
                                     });
-                                });
+                                    ui.end_row();
+                                    if close {
+                                        break;
+                                    }
+                                }
                             });
-                            if close {
-                                break;
-                            }
-                        }
                     });
             }
         }
@@ -320,11 +341,17 @@ impl HwpApp {
 fn size_fields(ui: &mut egui::Ui, width: &mut f64, height: &mut f64) {
     ui.horizontal(|ui| {
         ui.label("너비");
-        ui.add(egui::DragValue::new(width).range(1.0..=300.0).suffix(" mm"));
+        ui.add(
+            egui::DragValue::new(width)
+                .range(1.0..=300.0)
+                .fixed_decimals(2)
+                .suffix(" mm"),
+        );
         ui.label("높이");
         ui.add(
             egui::DragValue::new(height)
                 .range(1.0..=300.0)
+                .fixed_decimals(2)
                 .suffix(" mm"),
         );
     });

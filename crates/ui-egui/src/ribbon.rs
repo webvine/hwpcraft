@@ -256,7 +256,114 @@ const EDIT: &[Item] = &[
     ),
     Big(Icon::Replace, "글자\n바꾸기", A::Replace, true),
     Big(Icon::Sort, "정렬", A::Ext("edit.sort"), false),
+    // One entry point for the region editors; the nested-table editor is the narrower one.
+    Item::Menu(
+        Icon::Header,
+        "문서 영역\n편집",
+        &[
+            (
+                "문서 영역 편집 (본문·표·머리말·꼬리말·글상자·주석)",
+                A::Ext("edit.regions"),
+            ),
+            ("중첩 표 편집", A::Ext("edit.contexts")),
+        ],
+    ),
 ];
+/// Tooltips for ribbon commands that no module implements yet, shown while they are grey.
+/// `unsupported_reasons_name_only_unimplemented_commands` keeps this list honest.
+const WHY_TRACK: &str = "변경 내용 추적은 지원하지 않습니다. 변경 추적 기록은 파일에 그대로 보존하지만 본문의 변경 표시는 읽지 못합니다. 두 파일의 차이는 [문서 비교]로 볼 수 있습니다.";
+const WHY_SPELLING: &str = "맞춤법 검사는 지원하지 않습니다. 내장 맞춤법 사전이 없습니다.";
+const WHY_DICTIONARY: &str = "사전 찾기는 지원하지 않습니다. 내장 국어·한자 사전이 없습니다. 한자의 음과 뜻 후보는 [한자로 바꾸기](F9)에서 볼 수 있습니다.";
+const WHY_PROOF: &str = "교정 부호 넣기와 보기는 지원하지 않습니다.";
+const WHY_LINE_NUMBERS: &str = "줄 번호는 지원하지 않습니다. 조판 엔진(RHWP)에 줄 번호가 없습니다.";
+const WHY_GRID: &str = "격자 보기는 지원하지 않습니다. 화면 렌더에 격자 층이 없습니다.";
+const WHY_OUTLINE: &str =
+    "쪽 윤곽 끄기(본문만 이어 보기)는 지원하지 않습니다. 문서는 항상 쪽 모양으로 보입니다.";
+const WHY_DISTRIBUTION: &str = "배포용 문서 저장·편집은 지원하지 않습니다.";
+const WHY_WINDOWS: &str = "한 창에 문서 하나만 엽니다. 창 나누기·배열·전환은 지원하지 않습니다.";
+const WHY_CHART: &str = "새 차트 만들기는 지원하지 않습니다. 조판 엔진(RHWP)에 차트 생성 기능이 없습니다. 문서에 있는 차트는 그대로 보존합니다.";
+const WHY_NOT_YET: &str = "아직 지원하지 않는 기능입니다.";
+const UNSUPPORTED: &[(&str, &str)] = &[
+    ("review.history", WHY_TRACK),
+    ("review.track_changes", WHY_TRACK),
+    ("review.balloons", WHY_TRACK),
+    ("review.show_changes", WHY_TRACK),
+    ("review.view_original", WHY_TRACK),
+    ("review.view_original_marked", WHY_TRACK),
+    ("review.view_final_marked", WHY_TRACK),
+    ("review.view_final", WHY_TRACK),
+    ("review.accept", WHY_TRACK),
+    ("review.reject", WHY_TRACK),
+    ("review.prev", WHY_TRACK),
+    ("review.next", WHY_TRACK),
+    ("review.spelling", WHY_SPELLING),
+    ("tools.dictionary", WHY_DICTIONARY),
+    ("view.proof_marks", WHY_PROOF),
+    ("review.proof_marks", WHY_PROOF),
+    ("page.line_numbers", WHY_LINE_NUMBERS),
+    ("view.grid", WHY_GRID),
+    ("view.page_outline", WHY_OUTLINE),
+    ("security.distribution", WHY_DISTRIBUTION),
+    ("security.distribution_edit", WHY_DISTRIBUTION),
+    ("security.distribution_change", WHY_DISTRIBUTION),
+    ("view.split", WHY_WINDOWS),
+    ("view.arrange", WHY_WINDOWS),
+    ("view.switch_window", WHY_WINDOWS),
+    ("insert.chart", WHY_CHART),
+    ("view.guides", WHY_NOT_YET),
+    ("view.hanja_pronounce", WHY_NOT_YET),
+    ("insert.shape.freeline", WHY_NOT_YET),
+    ("insert.textart", WHY_NOT_YET),
+    ("insert.ole", WHY_NOT_YET),
+    ("insert.cross_reference", WHY_NOT_YET),
+    ("view.link_prev", WHY_NOT_YET),
+    ("view.link_next", WHY_NOT_YET),
+    ("insert.helper", WHY_NOT_YET),
+    ("page.text_direction", WHY_NOT_YET),
+    ("page.column_def_break", WHY_NOT_YET),
+    ("page.section_break", WHY_NOT_YET),
+    ("page.label", WHY_NOT_YET),
+    ("page.manuscript", WHY_NOT_YET),
+    ("security.protect_text", WHY_NOT_YET),
+    ("security.privacy_clear", WHY_NOT_YET),
+    ("security.privacy_password", WHY_NOT_YET),
+    ("security.settings", WHY_NOT_YET),
+    ("tools.index", WHY_NOT_YET),
+    ("tools.toc", WHY_NOT_YET),
+    ("tools.citation", WHY_NOT_YET),
+    ("tools.bibliography", WHY_NOT_YET),
+    ("tools.bibliography_style", WHY_NOT_YET),
+    ("tools.bibliography_refresh", WHY_NOT_YET),
+    ("table.block_calc", WHY_NOT_YET),
+    ("tools.macro", WHY_NOT_YET),
+    ("tools.autocorrect", WHY_NOT_YET),
+    ("tools.translate", WHY_NOT_YET),
+    ("tools.presentation", WHY_NOT_YET),
+    ("tools.keyboard", WHY_NOT_YET),
+    ("tools.customize", WHY_NOT_YET),
+    ("tools.options", WHY_NOT_YET),
+    ("tools.user_info", WHY_NOT_YET),
+    ("file.template", WHY_NOT_YET),
+];
+
+fn unsupported_reason(action: Action) -> Option<&'static str> {
+    let (A::Ext(id) | A::Or(id, _)) = action else {
+        return None;
+    };
+    UNSUPPORTED
+        .iter()
+        .find(|(cmd, _)| *cmd == id)
+        .map(|(_, why)| *why)
+}
+
+/// Attach the reason a grey command is unavailable (enabled or disabled hover).
+fn explain(response: egui::Response, action: Action, enabled: bool) -> egui::Response {
+    match unsupported_reason(action) {
+        Some(why) if !enabled => response.on_hover_text(why).on_disabled_hover_text(why),
+        _ => response,
+    }
+}
+
 /// Hangul 쪽 여백 gallery (measured values live in the engine's `page.margins.preset`).
 const MARGIN_MENU: &[(&str, Action)] = &[
     ("기본", A::Ext("page.margins.default")),
@@ -543,7 +650,7 @@ const FORMAT: &[Item] = &[
     Stack(&[
         &[
             W("format.font_lang", 91.0),
-            W("format.font_face", 118.0),
+            W("format.font_face", 150.0),
             W("format.font_size", 106.0),
             I(Icon::Prev, "이전 글꼴", A::Ext("format.font.prev"), false),
             I(Icon::Next, "다음 글꼴", A::Ext("format.font.next"), false),
@@ -998,9 +1105,10 @@ const TOOLS: &[Item] = &[
     Big(Icon::Help, "사용\n안내", A::Help, false),
 ];
 const TABLE_DESIGN: &[Item] = &[
+    // Hangul's order: selection, then the 모양 group (표마당·테두리·음영), drawing, caption.
     Big(
         Icon::ObjectSelect,
-        "표 선택\n크기 조절",
+        "표\n선택",
         A::Ext("table.select"),
         false,
     ),
@@ -1010,6 +1118,8 @@ const TABLE_DESIGN: &[Item] = &[
         A::Ext("table.properties"),
         false,
     ),
+    Sep,
+    Big(Icon::Table, "표마당", A::Ext("table.style"), true),
     Big(
         Icon::CellBorder,
         "테두리",
@@ -1031,7 +1141,6 @@ const TABLE_DESIGN: &[Item] = &[
         )],
     ]),
     Sep,
-    Big(Icon::Table, "표마당", A::Ext("table.style"), true),
     Big(Icon::Table, "표\n그리기", A::Ext("table.draw"), false),
     Big(
         Icon::DeleteTable,
@@ -1627,6 +1736,22 @@ const FILE_MENU: &[Option<(&str, &str, Action)>] = &[
     Some(("문서 닫기", "Ctrl+F4", A::New)),
     Some(("끝", "Alt+X", A::Ext("file.exit"))),
 ];
+/// 파일 tab command list: the 파일 menu without 최근 문서 (listed in full beside it),
+/// with no doubled or trailing separators left behind.
+fn backstage_entries() -> Vec<Option<(&'static str, &'static str, Action)>> {
+    let mut out: Vec<Option<(&'static str, &'static str, Action)>> = Vec::new();
+    for entry in FILE_MENU {
+        match entry {
+            Some((_, _, A::Ext("file.recent"))) => {}
+            None if out.last().is_none_or(Option::is_none) => {}
+            entry => out.push(*entry),
+        }
+    }
+    if out.last().is_some_and(Option::is_none) {
+        out.pop();
+    }
+    out
+}
 /// (tab label, mnemonic, items). Index 0 is the 파일 menu; 9–10 appear inside tables.
 const TABS: &[(&str, char, &[Item])] = &[
     ("파일", 'F', &[]),
@@ -1749,6 +1874,10 @@ impl HwpApp {
             A::PasteFormat => self.format_clipboard.is_some(),
             _ => true,
         }
+    }
+    /// A ribbon drop-down is usable when at least one of its entries is.
+    fn menu_enabled(&self, list: &[(&str, Action)]) -> bool {
+        list.iter().any(|(_, action)| self.enabled(*action))
     }
     fn checked(&self, action: Action) -> bool {
         match action {
@@ -2046,7 +2175,42 @@ impl HwpApp {
             });
         close
     }
+    /// 파일 tab: the file commands on the left (same entries and order as the 파일 menu),
+    /// the document summary and recent documents on the right.
     pub(super) fn file_backstage(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        egui::Panel::left("hwp-file-commands")
+            .exact_size(280.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::from_gray(245))
+                    .inner_margin(egui::Margin::symmetric(8, 16)),
+            )
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for entry in backstage_entries() {
+                        let Some((label, key, action)) = entry else {
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                            continue;
+                        };
+                        let enabled = self.enabled(action);
+                        let response = ui.add_enabled(
+                            enabled,
+                            egui::Button::new(label)
+                                .shortcut_text(key)
+                                .frame(false)
+                                .min_size(Vec2::new(262.0, 28.0)),
+                        );
+                        if explain(response, action, enabled).clicked() {
+                            self.dispatch(action, &ctx);
+                        }
+                    }
+                });
+            });
+        let mut open_recent = None;
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(22.0);
             ui.heading("문서 정보");
@@ -2060,7 +2224,7 @@ impl HwpApp {
             );
             ui.label(format!(
                 "{}쪽 · {}개 구역",
-                self.session.core.page_count(),
+                self.layout_page_count(),
                 self.session.core.document().sections.len()
             ));
             ui.label(if self.session.dirty() {
@@ -2072,7 +2236,40 @@ impl HwpApp {
             if ui.button("문서로 돌아가기").clicked() {
                 self.tab = 1;
             }
+            ui.add_space(26.0);
+            ui.heading("최근 문서");
+            ui.add_space(8.0);
+            if self.ext.shell.recent.is_empty() {
+                ui.label(
+                    RichText::new("최근에 연 문서가 없습니다.").color(Color32::from_gray(110)),
+                );
+            }
+            for (i, path) in self.ext.shell.recent.iter().enumerate() {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let folder = path
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                if ui
+                    .add(
+                        egui::Button::new(format!("{}  {name}    {folder}", i + 1))
+                            .frame(false)
+                            .min_size(Vec2::new(560.0, 26.0)),
+                    )
+                    .on_hover_text(path.display().to_string())
+                    .clicked()
+                {
+                    open_recent = Some(i);
+                }
+            }
         });
+        if let Some(i) = open_recent {
+            self.tab = 1;
+            self.open_recent(i, &ctx);
+        }
     }
     fn file_menu(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
@@ -2550,13 +2747,20 @@ impl HwpApp {
                     })
                     .inner
                 };
+                let response = explain(response, action, enabled);
                 self.keytip_badge(ui, response.rect, action);
                 if response.clicked() {
                     self.dispatch(action, &ctx);
                 }
             }
             Item::Menu(icon, label, list) => {
-                let response = self.icons.large(ui, icon, label, true, true, false);
+                // Grey out (and ignore clicks on) a menu whose every entry is unavailable.
+                let any = self.menu_enabled(list);
+                let response = self.icons.large(ui, icon, label, any, true, false);
+                let response = match list.first() {
+                    Some((_, first)) => explain(response, *first, any),
+                    None => response,
+                };
                 let popup = egui::Id::new(("hwp-menu", label, self.tab));
                 if response.clicked() {
                     egui::Popup::toggle_id(&ctx, popup);
@@ -2567,13 +2771,12 @@ impl HwpApp {
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                     .show(|ui| {
                         for (label, action) in list {
-                            if ui
-                                .add_enabled(
-                                    self.enabled(*action),
-                                    egui::Button::selectable(self.checked(*action), *label),
-                                )
-                                .clicked()
-                            {
+                            let enabled = self.enabled(*action);
+                            let entry = ui.add_enabled(
+                                enabled,
+                                egui::Button::selectable(self.checked(*action), *label),
+                            );
+                            if explain(entry, *action, enabled).clicked() {
                                 ui.close();
                                 self.dispatch(*action, &ctx);
                             }
@@ -2606,6 +2809,7 @@ impl HwpApp {
                         let mut on = self.checked(*action);
                         let response =
                             ui.add_enabled(enabled, egui::Checkbox::new(&mut on, *label));
+                        let response = explain(response, *action, enabled);
                         self.keytip_badge(
                             ui,
                             response.rect.translate(Vec2::new(-4.0, 6.0)),
@@ -2653,6 +2857,7 @@ impl HwpApp {
             menu,
             self.checked(action),
         );
+        let response = explain(response, action, enabled);
         self.keytip_badge(ui, response.rect, action);
         if response.clicked() {
             self.dispatch(action, &ctx);
@@ -2972,7 +3177,7 @@ impl HwpApp {
                     for (id, width) in [
                         ("format.style", 106.0),
                         ("format.font_lang", 91.0),
-                        ("format.font_face", 118.0),
+                        ("format.font_face", 150.0),
                         ("format.font_size", 106.0),
                         ("format.bold", 24.0),
                         ("format.italic", 24.0),
@@ -3109,4 +3314,112 @@ fn keytip(ui: &egui::Ui, at: Pos2, letter: char) {
         egui::FontId::proportional(10.0),
         Color32::WHITE,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same chain as `ext_enabled`, but distinguishing "no module owns this id".
+    fn owned(app: &HwpApp, id: &str) -> bool {
+        matches!(id, "edit.regions" | "tools.autotext.body")
+            || app.pen_enabled(id).is_some()
+            || app.core_ext_enabled(id).is_some()
+            || app.format_ext_enabled(id).is_some()
+            || app.table_ext_enabled(id).is_some()
+            || app.comments_ext_enabled(id).is_some()
+            || app.contexts_ext_enabled(id).is_some()
+            || app.object_ext_enabled(id).is_some()
+            || app.shell_ext_enabled(id).is_some()
+            || app.tools_ext_enabled(id).is_some()
+    }
+
+    #[test]
+    fn file_tab_lists_file_commands_without_recent_or_double_separators() {
+        let entries = backstage_entries();
+        assert!(entries.first().is_some_and(Option::is_some));
+        assert!(entries.last().is_some_and(Option::is_some));
+        assert!(entries.windows(2).all(|w| w[0].is_some() || w[1].is_some()));
+        let ids: Vec<_> = entries
+            .iter()
+            .flatten()
+            .filter_map(|(_, _, a)| HwpApp::action_id(*a))
+            .collect();
+        assert!(!ids.contains(&"file.recent"));
+        for id in [
+            "file.new",
+            "file.open",
+            "file.save",
+            "file.save_as",
+            "file.print",
+        ] {
+            assert!(ids.contains(&id), "{id}");
+        }
+    }
+
+    #[test]
+    fn region_editors_share_one_edit_tab_menu() {
+        let menus: Vec<&[(&str, Action)]> = EDIT
+            .iter()
+            .filter_map(|item| match item {
+                Item::Menu(_, _, list) => Some(*list),
+                _ => None,
+            })
+            .filter(|list| {
+                list.iter()
+                    .any(|(_, a)| matches!(a, A::Ext("edit.regions" | "edit.contexts")))
+            })
+            .collect();
+        assert_eq!(menus.len(), 1);
+        let ids: Vec<_> = HwpApp::tools(EDIT)
+            .into_iter()
+            .filter_map(|(_, _, a)| HwpApp::action_id(a))
+            .filter(|id| matches!(*id, "edit.regions" | "edit.contexts"))
+            .collect();
+        assert_eq!(ids, ["edit.regions", "edit.contexts"]);
+    }
+
+    #[test]
+    fn unsupported_reasons_name_only_unimplemented_commands() {
+        let app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        // A command that gained a handler must lose its "not supported" tooltip.
+        for (id, _) in UNSUPPORTED {
+            assert!(
+                !owned(&app, id),
+                "{id} is implemented now; remove it from UNSUPPORTED"
+            );
+        }
+        // Every ribbon command nobody implements explains why it is grey.
+        for (tab, _, items) in TABS {
+            for (_, label, action) in HwpApp::tools(items) {
+                if let A::Ext(id) = action
+                    && !owned(&app, id)
+                {
+                    assert!(
+                        unsupported_reason(action).is_some(),
+                        "{tab} {label} ({id}) is always grey without a reason"
+                    );
+                }
+            }
+        }
+        for (_, _, action) in FILE_MENU.iter().flatten() {
+            if let A::Ext(id) = action
+                && !owned(&app, id)
+                && *id != "file.recent"
+            {
+                assert!(unsupported_reason(*action).is_some(), "file menu {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn menu_buttons_follow_their_entries() {
+        let app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        // Body caret in a new document: page margins apply, text-box commands do not.
+        assert!(app.menu_enabled(MARGIN_MENU));
+        assert!(!app.menu_enabled(TEXTBOX_ALIGN));
+        assert!(!app.menu_enabled(TEXTBOX_DIRECTION));
+        assert!(!app.menu_enabled(CONNECTOR_TYPE));
+        assert!(!app.menu_enabled(&[]));
+    }
 }

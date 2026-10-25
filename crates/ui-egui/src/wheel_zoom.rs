@@ -19,7 +19,7 @@ impl HwpApp {
                         delta,
                         modifiers,
                         ..
-                    } if (!require_ctrl || modifiers.ctrl)
+                    } if (!require_ctrl || modifiers.ctrl || modifiers.command)
                         && !modifiers.alt
                         && !modifiers.shift =>
                     {
@@ -38,7 +38,7 @@ impl HwpApp {
             return None;
         }
         ctx.input_mut(|i| {
-            i.events.retain(|event|!matches!(event,Event::MouseWheel{modifiers,..} if (!require_ctrl || modifiers.ctrl) && !modifiers.alt && !modifiers.shift));
+            i.events.retain(|event|!matches!(event,Event::MouseWheel{modifiers,..} if (!require_ctrl || modifiers.ctrl || modifiers.command) && !modifiers.alt && !modifiers.shift));
             i.smooth_scroll_delta=Vec2::ZERO;
         });
         let old = self.zoom;

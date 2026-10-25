@@ -23,6 +23,7 @@ pub(crate) struct State {
     sort: Option<SortOptions>,
     marks: Option<Vec<(MarkKind, usize, bool)>>,
     goto: Option<GotoState>,
+    pub body_autotext: Option<body_autotext_editor::State>,
 }
 
 impl HwpApp {
@@ -73,6 +74,7 @@ impl HwpApp {
         self.ext.core.sort.is_some()
             || self.ext.core.marks.is_some()
             || self.ext.core.goto.is_some()
+            || self.ext.core.body_autotext.is_some()
     }
     pub(crate) fn core_ext_view(&mut self, name: &str) -> bool {
         match name {
@@ -86,13 +88,14 @@ impl HwpApp {
         self.sort_dialog(ctx);
         self.marks_dialog(ctx);
         self.goto_dialog(ctx);
+        self.body_autotext_dialog(ctx);
     }
     /// Hangul 이동 (Alt+G): jump to a page, section, paragraph or bookmark.
     fn goto_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut g) = self.ext.core.goto.take() else {
             return;
         };
-        let pages = self.session.core.page_count();
+        let pages = self.layout_page_count();
         let sections = self.session.core.document().sections.len();
         let paragraphs = self
             .session

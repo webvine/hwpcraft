@@ -136,13 +136,44 @@ pub(crate) struct State {
     /// Grid line being dragged: table, vertical, boundary, start (page px), span.
     line: Option<GridLine>,
     tool: Option<TableTool>,
-    layout: Option<(u64, u32, Value)>,
+    /// Page control layouts per page for one document generation. Every visible
+    /// page runs the canvas hooks each frame; a single-page cache made two visible
+    /// pages evict each other and rebuild the layout JSON every frame.
+    layout: Option<PageLayouts>,
     create: Option<Create>,
     properties: Option<Box<Properties>>,
     split: Option<Split>,
     formula: Option<(String, Option<String>)>,
 }
 
+/// (document generation, page → shared page control layout).
+pub(crate) type PageLayouts = (u64, std::collections::HashMap<u32, std::sync::Arc<Value>>);
+/// Cached layout of `page` in `cache`, rebuilt only after the document changes.
+pub(crate) fn cached_page_layout(
+    cache: &mut Option<PageLayouts>,
+    session: &hwpcraft_engine::Session,
+    page: u32,
+) -> std::sync::Arc<Value> {
+    let generation = session.generation;
+    if cache.as_ref().is_none_or(|(g, _)| *g != generation) {
+        *cache = Some((generation, Default::default()));
+    }
+    let Some((_, pages)) = cache.as_mut() else {
+        return std::sync::Arc::new(Value::Null);
+    };
+    pages
+        .entry(page)
+        .or_insert_with(|| {
+            std::sync::Arc::new(
+                session
+                    .page_control_layout(page)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(Value::Null),
+            )
+        })
+        .clone()
+}
 fn color_css(c: [u8; 3]) -> String {
     format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
 }
@@ -271,7 +302,11 @@ fn border_tab(ui: &mut egui::Ui, b: &mut Borders, multi: bool) {
                 if ui.button("바깥쪽").clicked() {
                     apply(b, &outer, line.clone());
                 }
-                if ui.add_enabled(multi, egui::Button::new("안쪽")).clicked() {
+                if ui
+                    .add_enabled(multi, egui::Button::new("안쪽"))
+                    .on_disabled_hover_text(INNER_EDGE_REASON)
+                    .clicked()
+                {
                     apply(b, &inner, line.clone());
                 }
                 if ui.button("모두").clicked() {
@@ -286,6 +321,7 @@ fn border_tab(ui: &mut egui::Ui, b: &mut Borders, multi: bool) {
                     let inner_edge = matches!(edge, Edge::InnerVertical | Edge::InnerHorizontal);
                     if ui
                         .add_enabled(!inner_edge || multi, egui::Button::new(label))
+                        .on_disabled_hover_text(INNER_EDGE_REASON)
                         .clicked()
                     {
                         apply(b, &[edge], line.clone());
@@ -848,33 +884,12 @@ impl HwpApp {
         self.paint_block(page, response, rect);
         consumed
     }
-    fn page_layout(&mut self, page: u32) -> &Value {
-        let generation = self.session.generation;
-        if self
-            .ext
-            .table
-            .layout
-            .as_ref()
-            .is_none_or(|(g, p, _)| *g != generation || *p != page)
-        {
-            let layout = self
-                .session
-                .core
-                .get_page_control_layout_native(page)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(Value::Null);
-            self.ext.table.layout = Some((generation, page, layout));
-        }
-        self.ext
-            .table
-            .layout
-            .as_ref()
-            .map_or(&Value::Null, |(_, _, l)| l)
+    pub(super) fn page_layout(&mut self, page: u32) -> std::sync::Arc<Value> {
+        cached_page_layout(&mut self.ext.table.layout, &self.session, page)
     }
     /// Inner and right/bottom outer grid lines of top-level tables under `p` (page px).
     fn grid_line_at(&mut self, page: u32, p: Pos2, tol: f32) -> Option<GridLine> {
-        let layout = self.page_layout(page).clone();
+        let layout = self.page_layout(page);
         let n = |v: &Value, k: &str| v[k].as_u64();
         let f = |v: &Value, k: &str| v[k].as_f64().unwrap_or(0.0) as f32;
         for t in layout["controls"].as_array()?.iter().rev() {
@@ -988,26 +1003,7 @@ impl HwpApp {
         let Some(b) = self.ext.table.block else {
             return;
         };
-        let generation = self.session.generation;
-        if self
-            .ext
-            .table
-            .layout
-            .as_ref()
-            .is_none_or(|(g, p, _)| *g != generation || *p != page)
-        {
-            let layout = self
-                .session
-                .core
-                .get_page_control_layout_native(page)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(Value::Null);
-            self.ext.table.layout = Some((generation, page, layout));
-        }
-        let Some((_, _, layout)) = &self.ext.table.layout else {
-            return;
-        };
+        let layout = self.page_layout(page);
         let range = b.range();
         let n = |v: &Value, k: &str| v[k].as_u64().unwrap_or(0);
         let painter = response.ctx.layer_painter(response.layer_id);
@@ -1050,7 +1046,8 @@ impl HwpApp {
             self.cell_block_key();
             return true;
         }
-        let ctrl_shift = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        // COMMAND is Ctrl on Windows/Linux and Cmd on macOS.
+        let ctrl_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
         for (key, id) in [
             (Key::S, "table.block_sum"),
             (Key::A, "table.block_average"),
@@ -1068,7 +1065,7 @@ impl HwpApp {
             (Key::ArrowUp, true, -1.0),
             (Key::ArrowDown, true, 1.0),
         ] {
-            if consume(egui::Modifiers::CTRL, key) {
+            if consume(egui::Modifiers::COMMAND, key) {
                 let mut p = json!({"vertical":vertical,"delta_mm":delta});
                 if let Some(r) = self.block_range() {
                     p["range"] = r;
@@ -1287,6 +1284,7 @@ impl HwpApp {
                                 d.custom_width,
                                 egui::DragValue::new(&mut d.width_mm)
                                     .range(1.0..=600.0)
+                                    .fixed_decimals(2)
                                     .suffix(" mm"),
                             );
                             ui.end_row();
@@ -1305,6 +1303,7 @@ impl HwpApp {
                                 d.custom_height,
                                 egui::DragValue::new(&mut d.height_mm)
                                     .range(1.0..=2000.0)
+                                    .fixed_decimals(2)
                                     .suffix(" mm"),
                             );
                             ui.end_row();
@@ -1341,7 +1340,9 @@ impl HwpApp {
                         false,
                         egui::Button::new("표 마당(Y)").min_size(Vec2::new(80.0, 28.0)),
                     )
-                    .on_disabled_hover_text("표 마당(스타일 목록)은 아직 구현하지 않았습니다.");
+                    .on_disabled_hover_text(
+                        "표를 만든 뒤 표 디자인 탭의 표 마당에서 모양을 고르세요.",
+                    );
                 });
             });
         });
@@ -1782,6 +1783,8 @@ const DELIMITERS: &[(&str, &str)] = &[
     ("space", "빈칸"),
     ("semicolon", "세미콜론"),
 ];
+/// Shown on the inner-line buttons of the border tab while only one cell is chosen.
+const INNER_EDGE_REASON: &str = "안쪽 선은 셀 블록(F5)을 두 칸 이상 지정했을 때 고를 수 있습니다.";
 /// Engine motions for 표 안 셀 이동 and their Hangul menu labels.
 const CELL_MOTIONS: &[(&str, &str)] = &[
     ("left", "왼쪽 셀"),
@@ -2145,5 +2148,52 @@ fn paint_style_preview(ui: &egui::Ui, r: Rect, style: usize) {
         p.line_segment([r.left_bottom(), r.right_bottom()], outer);
     } else {
         p.rect_stroke(r, 0.0, outer, egui::StrokeKind::Inside);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_layouts_stay_cached_per_page_until_the_document_changes() {
+        use hwpcraft_engine::Command;
+        let mut s = hwpcraft_engine::Session::new().unwrap();
+        s.execute(Command::Insert("첫 쪽".into())).unwrap();
+        s.execute(Command::PageBreak).unwrap();
+        s.execute(Command::Insert("둘째 쪽".into())).unwrap();
+        s.run("table.create", json!({"rows":1,"columns":3}))
+            .unwrap();
+        s.select(Cursor::default(), false).unwrap();
+        s.run("table.create", json!({"rows":2,"columns":2}))
+            .unwrap();
+        assert!(s.core.page_count() >= 2);
+        let mut cache = None;
+        let first = cached_page_layout(&mut cache, &s, 0);
+        let second = cached_page_layout(&mut cache, &s, 1);
+        // Two visible pages alternate every frame; neither evicts the other.
+        assert!(std::sync::Arc::ptr_eq(
+            &first,
+            &cached_page_layout(&mut cache, &s, 0)
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &second,
+            &cached_page_layout(&mut cache, &s, 1)
+        ));
+        let tables = |v: &Value| {
+            v["controls"]
+                .as_array()
+                .map_or(0, |c| c.iter().filter(|t| t["type"] == "table").count())
+        };
+        assert_eq!((tables(&first), tables(&second)), (1, 1));
+        // An edit changes the generation; the next lookup rebuilds the layout.
+        s.run("table.cell_move", json!({"motion":"next"})).unwrap();
+        s.execute(Command::Insert("가".into())).unwrap();
+        let rebuilt = cached_page_layout(&mut cache, &s, 1);
+        assert!(!std::sync::Arc::ptr_eq(&second, &rebuilt));
+        assert_eq!(
+            cache.as_ref().map(|(g, pages)| (*g, pages.len())),
+            Some((s.generation, 1))
+        );
     }
 }

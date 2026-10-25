@@ -184,7 +184,7 @@ impl HwpApp {
                     let chosen = d.items.get(current).and_then(|s| s.chosen);
                     ui.label(
                         RichText::new(format!("음: {reading} ({}자)", candidates.len()))
-                            .small()
+                            .size(12.5)
                             .color(Color32::DARK_GRAY),
                     );
                     let mut pick: Option<usize> = None;
@@ -243,26 +243,38 @@ impl HwpApp {
                         RichText::new(
                             "음절마다 한자를 고릅니다. 낱말 사전이 없어 낱말 단위 후보는 제공하지 않으며, 후보 순서는 KS X 1001·교육용 한자가 먼저입니다.",
                         )
-                        .small()
+                        .size(12.0)
                         .color(Color32::GRAY),
                     );
                 });
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
-                    let button = |ui: &mut egui::Ui, label: &str, enabled: bool| {
+                    let button = |ui: &mut egui::Ui, label: &str, enabled: bool, why: &str| {
                         ui.add_enabled(
                             enabled,
                             egui::Button::new(label).min_size(Vec2::new(96.0, 26.0)),
                         )
+                        .on_disabled_hover_text(why)
                         .clicked()
                     };
-                    if button(ui, "바꾸기(D)", d.any_chosen()) {
+                    if button(
+                        ui,
+                        "바꾸기(D)",
+                        d.any_chosen(),
+                        "한자 목록에서 한자를 하나 이상 고르세요.",
+                    ) {
                         action = Some("convert");
                     }
-                    if button(ui, "한글로 바꾸기", d.text.chars().any(|c| !('가'..='힣').contains(&c) && !c.is_ascii())) {
+                    // The engine's reading differs from the text exactly when it holds hanja.
+                    if button(
+                        ui,
+                        "한글로 바꾸기",
+                        d.hangul != d.text,
+                        "고른 낱말에 한자가 없습니다.",
+                    ) {
                         action = Some("to_hangul");
                     }
-                    if button(ui, "닫기", true) {
+                    if button(ui, "닫기", true, "") {
                         keep = false;
                     }
                 });

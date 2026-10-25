@@ -139,34 +139,21 @@ impl Matcher {
     /// Scalar ranges of every non-overlapping, non-empty match in `text`.
     pub(crate) fn ranges(&self, text: &str) -> Vec<Range<usize>> {
         let mut out = Vec::new();
-        if text.is_empty() {
-            return out;
-        }
-        // Byte offset → scalar offset, walked once in order.
-        let mut byte_to_char: Vec<(usize, usize)> = text
-            .char_indices()
-            .enumerate()
-            .map(|(k, (b, _))| (b, k))
-            .collect();
-        byte_to_char.push((text.len(), byte_to_char.len()));
-        let scalar = |byte: usize| {
-            byte_to_char
-                .binary_search_by_key(&byte, |(b, _)| *b)
-                .map(|i| byte_to_char[i].1)
-                .unwrap_or(usize::MAX)
-        };
-        let chars: Vec<char> = text.chars().collect();
-        let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric() || *c == '_');
+        let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        // Matches come in byte order, so scalar offsets are counted incrementally
+        // instead of building a per-character table for every paragraph.
+        let (mut byte, mut scalar) = (0, 0);
         for m in self.regex.find_iter(text) {
             if m.start() == m.end() {
                 continue;
             }
-            let (start, end) = (scalar(m.start()), scalar(m.end()));
-            if start == usize::MAX || end == usize::MAX {
-                continue;
-            }
+            scalar += text[byte..m.start()].chars().count();
+            let start = scalar;
+            let end = start + m.as_str().chars().count();
+            (byte, scalar) = (m.end(), end);
             if self.options.whole_word
-                && (word(start.checked_sub(1).and_then(|p| chars.get(p))) || word(chars.get(end)))
+                && (word(text[..m.start()].chars().next_back())
+                    || word(text[m.end()..].chars().next()))
             {
                 continue;
             }
@@ -185,6 +172,19 @@ fn matches(text: &str, query: &str, o: FindOptions) -> Vec<usize> {
 }
 
 impl Session {
+    /// Run many edits with RHWP pagination deferred to one pass at the end.
+    /// RHWP otherwise repaginates after every edit, which made 모두 바꾸기 of about
+    /// 1,300 matches in a 381-page document take over 80 seconds (mostly table cells).
+    /// Call inside `transaction`, so a failed edit still rolls everything back.
+    pub(crate) fn with_deferred_layout(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        self.core.begin_batch_native().map_err(err)?;
+        let result = f(self);
+        let ended = self.core.end_batch_native().map_err(err);
+        result.and(ended.map(|_| ()))
+    }
     /// Character-shape ids per scalar offset of a paragraph, for 서식 찾기.
     fn shape_ok(&self, c: Cursor, range: &Range<usize>, o: FindOptions) -> bool {
         if !o.has_format() {
@@ -234,6 +234,22 @@ impl Session {
                 .paragraph_ranges(self.cursor, m)
                 .is_ok_and(|ranges| ranges.contains(&r))
     }
+    /// Number of matches in body paragraphs and first-level table cells, for the
+    /// 찾기 window's result count. Counting stops at `limit`.
+    pub fn count_matches(&self, query: &str, o: FindOptions, limit: usize) -> Result<usize> {
+        if query.is_empty() || query.contains(['\r', '\n']) {
+            return Ok(0);
+        }
+        let m = Matcher::new(query, o)?;
+        let mut total = 0;
+        for c in self.cursors() {
+            total += self.paragraph_ranges(c, &m)?.len();
+            if total >= limit {
+                return Ok(limit);
+            }
+        }
+        Ok(total)
+    }
     /// Select the next match. Returns false when the document has none.
     pub fn find(&mut self, query: &str, o: FindOptions) -> Result<bool> {
         if query.is_empty() {
@@ -243,13 +259,14 @@ impl Session {
             bail!("찾기는 한 문단 안의 텍스트만 지원합니다.");
         }
         let m = Matcher::new(query, o)?;
-        let entries = self.entries();
+        // Addresses only: paragraph text is read in place, not copied per search.
+        let entries = self.cursors();
         if entries.is_empty() {
             return Ok(false);
         }
         let here = entries
             .iter()
-            .position(|(c, _)| {
+            .position(|c| {
                 c.section == self.cursor.section
                     && c.paragraph == self.cursor.paragraph
                     && c.cell == self.cursor.cell
@@ -269,7 +286,7 @@ impl Session {
             } else {
                 (start + step) % n
             };
-            let c = entries[i].0;
+            let c = entries[i];
             let found = self.paragraph_ranges(c, &m)?;
             let first_visit = step == 0 && o.direction != FindDirection::All;
             let last_visit = step == n;
@@ -338,39 +355,52 @@ impl Session {
         }
         let m = Matcher::new(query, o)?;
         let mut planned = Vec::new();
-        for (cursor, _) in self.entries() {
+        let mut count = 0;
+        for cursor in self.cursors() {
             // Protected cells keep their text, as in Hangul.
             if self.cell_protected(cursor) {
                 continue;
             }
-            for r in self.paragraph_ranges(cursor, &m)? {
-                planned.push((cursor, r));
-                if planned.len() > 10_000 {
+            let ranges = self.paragraph_ranges(cursor, &m)?;
+            let text = &self.paragraph(cursor)?.text;
+            for r in ranges {
+                count += 1;
+                if count > 10_000 {
                     bail!("한 번의 모두 바꾸기는 10,000건 이하입니다.");
+                }
+                // A match that already reads as the replacement needs no edit.
+                if !text
+                    .chars()
+                    .skip(r.start)
+                    .take(r.len())
+                    .eq(replacement.chars())
+                {
+                    planned.push((cursor, r));
                 }
             }
         }
-        let count = planned.len();
         let literal = !o.regex && !o.wildcards && !o.ignore_spaces && !o.hanja_by_hangul;
-        if count == 0 || (literal && o.case_sensitive && query == replacement) {
-            return Ok(if literal && query == replacement {
-                0
-            } else {
-                count
-            });
+        if literal && o.case_sensitive && query == replacement {
+            return Ok(0);
+        }
+        if planned.is_empty() {
+            return Ok(count);
         }
         let caret = self.cursor;
         self.transaction(|s| {
-            // Apply backwards so earlier addresses stay valid.
-            for (cursor, r) in planned.into_iter().rev() {
-                s.clear_selection();
-                s.cursor = Cursor {
-                    offset: r.end,
-                    ..cursor
-                };
-                s.anchor = Some(r.start);
-                s.insert(replacement)?;
-            }
+            s.with_deferred_layout(|s| {
+                // Apply backwards so earlier addresses stay valid.
+                for (cursor, r) in planned.into_iter().rev() {
+                    s.clear_selection();
+                    s.cursor = Cursor {
+                        offset: r.end,
+                        ..cursor
+                    };
+                    s.anchor = Some(r.start);
+                    s.insert(replacement)?;
+                }
+                Ok(())
+            })?;
             s.cursor = caret;
             s.clear_selection();
             Ok(())
@@ -439,6 +469,20 @@ mod tests {
         // `*` is literal without the wildcard option.
         let literal = ranges("a*b ab", "a*b", FindOptions::default());
         assert_eq!((literal.len(), literal.first()), (1, Some(&(0..3))));
+    }
+
+    #[test]
+    fn scalar_ranges_and_word_edges_with_wide_characters() {
+        let word = FindOptions {
+            whole_word: true,
+            ..Default::default()
+        };
+        assert_eq!(ranges("😀rust 한rust rust", "rust", word), [1..5, 12..16]);
+        assert_eq!(
+            ranges("😀가😀가", "가", FindOptions::default()),
+            [1..2, 3..4]
+        );
+        assert!(ranges("", "가", FindOptions::default()).is_empty());
     }
 
     #[test]

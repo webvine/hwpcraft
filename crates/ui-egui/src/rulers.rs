@@ -186,7 +186,7 @@ impl HwpApp {
 
     fn status_items(&mut self, ui: &mut egui::Ui, cache: &RulerCache) {
         let ctx = ui.ctx().clone();
-        let pages = self.session.core.page_count().max(1);
+        let pages = self.layout_page_count().max(1);
         let sections = self.session.core.document().sections.len().max(1);
         let (line, column) = self.line_and_column();
         let page = self
@@ -262,7 +262,7 @@ impl HwpApp {
                             "변경 내용 추적은 지원하지 않습니다.",
                         );
                     });
-                    if !self.message.is_empty() {
+                    if !self.message.is_empty() && !start_hint_is_stale(self) {
                         ui.add_space(12.0);
                         ui.add(
                             egui::Label::new(
@@ -362,7 +362,7 @@ impl HwpApp {
 
     fn document_tabs(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let pages = self.session.core.page_count().max(1);
+        let pages = self.layout_page_count().max(1);
         let full = ui.max_rect();
         let split = full.left() + (full.width() * 0.49).clamp(360.0, 740.0);
         let tabs = Rect::from_min_max(full.min, Pos2::new(split, full.bottom()));
@@ -761,4 +761,50 @@ fn tab_kind_marker(ui: &egui::Ui, corner: Rect) {
     );
     ui.painter()
         .line_segment([c + Vec2::new(-3.0, 3.0), c + Vec2::new(4.0, 3.0)], stroke);
+}
+
+/// Start-up hint the core view puts in the status line before any document is used.
+const START_HINT: &str = "문서를 열거나 흰 쪽을 클릭해 입력하세요.";
+
+/// The start-up hint no longer applies once a file is open or the document has content.
+fn start_hint_is_stale(app: &HwpApp) -> bool {
+    use hwpcraft_doc::model::control::Control;
+    app.message == START_HINT
+        && (app.session.path.is_some()
+            || app.session.dirty()
+            || app.session.core.page_count() > 1
+            || app
+                .session
+                .core
+                .document()
+                .sections
+                .iter()
+                .flat_map(|s| &s.paragraphs)
+                .any(|p| {
+                    !p.text.trim().is_empty()
+                        || p.controls
+                            .iter()
+                            .any(|c| !matches!(c, Control::SectionDef(_) | Control::ColumnDef(_)))
+                }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_hint_hides_once_a_document_is_in_use() -> anyhow::Result<()> {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        app.message = START_HINT.into();
+        assert!(
+            !start_hint_is_stale(&app),
+            "a blank document keeps the hint"
+        );
+        app.session.execute(Command::Insert("글".into()))?;
+        assert!(start_hint_is_stale(&app));
+        // Other messages (results, errors) are always shown.
+        app.message = "열기 완료".into();
+        assert!(!start_hint_is_stale(&app));
+        Ok(())
+    }
 }

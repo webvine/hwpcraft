@@ -25,10 +25,7 @@ impl CellGeometry {
 }
 impl HwpApp {
     pub(crate) fn paint_margin_corners(&self, ui: &egui::Ui, page: u32, rect: Rect) {
-        let Ok(raw) = self.session.core.get_page_info_native(page) else {
-            return;
-        };
-        let Ok(info) = serde_json::from_str::<Value>(&raw) else {
+        let Ok(info) = self.session.page_info(page) else {
             return;
         };
         let Some(body) = body_rect(&info) else { return };
@@ -69,11 +66,7 @@ impl HwpApp {
             return None;
         };
         let cell = table.cells.get(at.index)?;
-        let raw = self
-            .session
-            .core
-            .get_page_control_layout_native(page)
-            .ok()?;
+        let raw = self.session.page_control_layout(page).ok()?;
         let layout: Value = serde_json::from_str(&raw).ok()?;
         let t = layout["controls"].as_array()?.iter().find(|t| {
             t["type"] == "table"

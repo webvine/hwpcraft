@@ -21,7 +21,7 @@ pub(crate) fn actions(query: &str) -> Value {
         .iter()
         .filter(|(id, cmd, _, _)| query.is_empty() || id.to_lowercase().contains(&query) || cmd.contains(&query))
         .map(|(id, cmd, params, status)| {
-            json!({"id":id,"command":cmd,"defaultParams":serde_json::from_str::<Value>(params).unwrap_or(json!({})),"mapping":status})
+            json!({"id":id,"command":cmd,"defaultParams":serde_json::from_str::<Value>(params).unwrap_or(json!({})),"mapping":status,"parameterSet":hwpcraft_engine::hwp_parameter_schema(id)})
         })
         .collect();
     json!(list)

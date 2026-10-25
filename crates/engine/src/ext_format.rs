@@ -192,7 +192,7 @@ pub const COLOR_PRESETS: [(&str, &str, &str); 8] = [
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "format.bold",
-        "value?: bool; omitted toggles the shape under the caret. Selection or whole caret paragraph.",
+        "value?: bool; omitted toggles the shape under the caret. Selection, or future input at a collapsed caret.",
         r##"{"value":true}"##,
     ),
     ("format.italic", "value?: bool; omitted toggles.", "{}"),
@@ -990,8 +990,8 @@ impl Session {
     }
     /// 형광펜 through RHWP's `Paragraph::markpen_marks`, which HWP saves as PARA_RANGE_TAG
     /// kind 2 and HWPX as `<hp:markpenBegin color=…/>`…`<hp:markpenEnd/>`. No `color`
-    /// (or null) removes the highlight. RHWP's renderer does not draw markpen marks yet,
-    /// so the canvas shows no change; the file keeps it and Hangul shows it.
+    /// (or null) removes the highlight. HwpCraft's shared SVG output paints the
+    /// marks for desktop, PNG and PDF instead of relying on RHWP's renderer.
     fn highlight(&mut self, id: &str, params: &Value) -> Result<Value> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -1005,7 +1005,7 @@ impl Session {
         let p: Highlight = parse::<Highlight>(id, params)?;
         let color = preset_or_color(p.color.as_deref(), p.name.as_deref())?;
         let parts = self.selected_paragraphs()?;
-        // No selection marks the whole caret paragraph, like `format.character`.
+        // Markpen remains an explicit range/paragraph operation.
         let whole = parts.len() == 1 && parts[0].1.is_empty();
         self.transaction(|s| {
             for (c, r) in parts {
@@ -1095,6 +1095,7 @@ impl Session {
         // With no mark left, the HWP serializer falls back to the stored range tags;
         // drop the stored markpen tags so a removed highlight stays removed.
         para.range_tags.retain(|t| t.tag >> 24 != 2);
+        crate::highlights::resolve_markpen_positions(para);
         self.core.document_mut().sections[c.section].raw_stream = None;
         Ok(())
     }
@@ -1145,35 +1146,10 @@ impl Session {
         })?;
         Ok(self.info())
     }
-    /// Character shape of the selection (whole caret paragraph without one), no transaction.
+    /// Character shape of selected text or future input, within the caller transaction.
     fn apply_character_now(&mut self, v: Value) -> Result<()> {
-        let props = self.character_parameters(v)?.to_string();
-        let parts = self.selected_paragraphs()?;
-        let whole = parts.len() == 1 && parts[0].1.is_empty();
-        for (c, r) in parts {
-            let r = if whole {
-                0..self.paragraph(c)?.text.chars().count()
-            } else {
-                r
-            };
-            if let Some(t) = c.cell {
-                self.core.apply_char_format_in_cell_native(
-                    c.section,
-                    c.paragraph,
-                    t.control,
-                    t.index,
-                    t.paragraph,
-                    r.start,
-                    r.end,
-                    &props,
-                )
-            } else {
-                self.core
-                    .apply_char_format_native(c.section, c.paragraph, r.start, r.end, &props)
-            }
-            .map_err(err)?;
-        }
-        Ok(())
+        let plan = self.insertion_shape.prepare(self, v)?;
+        plan.apply(&mut self.core, &mut self.insertion_shape)
     }
 
     // ---- 머리말 / 꼬리말 · 각주 안 서식 ----
@@ -1473,9 +1449,12 @@ impl Session {
                 .collect::<Vec<_>>()
         )
     }
-    fn char_shape_json(&self, id: u16) -> Value {
+    pub(crate) fn char_shape_json(&self, id: impl TryInto<usize>) -> Value {
+        let Ok(id) = id.try_into() else {
+            return json!({});
+        };
         let doc = self.core.document();
-        let Some(cs) = doc.doc_info.char_shapes.get(id as usize) else {
+        let Some(cs) = doc.doc_info.char_shapes.get(id) else {
             return json!({});
         };
         let fonts: Vec<String> = (0..7)
@@ -1648,7 +1627,11 @@ impl Session {
         // Hangul's 스타일 추가하기 takes the caret's current paragraph and character shapes.
         let para = self.paragraph(self.cursor)?;
         let offset = self.selection().start.min(self.len().saturating_sub(1));
-        let char_shape_id = para.char_shape_id_at(offset).unwrap_or(0) as u16;
+        let char_shape_id = u16::try_from(para.char_shape_id_at(offset).unwrap_or(0))
+            .map_err(|_| anyhow!("스타일의 글자 모양 ID 공간이 소진되었습니다."))?;
+        let insertion = (!self.has_selection())
+            .then(|| self.insertion_shape.effective(self, self.cursor))
+            .transpose()?;
         let para_shape_id = if character {
             self.core
                 .document()
@@ -1662,6 +1645,12 @@ impl Session {
         };
         let name = p.name.trim().to_owned();
         self.transaction_value(|s| {
+            let char_shape_id = if let Some(shape) = insertion {
+                u16::try_from(shape.register(s.core.document_mut())?)
+                    .map_err(|_| anyhow!("스타일의 글자 모양 ID 공간이 소진되었습니다."))?
+            } else {
+                char_shape_id
+            };
             let id = s.create_style_now(NewStyle {
                 name,
                 english,
@@ -2948,7 +2937,7 @@ impl Session {
             if path.trim().is_empty() {
                 bail!("경로를 입력하세요.");
             }
-            std::fs::write(&path, serde_json::to_string_pretty(&out)?)
+            hwpcraft_formats::atomic_write(Path::new(&path), &serde_json::to_vec_pretty(&out)?)
                 .map_err(|e| anyhow!("스타일 파일을 쓰지 못했습니다: {e}"))?;
             return Ok(json!({"path": path, "count": info.styles.len()}));
         }
@@ -2959,7 +2948,11 @@ impl Session {
     fn import_styles(&mut self, p: StyleImport) -> Result<Value> {
         let data = match (p.path, p.styles) {
             (Some(path), None) => {
-                let text = std::fs::read_to_string(&path)
+                hwpcraft_formats::file_access::check_read(&path).map_err(anyhow::Error::msg)?;
+                use std::io::Read;
+                let mut text = String::new();
+                std::fs::File::open(&path)
+                    .and_then(|file| file.take(4_000_001).read_to_string(&mut text))
                     .map_err(|e| anyhow!("스타일 파일을 읽지 못했습니다: {e}"))?;
                 if text.len() > 4_000_000 {
                     bail!("스타일 파일이 너무 큽니다.");

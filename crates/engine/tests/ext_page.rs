@@ -814,3 +814,49 @@ fn save_block_writes_only_the_selection() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn background_pdf_jobs_cover_print_ranges_and_blocks() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("1쪽".into()))?;
+    s.execute(Command::PageBreak)?;
+    s.execute(Command::Insert("2쪽 블록".into()))?;
+    s.execute(Command::PageBreak)?;
+    s.execute(Command::Insert("3쪽".into()))?;
+    let (pages, job) = s.print_pdf_job("2-3", 0)?;
+    assert_eq!(pages, [1, 2]);
+    assert_eq!(job.page_count(), 2);
+    // The conversion needs no session: run it on another thread like the desktop.
+    let bytes = std::thread::spawn(move || job.convert())
+        .join()
+        .expect("worker")?;
+    assert!(bytes.starts_with(b"%PDF"));
+    assert!(s.print_pdf_job("9", 0).is_err());
+    assert!(s.save_block_pdf_job().is_err(), "no selection yet");
+    let block = s
+        .cursors()
+        .into_iter()
+        .find(|c| s.paragraph(*c).is_ok_and(|p| p.text.contains("블록")))
+        .ok_or_else(|| anyhow::anyhow!("block paragraph"))?;
+    s.select(at_offset(block, 3), false)?;
+    s.select(at_offset(block, 5), true)?;
+    let (generation, cursor) = (s.generation, s.cursor);
+    let job = s.save_block_pdf_job()?;
+    assert_eq!(job.page_count(), 1);
+    assert!(job.convert()?.starts_with(b"%PDF"));
+    assert_eq!(
+        (s.generation, s.cursor),
+        (generation, cursor),
+        "document untouched"
+    );
+    // The synchronous command keeps its behaviour.
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("block.hwpx");
+    let r = s.run("file.save_block", json!({"path": path}))?;
+    assert_eq!(r["text"], "블록");
+    Ok(())
+}
+
+fn at_offset(c: hwpcraft_engine::Cursor, offset: usize) -> hwpcraft_engine::Cursor {
+    hwpcraft_engine::Cursor { offset, ..c }
+}

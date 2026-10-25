@@ -4,7 +4,7 @@
 
 ArtCraft 팀의 [WordCraft](https://github.com/storytold/wordcraft) 기본 구조 위에, [RHWP](https://github.com/edwardkim/rhwp) 문서 엔진의 아래한글 편집 기능과 [egui](https://github.com/emilk/egui) 화면을 결합해 만든 Rust 네이티브 HWP/HWPX 편집기입니다. 두 프로젝트는 모두 MIT 라이선스입니다.
 
-현재 버전은 **0.14**이며, 버전은 `0.10 → 0.11 → 0.12 …`처럼 `x.xx` 형식으로 증가합니다. 0.14는 아래한글의 편집 동작을 실제 프로그램으로 확인해 같은 결과를 내도록 맞춘 판입니다: 한글식 캐럿·선택·삭제·특수 문자 명령, 한글 자동화 동작 이름을 그대로 받는 MCP `hwp_action`(580여 개)과 원자적 `batch`, 서식 증감·글자 겹치기·스타일 가져오기/내보내기, 표 안 이동·표 마당 옵션·개체 맞춤/회전/그림자·글상자 정렬·각주↔미주·자동 번호, 쪽 여백 사전 값·문서 보기 색·쪽 복사/붙이기·끼워 넣기·맞쪽 보기, 한자 변환·찾기 확장(조건식·아무개 문자)·문서 비교·상용구. 자세한 내용: [docs/RELEASE-0.14.md](docs/RELEASE-0.14.md), 이전 판: [docs/RELEASE-0.13.md](docs/RELEASE-0.13.md).
+현재 버전은 **0.17**이며, 버전은 `0.10 → 0.11 → 0.12 …`처럼 `x.xx` 형식으로 증가합니다. 0.15·0.16은 본문 메모 생성·편집·삭제, 중첩 표의 주소 기반 편집과 생성·삭제, 본문 자동 쪽 번호의 공통 화면·PDF 표시, 공개 자동화 인자 일부를 HwpCraft 자체 계층에 추가했습니다. 아래한글 전체 기능과 동등하다고 판정한 버전은 아닙니다. 0.17은 입력 서식, 머리말·꼬리말·글상자·주석의 문서 영역 편집, MCP 2026-07-28 규격(문서별 작업자, HTTP 토큰 인증), 열기 속도·편집 지연·PDF 저장 속도·화면 정리, Windows·macOS·Linux 배포를 다룹니다. 자세한 내용: [0.17 릴리스](docs/RELEASE-0.17.md), [0.16 릴리스](docs/RELEASE-0.16.md), [0.15 릴리스](docs/RELEASE-0.15.md), [기능 확장 순서](docs/FEATURE-ROADMAP.md).
 
 HwpCraft는 독립적인 오픈소스 프로젝트이며 한글과컴퓨터와 관련이 없습니다. 한컴의 코드·아이콘·로고·글꼴은 포함하지 않습니다. **아래한글의 모든 기능·화면과 100 % 같은 제품은 아닙니다.** 구현하지 않은 기능과 차이는 [현재 범위와 한계](#현재-범위와-한계)에 숨기지 않고 적었습니다.
 
@@ -40,7 +40,7 @@ HwpCraft는 두 오픈소스 프로젝트를 결합해 구현했습니다. 어�
 - 한글식 배치: 메뉴 탭 줄(파일 | 편집 보기 입력 서식 쪽 보안 검토 도구), 상황 탭(표 디자인·표 레이아웃·그림·도형), 좁은 창에서 오른쪽부터 접히는 리본, 서식 도구줄, 눈금자, 문서 탭, 배율 10–500 % 상태 표시줄.
 - 저장은 임시 파일에 다 쓴 뒤 교체하므로 저장 실패가 기존 파일을 망가뜨리지 않습니다. 실패한 편집 명령은 문서와 실행 취소 기록을 그대로 둡니다.
 - 완전히 오프라인으로 동작합니다. 로그인·서버·데이터베이스·Docker가 필요 없고 문서는 외부로 전송되지 않습니다.
-- 같은 편집 엔진을 데스크톱 앱, CLI, 로컬 stdio **MCP** 서버 세 가지로 제공합니다.
+- 같은 편집 엔진을 데스크톱 앱, CLI, stdio·loopback HTTP **MCP** 서버로 제공합니다.
 
 ### 편집
 
@@ -71,7 +71,7 @@ HwpCraft는 두 오픈소스 프로젝트를 결합해 구현했습니다. 어�
 - 표 그리기/지우개: 외곽·줄·칸·대각선, 선 모양·색·굵기 적용, 공유 경계 지우기로 셀 합치기. 각 동작은 한 번에 실행 취소합니다.
 - 그림: PNG·JPG·BMP·GIF, 크기·위치·배치·회전·대칭·자르기·효과·밝기·대비·투명도·캡션.
 - 도형·글상자: 직선·사각형·타원·호·다각형·자유 곡선·글상자를 끌어 그리기, 8개 핸들·회전 손잡이, 선·채우기·그림자 속성, 여러 문단 글상자.
-- 수식 편집기(구조·기호 도구와 미리 보기), 여러 문단 각주·미주, 기존 차트 값 편집, 메모 목록.
+- 수식 편집기(구조·기호 도구와 미리 보기), 여러 문단 각주·미주, 기존 차트 값 편집, 메모 목록. 공통 엔진·CLI·MCP의 `chart.create`/`chart.configure`는 본문의 막대·가로 막대·선·원형·도넛 차트 생성과 자체 차트 구성을 지원합니다. HWP/HWPX 자체 왕복·SVG/PDF 검증과 한컴 네이티브 호환성은 별개이며, 후자는 아직 검증 중입니다.
 - 표·개체(0.14): 표 안 셀 이동(Tab/Shift+Tab, 마지막 셀에서 줄 추가, `table.cell_move`), 표 마당 옵션(제목 줄·첫/마지막 칸·마지막 줄·회색조·테두리·배경), 셀 음영 진하게/연하게, 사용자 목록 자동 채우기, 개체 맞춤 11종·크기·회전·크기 고정·바깥 여백 사전 값·채우기/선/화살표 빠른 설정·그림자 이동·개체 모양 복사/붙이기·Tab 개체 순환·개체 선택 단추·연결선 종류 바꾸기, 글상자 9방향 정렬·여백·세로 글상자, 그림 파일로 저장·색조(회색조·흑백), 자동 번호(쪽·전체·그림·표·수식), 각주↔미주 변환과 각주/미주 모양(구분선·번호 모양), 주석·누름틀 지우기.
 - 개체 조작(0.13): 묶기/풀기(Shift+클릭 다중 선택), 맨 앞/맨 뒤/앞/뒤 순서, 개체 보호(보호된 개체는 끌기·삭제·편집 거부)와 보호 모두 해제, 가로/세로 대칭, 연결선 6종(도형→도형 끌기, 도형 이동 시 재계산), 직선 끝점 손잡이, 누름틀 넣기와 이름·값 편집, 기존 양식 개체 값 편집.
 
@@ -79,7 +79,7 @@ HwpCraft는 두 오픈소스 프로젝트를 결합해 구현했습니다. 어�
 
 - 문서 위 Ctrl+휠 확대/축소(10–500 %), 배율 표시 위에서는 휠만으로 확대/축소.
 - 편집 용지(F7), 쪽 번호 매기기(위치 11종·모양 10종), 머리말/꼬리말(마당 11종 × 양쪽/홀수/짝수), 쪽 테두리/배경, 새 번호로 시작, 현재 쪽만 감추기, 다단.
-- 문서 정보, 인쇄(범위·매수, PDF를 거쳐 Windows 인쇄 동사·macOS `open`·Linux `xdg-open` 또는 PDF 저장), 보기 배율·쪽 맞춤·폭 맞춤, 눈금자·문서 탭 보이기.
+- 문서 정보, 인쇄(범위·매수, PDF를 거쳐 Windows 인쇄 동사, macOS·Linux는 CUPS `lp`, 실패하면 기본 PDF 보기 프로그램으로 열기, 또는 PDF 저장), 보기 배율·쪽 맞춤·폭 맞춤, 눈금자·문서 탭 보이기.
 - 한글처럼 여러 쪽을 세로로 이어 보는 연속 보기(쪽 사이 14 px). 보이는 쪽만 그리고 커서를 따라 스크롤합니다.
 - 0.14: 쪽 여백 사전 값 6종(한글 실측 수치), 문서 보기 색(기본·어둡게·고대비·옛 한글·사용자 설정)과 그림 자리 표시, 맞쪽 보기, 쪽 복사/붙이기/지우기, 끼워 넣기(`file.insert`), 블록 저장, 그림 파일로 저장(쪽 PNG), 머리말/꼬리말 편집 창 이전·다음, 문서 정보(일반·글꼴 대체·그림), 구역 이전/다음. 서식(0.14): 글자 크기·장평·줄 간격·여백 증감, 글꼴 순환, 글자 색/음영/형광펜 사전 색, 글자 테두리, 현재 위치로 들여쓰기, 문단 위/아래 이동, 위/아래 첨자 순환, 글자 스타일 해제, 현재 모양으로 스타일 갱신, 스타일 순서·JSON 가져오기/내보내기, 글자 겹치기. 검토·도구(0.14): 한자 변환(F9, Unihan 독음표), 찾기 확장(띄어쓰기 무시·아무개 문자·조건식·여러 단어·한글로 한자·서식 조건), 문서 비교(RHWP docdiff), 상용구(Ctrl+F3·Alt+I). 편집(0.14): 이동 창(Alt+G).
 - 0.13: 보기 탭 문단 부호·조판 부호·투명 선, 보안 탭 문서 암호와 *개인 정보 찾아서 보호*(주민등록번호·카드·전화·전자우편·숨은 글자, 선택 값 가리기 1단계 실행 취소), 머리말/꼬리말 쪽 번호·전체 쪽수·파일 이름 필드, 파일 메뉴 미리 보기·최근 문서·HML로 저장(HML 원본만)·쪽 범위 저장, 구역 설정, 탭·리본 Alt 키팁.
@@ -100,15 +100,15 @@ hwpcraft-cli mcp --help                     # 로컬 stdio MCP 서버
 
 `edit`의 명령 파일은 `[{"command":"text.insert","params":{"text":"안녕하세요"}},{"command":"page.setup","params":{"landscape":true}}]` 형태의 JSON 배열이며 최대 1 MB / 1,000개 명령입니다. 전체 명령이 성공한 뒤에만 출력 파일을 저장합니다. 텍스트 위치(offset)는 유니코드 스칼라 값 단위입니다.
 
-`hwpcraft-cli mcp`는 헤드리스 stdio MCP 서버입니다. 한글 문서 생성, 텍스트/서식/표/개체 편집, HWP/HWPX 저장, PDF/TXT 출력, PNG 확인, 읽기/쓰기 폴더 제한을 지원합니다. 0.14: `hwp_action` 도구가 한글 자동화 동작 이름(`MoveLineEnd`, `CharShapeBold`, `DeleteWord` 등 300여 개)을 그대로 받아 대응 명령을 실행하고, `batch {atomic:true}`는 하나라도 실패하면 문서 변경을 모두 되돌리며, `get_selection`이 선택 영역을 돌려줍니다. 명령 인자 도움말은 엔진 모듈의 `PARAMS` 표에서 나옵니다. 실행 중인 데스크톱 창이나 한컴 프로그램은 제어하지 않습니다. [MCP 연결과 사용법](docs/mcp.md), [명령 인자](docs/mcp-commands.md)를 참조하세요.
+`hwpcraft-cli mcp`는 MCP `2026-07-28` 전용 헤드리스 서버입니다. 기본 stdio 외에 `--transport http --listen 127.0.0.1:7082`를 지원합니다. HTTP는 loopback 주소에서만 열리고 모든 요청에 `Authorization: Bearer <토큰>`이 필요합니다. 토큰은 설정 폴더의 `mcp-http-token`(또는 `--auth-token-file`로 지정한 파일)에 있으며, 없으면 서버가 본인만 읽을 수 있게 새로 만듭니다. 요청에는 요청마다 프로토콜 `_meta`와 문서 작업의 명시적 `document_id`를 전달합니다. 한 프로세스에서 여러 문서를 격리하고 문서 생성·텍스트/서식/표/개체 편집·HWP/HWPX 저장·PDF/TXT 출력·PNG 확인·읽기/쓰기 폴더 제한을 제공합니다. `hwp_action`은 등록된 한글 동작 별칭과 일부 공개 ParameterSet을 공통 엔진으로 연결합니다. 별칭 등록이 모든 원래 옵션의 동등성을 뜻하지는 않습니다. `batch {atomic:true}`는 문서 편집을 되돌리고 파일·설정 쓰기를 사전에 거절합니다. 명령 인자는 `list_commands`에서 조회합니다. 실행 중인 데스크톱 창이나 한컴 프로그램은 제어하지 않습니다. [MCP 연결과 사용법](docs/mcp.md), [명령 인자](docs/mcp-commands.md)를 참조하세요.
 
 ## 빌드
 
-Rust 1.98.1(`rust-toolchain.toml`에 고정). Windows x64는 MSVC와 Visual Studio C++ 빌드 도구, macOS는 Xcode 명령줄 도구, Linux는 C 컴파일러와 X11/Wayland·OpenGL·GTK3(파일 대화상자) 개발 패키지가 필요합니다. `HwpCraft.ps1`(Windows)과 `hwpcraft.sh`(macOS·Linux: `build`, `test`, `install`, `start`, `status`)가 같은 Cargo 명령을 감쌉니다.
+Rust 1.98.1(`rust-toolchain.toml`에 고정). Windows x64는 MSVC와 Visual Studio C++ 빌드 도구, macOS는 Xcode 명령줄 도구, Linux는 C 컴파일러와 X11/Wayland·OpenGL 개발 패키지가 필요합니다. 파일 대화상자는 xdg-desktop-portal(GNOME·KDE 기본 제공)을 쓰므로 GTK 개발 패키지는 필요 없습니다. `HwpCraft.ps1`(Windows)과 `hwpcraft.sh`(macOS·Linux: `build`, `test`, `install`, `start`, `status`)가 같은 Cargo 명령을 감쌉니다.
 
 Windows 설치 파일: `scripts/build-installer.ps1`이 `HwpCraft.ps1 Install`과 같은 파일을 모아 Inno Setup 6으로 `packaging/windows/HwpCraft.iss`를 컴파일해 `output/installer/HwpCraft-<버전>-windows-x64-setup.exe`를 만듭니다(바탕 화면 바로 가기·`.hwp`/`.hwpx` 연결은 선택).
 
-플랫폼 현황(0.13): 글꼴은 OS별 한글 글꼴 후보(Windows 맑은 고딕, macOS Apple SD Gothic Neo, Linux Noto Sans CJK KR·나눔고딕 등) 중 설치된 첫 글꼴을 쓰고, 인쇄와 설정 폴더도 OS별로 나눕니다. Windows x64는 전체 검증, Linux x86_64는 `cargo check --workspace --all-targets`만 통과했습니다. macOS는 이 Windows 호스트에 Apple 교차 C 컴파일러가 없어 RHWP 의존성(`blake3`) 빌드 스크립트에서 검사가 멈췄으므로 실제 Mac에서 빌드해 확인해야 합니다. Launcher 등록·portable ZIP 패키징은 Windows 스크립트에만 있습니다.
+플랫폼 현황(0.17): Windows x64는 전체 검증했습니다. Linux x86_64는 WSL Ubuntu 24.04에서 workspace 테스트와 clippy를 실제로 실행했고, macOS arm64는 교차 `cargo check`·clippy만 통과했습니다(실제 Mac에서는 아직 확인하지 않음). 글꼴은 OS별 한글 글꼴 후보(Windows 맑은 고딕, macOS Apple SD Gothic Neo, Linux Noto Sans CJK KR·나눔고딕 등) 중 설치된 첫 글꼴을 씁니다. Linux에는 한글 글꼴(`fonts-noto-cjk` 또는 `fonts-nanum`)이 필요하며, 없으면 영문·숫자만 보이고 한글은 다른 설치 글꼴에 한글이 있을 때만 표시됩니다. 설정 폴더는 Windows `%APPDATA%\HwpCraft`, macOS `~/Library/Application Support/HwpCraft`(기존 `~/.config/HwpCraft`가 있으면 그대로 사용), Linux `$XDG_CONFIG_HOME/HwpCraft` 또는 `~/.config/HwpCraft`입니다. macOS 단축키는 Ctrl 대신 Cmd(⌘)이지만 메뉴·툴팁 표기는 아직 "Ctrl+…"입니다. macOS 앱은 서명·공증하지 않았으므로 처음 실행할 때 우클릭 → 열기 또는 `xattr -d com.apple.quarantine HwpCraft.app`이 필요하고, Finder에서 문서를 더블클릭해 여는 것은 지원하지 않습니다(앱 안에서 열기). Linux 배포 묶음은 압축을 풀고 `./install.sh`로 `~/.local`에 설치합니다. Launcher 등록·portable ZIP 패키징은 Windows 스크립트에만 있습니다.
 
 HwpCraft는 RHWP를 **형제 폴더 경로 의존성**(`../rhwp`, RHWP **v0.8.7**, 커밋 `1a76570e`)으로 사용합니다. 두 저장소를 같은 상위 폴더에 받으세요.
 
@@ -121,7 +121,7 @@ cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
-엔진 테스트 하나가 `../rhwp/samples`의 차트 예제를 열므로 RHWP 체크아웃에 `samples` 폴더가 있어야 합니다. Windows에서는 `HwpCraft.ps1`(`Build`, `Test`, `Install`, `Start`, `Status`)이 같은 명령을 감싸며 `../.build/hwpcraft`를 Cargo 빌드 폴더로 씁니다. `Launcher`·`Install` 동작은 이 저장소에 포함되지 않은 로컬 런처를 대상으로 합니다.
+엔진 테스트 하나가 `../rhwp/samples`의 차트 예제를 열므로 RHWP 체크아웃에 `samples` 폴더가 있어야 합니다. HwpCraft가 RHWP에 적용하는 로컬 패치는 `patches/rhwp/`에 있습니다. 빌드 전에 `pwsh -File scripts/rhwp-patches.ps1 -Mode Apply`로 적용하세요(`scripts/sync-siblings.ps1`은 RHWP를 최신화한 뒤 자동으로 다시 적용합니다). Windows에서는 `HwpCraft.ps1`(`Build`, `Test`, `Install`, `Start`, `Status`)이 같은 명령을 감싸며 `../.build/hwpcraft`를 Cargo 빌드 폴더로 씁니다. `Launcher`·`Install` 동작은 이 저장소에 포함되지 않은 로컬 런처를 대상으로 합니다.
 
 데스크톱 앱 실행:
 
@@ -142,7 +142,7 @@ hwpcraft ./samples/HwpCraft-시작하기.hwpx --view replace --screenshot out.pn
 | `crates/formats` | HWP/HWPX 읽기·저장, PDF/TXT 내보내기, 안전한 파일 교체 |
 | `crates/render` | RHWP SVG → resvg 쪽 이미지, 얇은 선 처리, 설치 글꼴 목록 |
 | `crates/engine` | Session·명령 프로토콜, 선택·클립보드·커서, 찾기, 정렬·조판 부호, 탭 폭 저장, 서식, 표·개체, 쪽 서비스 |
-| `crates/mcp` | stdio JSON-RPC MCP 서버, 헤드리스 편집·도구·리소스·명령 안내 |
+| `crates/mcp` | stdio·loopback HTTP MCP 서버, 문서 격리·헤드리스 편집·도구·리소스·프롬프트·명령 안내 |
 | `crates/ui-egui` | 메인 창·연속 쪽 보기·키보드/IME, 리본·도구줄·눈금자·상태 표시줄, 영역별 대화상자 |
 | `apps/hwpcraft` | eframe/glow 데스크톱 실행 파일 |
 | `apps/hwpcraft-cli` | 문서 분석·변환·PNG 렌더·명령 일괄 편집 CLI, MCP 진입점 |
@@ -155,26 +155,30 @@ hwpcraft ./samples/HwpCraft-시작하기.hwpx --view replace --screenshot out.pn
 
 ### 구현하지 않음(리본·메뉴에서 비활성)
 
-- MCP: 실행 중인 데스크톱 창 연결, 클릭/키 입력/창 캡처, HTTP/SSE, 변경 내용 추적. 각 MCP 프로세스는 독립적인 헤드리스 세션입니다.
-- 보안 탭: 배포용 문서, 선택 글자 보호, 보안 설정, 보안 종류 선택(RHWP는 한 가지). 검토·도구 탭 전체: 교정 부호, 문서 이력·비교, 변경 내용 추적, 맞춤법, 빠른 교정, 사전, 번역, 한자 변환(사전 데이터 없음), 매크로, 색인·차례·인용, 환경 설정.
-- 보기: 쪽 윤곽, 격자, 안내선, 문서 보기 색, 편집 화면 나누기, 다중 문서 창(RHWP 렌더 모드 없음). 파일: 문서마당, HML 원본이 아닌 문서의 HML 저장.
+- MCP: 실행 중인 데스크톱 창 연결, 클릭/키 입력/창 캡처, 원격 인증, 전체 선택 확장과 규격 적합성 검증은 미완료입니다. HTTP는 loopback만 허용하며 문서별 명시 ID를 사용합니다. 연결 취소가 이미 실행된 동기 편집이나 파일 쓰기의 rollback을 보장하지 않습니다.
+- 보안 탭: 배포용 문서, 선택 글자 보호, 보안 설정, 보안 종류 선택(RHWP는 한 가지). 검토·도구: 교정 부호, 문서 이력, 변경 내용 추적, 메모 답글·해결 상태·표 셀/여러 문단 범위의 메모, 맞춤법, 빠른 교정, 사용자 사전, 번역, 매크로, 색인·차례·인용, 환경 설정. 문서 비교·한자 변환·상용구는 아래에 적은 제한 범위에서 지원합니다.
+- 보기: 쪽 윤곽, 격자, 안내선, 편집 화면 나누기, 다중 문서 창. 문서 보기 색은 화면 후처리로 지원합니다. 파일: 문서마당, HML 원본이 아닌 문서의 HML 저장.
 - 쪽: 글자 방향, 줄 번호, 구역 시작 위치, 라벨, 원고지, 머리말/꼬리말 날짜 필드, 쪽 번호 홀/짝 분리. 인쇄 세부(프린터 목록, 모아 찍기, 워터마크).
-- 서식: 스타일마당·가져오기/내보내기, 사용자 정의 번호/글머리표 모양, 그림 글머리표, 문단 첫 글자 장식, 각주 안 글자 모양(문단 모양만 가능).
-- 표·개체: 한 셀만 경계선 옮기기, 중첩 표 편집, 세로 글상자, 맞춤, 개체 선택 단추(개체는 쪽에서 직접 클릭), 그림 반사·네온·사진 편집, 수식 시각 편집·매크로, 새 메모, 양식 개체 새로 만들기(기존 개체 값 편집만), 새 차트·글맵시·OLE. 연결선 부착 좌표는 종이 기준 개체에 정확하고 문단 기준 개체는 어긋날 수 있으며, 직선 끝점 편집은 글자처럼 취급한 직선·연결선을 제외합니다.
+- 서식: 사용자 정의 번호/글머리표 모양, 그림 글머리표, 문단 첫 글자 장식, 각주 안 글자 모양(문단 모양만 가능). 스타일 가져오기/내보내기는 HwpCraft JSON 형식을 지원합니다.
+- 표·개체: 한 셀만 경계선 옮기기, 중첩 표의 캔버스 직접 선택·끌기, 그림 반사·네온·사진 편집, 수식 시각 편집·매크로, 양식 개체 새로 만들기(기존 개체 값 편집만), 글맵시·일반 OLE 생성은 미지원입니다. 새 차트는 위의 5종·본문 명령 범위이며 다른 종류·중첩/그룹 도넛 표시·한컴 네이티브 호환성은 미완료입니다. 세로 글상자·개체 맞춤·개체 선택 단추는 기본 경로를 지원합니다. 연결선 부착 좌표는 종이 기준 개체에 정확하고 문단 기준 개체는 어긋날 수 있으며, 직선 끝점 편집은 글자처럼 취급한 직선·연결선을 제외합니다.
 - 탭 ∨ 목록은 한글 하위 메뉴가 아닌 리본 명령 목록입니다. 상태 표시줄 '단'은 항상 1입니다.
 - 표 직접 이동은 한 쪽 안의 최상위 표가 대상이며, 글자처럼 취급한 표는 이동 시 떠 있는 표로 전환됩니다. 여러 쪽에 걸친 표는 속성으로 조절하세요. 표 그리기는 셀 간격 0인 표만 지원합니다.
 
-### RHWP 조판·저장 한계(HwpCraft에서 우회하지 않음)
+- 본문 메모는 범위/커서 앵커·작성자·여러 줄 메모 본문·undo/redo·HWP/HWPX 저장을 지원합니다. 중첩 표와 머리말·꼬리말·글상자·주석은 편집 탭의 **문서 영역 편집** 메뉴에서 문자/문단 서식·나누기/합치기·표 생성/삭제를 수행합니다. 공개 인자 `CharShape`·`ParagraphShape`·`TableCreate`는 `hwp.parameters.schema`로 지원 필드를 조회할 수 있습니다.
+
+### 남아 있는 조판·저장 한계
 
 - 문단 테두리 위·아래 간격이 줄 배치에 반영되지 않아 화면과 한글에서 연 저장본 모두 문단이 겹칠 수 있습니다. 좌우 간격과 일부 선 종류(이중선 등)는 단선으로 그려집니다.
 - 각주 구분선 길이 −1(단 너비)은 짧게, 바깥 여백이 있는 개체는 여백만큼 다른 자리에 그립니다(저장본은 한글에서 정상).
-- 형광펜은 markpen으로 저장되지만 RHWP 렌더러가 그리지 않아 HwpCraft가 화면에만 덧그립니다(인쇄·PDF에는 없음). 새 번호 목록은 새 번호 정의로 저장합니다(RHWP `set_numbering_restart`는 저장되지 않음). 곡선은 촘촘한 직선 구간으로 저장합니다.
-- 본문에 넣은 쪽 번호·전체 쪽수 자동 번호(`insert.auto_text`)는 저장되고 한글에서 번호로 표시되지만, RHWP 렌더러가 본문 자동 번호를 그리지 않아 HwpCraft 화면과 PDF에서는 빈칸입니다. 한글의 날짜 코드 필드는 RHWP에 없어 현재 날짜 글로 넣습니다.
-- 표: 셀 음영 진하게/연하게는 한글처럼 ±1단계에서 멈추지 않고 누를 때마다 적용됩니다. 표 마당의 글자 모양 적용·사용자 표 마당은 없습니다. 개체: 그림 그림자·네온·옅은 테두리·반사(RHWP는 보존만), 자유선·그리기 마당·안내선·격자·서식 저장은 없습니다. 바깥 여백·글상자 여백 사전 값과 그림자 이동 단위는 한글 수치를 확인하지 못한 가정값입니다. 각주 번호 '쪽마다 새로'는 모양 값만 저장하고 번호는 구역 단위로 매깁니다.
+- 형광펜은 markpen으로 저장하고 HwpCraft가 공통 SVG 경로에 합성해 화면·PNG·PDF/인쇄에 표시합니다. 좌표 지원 범위는 본문과 1단계 표 셀이며, 중첩 표·머리말·글상자·주석 내부는 지원하지 않습니다. 새 번호 목록은 새 번호 정의로 저장합니다(RHWP `set_numbering_restart`는 저장되지 않음). 곡선은 촘촘한 직선 구간으로 저장합니다.
+- 새로 만들거나 편집한 중첩 표는 조상 셀의 필요한 높이를 보정합니다. 가져온 문서의 짧은 셀 프레임은 화면 표시용으로만 보정하며(원본·저장본은 그대로), 열기가 멈추지 않도록 문서마다 정해진 작업량 안에서만 보정합니다. 한도를 넘는 문서와 128쪽을 넘는 문서는 일부 또는 전체 표를 원본 배치 그대로 표시하므로 깊은 중첩 표가 잘려 보일 수 있습니다.
+- 행·열 수가 실제 셀보다 작게 기록된 손상 표는 열 때 실제 셀 범위로 보정합니다.
+- 본문 쪽 번호·전체 쪽수는 글자 모양과 여러 자리 폭을 반영해 화면·PNG·PDF에 동적으로 표시합니다. 표/글상자/주석 안의 동적 번호와 복잡한 조판은 아직 별도 검증·구현 대상입니다. 번호로 쪽 경계가 달라지면 HWP/HWPX/TXT 쪽 추출은 거절하며 PDF 쪽 저장은 지원합니다. 쪽 번호 필드가 있는 문서는 본문 글자 입력·삭제만 해당 문단을 다시 배치하고(381쪽 문서 약 40 ms), 문단 나누기 등 다른 편집은 표시용 문서 전체를 다시 조판합니다(약 0.3초). 날짜 코드는 현재 날짜 글로 넣습니다.
+- 표: 셀 음영 진하게/연하게는 한글처럼 ±1단계에서 멈추지 않고 누를 때마다 적용됩니다. 표 마당의 글자 모양 적용·사용자 표 마당은 없고, 표 만들기 창에서는 표 마당을 고를 수 없습니다(표를 만든 뒤 표 디자인 탭에서 적용). 개체: 그림 그림자·네온·옅은 테두리·반사(RHWP는 보존만), 자유선·그리기 마당·안내선·격자·서식 저장은 없습니다. 바깥 여백·글상자 여백 사전 값과 그림자 이동 단위는 한글 수치를 확인하지 못한 가정값입니다. 각주 번호 '쪽마다 새로'는 모양 값만 저장하고 번호는 구역 단위로 매깁니다.
 - 쪽 복사/지우기는 문단 단위입니다(앞 쪽에서 이어진 문단은 제외, 한 문단이 쪽 전체면 지우기 거부). 끼워 넣기는 파일 메뉴에서만(Ctrl+O는 불러오기). PDF 인쇄 옵션(형광펜·그리기 개체·그림·메모 포함)·쪽 윤곽 끄기·격자·줄 번호·바탕쪽 편집·문서 이력은 RHWP에 옵션·모델이 없어 제공하지 않습니다. 맞쪽 보기는 쪽 배치만 바꾸며 쪽 번호 안/바깥 구분은 없습니다.
-- 상용구는 글 상용구만 지원하며 서식·표·개체가 든 본문 상용구는 저장하지 않습니다(그룹·가져오기/내보내기 없음).
-- 한자 변환은 Unicode Unihan 독음표로 음절마다 후보를 고르는 방식이며 낱말 사전이 없어 아래한글처럼 낱말 단위 후보·빈도순 정렬은 하지 않습니다. 변경 내용 추적·메모 새로 넣기·맞춤법 검사는 RHWP에 모델·사전이 없어 제공하지 않습니다. 문서 비교는 추가·삭제·변경 문단 목록으로 보여 주며 나란히 보기는 없습니다. 음영 없음은 RHWP가 흰색(#ffffff)으로 보고합니다.
-- 바탕쪽, 문서 요약 정보, 쪽 테두리의 홀수/짝수·첫 쪽만·그림 채우기, 새 메모(MemoShape 미지원), 양식 개체 생성, 차트·글맵시·OLE 생성은 RHWP API가 없어 지원하지 않습니다. 스타일 추가·고치기·지우기는 RHWP wasm 래퍼에만 있어 HwpCraft가 모델을 직접 고칩니다. 줄 단위 커서 이동·선택 영역 좌표 조회는 RHWP 비공개라 캐럿 좌표로 계산합니다.
+- 글 상용구 외에 서식·표·내장 그림·기본 도형을 포함한 본문 상용구를 별도 저장소로 지원합니다. 본문 문단 경계 삽입 프로필에 한하며 임의 문단 중간/셀 삽입, 그룹·차트/OLE 조각과 범용 외부 교환은 미지원입니다.
+- 한자 변환은 Unicode Unihan 독음표로 음절마다 후보를 고르는 방식이며 낱말 사전이 없어 아래한글처럼 낱말 단위 후보·빈도순 정렬은 하지 않습니다. 변경 내용 추적·맞춤법 검사는 미지원이며, 새 메모는 본문 범위 CRUD·작성자·이력까지만 지원합니다(답글·해결·셀/다문단 앵커 미지원). 문서 비교는 추가·삭제·변경 문단 목록으로 보여 주며 나란히 보기는 없습니다. 음영 없음은 RHWP가 흰색(#ffffff)으로 보고합니다.
+- 바탕쪽, 문서 요약 정보, 쪽 테두리의 홀수/짝수·첫 쪽만·그림 채우기, 양식 개체 생성, 글맵시·일반 OLE 생성은 미지원입니다. 차트는 위의 자체 5종 생성·구성 명령 범위와 한계를 따릅니다. 스타일 추가·고치기·지우기는 RHWP wasm 래퍼에만 있어 HwpCraft가 모델을 직접 고칩니다. 줄 단위 커서 이동·선택 영역 좌표 조회는 RHWP 비공개라 캐럿 좌표로 계산합니다.
 - 탭 폭 자동 기록은 본문과 1단계 표 셀만 대상입니다. 머리말·글상자·주석 안의 탭은 폭 0으로 저장됩니다.
 - 여러 문단 선택은 한 구역 본문 또는 한 셀 안에서만 되며, 전체 선택은 현재 구역입니다.
 
@@ -182,7 +186,7 @@ hwpcraft ./samples/HwpCraft-시작하기.hwpx --view replace --screenshot out.pn
 
 - 표 선택·이동·크기 조절에는 포인터 이벤트 회귀 검사가 있습니다. 앱 전체 기능의 클릭·끌기 E2E 검증을 완료한 것은 아닙니다.
 - 복잡한 실제 문서의 편집 후 왕복 저장, 대용량 문서·표 성능, 장시간 IME 입력은 충분히 검사하지 않았습니다. 중요한 문서는 원본을 유지하고 다른 이름으로 저장한 뒤 한글에서도 확인하세요.
-- 문서 입력 크기는 128 MB, 한 번의 텍스트 삽입은 1 MB로 제한합니다. 파싱·렌더링이 동기식이라 복잡한 문서에서 UI가 잠시 멈출 수 있습니다.
+- 문서 입력 크기는 128 MB, 한 번의 텍스트 삽입은 1 MB로 제한합니다. 파싱·렌더링이 동기식이라 복잡한 문서에서 UI가 잠시 멈출 수 있습니다. 큰 문서의 PDF 저장은 오래 걸립니다(381쪽 문서 약 84초, 대부분 RHWP의 글꼴 서브셋 처리).
 
 릴리스 노트는 `docs/`에 있습니다.
 
@@ -230,7 +234,7 @@ HwpCraft는 **MIT 라이선스**로 배포합니다. 전문은 [LICENSE](LICENSE
 
 A native Rust desktop editor for Korean HWP / HWPX word-processor documents. It takes its application structure from the ArtCraft team's [WordCraft](https://github.com/storytold/wordcraft), its Hangul editing capabilities from the [RHWP](https://github.com/edwardkim/rhwp) document engine, and its user interface from [egui](https://github.com/emilk/egui). Both WordCraft and RHWP are MIT-licensed.
 
-Current version: **0.14**. Versions increase as `0.10 → 0.11 → 0.12 …`. 0.14 matches Hangul's editing behaviour as observed in the real program: Hangul-style caret / selection / deletion / special-character commands, the MCP `hwp_action` tool that accepts Hangul automation action names (about 580) plus atomic `batch`, formatting steps, character overlap and style import / export, in-table navigation, table-style options, object align / rotate / shadow, text-box alignment, footnote ↔ endnote conversion and auto numbers, margin presets, document view colours, page copy / paste, insert file and facing pages, Hanja conversion, extended find (regex, wildcards), document compare and AutoText. Details: [docs/RELEASE-0.14.md](docs/RELEASE-0.14.md) (Korean); previous: [docs/RELEASE-0.13.md](docs/RELEASE-0.13.md).
+Current version: **0.17**. Versions increase as `0.10 → 0.11 → 0.12 …`. 0.15 and 0.16 added body memo creation/editing/deletion, address-based nested table editing and creation/deletion, dynamic body page fields in shared screen/PDF output, and a subset of public automation parameters. Full Hangul feature parity has not been established. 0.17 covers pending input formatting, document-region editing of headers, footers, text boxes and notes, the MCP 2026-07-28 service (per-document workers, HTTP token authentication), opening speed, edit latency, PDF export speed and UI cleanup, and Windows / macOS / Linux packages. Details: [0.17 release](docs/RELEASE-0.17.md), [0.16 release](docs/RELEASE-0.16.md), [0.15 release](docs/RELEASE-0.15.md), [feature roadmap](docs/FEATURE-ROADMAP.md).
 
 HwpCraft is an independent open-source project. It is not affiliated with, endorsed by, or derived from Hancom Inc. It ships no Hancom code, icons, logos or fonts. **It is not a 100 % replacement for Hancom Office Hangul.** Unimplemented features and known differences are listed under [Scope and limits](#scope-and-limits) rather than hidden.
 
@@ -305,7 +309,7 @@ No Hancom code or resources are used in any layer. Hancom Office Hangul is the r
 
 - Ctrl+wheel zoom (10–500 %) over the document, wheel-only zoom over the status-bar zoom indicator.
 - Page setup (F7), page numbering (11 positions, 10 formats), headers / footers (11 templates × both / odd / even), page borders and backgrounds, restart numbering, hide current page, columns.
-- Document information, print (range, copies; via PDF to the Windows print verb, macOS `open` or Linux `xdg-open`, or a PDF file), zoom presets, fit page / fit width, show or hide rulers and document tabs.
+- Document information, print (range, copies; via PDF to the Windows print verb or CUPS `lp` on macOS / Linux, falling back to the default PDF viewer, or a PDF file), zoom presets, fit page / fit width, show or hide rulers and document tabs.
 - Continuous multi-page view like Hangul (14 px page gap), drawing only visible pages and scrolling with the caret.
 - 0.14: six page-margin presets (values measured in Hangul), document view colours (default, dark, high contrast, classic, custom) and picture placeholders, facing pages, page copy / paste / delete, insert file (`file.insert`), save block, save pages as PNG, previous / next in the header-footer editor, document info (general, font substitution, pictures), previous / next section. Formatting (0.14): font size / width / line spacing / margin steps, font cycling, preset text / shade / highlight colours, character borders, indent at caret, move paragraph up / down, super- / subscript cycle, clear character style, update style from caret, style ordering and JSON import / export, character overlap. Review and tools (0.14): Hanja conversion (F9, Unihan readings), extended find (ignore spaces, wildcards, regex, any word, Hanja by Hangul reading, format conditions), document compare (RHWP docdiff), AutoText (Ctrl+F3, Alt+I). Editing (0.14): Go To dialog (Alt+G).
 - 0.13: View tab paragraph marks / control codes / transparent lines; Security tab document password and *find and protect personal information* (resident numbers, cards, phones, e-mail, hidden text; mask selected values in one undo step); header / footer page-number, total-pages and file-name fields; File menu preview, recent documents, save as HML (HML-sourced documents only) and save a page range; section settings; Alt key tips for tabs and ribbon items.
@@ -326,15 +330,15 @@ hwpcraft-cli mcp --help                     # local stdio MCP server
 
 The `edit` command file is a JSON array such as `[{"command":"text.insert","params":{"text":"Hello"}},{"command":"page.setup","params":{"landscape":true}}]`, limited to 1 MB / 1,000 commands. The output file is written only when every command succeeds. Text offsets count Unicode scalar values.
 
-`hwpcraft-cli mcp` is a headless stdio MCP server: create Korean documents, edit text / formatting / tables / objects, save HWP / HWPX, export PDF / TXT, render PNG for checking, and restrict read / write roots. 0.14 adds `hwp_action`, which accepts Hangul automation action names (`MoveLineEnd`, `CharShapeBold`, `DeleteWord`, about 300 of them) and runs the matching command, `batch {atomic:true}` that rolls every document change back when any command fails, and `get_selection`. It does not control a running desktop window or Hancom software. See [docs/mcp.md](docs/mcp.md) and [docs/mcp-commands.md](docs/mcp-commands.md) (Korean).
+`hwpcraft-cli mcp` is a headless MCP server (stdio by default; `--transport http --listen 127.0.0.1:7082` serves loopback HTTP, where every request needs `Authorization: Bearer <token>` with the token read from `mcp-http-token` in the settings folder or `--auth-token-file`, created readable only by you if missing): create Korean documents, edit text / formatting / tables / objects, save HWP / HWPX, export PDF / TXT, render PNG for checking, and restrict read / write roots. 0.14 adds `hwp_action`, which accepts Hangul automation action names (`MoveLineEnd`, `CharShapeBold`, `DeleteWord`, about 300 of them) and runs the matching command, `batch {atomic:true}` that rolls every document change back when any command fails, and `get_selection`. It does not control a running desktop window or Hancom software. See [docs/mcp.md](docs/mcp.md) and [docs/mcp-commands.md](docs/mcp-commands.md) (Korean).
 
 ## Build
 
-Rust 1.98.1, pinned in `rust-toolchain.toml`. Windows x64 needs MSVC and the Visual Studio C++ build tools; macOS needs the Xcode command-line tools; Linux needs a C compiler plus X11 / Wayland, OpenGL and GTK3 (file dialogs) development packages. `HwpCraft.ps1` (Windows) and `hwpcraft.sh` (macOS / Linux: `build`, `test`, `install`, `start`, `status`) wrap the same Cargo commands.
+Rust 1.98.1, pinned in `rust-toolchain.toml`. Windows x64 needs MSVC and the Visual Studio C++ build tools; macOS needs the Xcode command-line tools; Linux needs a C compiler plus X11 / Wayland and OpenGL development packages; file dialogs use xdg-desktop-portal (shipped by GNOME and KDE), so no GTK development packages are needed. `HwpCraft.ps1` (Windows) and `hwpcraft.sh` (macOS / Linux: `build`, `test`, `install`, `start`, `status`) wrap the same Cargo commands.
 
 Windows installer: `scripts/build-installer.ps1` stages the same files as `HwpCraft.ps1 Install` and compiles `packaging/windows/HwpCraft.iss` with Inno Setup 6 into `output/installer/HwpCraft-<version>-windows-x64-setup.exe` (optional desktop shortcut and `.hwp` / `.hwpx` association).
 
-Platform status (0.13): fonts come from a per-OS candidate list (Windows 맑은 고딕, macOS Apple SD Gothic Neo, Linux Noto Sans CJK KR / NanumGothic …), printing and the settings folder are OS-specific. Windows x64 is fully tested; Linux x86_64 passed `cargo check --workspace --all-targets` only; macOS could not be checked from the Windows host (the RHWP dependency `blake3` needs an Apple C cross-compiler) and must be built on a Mac. Launcher registration and portable ZIP packaging exist in the Windows script only.
+Platform status (0.17): Windows x64 is fully tested. Linux x86_64 ran the workspace tests and clippy on WSL Ubuntu 24.04; macOS arm64 passed cross `cargo check` and clippy only (not yet run on a real Mac). Fonts come from a per-OS candidate list (Windows 맑은 고딕, macOS Apple SD Gothic Neo, Linux Noto Sans CJK KR / NanumGothic …), first installed wins. Linux needs a Korean font (`fonts-noto-cjk` or `fonts-nanum`); without one only Latin text and digits show, and Hangul appears only if another installed font covers it. The settings folder is `%APPDATA%\HwpCraft` on Windows, `~/Library/Application Support/HwpCraft` on macOS (an existing `~/.config/HwpCraft` keeps being used) and `$XDG_CONFIG_HOME/HwpCraft` or `~/.config/HwpCraft` on Linux. On macOS shortcuts use Cmd (⌘) instead of Ctrl, although menus and tooltips still read "Ctrl+…". The macOS app is not signed or notarized: on first launch right-click → Open, or run `xattr -d com.apple.quarantine HwpCraft.app`; opening documents by double-clicking in Finder is not supported (open them from the app). On Linux, unpack the bundle and run `./install.sh` to install into `~/.local`. Launcher registration and portable ZIP packaging exist in the Windows script only.
 
 HwpCraft depends on RHWP as a **sibling path dependency** (`../rhwp`, pinned to RHWP **v0.8.7**, commit `1a76570e`). Clone both repositories next to each other:
 
@@ -347,7 +351,7 @@ cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
-One engine test opens a chart sample from `../rhwp/samples`, so the RHWP checkout must include its `samples` folder. On Windows, `HwpCraft.ps1` (`Build`, `Test`, `Install`, `Start`, `Status`) wraps the same commands and uses `../.build/hwpcraft` as the Cargo target directory; the `Launcher` and `Install` actions target a local launcher that is not part of this repository.
+One engine test opens a chart sample from `../rhwp/samples`, so the RHWP checkout must include its `samples` folder. HwpCraft's local RHWP patches live in `patches/rhwp/`; apply them before building with `pwsh -File scripts/rhwp-patches.ps1 -Mode Apply` (`scripts/sync-siblings.ps1` re-applies them after updating RHWP). On Windows, `HwpCraft.ps1` (`Build`, `Test`, `Install`, `Start`, `Status`) wraps the same commands and uses `../.build/hwpcraft` as the Cargo target directory; the `Launcher` and `Install` actions target a local launcher that is not part of this repository.
 
 Run the desktop app:
 
@@ -382,25 +386,27 @@ Feature areas plug in through `extensions.rs`, so each area adds its own command
 ### Not implemented (disabled in the ribbon and menus)
 
 - MCP: connecting to a running desktop window, click / key / screen capture, HTTP / SSE transport, track changes. Each MCP process is an independent headless session.
-- Security tab: distribution documents, protecting selected text, security settings, choosing a security kind (RHWP has one). Entire Review and Tools tabs: proofreading marks, document history / compare, track changes, spell check, quick correction, dictionaries, translation, Hanja conversion (no dictionary data), macros, index / table of contents / citations, preferences.
-- View: page outline, grid, guides, view colour modes, split editing window, multiple document windows (RHWP has no such render modes). File: templates gallery; HML export of documents not opened from HML.
+- Security: distribution documents, selected-text protection and policy settings. Review/tools: proofreading marks, document history, track changes, memo replies/resolution and cell/cross-paragraph anchors, spelling, quick correction, user dictionaries, translation, macros, index/table of contents/citations and preferences. Document comparison, Hanja conversion and AutoText have the limited implementations described below.
+- View: page outline, grid, guides, split editing window and multiple document windows. View colours use screen post-processing. File: templates gallery; HML export of documents not opened from HML.
 - Page: text direction, line numbers, section start position, labels, manuscript paper, header / footer date field, odd / even page-number split. Print details (printer list, N-up, watermark).
-- Format: style gallery import / export, custom numbering / bullet shapes, picture bullets, drop caps. Character format inside footnotes (paragraph format only).
-- Tables and objects: moving a single cell border, editing nested tables, vertical text boxes, align, the object-selection button (objects are selected on the page), picture reflection / glow / photo editing, visual equation editing and macros, new memos, creating form objects (values of existing ones can be edited), new charts, WordArt, OLE. Connector anchors are exact for paper-anchored objects and may drift for paragraph-anchored ones; line end-point editing excludes inline lines and connectors.
+- Format: custom numbering/bullet shapes, picture bullets and drop caps. Character format inside footnotes (paragraph format only). Style import/export supports HwpCraft JSON.
+- Tables and objects: single-cell border dragging, inline nested-table canvas selection/dragging, picture reflection/glow/photo editing, visual equation editing/macros, general form creation, new charts, WordArt and OLE. Vertical text boxes, object alignment/selection and existing form values have basic support. Connector anchors are exact for paper-anchored objects and may drift for paragraph-anchored ones; line end-point editing excludes inline lines and connectors.
 - Tab drop-down lists are ribbon command lists, not Hangul submenus. The status-bar column indicator is always 1.
 - Direct table dragging targets top-level tables within one page; an inline table becomes floating when moved. Multi-page tables are adjusted through properties. Table drawing supports zero cell spacing only.
 
-### RHWP typesetting and save limits (not worked around in HwpCraft)
+### Remaining typesetting and save limits
 
 - Paragraph border top / bottom spacing is not reflected in line layout, so paragraphs may overlap both on screen and in Hangul. Side spacing and some line styles (double lines) draw as single lines.
 - Footnote separator length −1 (column width) is drawn short, and objects with outer margins are offset on screen (saved files open correctly in Hangul).
-- The highlighter is saved as markpen marks but RHWP's renderer does not paint them, so HwpCraft overlays them on screen only (not in print / PDF). New numbered lists create new numbering definitions (RHWP's `set_numbering_restart` is not saved); curves are saved as dense polylines.
-- Page-number / total-page auto numbers inserted into body text (`insert.auto_text`) are saved and Hangul shows the numbers, but RHWP's renderer does not draw body auto numbers, so HwpCraft's screen and PDF leave them blank. Hangul's date-code field has no RHWP counterpart; the current date is inserted as text.
-- Tables: darker / lighter cell shading applies on every press instead of stopping after one step like Hangul; table-style font application and user table styles are missing. Objects: picture shadow / glow / soft edge / reflection (RHWP only preserves them), free-form lines, drawing gallery, guides, grid and saved formats are missing; outer-margin / text-box-margin presets and the shadow nudge unit are assumptions not verified against Hangul. Footnote "restart per page" stores the shape value only; numbers run per section.
+- Highlights are saved as markpen marks and composited by HwpCraft's shared SVG path for screen, PNG and PDF/print. Geometry covers body text and first-level cells; nested tables, headers, text boxes and notes are excluded. New numbered lists create new numbering definitions (RHWP's `set_numbering_restart` is not saved); curves are saved as dense polylines.
+- Newly created/edited nested tables grow the necessary ancestor frames. Short frames in imported documents are normalized for display only (source and saved file unchanged) and within a fixed per-document work budget so opening never stalls. Documents over the budget or over 128 pages keep some or all tables in their original layout, so deeply nested content may still look clipped.
+- Damaged tables whose stored row/column counts are smaller than their cells are repaired to the addressed extent on open.
+- Body page/total fields reserve measured width and render dynamically in screen, PNG and PDF output. Dynamic fields inside tables/textboxes/notes and complex layout remain incomplete. HWP/HWPX/TXT page extraction refuses field-induced boundary differences; PDF page export is supported. In documents with page fields, body typing and deletion re-lay out only the edited paragraph (about 40 ms on a 381-page document); other edits such as paragraph splits re-lay out the whole display copy (about 0.3 s). Date codes currently insert literal text.
+- Tables: darker / lighter cell shading applies on every press instead of stopping after one step like Hangul; table-style font application and user table styles are missing, and the table-creation dialog cannot pick a table style (apply one from the Table Design tab afterwards). Objects: picture shadow / glow / soft edge / reflection (RHWP only preserves them), free-form lines, drawing gallery, guides, grid and saved formats are missing; outer-margin / text-box-margin presets and the shadow nudge unit are assumptions not verified against Hangul. Footnote "restart per page" stores the shape value only; numbers run per section.
 - Page copy / delete work per paragraph (a paragraph continued from the previous page is left out; deleting is refused when one paragraph fills the page). Insert file lives in the File menu only (Ctrl+O stays Open). PDF print options (highlighter, drawing objects, pictures, memos), page outline off, grid, line numbers, master-page editing and document history are not provided because RHWP has no option or model for them. Facing pages only changes the page layout.
 - AutoText (상용구) stores plain-text entries only; body entries with formatting, tables or objects are not saved (no groups or import / export).
-- Hanja conversion picks candidates per syllable from the Unicode Unihan reading table; without a word dictionary it does not offer word-level candidates or frequency ordering like Hangul. Track changes, new memos and spell checking are not provided because RHWP has no model or dictionary for them. Document compare lists added / removed / changed paragraphs without a side-by-side view. "No shading" is reported by RHWP as white (#ffffff).
-- Master pages, document summary, odd / even / first-page-only page borders, picture fill, new memos (MemoShape unsupported), form-object creation, chart / WordArt / OLE creation are unavailable because RHWP has no API for them. Style create / update / delete exist only in RHWP's wasm wrapper, so HwpCraft edits the model directly. Line-based caret motion and selection-rectangle queries are crate-private in RHWP; HwpCraft computes them from caret geometry.
+- Hanja conversion picks candidates per syllable from the Unicode Unihan reading table; without a word dictionary it does not offer word-level candidates or frequency ordering like Hangul. Track changes and spell checking remain unavailable. Memo replies/resolution, cell anchors and cross-paragraph memo anchors remain unsupported. Document compare lists added / removed / changed paragraphs without a side-by-side view. "No shading" is reported by RHWP as white (#ffffff).
+- Master pages, document summary, odd / even / first-page-only page borders, picture fill, form-object creation, chart / WordArt / OLE creation are unavailable because RHWP has no API for them. Style create / update / delete exist only in RHWP's wasm wrapper, so HwpCraft edits the model directly. Line-based caret motion and selection-rectangle queries are crate-private in RHWP; HwpCraft computes them from caret geometry.
 - Automatic tab-width recording covers body text and first-level table cells only; tabs inside headers, text boxes and notes are saved with width 0.
 - Multi-paragraph selection works within one section body or one cell; Select All covers the current section.
 
@@ -408,7 +414,7 @@ Feature areas plug in through `extensions.rs`, so each area adds its own command
 
 - Pointer-event regression tests cover table selection, moving and resizing. End-to-end click / drag verification of every feature has not been completed.
 - Round-trip saving of complex real-world documents, performance on very large documents and tables, and long IME sessions have not been tested thoroughly. Keep originals and save important documents under a new name, then check them in Hangul.
-- Input documents are limited to 128 MB and a single text insertion to 1 MB. Parsing and rendering are synchronous, so the UI may pause on complex documents.
+- Input documents are limited to 128 MB and a single text insertion to 1 MB. Parsing and rendering are synchronous, so the UI may pause on complex documents. PDF export of large documents takes time (about 84 s for a 381-page document, mostly font subsetting inside RHWP).
 
 Release notes are in `docs/` (Korean).
 

@@ -2039,3 +2039,39 @@ fn auto_numbers_note_conversion_note_shape_and_deletions() -> anyhow::Result<()>
     assert!(body.run("field.delete", json!({"field_id":9999})).is_err());
     Ok(())
 }
+
+#[test]
+fn note_shape_rejects_decoration_characters_outside_the_bmp() -> anyhow::Result<()> {
+    // HWP stores note decoration characters as one UTF-16 unit; a non-BMP
+    // character would be truncated to an unrelated code unit on save.
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("본문".into()))?;
+    s.run(
+        "note.insert",
+        json!({"endnote":false,"paragraphs":["각주"]}),
+    )?;
+    for kind in ["footnote", "endnote"] {
+        for key in ["prefixChar", "suffixChar", "userChar"] {
+            let generation = s.generation;
+            let before = s.run("note.shape.get", json!({"kind":kind}))?;
+            let r = s.run("note.shape", json!({"kind":kind,"props":{key:"😀"}}));
+            assert!(r.is_err(), "{kind} {key} accepted a non-BMP character");
+            assert_eq!(s.generation, generation, "{kind} {key}");
+            assert_eq!(s.run("note.shape.get", json!({"kind":kind}))?, before);
+        }
+    }
+    s.run(
+        "note.shape",
+        json!({"kind":"footnote","props":{"prefixChar":"※","suffixChar":"〕"}}),
+    )?;
+    for ext in ["hwp", "hwpx"] {
+        let mut r = reopen(&mut s, ext)?;
+        let g = r.run("note.shape.get", json!({"kind":"footnote"}))?;
+        assert_eq!(
+            (g["prefixChar"].as_str(), g["suffixChar"].as_str()),
+            (Some("※"), Some("〕")),
+            "{ext}"
+        );
+    }
+    Ok(())
+}

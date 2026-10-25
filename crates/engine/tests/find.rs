@@ -167,3 +167,199 @@ fn format_conditions_restrict_matches() -> anyhow::Result<()> {
     assert_eq!(s.text(), "B plain bold");
     Ok(())
 }
+
+fn all_text(s: &Session) -> Vec<String> {
+    s.cursors()
+        .into_iter()
+        .filter_map(|c| s.paragraph(c).ok().map(|p| p.text.clone()))
+        .collect()
+}
+
+#[test]
+fn replace_all_in_body_and_cells_is_one_step_with_fresh_layout() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    let line = "문서 관리 문서 보관 ".repeat(8);
+    s.execute(Command::Insert(vec![line.as_str(); 40].join(
+        "
+",
+    )))?;
+    s.execute(Command::Table {
+        rows: 2,
+        columns: 2,
+    })?;
+    let cells: Vec<Cursor> = s
+        .cursors()
+        .into_iter()
+        .filter(|c| c.cell.is_some())
+        .collect();
+    for c in &cells {
+        s.select(*c, false)?;
+        s.execute(Command::Insert("셀 문서 문서".into()))?;
+    }
+    let before = all_text(&s);
+    let pages = s.page_count()?;
+    assert_eq!(
+        s.count_matches("문서", FindOptions::default(), usize::MAX)?,
+        40 * 16 + 8
+    );
+    assert_eq!(s.count_matches("문서", FindOptions::default(), 10)?, 10);
+    let n = s.replace_all_with("문서", "기록물 문서철", FindOptions::default())?;
+    assert_eq!(n, 40 * 16 + 8);
+    assert_eq!(
+        s.count_matches("기록물 문서철", FindOptions::default(), usize::MAX)?,
+        n
+    );
+    // Pagination was redone once at the end: the longer text needs more pages,
+    // and a reopened copy agrees with the live layout.
+    let grown = s.page_count()?;
+    assert!(grown > pages, "{pages} -> {grown}");
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("replaced.hwpx");
+    s.save(&path)?;
+    let mut reopened = Session::new()?;
+    reopened.open(&path)?;
+    assert_eq!(reopened.page_count()?, grown);
+    s.execute(Command::Undo)?;
+    assert_eq!(all_text(&s), before);
+    assert_eq!(s.page_count()?, pages);
+    Ok(())
+}
+
+#[test]
+fn replace_all_skips_matches_that_already_read_as_the_replacement() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("문서 Doc doc".into()))?;
+    let generation = s.generation;
+    // Case-insensitive 문서 -> 문서 changes nothing and leaves no undo step.
+    assert_eq!(
+        s.replace_all_with("문서", "문서", FindOptions::default())?,
+        1
+    );
+    assert_eq!(s.generation, generation);
+    // Only the match that differs is edited: Doc -> doc, doc stays.
+    assert_eq!(s.replace_all_with("doc", "doc", FindOptions::default())?, 2);
+    assert_eq!(s.text(), "문서 doc doc");
+    s.execute(Command::Undo)?;
+    assert_eq!(s.text(), "문서 Doc doc");
+    Ok(())
+}
+
+/// Timing probe for the review-tools paths on a long document. Run with
+/// `HWPCRAFT_PERF_SAMPLE=<file.hwp> cargo test --release --test find -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn perf_review_tools_on_sample() -> anyhow::Result<()> {
+    let Some(path) = std::env::var_os("HWPCRAFT_PERF_SAMPLE") else {
+        return Ok(());
+    };
+    let time = |label: &str, f: &mut dyn FnMut() -> anyhow::Result<String>| -> anyhow::Result<()> {
+        let t = std::time::Instant::now();
+        let out = f()?;
+        eprintln!("{label}: {:?} {out}", t.elapsed());
+        Ok(())
+    };
+    let mut s = Session::new()?;
+    time("open", &mut || {
+        s.open(std::path::Path::new(&path))?;
+        Ok(format!("paragraphs {}", s.cursors().len()))
+    })?;
+    let o = FindOptions::default();
+    s.select(at(0, 0), false)?;
+    time("find missing", &mut || {
+        Ok(s.find("없는낱말쿼리", o)?.to_string())
+    })?;
+    time("find 10x common", &mut || {
+        let mut n = 0;
+        for _ in 0..10 {
+            n += usize::from(s.find("문서", o)?);
+        }
+        Ok(n.to_string())
+    })?;
+    let regex = FindOptions { regex: true, ..o };
+    time("find regex missing", &mut || {
+        Ok(s.find(r"\d{9}없음", regex)?.to_string())
+    })?;
+    let hanja = FindOptions {
+        hanja_by_hangul: true,
+        ..o
+    };
+    time("find hanja_by_hangul missing", &mut || {
+        Ok(s.find("없는한자", hanja)?.to_string())
+    })?;
+    time("replace_all common", &mut || {
+        Ok(s.replace_all_with(
+            "문서",
+            "문서",
+            FindOptions {
+                case_sensitive: false,
+                ..o
+            },
+        )?
+        .to_string())
+    })?;
+    time("replace_all changing", &mut || {
+        Ok(s.replace_all_with("문서", "서류", o)?.to_string())
+    })?;
+    s.execute(Command::Undo)?;
+    time("page count after undo", &mut || {
+        Ok(s.page_count()?.to_string())
+    })?;
+    time("symbol_search 20 keys", &mut || {
+        let mut n = 0;
+        for q in [
+            "ㄱ",
+            "화",
+            "화살",
+            "화살표",
+            "a",
+            "ar",
+            "arr",
+            "arrow",
+            "u+2605",
+            "별",
+        ]
+        .iter()
+        .cycle()
+        .take(20)
+        {
+            n += hwpcraft_engine::symbol_search(q).sets.len();
+        }
+        Ok(n.to_string())
+    })?;
+    time("highlight rects (no markpen)", &mut || {
+        Ok(s.highlight_rects().len().to_string())
+    })?;
+    for round in 0..3 {
+        time(&format!("steady edit+render round {round}"), &mut || {
+            s.execute(Command::Insert("y".into()))?;
+            Ok(s.render_page_svg(0)?.len().to_string())
+        })?;
+    }
+    time("render page 0 after edit", &mut || {
+        s.execute(Command::Insert("x".into()))?;
+        Ok(s.render_page_svg(0)?.len().to_string())
+    })?;
+    time("render page 0 cached", &mut || {
+        Ok(s.render_page_svg(0)?.len().to_string())
+    })?;
+    if std::env::var_os("HWPCRAFT_PERF_HIGHLIGHT").is_some() {
+        time("highlight whole document", &mut || {
+            s.select_all()?;
+            s.run("format.highlight", json!({"color": "#ffff00"}))?;
+            s.clear_selection();
+            Ok(String::new())
+        })?;
+        time("highlight rects (limited)", &mut || {
+            Ok(s.highlight_rects().len().to_string())
+        })?;
+        time("render page 0 after edit, all highlighted", &mut || {
+            s.select(at(0, 0), false)?;
+            s.execute(Command::Insert("x".into()))?;
+            Ok(s.render_page_svg(0)?.len().to_string())
+        })?;
+        time("render page 1 next frame", &mut || {
+            Ok(s.render_page_svg(1)?.len().to_string())
+        })?;
+    }
+    Ok(())
+}

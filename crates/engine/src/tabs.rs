@@ -120,9 +120,7 @@ impl Session {
         let base = match at.cell {
             Some(_) => caret(0)?.1,
             None => {
-                let info: Value =
-                    serde_json::from_str(&self.core.get_page_info_native(page as u32).ok()?)
-                        .ok()?;
+                let info = self.page_info(page as u32).ok()?;
                 info["columns"]
                     .as_array()
                     .and_then(|cols| {
@@ -263,13 +261,24 @@ impl Session {
     /// Save with laid-out tab widths, keeping the live model unchanged.
     pub(crate) fn save_with_tab_widths(&mut self, path: &Path) -> Result<()> {
         let saved = self.materialize_tabs();
-        let result = match self.password.as_deref() {
+        *self.page_field_cache.borrow_mut() = None;
+        *self.render_highlights.borrow_mut() = None;
+        let result = (|| match self.password.as_deref() {
             Some(password) if is_hwp(path) => {
                 hwpcraft_formats::save_with_password(&self.core, path, password)
             }
+            _ if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")) =>
+            {
+                self.render_pdf(&(0..self.page_count()?).collect::<Vec<_>>())
+                    .and_then(|bytes| hwpcraft_formats::atomic_write(path, &bytes))
+            }
             _ => hwpcraft_formats::save(&self.core, path),
-        };
+        })();
         self.restore_tabs(saved);
+        *self.page_field_cache.borrow_mut() = None;
+        *self.render_highlights.borrow_mut() = None;
         result
     }
 }

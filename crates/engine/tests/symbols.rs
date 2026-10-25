@@ -171,6 +171,7 @@ fn protocol_lists_pages_searches_and_inserts() -> anyhow::Result<()> {
         let mut r = Session::new()?;
         r.open(&path)?;
         assert_eq!(r.text(), "①", "{ext}");
+        r.select_all()?; // Inspect the saved symbol's font, not the leading control run.
         assert_eq!(r.character_properties()?["fontFamily"], "Arial", "{ext}");
     }
     Ok(())

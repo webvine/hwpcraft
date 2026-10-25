@@ -4,7 +4,7 @@ members = ["crates/*", "apps/*"]
 default-members = ["apps/hwpcraft", "apps/hwpcraft-cli"]
 
 [workspace.package]
-version = "0.14.0"
+version = "0.17.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.98"
@@ -31,6 +31,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 tempfile = "3"
 base64 = "0.22"
 encoding_rs = "0.8"
+quick-xml = "0.42"
+cfb = "0.15"
+flate2 = "1.0"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [patch.crates-io]
 svg2pdf = { path = "../rhwp/vendor/svg2pdf" }

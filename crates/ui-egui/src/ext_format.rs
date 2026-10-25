@@ -599,9 +599,10 @@ impl HwpApp {
         if focus.is_some_and(|f| f != egui::Id::new("document-canvas")) {
             return false;
         }
-        let ctrl = Modifiers::CTRL;
-        let ctrl_alt = Modifiers::CTRL | Modifiers::ALT;
-        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        // COMMAND is Ctrl on Windows/Linux and Cmd on macOS, where Hangul uses Cmd.
+        let ctrl = Modifiers::COMMAND;
+        let ctrl_alt = Modifiers::COMMAND | Modifiers::ALT;
+        let ctrl_shift = Modifiers::COMMAND | Modifiers::SHIFT;
         let alt_shift = Modifiers::ALT | Modifiers::SHIFT;
         // More specific modifier sets first: egui matches extra Shift/Alt logically.
         let table: &[(Modifiers, Key, &str)] = &[

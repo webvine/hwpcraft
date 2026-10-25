@@ -62,6 +62,15 @@ pub fn tool_definitions() -> Value {
             false
         ),
         tool(
+            "open_protected_document",
+            "Open a password-protected HWP/HWPX/HWP3 file without a dialog. Wrong passwords and failed loads preserve the current document. Unsaved changes require force=true. The password is not returned.",
+            object(
+                json!({"path":text,"password":{"type":"string","minLength":1},"force":boolean}),
+                &["path", "password"]
+            ),
+            false
+        ),
+        tool(
             "type_text",
             "Insert text at the caret, replacing selection. Newlines create paragraphs. Maximum 1,000,000 UTF-8 bytes per edit.",
             object(json!({"text":text}), &["text"]),
@@ -92,7 +101,7 @@ pub fn tool_definitions() -> Value {
             "hwp_action",
             "Run a Hangul automation action by its public name (e.g. MoveLineEnd, CharShapeBold, DeleteWord). Default parameters from the mapping table are merged under params. Omit id to list actions (query filters).",
             object(
-                json!({"id":text,"params":{"type":"object","default":{}},"query":text}),
+                json!({"id":text,"params":{"type":"object","default":{}},"parameterSet":{"type":"object"},"query":text}),
                 &[]
             ),
             false
@@ -113,24 +122,6 @@ pub fn tool_definitions() -> Value {
             true
         )
     ])
-}
-pub(crate) fn known_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "list_commands"
-            | "execute"
-            | "batch"
-            | "new_document"
-            | "open_document"
-            | "save_document"
-            | "type_text"
-            | "select_text"
-            | "get_text"
-            | "inspect_document"
-            | "hwp_action"
-            | "get_selection"
-            | "render_page"
-    )
 }
 pub(crate) fn result(value: Value, is_error: bool) -> Value {
     json!({"content":[{"type":"text","text":value.to_string()}],"isError":is_error})
@@ -193,18 +184,29 @@ fn answer(b: &mut Headless, name: &str, args: Value) -> Result<Value> {
                         c.command.as_str(),
                         "file.new"
                             | "file.open"
+                            | "file.open_protected"
                             | "file.save"
                             | "file.save_as"
                             | "file.pdf"
                             | "file.save_hml"
                             | "file.save_pages"
                             | "file.print_pdf"
-                    )
+                            | "file.save_block"
+                            | "picture.save"
+                            | "picture.save_all"
+                            | "tools.autotext.add"
+                            | "tools.autotext.delete"
+                            | "tools.autotext.body.add"
+                            | "tools.autotext.body.delete"
+                    ) || (c.command == "format.style.export"
+                        && c.params.get("path").is_some_and(|path| !path.is_null()))
                 })
             {
-                bail!("atomic batch에는 파일 명령을 넣을 수 없습니다.");
+                bail!("atomic batch에는 파일 또는 설정 쓰기 명령을 넣을 수 없습니다.");
             }
             let checkpoint = p.atomic.then(|| b.session.checkpoint());
+            // Beyond the list above, any write a command attempts is refused while atomic.
+            let _no_writes = p.atomic.then(hwpcraft_formats::file_access::forbid_writes);
             let mut results = Vec::new();
             let mut failed = false;
             for c in p.commands {
@@ -246,33 +248,23 @@ fn answer(b: &mut Headless, name: &str, args: Value) -> Result<Value> {
                 params: Value,
                 #[serde(default)]
                 query: String,
+                #[serde(default, rename = "parameterSet")]
+                parameter_set: Option<Value>,
             }
             let p: Action = serde_json::from_value(args)?;
             let Some(id) = p.id else {
                 return Ok(result(catalog::actions(&p.query), false));
             };
-            let (command, defaults, mapping) = hwpcraft_engine::hwp_action(&id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "대응하는 HwpCraft 명령이 없는 한글 동작: {id}. hwp_action {{query}}로 목록을 보세요."
-                )
-            })?;
-            let mut merged: serde_json::Map<String, Value> =
-                serde_json::from_str::<Value>(defaults)?
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default();
-            let Some(given) = p.params.as_object() else {
-                bail!("params는 JSON 객체여야 합니다.");
-            };
-            for (k, v) in given {
-                merged.insert(k.clone(), v.clone());
-            }
-            let value = b.execute(command, Value::Object(merged))?;
-            json!({"action":id,"command":command,"mapping":mapping,"result":value})
+            let prepared = b
+                .session
+                .prepare_hwp_action(&id, p.params, p.parameter_set)?;
+            let value = b.execute(prepared.command, prepared.params)?;
+            json!({"action":id,"command":prepared.command,"mapping":prepared.mapping,"result":value})
         }
         "get_selection" => b.execute("select.get", args)?,
         "new_document" => b.execute("file.new", args)?,
         "open_document" => b.execute("file.open", args)?,
+        "open_protected_document" => b.execute("file.open_protected", args)?,
         "save_document" => b.execute("file.save", args)?,
         "type_text" => b.execute("text.insert", args)?,
         "select_text" => b.execute("select.text", args)?,
