@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MIN_TOKEN_CHARS: usize = 32;
+const REJECTED_BODY_DRAIN_BYTES: usize = 64 * 1024;
 
 /// Shared secret every HTTP request presents as `Authorization: Bearer <token>`.
 #[derive(Clone)]
@@ -104,6 +105,10 @@ async fn require_token(
     if presented.is_some_and(|value| token.accepts(value.as_bytes())) {
         return next.run(request).await;
     }
+    // Read a small unread body before answering: closing a socket with unread
+    // request bytes makes some systems (macOS) reset the connection, and the
+    // client would see a reset instead of the 401. Larger bodies are not read.
+    let _ = axum::body::to_bytes(request.into_body(), REJECTED_BODY_DRAIN_BYTES).await;
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, "Bearer")],
