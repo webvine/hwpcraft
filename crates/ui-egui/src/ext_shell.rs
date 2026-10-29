@@ -3295,24 +3295,23 @@ mod tests {
 
     #[test]
     fn recent_list_moves_to_front_dedupes_and_keeps_nine() {
+        // Absolute on every OS, so recent_path keeps them as they are.
+        let docs = if cfg!(windows) { "C:/docs" } else { "/docs" };
         let mut list = Vec::new();
         for i in 0..12 {
-            push_recent(
-                &mut list,
-                std::path::Path::new(&format!("C:/docs/{i}.hwpx")),
-            );
+            push_recent(&mut list, std::path::Path::new(&format!("{docs}/{i}.hwpx")));
         }
         assert_eq!(list.len(), RECENT_LIMIT);
-        assert_eq!(list[0], PathBuf::from("C:/docs/11.hwpx"));
-        push_recent(&mut list, std::path::Path::new("C:/docs/5.hwpx"));
-        assert_eq!(list[0], PathBuf::from("C:/docs/5.hwpx"));
+        assert_eq!(list[0], PathBuf::from(format!("{docs}/11.hwpx")));
+        push_recent(&mut list, std::path::Path::new(&format!("{docs}/5.hwpx")));
+        assert_eq!(list[0], PathBuf::from(format!("{docs}/5.hwpx")));
         assert_eq!(list.len(), RECENT_LIMIT);
         assert_eq!(list.iter().filter(|p| p.ends_with("5.hwpx")).count(), 1);
         let text = serialize_recent(&list);
         assert_eq!(parse_recent(&text), list);
         assert_eq!(
-            parse_recent("\n  \nC:/a.hwp\n"),
-            vec![PathBuf::from("C:/a.hwp")]
+            parse_recent(&format!("\n  \n{docs}/a.hwp\n")),
+            vec![PathBuf::from(format!("{docs}/a.hwp"))]
         );
     }
 
