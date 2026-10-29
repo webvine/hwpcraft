@@ -643,29 +643,11 @@ impl Session {
             return Ok(String::new());
         }
         let text = self.span_text()?;
-        let parts = self.selected_paragraphs()?;
-        let (Some((first, r1)), Some((last, r2))) = (parts.first(), parts.last()) else {
-            return Ok(text);
-        };
-        let result = match first.cell {
-            Some(t) => self.core.copy_selection_in_cell_native(
-                first.section,
-                first.paragraph,
-                t.control,
-                t.index,
-                index(first),
-                r1.start,
-                index(last),
-                r2.end,
-            ),
-            None => self.core.copy_selection_native(
-                first.section,
-                first.paragraph,
-                r1.start,
-                last.paragraph,
-                r2.end,
-            ),
-        };
+        let replay = clipboard_history::ClipboardReplay::prepare(self)?;
+        let result = replay.copy_into(&mut self.core);
+        if result.is_ok() {
+            self.clipboard_replay = Some(std::rc::Rc::new(replay));
+        }
         // Plain text still reaches the system clipboard if rich copy is unsupported here.
         self.clipboard_text = result.ok().map(|_| text.clone());
         Ok(text)

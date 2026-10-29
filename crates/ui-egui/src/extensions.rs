@@ -59,7 +59,6 @@ impl HwpApp {
         self.core_ext_dialogs(ctx);
         self.format_ext_dialogs(ctx);
         self.table_ext_dialogs(ctx);
-        self.comments_ext_dialogs(ctx);
         self.contexts_ext_dialogs(ctx);
         let mut regions = std::mem::take(&mut self.ext.context_regions);
         regions.show(ctx, &mut self.session, &mut self.message);

@@ -1,5 +1,5 @@
 //! Reproductions from the read-only review of new engine modules (table-object area).
-//! Ignored until the owning module is fixed; run with `--ignored`.
+//! Keep former owner-review reproductions enabled after their fixes are verified.
 use hwpcraft_engine::{Command, Session};
 use serde_json::json;
 
@@ -8,7 +8,6 @@ use serde_json::json;
 /// decimal string, so a chart well inside the documented limits (16 series ×
 /// 1000 values) is rejected as "XML over 2 MiB". Expected: created.
 #[test]
-#[ignore = "chart_creation.rs formats tiny values as full decimals"]
 fn chart_with_tiny_values_inside_documented_limits_is_created() -> anyhow::Result<()> {
     let mut s = Session::new()?;
     s.execute(Command::Insert("차트".into()))?;

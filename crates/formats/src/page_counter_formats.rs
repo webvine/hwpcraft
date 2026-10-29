@@ -510,32 +510,44 @@ pub(crate) fn open(bytes: &[u8], password: Option<&[u8]>) -> Result<Option<Docum
     }
     cfb.flush()?;
     let marked = cfb.into_inner().into_inner();
-    let mut core = match password {
-        Some(p) => DocumentCore::from_bytes_with_password(&marked, p),
-        None => DocumentCore::from_bytes(&marked),
+    // Restore before the first layout: restoring after it and calling set_document
+    // laid the whole document out twice (about 0.25 s of a 0.8 s handbook open).
+    // RHWP seals the original raw cache after that layout, as on a native load.
+    let mut failure = None;
+    let core = DocumentCore::from_bytes_prepared(&marked, password, |doc| {
+        let restored = restore_parsed(doc, &identities, &mut bodies);
+        restored.map_err(|e| {
+            let message = e.to_string();
+            failure = Some(e);
+            message
+        })
+    });
+    if let Some(e) = failure {
+        return Err(e);
     }
-    .map_err(|e| anyhow!("{e}"))?;
-    let mut doc = core.document().clone();
+    Ok(Some(core.map_err(|e| anyhow!("{e}"))?))
+}
+
+fn restore_parsed(
+    doc: &mut hwpcraft_doc::model::document::Document,
+    identities: &[Identity],
+    bodies: &mut [Body],
+) -> Result<()> {
     ensure!(
         doc.sections.len() == bodies.len(),
         "HWP 원본 구역 수와 파싱 모델이 다릅니다."
     );
-    for body in &bodies {
+    for body in bodies.iter() {
         ensure!(
             doc.sections[body.index].raw_stream.as_ref() == Some(&body.marked),
             "파싱된 쪽 번호의 원본 BodyText 스트림이 다릅니다."
         );
     }
-    restore(&mut doc, &identities)?;
+    restore(doc, identities)?;
     for body in bodies {
-        doc.sections[body.index].raw_stream = Some(body.raw);
+        doc.sections[body.index].raw_stream = Some(std::mem::take(&mut body.raw));
     }
-    doc.seal_body_raw_provenance();
-    core.set_document(doc);
-    // set_document rebuilds derived paragraph/layout state. Match native load's
-    // seal timing: only publish the original raw cache after that rebuild.
-    core.document_mut().seal_body_raw_provenance();
-    Ok(Some(core))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -655,6 +667,26 @@ mod tests {
             restore(&mut unmarked, &identities).is_err(),
             "unpatched TotalPage must never masquerade as a token"
         );
+        Ok(())
+    }
+
+    /// Restoring before the first layout gives the same model and pages as the old
+    /// restore-then-`set_document`, and a failed restore keeps its own message.
+    #[test]
+    fn restore_before_layout_matches_the_relayout_path() -> Result<()> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../rhwp/samples/exam_math_8.hwp");
+        let bytes = std::fs::read(&path)?;
+        let core = open(&bytes, None)?.expect("the sample has PAGE fields");
+        let native = DocumentCore::from_bytes(&bytes).map_err(|e| anyhow!("{e}"))?;
+        assert_eq!(core.page_count(), native.page_count());
+        assert_eq!(
+            core.document().sections[0].raw_stream,
+            native.document().sections[0].raw_stream,
+            "the original BodyText bytes are restored"
+        );
+        let refused = DocumentCore::from_bytes_prepared(&bytes, None, |_| Err("거절".into()));
+        assert!(refused.is_err_and(|e| e.to_string().contains("거절")));
         Ok(())
     }
 }

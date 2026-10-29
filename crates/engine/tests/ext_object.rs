@@ -2075,3 +2075,26 @@ fn note_shape_rejects_decoration_characters_outside_the_bmp() -> anyhow::Result<
     }
     Ok(())
 }
+
+#[test]
+fn chart_data_help_example_runs_against_a_chart() -> anyhow::Result<()> {
+    // The documented chart.data example must be accepted as written (values are strings).
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("차트".into()))?;
+    s.run(
+        "chart.create",
+        json!({"chart":{"kind":"column","categories":["a","b","c"],"series":[{"name":"1분기","values":[1,2,3]}]}}),
+    )?;
+    let (_, params) = hwpcraft_engine::command_help("chart.data")
+        .ok_or_else(|| anyhow::anyhow!("no chart.data help"))?;
+    s.run("chart.data", params)?;
+    let data = s.run("chart.data.get", json!({"index":0}))?;
+    assert!(data.to_string().contains("1분기"), "{data}");
+    // Renaming a series needs structure:true, as the help text says.
+    let renamed = json!({"index":0,"series":[{"name":"2분기","values":["1","2","3"]}]});
+    assert!(s.run("chart.data", renamed.clone()).is_err());
+    let mut with_structure = renamed;
+    with_structure["structure"] = json!(true);
+    s.run("chart.data", with_structure)?;
+    Ok(())
+}

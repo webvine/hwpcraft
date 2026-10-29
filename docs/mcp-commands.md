@@ -74,7 +74,7 @@ python scripts/mcp-command-docs.py ../.build/hwpcraft/release/hwpcraft-cli.exe -
 
 ## 차트 만들기·구성 변경
 
-`chart.create`는 본문에서 `column`·`bar`·`line`·`pie`·`doughnut`을 지원합니다. 다음은 본문 커서가 준비된 문서의 새 차트 예제입니다. 선택이 있다면 기존 내용을 대체할 수 있으므로 삽입 대상을 먼저 확인하세요.
+`chart.create`는 본문에서 `column`·`bar`·`line`·`pie`·`doughnut`·`scatter`·`stock_hlc`·`stock_ohlc`·`column_3d`·`bar_3d`·`pie_3d`를 지원합니다. `chart.types`에서 각 종류의 실제 제약을 먼저 조회하고, 기존 자체 차트는 `chart.definition.get {index}`의 최신 구성과 `generation`으로 편집하세요. 다음은 본문 커서가 준비된 문서의 새 차트 예제입니다. 선택이 있다면 기존 내용을 대체할 수 있으므로 삽입 대상을 먼저 확인하세요.
 
 ```json
 {"name":"execute","arguments":{"document_id":"<doc>","command":"chart.create","params":{"chart":{"kind":"column","title":"분기 실적","categories":["전반기","후반기"],"series":[{"name":"매출","values":[4,6],"color":"#4472C4"}],"width_mm":120,"height_mm":75,"legend":false}}}}

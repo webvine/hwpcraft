@@ -6,6 +6,7 @@ use hwpcraft_doc::{
     DocumentCore,
     model::{
         control::{Control, PageNumberPos},
+        document::Document,
         paragraph::Paragraph,
         shape::ShapeObject,
     },
@@ -280,7 +281,7 @@ fn shape(
 }
 
 fn document(
-    doc: &mut hwpcraft_doc::model::document::Document,
+    doc: &mut Document,
     mut visit: impl FnMut(&mut PageNumberPos) -> Result<()>,
 ) -> Result<()> {
     for section in &mut doc.sections {
@@ -292,39 +293,37 @@ fn document(
     Ok(())
 }
 
-pub(crate) fn open(bytes: &[u8], password: Option<&[u8]>) -> Result<DocumentCore> {
-    let original = crate::auto_number_formats::open(bytes, password)?;
-    if !bytes.starts_with(b"PK\x03\x04") {
-        return Ok(original);
+/// PageNumberPos identities, marked and restored with the AutoNumber ones.
+#[derive(Default)]
+struct PageMarks(Vec<Identity>);
+
+impl crate::auto_number_formats::Marks for PageMarks {
+    fn mark(&mut self, xml: &[u8]) -> Result<Vec<u8>> {
+        mark_xml(xml, &mut self.0)
     }
-    let decrypted = match password {
-        Some(password) => hwpcraft_doc::password_crypto::decrypt_hwpx_package(bytes, password)?,
-        None => None,
-    };
-    let mut identities = Vec::new();
-    let marked = crate::auto_number_formats::rewrite_package(
-        decrypted.as_deref().unwrap_or(bytes),
-        |xml| mark_xml(xml, &mut identities),
-    )?;
-    if identities.is_empty() {
-        return Ok(original);
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
-    let mut core = crate::auto_number_formats::open(&marked, None)?;
-    let mut doc = core.document().clone();
-    let mut seen = BTreeSet::new();
-    document(&mut doc, |number| {
-        let index = token_index(number.dash_char, identities.len())?;
-        ensure!(seen.insert(index), "중복 네이티브 쪽 번호 식별자");
-        number.format = identities[index].format;
-        number.dash_char = identities[index].side;
+    fn restore(&self, doc: &mut Document) -> Result<()> {
+        let identities = &self.0;
+        let mut seen = BTreeSet::new();
+        document(doc, |number| {
+            let index = token_index(number.dash_char, identities.len())?;
+            ensure!(seen.insert(index), "중복 네이티브 쪽 번호 식별자");
+            number.format = identities[index].format;
+            number.dash_char = identities[index].side;
+            Ok(())
+        })?;
+        ensure!(
+            seen.len() == identities.len(),
+            "HWPX 쪽 번호 일부를 모델에서 찾지 못했습니다. 원본 보존을 위해 열기를 중단했습니다."
+        );
         Ok(())
-    })?;
-    ensure!(
-        seen.len() == identities.len(),
-        "HWPX 쪽 번호 일부를 모델에서 찾지 못했습니다. 원본 보존을 위해 열기를 중단했습니다."
-    );
-    core.set_document(doc);
-    Ok(core)
+    }
+}
+
+pub(crate) fn open(bytes: &[u8], password: Option<&[u8]>) -> Result<DocumentCore> {
+    crate::auto_number_formats::open_marked(bytes, password, &mut PageMarks::default())
 }
 
 pub(crate) fn export(core: &DocumentCore, password: Option<&[u8]>) -> Result<Vec<u8>> {
@@ -467,6 +466,45 @@ mod tests {
                 .ok_or_else(|| anyhow!("wrong password accepted"))?
         ));
         assert_eq!(format!("{:?}", core.document()), before);
+        Ok(())
+    }
+
+    /// Page numbers and body AutoNumbers are marked in one rewrite and restored
+    /// in one parse; the reopened model saves to the same bytes, and a package
+    /// without identities opens exactly as the native parser reads it.
+    #[test]
+    fn one_parse_restores_both_identity_kinds_and_resaves_identically() -> Result<()> {
+        let mut core = fixture(3, '-')?;
+        core.insert_auto_number_at_cursor(0, 0, 0, "total")
+            .map_err(|e| anyhow!("{e}"))?;
+        for control in &mut core.document_mut().sections[0].paragraphs[0].controls {
+            if let Control::AutoNumber(number) = control {
+                number.format = 12;
+            }
+        }
+        let bytes = export(&core, None)?;
+        let opened = open(&bytes, None)?;
+        assert_eq!(numbers(&opened)?, vec![(3, 6, '-')]);
+        assert!(
+            opened.document().sections[0].paragraphs[0]
+                .controls
+                .iter()
+                .any(
+                    |control| matches!(control, Control::AutoNumber(number) if number.format == 12)
+                )
+        );
+        assert_eq!(export(&opened, None)?, bytes);
+
+        let mut blank = DocumentCore::new_empty();
+        blank
+            .create_blank_document_native()
+            .map_err(|e| anyhow!("{e}"))?;
+        let bytes = export(&blank, None)?;
+        let native = DocumentCore::from_bytes(&bytes).map_err(|e| anyhow!("{e}"))?;
+        assert_eq!(
+            format!("{:?}", open(&bytes, None)?.document()),
+            format!("{:?}", native.document())
+        );
         Ok(())
     }
 

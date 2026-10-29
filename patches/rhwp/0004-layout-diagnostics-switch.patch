@@ -1,0 +1,118 @@
+diff --git a/src/renderer/layout.rs b/src/renderer/layout.rs
+index 6ee65a450..6391e20f1 100644
+--- a/src/renderer/layout.rs
++++ b/src/renderer/layout.rs
+@@ -2934,6 +2934,38 @@ impl NumberingState {
+     }
+ }
+ 
++/// 조판 진단(`LAYOUT_OVERFLOW`, `LAYOUT_OVERFLOW_CELL`, `LAYOUT_OVERFLOW_DRAW`,
++/// `LAYOUT_TABLE_OVERLAP`)을 stderr 에 출력할지.
++/// 0 = 끔, 1 = 켬, 2 = 아직 정하지 않음(처음 쓸 때 `RHWP_LAYOUT_DIAG` 로 정한다).
++static LAYOUT_DIAGNOSTICS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
++
++/// 조판 진단의 stderr 출력을 켜거나 끈다. 기본은 켬이며 `RHWP_LAYOUT_DIAG=0` 이면 끈 채로
++/// 시작한다. 진단 값은 출력과 상관없이 [`LayoutEngine::take_overflows`] ·
++/// [`LayoutEngine::take_table_overlaps`] 로 계속 모은다. stderr 를 로그로 넘기는
++/// 프로그램(예: stdio MCP 서버)이 시작할 때 끄려는 용도다.
++pub fn set_layout_diagnostics(enabled: bool) {
++    LAYOUT_DIAGNOSTICS.store(u8::from(enabled), std::sync::atomic::Ordering::Relaxed);
++}
++
++fn layout_diagnostics_enabled() -> bool {
++    use std::sync::atomic::Ordering;
++    match LAYOUT_DIAGNOSTICS.load(Ordering::Relaxed) {
++        0 => false,
++        1 => true,
++        _ => {
++            let enabled = std::env::var_os("RHWP_LAYOUT_DIAG").is_none_or(|value| value != "0");
++            // 그 사이 set_layout_diagnostics 가 정했다면 그 값을 따른다.
++            let _ = LAYOUT_DIAGNOSTICS.compare_exchange(
++                2,
++                u8::from(enabled),
++                Ordering::Relaxed,
++                Ordering::Relaxed,
++            );
++            LAYOUT_DIAGNOSTICS.load(Ordering::Relaxed) == 1
++        }
++    }
++}
++
+ /// 레이아웃 엔진
+ /// 레이아웃 검증 경고: 요소가 페이지 경계를 초과한 경우
+ #[derive(Debug, Clone)]
+@@ -3980,7 +4012,9 @@ impl LayoutEngine {
+ 
+     /// 레이아웃 경계 초과 기록
+     fn record_overflow(&self, overflow: LayoutOverflow) {
+-        eprintln!("{}", overflow);
++        if layout_diagnostics_enabled() {
++            eprintln!("{}", overflow);
++        }
+         self.layout_overflows.borrow_mut().push(overflow);
+     }
+ 
+@@ -3991,7 +4025,9 @@ impl LayoutEngine {
+ 
+     /// [#4515] 최상위 표 y 겹침 기록
+     fn record_table_overlap(&self, overlap: LayoutTableOverlap) {
+-        eprintln!("{}", overlap);
++        if layout_diagnostics_enabled() {
++            eprintln!("{}", overlap);
++        }
+         self.layout_table_overlaps.borrow_mut().push(overlap);
+     }
+ 
+diff --git a/src/renderer/layout/paragraph_layout.rs b/src/renderer/layout/paragraph_layout.rs
+index c585b32a6..144c99ab7 100755
+--- a/src/renderer/layout/paragraph_layout.rs
++++ b/src/renderer/layout/paragraph_layout.rs
+@@ -5832,6 +5832,7 @@ impl LayoutEngine {
+                 && line_visual_bottom > col_bottom + 0.5
+                 && !blank_spacer_line
+                 && !tolerated_endnote_bottom_bleed
++                && super::layout_diagnostics_enabled()
+             {
+                 eprintln!(
+                     "LAYOUT_OVERFLOW_DRAW: section={} pi={} line={} y={:.1} col_bottom={:.1} overflow={:.1}px",
+@@ -5867,16 +5868,18 @@ impl LayoutEngine {
+                     // [#3668] stderr 진단과 같은 조건에서 집계 카운터도 올린다.
+                     self.overflow_cell_lines
+                         .set(self.overflow_cell_lines.get() + 1);
+-                    eprintln!(
+-                        "LAYOUT_OVERFLOW_CELL: section={} pi={} line={} y={:.1} \
+-                         page_bottom={:.1} overflow={:.1}px",
+-                        section_index,
+-                        para_index,
+-                        line_idx,
+-                        text_y,
+-                        page_h,
+-                        text_y - page_h,
+-                    );
++                    if super::layout_diagnostics_enabled() {
++                        eprintln!(
++                            "LAYOUT_OVERFLOW_CELL: section={} pi={} line={} y={:.1} \
++                             page_bottom={:.1} overflow={:.1}px",
++                            section_index,
++                            para_index,
++                            line_idx,
++                            text_y,
++                            page_h,
++                            text_y - page_h,
++                        );
++                    }
+                     if std::env::var("RHWP_DIAG_OVERFLOW_CELL").is_ok() {
+                         eprintln!(
+                             "DIAG_OVERFLOW_CELL_CTX: section={} pi={} line={} ctx={cell_ctx:?}",
+@@ -10056,7 +10059,10 @@ impl LayoutEngine {
+ 
+             // Task #332 Stage 4b: clamp 제거, overflow 그대로 그림 (piling 차단)
+             let col_bottom = col_area.y + col_area.height;
+-            if self.is_body_flow_col_area(col_area) && y + line_height > col_bottom + 0.5 {
++            if self.is_body_flow_col_area(col_area)
++                && y + line_height > col_bottom + 0.5
++                && super::layout_diagnostics_enabled()
++            {
+                 eprintln!(
+                     "LAYOUT_OVERFLOW_DRAW: line={} y={:.1} col_bottom={:.1} overflow={:.1}px (fast path)",
+                     line_idx, y + line_height, col_bottom, y + line_height - col_bottom,

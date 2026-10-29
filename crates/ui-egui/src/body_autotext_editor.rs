@@ -293,7 +293,7 @@ impl State {
             && (session.cursor.offset == 0 || session.cursor.offset == session.len());
         let mut selected = self.selected.clone();
         chrome::modal("body-autotext-editor").show(ctx,|ui| {
-            ui.set_width(820.0_f32.min((ctx.content_rect().width()-48.0).max(300.0)));
+            ui.set_width(640.0_f32.min((ctx.content_rect().width()-48.0).max(300.0)));
             // Let the scroll viewport measure the form against the real screen
             // budget, rather than retaining Area's small initial size forever.
             ui.set_max_height((ctx.content_rect().height()-150.0).max(260.0));
@@ -312,13 +312,14 @@ impl State {
                             }
                         });
                     });
-                    ui.add_sized(Vec2::new(ui.spacing().item_spacing.x,240.0),egui::Separator::default().vertical());
+                    let band=if self.entries.is_empty() {90.0} else {240.0};
+                    ui.add_sized(Vec2::new(ui.spacing().item_spacing.x,band),egui::Separator::default().vertical());
                     ui.vertical(|ui| {
                         ui.set_width(ui.available_width().max(240.0));
                         ui.strong("미리 보기");
                         if let Some(entry)=self.entries.iter().find(|e|Some(&e.id)==selected.as_ref()) {
                             ui.label(&entry.description);
-                            ui.small(format!("{}개 문단 · {}바이트",entry.paragraphs,entry.bytes));
+                            ui.label(RichText::new(format!("{}개 문단 · {}바이트",entry.paragraphs,entry.bytes)).size(12.5).color(Color32::DARK_GRAY));
                             if selected==self.selected && let Some((texture,size))=&self.texture {
                                 let width=ui.available_width().min(size.x).min(420.0);
                                 let display=Vec2::new(width,size.y*width/size.x.max(1.0));
@@ -330,16 +331,17 @@ impl State {
                     });
                 });
                 ui.horizontal(|ui| {
+                    let insert_why=if self.selected.is_none() {"목록에서 넣을 상용구를 고르세요."} else {"선택을 풀고 본문 문단의 시작이나 끝에 커서를 놓으세요(표 셀 안에는 넣을 수 없습니다)."};
                     let response=ui.add_enabled(self.selected.is_some()&&can_insert,egui::Button::new("현재 본문에 넣기"));
                     #[cfg(test)] self.record_action("insert",ui,&response);
-                    insert=response.on_hover_text("본문 문단의 시작 또는 끝에 커서를 놓으면 넣을 수 있습니다.").clicked();
+                    insert=response.on_hover_text("본문 문단의 시작 또는 끝에 커서를 놓으면 넣을 수 있습니다.").on_disabled_hover_text(insert_why).clicked();
                     let response=ui.add_enabled(self.selected.is_some(),egui::Button::new("선택 항목 지우기"));
                     #[cfg(test)] self.record_action("delete",ui,&response);
-                    delete=response.clicked();
+                    delete=response.on_disabled_hover_text("목록에서 지울 상용구를 고르세요.").clicked();
                 });
                 chrome::section(ui,"현재 문단 선택 등록");
                 ui.horizontal(|ui| {ui.label("이름");ui.add(egui::TextEdit::singleline(&mut self.draft.name).id_salt("body-autotext-name").desired_width(250.0));});
-                ui.horizontal(|ui| {ui.label("설명");ui.add(egui::TextEdit::singleline(&mut self.draft.description).id_salt("body-autotext-description").desired_width(500.0));});
+                ui.horizontal(|ui| {ui.label("설명");ui.add(egui::TextEdit::singleline(&mut self.draft.description).id_salt("body-autotext-description").desired_width(420.0));});
                 if let Some(source)=&self.draft.capture {
                     ui.label(format!("구역 {} · 문단 {}–{} · {}개 문단",source.source["section"].as_u64().unwrap_or(0)+1,source.source["start"].as_u64().unwrap_or(0)+1,source.source["end"].as_u64().unwrap_or(0),source.paragraphs));
                     ui.add(egui::Label::new(&source.summary).wrap());
@@ -351,11 +353,12 @@ impl State {
                     #[cfg(test)] self.record_action("capture",ui,&response);
                     capture=response.clicked();
                     ui.checkbox(&mut self.draft.overwrite,"같은 이름 덮어쓰기");
+                    let register_why=if self.draft.capture.is_none() {"[현재 선택 다시 읽기]로 등록할 문단을 먼저 읽으세요."} else if !self.draft.selection_status.is_empty() {"읽은 선택을 등록할 수 없습니다. 아래 빨간 안내를 확인하세요."} else if self.revision.is_none() {"[새로 고침]으로 목록을 읽은 뒤 등록하세요."} else {"이름을 입력하세요."};
                     let response=ui.add_enabled(self.draft.capture.is_some()&&self.draft.selection_status.is_empty()&&self.revision.is_some()&&!self.draft.name.trim().is_empty(),egui::Button::new("등록"));
                     #[cfg(test)] self.record_action("register",ui,&response);
-                    register=response.clicked();
+                    register=response.on_disabled_hover_text(register_why).clicked();
                 });
-                ui.small("선택이 없으면 현재 본문 문단 전체를 등록합니다. 서식·표·개체를 포함할 문단은 처음부터 끝까지 선택하세요.");
+                ui.label(RichText::new("선택이 없으면 현재 본문 문단 전체를 등록합니다. 서식·표·개체를 포함할 문단은 처음부터 끝까지 선택하세요.").size(12.5).color(Color32::GRAY));
                 if !self.status.is_empty() {ui.colored_label(Color32::DARK_RED,&self.status);}
             });
             ui.separator();

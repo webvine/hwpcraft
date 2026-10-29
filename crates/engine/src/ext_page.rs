@@ -215,7 +215,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "page.copy",
-        "page: optional 1-based page (default: caret page). Copies the paragraphs that start on that page to the process-wide page clipboard.",
+        "page: optional 1-based page (default: caret page). Copies the paragraphs that start on that page to the document-local page clipboard.",
         r#"{"page":2}"#,
     ),
     (
@@ -1775,16 +1775,8 @@ struct InsertFile {
     password: Option<String>,
 }
 
-/// The copied page (Hangul puts it on the system clipboard; HwpCraft keeps it per process so
-/// the CLI, MCP and desktop sessions share one 쪽 클립보드). Never written to disk.
-static PAGE_CLIPBOARD: std::sync::Mutex<Option<Document>> = std::sync::Mutex::new(None);
-
-fn page_clipboard() -> std::sync::MutexGuard<'static, Option<Document>> {
-    match PAGE_CLIPBOARD.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
+// The copied page belongs to this Session. A process-global clipboard would
+// let an unrelated MCP document paste content without its source handle.
 
 /// `Document` holding only `range` of section `sec` of `doc`, with the format tables kept so
 /// `paste_foreign_document_native` can remap them.
@@ -1937,15 +1929,17 @@ impl Session {
             range
         };
         let foreign = excerpt(self.core.document(), sec, range.clone())?;
-        *page_clipboard() = Some(foreign);
+        self.page_clipboard = Some(std::rc::Rc::new(foreign));
         Ok(json!({"page": page + 1, "paragraphs": range.len()}))
     }
 
     /// Hangul PastePage: the copied page becomes a new page right after the current one and
     /// the caret lands at the end of the pasted content (observed behaviour).
     fn paste_page(&mut self, page: Option<u32>) -> Result<Value> {
-        let foreign = page_clipboard()
-            .clone()
+        let foreign = self
+            .page_clipboard
+            .as_deref()
+            .cloned()
             .ok_or_else(|| anyhow!("복사한 쪽이 없습니다. 먼저 쪽 복사하기를 실행하세요."))?;
         let count: usize = foreign.sections.iter().map(|s| s.paragraphs.len()).sum();
         let page = self.page_target(page)?;
@@ -2121,6 +2115,31 @@ impl Session {
         let pages = print_pages(range, current, self.page_count()?)?;
         let job = self.pdf_job(&pages)?;
         Ok((pages, job))
+    }
+
+    /// 0-based pages of a Hangul 인쇄 범위 (`print_pages` names) in this document, for a
+    /// PDF prepared a few pages per frame (`Session::pdf_prepare`).
+    pub fn print_pdf_pages(&self, range: &str, current: u32) -> Result<Vec<u32>> {
+        print_pages(range, current, self.page_count()?)
+    }
+
+    /// The selected block as its own session, for a PDF prepared a few pages per frame.
+    /// It is a copy, so later edits of this document do not change it.
+    pub fn block_pdf_session(&self) -> Result<Session> {
+        Ok(self.block_session()?.0)
+    }
+
+    /// Whether the document carries Hangul change-tracking records (HWP 5 `DocInfo`
+    /// TRACK_CHANGE / TRACK_CHANGE_AUTHOR). RHWP keeps them as raw records and writes
+    /// them back but does not show the changes. RHWP does not read HWPX change lists.
+    pub fn has_track_change_records(&self) -> bool {
+        // HWPTAG_BEGIN (16) + 80 and + 81.
+        self.core
+            .document()
+            .doc_info
+            .extra_records
+            .iter()
+            .any(|r| matches!(r.tag_id, 96 | 97))
     }
 
     /// The selected body text as a separate document session, plus its paragraph texts.

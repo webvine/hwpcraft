@@ -5,7 +5,7 @@
 //! parity has not yet been measured. Root owns Session/history integration.
 use super::*;
 use hwpcraft_doc::model::{
-    document::Document,
+    document::{DocInfo, Document},
     paragraph::CharShapeRef,
     style::{BorderFill, CharShape, Font},
 };
@@ -38,6 +38,8 @@ pub(crate) struct PreparedFormat {
     patch: Value,
     collapsed: Option<(Cursor, Boundary, NativeInsertionShape)>,
     durable_write: bool,
+    /// The caller already defers pagination (an atomic batch or replace-all).
+    layout_deferred: bool,
 }
 
 #[derive(Clone)]
@@ -193,11 +195,13 @@ impl NativeInsertionShape {
 
     /// Registration happens only in a detached document being committed.
     pub(crate) fn register(&self, doc: &mut Document) -> Result<u32> {
+        self.register_info(&mut doc.doc_info)
+    }
+    fn register_info(&self, info: &mut DocInfo) -> Result<u32> {
         let mut shape = self.shape.clone();
         for language in 0..7 {
             if let Some(font) = &self.fonts[language] {
-                let faces = doc
-                    .doc_info
+                let faces = info
                     .font_faces
                     .get_mut(language)
                     .ok_or_else(|| anyhow!("언어별 글꼴 목록이 없습니다."))?;
@@ -220,14 +224,14 @@ impl NativeInsertionShape {
             }
         }
         if let Some(border) = &self.border {
-            let existing = resource_index(&doc.doc_info.border_fills, border)?;
+            let existing = resource_index(&info.border_fills, border)?;
             let index = match existing {
                 Some(index) => index,
                 None => {
-                    u16::try_from(doc.doc_info.border_fills.len() + 1)
+                    u16::try_from(info.border_fills.len() + 1)
                         .map_err(|_| anyhow!("테두리 ID 공간이 소진되었습니다."))?;
-                    doc.doc_info.border_fills.push(border.clone());
-                    doc.doc_info.border_fills.len() - 1
+                    info.border_fills.push(border.clone());
+                    info.border_fills.len() - 1
                 }
             };
             let id = u16::try_from(index + 1)
@@ -237,20 +241,15 @@ impl NativeInsertionShape {
                 shape.border_fill_id = id;
             }
         }
-        let id = if let Some(id) = doc
-            .doc_info
-            .char_shapes
-            .iter()
-            .position(|old| *old == shape)
-        {
+        let id = if let Some(id) = info.char_shapes.iter().position(|old| *old == shape) {
             id
         } else {
-            u32::try_from(doc.doc_info.char_shapes.len())
+            u32::try_from(info.char_shapes.len())
                 .map_err(|_| anyhow!("글자 모양 ID 공간이 소진되었습니다."))?;
-            doc.doc_info.char_shapes.push(shape);
-            doc.doc_info.char_shapes.len() - 1
+            info.char_shapes.push(shape);
+            info.char_shapes.len() - 1
         };
-        doc.doc_info.raw_stream_dirty = true;
+        info.raw_stream_dirty = true;
         u32::try_from(id).map_err(|_| anyhow!("글자 모양 ID 공간이 소진되었습니다."))
     }
 
@@ -258,6 +257,8 @@ impl NativeInsertionShape {
         // Preview through the real native formatter on one detached character.
         // Fonts, borders and native attr bits are handled by existing code.
         let mut doc = session.core.document().clone();
+        // Laying out the other sections cost about 0.25 s on a 380-page document.
+        doc.sections.truncate(1);
         let id = self.register(&mut doc)?;
         let mut p = Paragraph::new_empty();
         p.insert_text_at(0, "x");
@@ -380,6 +381,7 @@ impl InsertionShapeState {
             patch,
             collapsed,
             durable_write,
+            layout_deferred: session.layout_deferred(),
         })
     }
 
@@ -433,7 +435,8 @@ impl PreparedFormat {
         self.collapsed.is_none() || self.durable_write
     }
 
-    /// Core and state remain unchanged if validation/native formatting fails.
+    /// Both forms edit the live core inside the caller's undo transaction, whose
+    /// snapshot restores a paragraph that fails part-way.
     pub(crate) fn apply(
         self,
         core: &mut DocumentCore,
@@ -442,57 +445,94 @@ impl PreparedFormat {
         if let Some((at, kind, style)) = self.collapsed {
             checked(core.document(), at, &(at.offset..at.offset))?;
             if self.durable_write {
-                let mut doc = core.document().clone();
-                let id = style.register(&mut doc)?;
-                apply_boundary(&mut doc, at, kind, id)?;
-                core.set_document(doc);
+                write_boundary(core, at, kind, &style)?;
             }
             state.set(at, style);
             return Ok(());
         }
-        let mut staged = DocumentCore::new_empty();
-        staged.set_document(core.document().clone());
-        let mut formatter = Session::with_core(staged, None);
-        for (at, range) in self.parts {
-            checked(formatter.core.document(), at, &range)?;
-            formatter.cursor = at;
-            let id = paragraph(formatter.core.document(), at)?
-                .char_shape_id_at(range.start)
-                .unwrap_or(0);
-            let current = formatter.char_shape_json(id);
-            let props = formatter
-                .character_parameters_from(self.patch.clone(), Some(current))?
-                .to_string();
-            if let Some(cell) = at.cell {
-                formatter.core.apply_char_format_in_cell_native(
-                    at.section,
-                    at.paragraph,
-                    cell.control,
-                    cell.index,
-                    cell.paragraph,
-                    range.start,
-                    range.end,
-                    &props,
-                )
-            } else {
-                formatter.core.apply_char_format_native(
-                    at.section,
-                    at.paragraph,
-                    range.start,
-                    range.end,
-                    &props,
-                )
-            }
-            .map_err(err)?;
-            if range.start == 0 {
-                align_selected_leading(formatter.core.document_mut(), at)?;
-            }
-            validate_resources(formatter.core.document())?;
-        }
-        core.set_document(formatter.core.document().clone());
+        // A staged copy cost two full re-layouts (copy in, copy back), about 0.5 s on
+        // a 380-page document whatever the selection size. Pagination runs once at
+        // the end instead of after every paragraph.
+        let mut formatter =
+            Session::with_core(std::mem::replace(core, DocumentCore::new_empty()), None);
+        let result = if self.layout_deferred {
+            format_selection(&mut formatter, self.parts, &self.patch)
+        } else {
+            formatter.deferred_layout(|f| format_selection(f, self.parts, &self.patch))
+        };
+        *core = formatter.core;
+        result?;
         state.clear();
         Ok(())
     }
+}
+
+fn format_selection(
+    formatter: &mut Session,
+    parts: Vec<(Cursor, Range<usize>)>,
+    patch: &Value,
+) -> Result<()> {
+    for (at, range) in parts {
+        checked(formatter.core.document(), at, &range)?;
+        formatter.cursor = at;
+        let id = paragraph(formatter.core.document(), at)?
+            .char_shape_id_at(range.start)
+            .unwrap_or(0);
+        let current = formatter.char_shape_json(id);
+        let props = formatter
+            .character_parameters_from(patch.clone(), Some(current))?
+            .to_string();
+        if let Some(cell) = at.cell {
+            formatter.core.apply_char_format_in_cell_native(
+                at.section,
+                at.paragraph,
+                cell.control,
+                cell.index,
+                cell.paragraph,
+                range.start,
+                range.end,
+                &props,
+            )
+        } else {
+            formatter.core.apply_char_format_native(
+                at.section,
+                at.paragraph,
+                range.start,
+                range.end,
+                &props,
+            )
+        }
+        .map_err(err)?;
+        if range.start == 0 {
+            align_selected_leading(formatter.core.document_mut(), at)?;
+        }
+        validate_resources(formatter.core.document())?;
+    }
+    Ok(())
+}
+
+/// Register `style` and point the boundary run at it in the live document, then lay
+/// out that paragraph again. A copied document plus `set_document` re-laid out the
+/// whole document (about 0.25 s per Enter at a paragraph end on 380 pages).
+fn write_boundary(
+    core: &mut DocumentCore,
+    at: Cursor,
+    kind: Boundary,
+    style: &NativeInsertionShape,
+) -> Result<()> {
+    let id = register_live(core, style)?;
+    apply_boundary(core.document_mut(), at, kind, id)?;
+    core.relayout_paragraph_native(at.section, at.paragraph, at.cell.map(|c| c.control))
+        .map_err(err)?;
+    Ok(())
+}
+
+/// Resources go in as one doc_info swap, so a failed registration changes nothing.
+fn register_live(core: &mut DocumentCore, style: &NativeInsertionShape) -> Result<u32> {
+    let mut info = core.document().doc_info.clone();
+    let id = style.register_info(&mut info)?;
+    core.document_mut().doc_info = info;
+    Ok(id)
 }
 
 /// Native selection formatting starting at the first text character also sets
@@ -593,12 +633,9 @@ impl InsertTicket {
         if exact {
             return Ok(());
         }
-        let mut doc = core.document().clone();
-        let id = self.style.register(&mut doc)?;
-        let mut staged = DocumentCore::new_empty();
-        staged.set_document(doc);
+        let id = register_live(core, &self.style)?;
         if let Some(cell) = at.cell {
-            staged.set_char_shape_id_in_cell_native(
+            core.set_char_shape_id_in_cell_native(
                 at.section,
                 at.paragraph,
                 cell.control,
@@ -609,10 +646,9 @@ impl InsertTicket {
                 id,
             )
         } else {
-            staged.set_char_shape_id_native(at.section, at.paragraph, range.start, range.end, id)
+            core.set_char_shape_id_native(at.section, at.paragraph, range.start, range.end, id)
         }
         .map_err(err)?;
-        core.set_document(staged.document().clone());
         Ok(())
     }
 
@@ -635,10 +671,7 @@ impl SplitTicket {
                 bail!("문단 끝 나누기의 대상 문단이 비어 있지 않습니다.");
             }
             checked(core.document(), caret, &(0..0))?;
-            let mut doc = core.document().clone();
-            let id = style.register(&mut doc)?;
-            apply_boundary(&mut doc, caret, Boundary::Empty, id)?;
-            core.set_document(doc);
+            write_boundary(core, caret, Boundary::Empty, &style)?;
             state.set(caret, style);
         } else {
             state.clear();

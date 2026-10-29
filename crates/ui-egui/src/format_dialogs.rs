@@ -230,17 +230,6 @@ impl HwpApp {
                                     paragraph_fields(ui, &mut draft);
                                 }
                             });
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label("대화 상자 설정");
-                            ui.add_enabled_ui(false, |ui| {
-                                egui::ComboBox::from_id_salt("dialog-preset")
-                                    .width(body - 150.0)
-                                    .selected_text("사용자 지정")
-                                    .show_ui(ui, |_| {});
-                                let _ = ui.button("구성...");
-                            });
-                        });
                     });
                     ui.add_space(12.0);
                     ui.vertical(|ui| {

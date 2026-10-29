@@ -17,8 +17,12 @@ struct OpenProtected {
 pub(crate) fn open(backend: &mut Headless, params: Value) -> Result<Value> {
     let p: OpenProtected = serde_json::from_value(params)?;
     backend.require_discard(p.force)?;
-    backend.session.open_with_password(&p.path, &p.password)?;
-    Ok(backend.session.info())
+    let prepared = crate::staged_document::prepare_open(
+        p.path,
+        Some(p.password),
+        crate::staged_document::next_generation(backend.session.generation),
+    )?;
+    Ok(prepared.commit(&mut backend.session))
 }
 
 #[cfg(test)]

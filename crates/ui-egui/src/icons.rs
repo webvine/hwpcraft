@@ -243,6 +243,7 @@ impl Icons {
 
     /// Hangul's large ribbon button: 32 px icon over one or two label lines
     /// (`\n` splits them); `menu` adds the ∨ drop-down mark after the label.
+    /// The caller adds the tooltip.
     pub fn large(
         &self,
         ui: &mut Ui,
@@ -301,10 +302,11 @@ impl Icons {
                 color,
             );
         }
-        hover_text(response, label, enabled)
+        response
     }
 
-    /// Hangul's small 24 px button: icon, optional label and optional ∨ part.
+    /// Hangul's small 24 px button: icon, optional label and optional ∨ part, with
+    /// `tooltip` as given.
     #[allow(clippy::too_many_arguments)]
     pub fn small(
         &self,
@@ -340,7 +342,7 @@ impl Icons {
         if menu {
             chevron(ui, Pos2::new(rect.right() - 8.0, rect.center().y), color);
         }
-        hover_text(response, tooltip, enabled)
+        response.on_hover_text(tooltip)
     }
 }
 
@@ -376,14 +378,6 @@ fn frame(ui: &Ui, rect: Rect, response: &Response, enabled: bool, selected: bool
             egui::StrokeKind::Inside,
         );
     }
-}
-fn hover_text(response: Response, label: &str, enabled: bool) -> Response {
-    let label = label.replace('\n', " ");
-    response.on_hover_text(if enabled {
-        label
-    } else {
-        format!("{label} · 아직 지원하지 않거나 지금은 사용할 수 없습니다.")
-    })
 }
 /// The small ∨ that marks a drop-down part.
 pub fn chevron(ui: &Ui, center: Pos2, color: Color32) {

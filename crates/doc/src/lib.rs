@@ -12,6 +12,8 @@ pub use rhwp::paint::{LayerNode, LayerNodeKind, PaintOp};
 pub use rhwp::parser::body_text::parse_paragraph_list as parse_hwp_paragraph_list;
 pub use rhwp::parser::record::Record as HwpRecord;
 pub use rhwp::password_crypto;
+pub use rhwp::renderer::hyperlinks::PdfLink;
+pub use rhwp::renderer::layout::set_layout_diagnostics;
 pub use rhwp::renderer::pdf::PdfExportOptions;
 pub use rhwp::renderer::pdf::svgs_to_pdf_with_links;
 pub use rhwp::renderer::render_tree::{PageRenderTree, RenderNode, RenderNodeType};
@@ -26,7 +28,9 @@ pub use rhwp::wasm_api::HwpDocument;
 
 /// Public chart/compound-file primitives used by HwpCraft's own chart authoring.
 pub mod chart_io {
-    pub use rhwp::ooxml_chart::{OoxmlChart, data::scan_chart_values};
+    pub use rhwp::ooxml_chart::{
+        OoxmlChart, OoxmlChartType, ScatterStyle, data::scan_chart_values,
+    };
     pub use rhwp::parser::ole_container::{all_ole_streams, ole_root_clsid};
     pub use rhwp::serializer::mini_cfb::build_cfb_with_root_clsid;
     pub use rhwp::serializer::ole_container::replace_ole_stream;

@@ -23,6 +23,8 @@ use tokio_util::sync::CancellationToken;
 const PREFIX: &str = "hwpcraft://documents/";
 const MAX_DOCUMENTS: usize = 16;
 const MAX_SUBSCRIPTIONS: usize = 64;
+/// Application error code outside the JSON-RPC reserved range (-32768..=-32000).
+pub(crate) const SUBSCRIPTION_CAPACITY_REACHED: i32 = -31503;
 type Revision = Arc<()>;
 type Documents = BTreeMap<String, Revision>;
 
@@ -205,7 +207,7 @@ impl DocumentSubscriptions {
         }
         let _permit = self.permits.clone().try_acquire_owned().map_err(|_| {
             ErrorData::new(
-                ErrorCode(-32901),
+                ErrorCode(SUBSCRIPTION_CAPACITY_REACHED),
                 "document subscription capacity reached (64)",
                 None,
             )

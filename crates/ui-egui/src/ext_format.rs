@@ -772,397 +772,353 @@ impl HwpApp {
             .unwrap_or(0);
         let mut close = false;
         let mut apply = None;
-        let r = chrome::modal("format-style").show(ctx, |ui| {
-            ui.set_width(763.0);
-            close = chrome::title(ui, "스타일");
-            ui.horizontal_top(|ui| {
-                egui::Frame::new()
-                    .stroke(Stroke::new(1.0, Color32::from_gray(227)))
-                    .inner_margin(egui::Margin::symmetric(14, 10))
-                    .show(ui, |ui| {
-                        ui.set_width(640.0);
-                        ui.horizontal_top(|ui| {
-                            ui.vertical(|ui| {
-                                ui.set_width(314.0);
-                                ui.label("스타일 목록");
-                                egui::Frame::new()
-                                    .stroke(Stroke::new(1.0, Color32::from_gray(200)))
-                                    .show(ui, |ui| {
-                                        ui.set_min_size(Vec2::new(312.0, 440.0));
-                                        ui.horizontal(|ui| {
-                                            ui.add_sized(
-                                                [192.0, 22.0],
-                                                egui::Label::new(RichText::new("이름").weak()),
-                                            );
-                                            ui.add_sized(
-                                                [90.0, 22.0],
-                                                egui::Label::new(RichText::new("단축키").weak()),
-                                            );
-                                        });
-                                        egui::ScrollArea::vertical().max_height(410.0).show(
-                                            ui,
-                                            |ui| {
-                                                for (i, s) in styles.iter().enumerate() {
-                                                    let character = s["type"] == "character";
-                                                    let name = s["name"].as_str().unwrap_or("");
-                                                    let shortcut =
-                                                        s["shortcut"].as_str().unwrap_or("-");
-                                                    let (rect, resp) = ui.allocate_exact_size(
-                                                        Vec2::new(296.0, 28.0),
-                                                        egui::Sense::click(),
-                                                    );
-                                                    let p = ui.painter();
-                                                    if d.selected == i {
-                                                        p.rect(
-                                                            rect,
-                                                            0.0,
-                                                            Color32::from_rgb(222, 233, 255),
-                                                            Stroke::new(
-                                                                1.0,
-                                                                chrome::Tokens::ACCENT,
-                                                            ),
-                                                            egui::StrokeKind::Inside,
-                                                        );
-                                                    } else if resp.hovered() {
-                                                        p.rect_filled(
-                                                            rect,
-                                                            0.0,
-                                                            Color32::from_gray(245),
-                                                        );
-                                                    }
-                                                    let icon = Rect::from_min_size(
-                                                        rect.min + Vec2::new(8.0, 7.0),
-                                                        Vec2::splat(14.0),
-                                                    );
-                                                    if character {
-                                                        p.text(
-                                                            icon.center(),
-                                                            egui::Align2::CENTER_CENTER,
-                                                            "가",
-                                                            egui::FontId::proportional(12.0),
-                                                            Color32::from_rgb(46, 105, 220),
-                                                        );
-                                                    } else {
-                                                        paint_align(p, icon, "justify");
-                                                    }
-                                                    if i == current {
-                                                        let red = Stroke::new(
-                                                            1.8,
-                                                            Color32::from_rgb(200, 40, 40),
-                                                        );
-                                                        let o = icon.left_bottom()
-                                                            + Vec2::new(-2.0, -5.0);
-                                                        p.line_segment(
-                                                            [o, o + Vec2::new(4.0, 4.0)],
-                                                            red,
-                                                        );
-                                                        p.line_segment(
-                                                            [
-                                                                o + Vec2::new(4.0, 4.0),
-                                                                o + Vec2::new(11.0, -5.0),
-                                                            ],
-                                                            red,
-                                                        );
-                                                    }
-                                                    p.text(
-                                                        Pos2::new(
-                                                            rect.left() + 32.0,
-                                                            rect.center().y,
-                                                        ),
-                                                        egui::Align2::LEFT_CENTER,
-                                                        name,
-                                                        egui::FontId::proportional(13.0),
-                                                        Color32::from_gray(25),
-                                                    );
-                                                    p.text(
-                                                        Pos2::new(
-                                                            rect.left() + 200.0,
-                                                            rect.center().y,
-                                                        ),
-                                                        egui::Align2::LEFT_CENTER,
-                                                        shortcut,
-                                                        egui::FontId::proportional(12.0),
-                                                        Color32::from_gray(60),
-                                                    );
-                                                    if resp.clicked() {
-                                                        d.selected = i;
-                                                        d.preview = None;
-                                                    }
-                                                    if resp.double_clicked() {
-                                                        apply = Some(i);
-                                                    }
-                                                }
-                                            },
-                                        );
-                                    });
+        // Shared dialog frame: title bar, body, 설정(D)/취소 on the right,
+        // Enter applies the selected style and Esc/× cancel.
+        let button =
+            super::ext_shell::dialog(ctx, "스타일", 784.0, &["설정(D)", "취소"], |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(314.0);
+                        ui.label("스타일 목록");
+                        egui::Frame::new()
+                            .stroke(Stroke::new(1.0, Color32::from_gray(200)))
+                            .show(ui, |ui| {
+                                ui.set_min_size(Vec2::new(312.0, 440.0));
                                 ui.horizontal(|ui| {
-                                    let small = format_dialogs::icon_button;
-                                    if small(ui, "add", "스타일 추가하기", true) {
-                                        d.edit = Some(self.new_style_edit(None));
-                                    }
-                                    if small(ui, "edit", "스타일 편집하기", true) {
-                                        d.edit = Some(self.new_style_edit(Some(d.selected)));
-                                    }
-                                    if small(ui, "delete", "스타일 지우기", d.selected > 0) {
-                                        d.delete = Some(0);
-                                    }
-                                    if small(ui, "replace", "커서 위치의 모양으로 바꾸기", true)
-                                        && self.run(
-                                            "format.style.update_from_caret",
-                                            json!({ "id": d.selected }),
-                                        )
-                                    {
-                                        d.preview = None;
-                                    }
-                                    ui.add_space(6.0);
-                                    // 바탕글 stays first, so the second style cannot move up.
-                                    if small(ui, "up", "한 줄 위로 이동하기", d.selected > 1)
-                                        && self.run(
-                                            "format.style.move",
-                                            json!({"id": d.selected, "direction": "up"}),
-                                        )
-                                    {
-                                        d.selected -= 1;
-                                        d.preview = None;
-                                    }
-                                    let can_down = d.selected > 0 && d.selected + 1 < styles.len();
-                                    if small(ui, "down", "한 줄 아래로 이동하기", can_down)
-                                        && self.run(
-                                            "format.style.move",
-                                            json!({"id": d.selected, "direction": "down"}),
-                                        )
-                                    {
-                                        d.selected += 1;
-                                        d.preview = None;
-                                    }
-                                    ui.add_space(6.0);
-                                    small(ui, "gallery", "스타일마당 (지원하지 않음)", false);
-                                    if small(ui, "import", "스타일 가져오기 (JSON)", true)
-                                        && let Some(path) = rfd::FileDialog::new()
-                                            .add_filter("스타일 JSON", &["json"])
-                                            .pick_file()
-                                        && self.run(
-                                            "format.style.import",
-                                            json!({ "path": path.to_string_lossy() }),
-                                        )
-                                    {
-                                        self.message = "스타일을 가져왔습니다.".into();
-                                        d.preview = None;
-                                    }
-                                    if small(ui, "export", "스타일 내보내기 (JSON)", true)
-                                        && let Some(path) = rfd::FileDialog::new()
-                                            .add_filter("스타일 JSON", &["json"])
-                                            .set_file_name("styles.json")
-                                            .save_file()
-                                        && self.run(
-                                            "format.style.export",
-                                            json!({ "path": path.to_string_lossy() }),
-                                        )
-                                    {
-                                        self.message = "스타일을 내보냈습니다.".into();
-                                    }
-                                });
-                            });
-                            ui.add_space(14.0);
-                            ui.vertical(|ui| {
-                                ui.set_width(310.0);
-                                ui.label("문단 모양");
-                                let (rect, _) = ui.allocate_exact_size(
-                                    Vec2::new(310.0, 100.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect(
-                                    rect,
-                                    0.0,
-                                    Color32::WHITE,
-                                    Stroke::new(1.0, Color32::from_gray(215)),
-                                    egui::StrokeKind::Inside,
-                                );
-                                if let Some((_, t, size)) = &d.preview {
-                                    let inner = rect.shrink(4.0);
-                                    let scale = (inner.width() / size.x)
-                                        .min(inner.height() / size.y)
-                                        .min(1.0);
-                                    let size = *size * scale;
-                                    ui.painter().image(
-                                        t.id(),
-                                        Rect::from_min_size(
-                                            Pos2::new(inner.center().x - size.x / 2.0, inner.top()),
-                                            size,
-                                        ),
-                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                        Color32::WHITE,
+                                    ui.add_sized(
+                                        [192.0, 22.0],
+                                        egui::Label::new(RichText::new("이름").weak()),
                                     );
-                                }
-                                let para = &detail["paragraph"];
-                                let chars = &detail["character"];
-                                let pt = |v: &Value, scale: f64| {
-                                    format!(
-                                        "{} pt",
-                                        (v.as_f64().unwrap_or(0.0) / scale * 10.0).round() / 10.0
-                                    )
-                                };
-                                let indent = para["indent"].as_f64().unwrap_or(0.0);
-                                let first = if indent > 0.0 {
-                                    format!("들여쓰기 {}", pt(&json!(indent), 200.0))
-                                } else if indent < 0.0 {
-                                    format!("내어쓰기 {}", pt(&json!(-indent), 200.0))
-                                } else {
-                                    "보통".into()
-                                };
-                                let align = match para["alignment"].as_str() {
-                                    Some("left") => "왼쪽",
-                                    Some("right") => "오른쪽",
-                                    Some("center") => "가운데",
-                                    Some("distribute") => "배분",
-                                    Some("split") => "나눔",
-                                    _ => "양쪽",
-                                };
-                                let spacing = if para["lineSpacingType"] == "Percent" {
-                                    format!("{} %", para["lineSpacing"].as_i64().unwrap_or(160))
-                                } else {
-                                    pt(&para["lineSpacing"], 100.0)
-                                };
-                                let next = styles
-                                    .get(detail["nextStyleId"].as_u64().unwrap_or(0) as usize)
-                                    .and_then(|s| s["name"].as_str())
-                                    .unwrap_or("-")
-                                    .to_owned();
-                                let info = |ui: &mut egui::Ui, rows: &[(&str, String)]| {
-                                    egui::Grid::new(ui.next_auto_id())
-                                        .num_columns(4)
-                                        .spacing([6.0, 6.0])
-                                        .show(ui, |ui| {
-                                            for pair in rows.chunks(2) {
-                                                for (k, v) in pair {
-                                                    lbl(ui, k, 62.0);
-                                                    ui.label(format!(": {v}"));
-                                                }
-                                                ui.end_row();
+                                    ui.add_sized(
+                                        [90.0, 22.0],
+                                        egui::Label::new(RichText::new("단축키").weak()),
+                                    );
+                                });
+                                egui::ScrollArea::vertical()
+                                    .max_height(410.0)
+                                    .show(ui, |ui| {
+                                        for (i, s) in styles.iter().enumerate() {
+                                            let character = s["type"] == "character";
+                                            let name = s["name"].as_str().unwrap_or("");
+                                            let shortcut = s["shortcut"].as_str().unwrap_or("-");
+                                            let (rect, resp) = ui.allocate_exact_size(
+                                                Vec2::new(296.0, 28.0),
+                                                egui::Sense::click(),
+                                            );
+                                            let p = ui.painter();
+                                            if d.selected == i {
+                                                p.rect(
+                                                    rect,
+                                                    0.0,
+                                                    Color32::from_rgb(222, 233, 255),
+                                                    Stroke::new(1.0, chrome::Tokens::ACCENT),
+                                                    egui::StrokeKind::Inside,
+                                                );
+                                            } else if resp.hovered() {
+                                                p.rect_filled(rect, 0.0, Color32::from_gray(245));
                                             }
-                                        });
-                                };
-                                let mut edit_shape = None;
-                                chrome::section(ui, "문단 모양 정보");
-                                ui.horizontal_top(|ui| {
-                                    ui.vertical(|ui| {
-                                        ui.set_width(250.0);
-                                        info(
-                                            ui,
-                                            &[
-                                                ("왼쪽 여백", pt(&para["marginLeft"], 200.0)),
-                                                ("첫 줄", first),
-                                                ("오른쪽 여백", pt(&para["marginRight"], 200.0)),
-                                                ("정렬", align.into()),
-                                                ("줄 간격", spacing),
-                                                ("다음 스타일", next),
-                                            ],
-                                        );
+                                            let icon = Rect::from_min_size(
+                                                rect.min + Vec2::new(8.0, 7.0),
+                                                Vec2::splat(14.0),
+                                            );
+                                            if character {
+                                                p.text(
+                                                    icon.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    "가",
+                                                    egui::FontId::proportional(12.0),
+                                                    Color32::from_rgb(46, 105, 220),
+                                                );
+                                            } else {
+                                                paint_align(p, icon, "justify");
+                                            }
+                                            if i == current {
+                                                let red = Stroke::new(
+                                                    1.8,
+                                                    Color32::from_rgb(200, 40, 40),
+                                                );
+                                                let o = icon.left_bottom() + Vec2::new(-2.0, -5.0);
+                                                p.line_segment([o, o + Vec2::new(4.0, 4.0)], red);
+                                                p.line_segment(
+                                                    [
+                                                        o + Vec2::new(4.0, 4.0),
+                                                        o + Vec2::new(11.0, -5.0),
+                                                    ],
+                                                    red,
+                                                );
+                                            }
+                                            p.text(
+                                                Pos2::new(rect.left() + 32.0, rect.center().y),
+                                                egui::Align2::LEFT_CENTER,
+                                                name,
+                                                egui::FontId::proportional(13.0),
+                                                Color32::from_gray(25),
+                                            );
+                                            p.text(
+                                                Pos2::new(rect.left() + 200.0, rect.center().y),
+                                                egui::Align2::LEFT_CENTER,
+                                                shortcut,
+                                                egui::FontId::proportional(12.0),
+                                                Color32::from_gray(60),
+                                            );
+                                            if resp.clicked() {
+                                                d.selected = i;
+                                                d.preview = None;
+                                            }
+                                            if resp.double_clicked() {
+                                                apply = Some(i);
+                                            }
+                                        }
                                     });
-                                    if ui.button("설정...").clicked() {
-                                        edit_shape = Some(false);
-                                    }
-                                });
-                                chrome::section(ui, "글자 모양 정보");
-                                ui.horizontal_top(|ui| {
-                                    ui.vertical(|ui| {
-                                        ui.set_width(250.0);
-                                        info(
-                                            ui,
-                                            &[
-                                                (
-                                                    "글꼴",
-                                                    chars["fontFamily"]
-                                                        .as_str()
-                                                        .unwrap_or("")
-                                                        .into(),
-                                                ),
-                                                (
-                                                    "장평",
-                                                    format!(
-                                                        "{} %",
-                                                        chars["ratios"][0].as_i64().unwrap_or(100)
-                                                    ),
-                                                ),
-                                                ("크기", pt(&chars["fontSize"], 100.0)),
-                                                (
-                                                    "자간",
-                                                    format!(
-                                                        "{} %",
-                                                        chars["spacings"][0].as_i64().unwrap_or(0)
-                                                    ),
-                                                ),
-                                            ],
-                                        );
-                                    });
-                                    if ui.button("설정...").clicked() {
-                                        edit_shape = Some(true);
-                                    }
-                                });
-                                chrome::section(ui, "글머리표/문단 번호 정보");
-                                let head = match para["headType"].as_str() {
-                                    Some("Outline") => "개요",
-                                    Some("Number") => "문단 번호",
-                                    Some("Bullet") => "글머리표",
-                                    _ => "없음",
-                                };
-                                ui.horizontal(|ui| {
-                                    lbl(ui, "종류", 62.0);
-                                    ui.label(format!(": {head}"));
-                                });
-                                chrome::section(ui, "현재 커서 위치 스타일");
-                                ui.horizontal(|ui| {
-                                    lbl(ui, "스타일", 62.0);
-                                    ui.label(format!(
-                                        ": {}",
-                                        styles
-                                            .get(current)
-                                            .and_then(|s| s["name"].as_str())
-                                            .unwrap_or("")
-                                    ));
-                                    if ui.button("글자 스타일 해제").clicked() {
-                                        self.run("format.style.clear_char", json!({}));
-                                        d.preview = None;
-                                    }
-                                });
-                                if let Some(character) = edit_shape {
-                                    let values = if character {
-                                        chars.clone()
-                                    } else {
-                                        para.clone()
-                                    };
-                                    let mut draft = FormatDraft::new(values);
-                                    draft.for_style = true;
-                                    self.format_draft = Some(draft);
-                                    self.show_character = character;
-                                    self.show_paragraph = !character;
-                                    d.shape = Some(character);
-                                }
                             });
+                        ui.horizontal(|ui| {
+                            let small = format_dialogs::icon_button;
+                            if small(ui, "add", "스타일 추가하기", true) {
+                                d.edit = Some(self.new_style_edit(None));
+                            }
+                            if small(ui, "edit", "스타일 편집하기", true) {
+                                d.edit = Some(self.new_style_edit(Some(d.selected)));
+                            }
+                            if small(ui, "delete", "스타일 지우기", d.selected > 0) {
+                                d.delete = Some(0);
+                            }
+                            if small(ui, "replace", "커서 위치의 모양으로 바꾸기", true)
+                                && self.run(
+                                    "format.style.update_from_caret",
+                                    json!({ "id": d.selected }),
+                                )
+                            {
+                                d.preview = None;
+                            }
+                            ui.add_space(6.0);
+                            // 바탕글 stays first, so the second style cannot move up.
+                            if small(ui, "up", "한 줄 위로 이동하기", d.selected > 1)
+                                && self.run(
+                                    "format.style.move",
+                                    json!({"id": d.selected, "direction": "up"}),
+                                )
+                            {
+                                d.selected -= 1;
+                                d.preview = None;
+                            }
+                            let can_down = d.selected > 0 && d.selected + 1 < styles.len();
+                            if small(ui, "down", "한 줄 아래로 이동하기", can_down)
+                                && self.run(
+                                    "format.style.move",
+                                    json!({"id": d.selected, "direction": "down"}),
+                                )
+                            {
+                                d.selected += 1;
+                                d.preview = None;
+                            }
+                            ui.add_space(6.0);
+                            small(ui, "gallery", "스타일마당 (지원하지 않음)", false);
+                            if small(ui, "import", "스타일 가져오기 (JSON)", true)
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("스타일 JSON", &["json"])
+                                    .pick_file()
+                                && self.run(
+                                    "format.style.import",
+                                    json!({ "path": path.to_string_lossy() }),
+                                )
+                            {
+                                self.message = "스타일을 가져왔습니다.".into();
+                                d.preview = None;
+                            }
+                            if small(ui, "export", "스타일 내보내기 (JSON)", true)
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("스타일 JSON", &["json"])
+                                    .set_file_name("styles.json")
+                                    .save_file()
+                                && self.run(
+                                    "format.style.export",
+                                    json!({ "path": path.to_string_lossy() }),
+                                )
+                            {
+                                self.message = "스타일을 내보냈습니다.".into();
+                            }
                         });
                     });
-                ui.add_space(10.0);
-                ui.vertical(|ui| {
-                    ui.set_width(80.0);
-                    if ui
-                        .add(
-                            egui::Button::new("설정(D)")
-                                .fill(Color32::WHITE)
-                                .stroke(Stroke::new(1.5, chrome::Tokens::ACCENT))
-                                .min_size(Vec2::new(80.0, 28.0)),
-                        )
-                        .clicked()
-                    {
-                        apply = Some(d.selected);
-                    }
+                    ui.add_space(14.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(310.0);
+                        ui.label("문단 모양");
+                        let (rect, _) =
+                            ui.allocate_exact_size(Vec2::new(310.0, 100.0), egui::Sense::hover());
+                        ui.painter().rect(
+                            rect,
+                            0.0,
+                            Color32::WHITE,
+                            Stroke::new(1.0, Color32::from_gray(215)),
+                            egui::StrokeKind::Inside,
+                        );
+                        if let Some((_, t, size)) = &d.preview {
+                            let inner = rect.shrink(4.0);
+                            let scale = (inner.width() / size.x)
+                                .min(inner.height() / size.y)
+                                .min(1.0);
+                            let size = *size * scale;
+                            ui.painter().image(
+                                t.id(),
+                                Rect::from_min_size(
+                                    Pos2::new(inner.center().x - size.x / 2.0, inner.top()),
+                                    size,
+                                ),
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        }
+                        let para = &detail["paragraph"];
+                        let chars = &detail["character"];
+                        let pt = |v: &Value, scale: f64| {
+                            format!(
+                                "{} pt",
+                                (v.as_f64().unwrap_or(0.0) / scale * 10.0).round() / 10.0
+                            )
+                        };
+                        let indent = para["indent"].as_f64().unwrap_or(0.0);
+                        let first = if indent > 0.0 {
+                            format!("들여쓰기 {}", pt(&json!(indent), 200.0))
+                        } else if indent < 0.0 {
+                            format!("내어쓰기 {}", pt(&json!(-indent), 200.0))
+                        } else {
+                            "보통".into()
+                        };
+                        let align = match para["alignment"].as_str() {
+                            Some("left") => "왼쪽",
+                            Some("right") => "오른쪽",
+                            Some("center") => "가운데",
+                            Some("distribute") => "배분",
+                            Some("split") => "나눔",
+                            _ => "양쪽",
+                        };
+                        let spacing = if para["lineSpacingType"] == "Percent" {
+                            format!("{} %", para["lineSpacing"].as_i64().unwrap_or(160))
+                        } else {
+                            pt(&para["lineSpacing"], 100.0)
+                        };
+                        let next = styles
+                            .get(detail["nextStyleId"].as_u64().unwrap_or(0) as usize)
+                            .and_then(|s| s["name"].as_str())
+                            .unwrap_or("-")
+                            .to_owned();
+                        let info = |ui: &mut egui::Ui, rows: &[(&str, String)]| {
+                            egui::Grid::new(ui.next_auto_id())
+                                .num_columns(4)
+                                .spacing([6.0, 6.0])
+                                .show(ui, |ui| {
+                                    for pair in rows.chunks(2) {
+                                        for (k, v) in pair {
+                                            lbl(ui, k, 62.0);
+                                            ui.label(format!(": {v}"));
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        };
+                        let mut edit_shape = None;
+                        chrome::section(ui, "문단 모양 정보");
+                        ui.horizontal_top(|ui| {
+                            ui.vertical(|ui| {
+                                ui.set_width(250.0);
+                                info(
+                                    ui,
+                                    &[
+                                        ("왼쪽 여백", pt(&para["marginLeft"], 200.0)),
+                                        ("첫 줄", first),
+                                        ("오른쪽 여백", pt(&para["marginRight"], 200.0)),
+                                        ("정렬", align.into()),
+                                        ("줄 간격", spacing),
+                                        ("다음 스타일", next),
+                                    ],
+                                );
+                            });
+                            if ui.button("설정...").clicked() {
+                                edit_shape = Some(false);
+                            }
+                        });
+                        chrome::section(ui, "글자 모양 정보");
+                        ui.horizontal_top(|ui| {
+                            ui.vertical(|ui| {
+                                ui.set_width(250.0);
+                                info(
+                                    ui,
+                                    &[
+                                        ("글꼴", chars["fontFamily"].as_str().unwrap_or("").into()),
+                                        (
+                                            "장평",
+                                            format!(
+                                                "{} %",
+                                                chars["ratios"][0].as_i64().unwrap_or(100)
+                                            ),
+                                        ),
+                                        ("크기", pt(&chars["fontSize"], 100.0)),
+                                        (
+                                            "자간",
+                                            format!(
+                                                "{} %",
+                                                chars["spacings"][0].as_i64().unwrap_or(0)
+                                            ),
+                                        ),
+                                    ],
+                                );
+                            });
+                            if ui.button("설정...").clicked() {
+                                edit_shape = Some(true);
+                            }
+                        });
+                        chrome::section(ui, "글머리표/문단 번호 정보");
+                        let head = match para["headType"].as_str() {
+                            Some("Outline") => "개요",
+                            Some("Number") => "문단 번호",
+                            Some("Bullet") => "글머리표",
+                            _ => "없음",
+                        };
+                        ui.horizontal(|ui| {
+                            lbl(ui, "종류", 62.0);
+                            ui.label(format!(": {head}"));
+                        });
+                        chrome::section(ui, "현재 커서 위치 스타일");
+                        ui.horizontal(|ui| {
+                            lbl(ui, "스타일", 62.0);
+                            ui.label(format!(
+                                ": {}",
+                                styles
+                                    .get(current)
+                                    .and_then(|s| s["name"].as_str())
+                                    .unwrap_or("")
+                            ));
+                            if ui.button("글자 스타일 해제").clicked() {
+                                self.run("format.style.clear_char", json!({}));
+                                d.preview = None;
+                            }
+                        });
+                        if let Some(character) = edit_shape {
+                            let values = if character {
+                                chars.clone()
+                            } else {
+                                para.clone()
+                            };
+                            let mut draft = FormatDraft::new(values);
+                            draft.for_style = true;
+                            self.format_draft = Some(draft);
+                            self.show_character = character;
+                            self.show_paragraph = !character;
+                            d.shape = Some(character);
+                        }
+                    });
                 });
             });
-        });
+        match button {
+            Some(0) => apply = apply.or(Some(d.selected)),
+            Some(_) => close = true,
+            None => {}
+        }
         if let Some(id) = apply {
             if self.run("style.apply", json!({ "id": id })) {
                 return;
             }
-        } else if close || (r.should_close() && d.shape.is_none()) {
+        } else if close && d.shape.is_none() {
             return;
         }
         self.ext.format.style = Some(d);

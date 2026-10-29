@@ -4,7 +4,8 @@
 use super::*;
 use chrome::Tokens;
 
-/// Hangul's zoom range is 10–500 %; pages are rendered at 1.25× and scaled.
+/// Hangul's zoom range is 10–500 %; pages are rasterised at a step near the zoom
+/// (`raster_scale`) and the texture is scaled to the exact zoom.
 pub(crate) const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.1..=5.0;
 /// Fixed chrome around the page view (menu tabs, ribbon, tool bar, ruler, tabs, status bar).
 const CHROME_HEIGHT: f32 = 33.0 + 88.0 + 32.0 + 28.0 + 29.0 + 25.0;
@@ -176,13 +177,21 @@ pub(crate) const RECENT_LIMIT: usize = 9;
 /// Dialog and tool state owned by this module. Stored in `HwpApp::ext.shell`.
 pub(crate) struct State {
     pub show_status_bar: bool,
+    /// 보기 → 지원하지 않는 명령: show unsupported commands (grey) in the ribbon.
+    pub show_unsupported: bool,
     pub show_doc_tabs: bool,
     pub rulers: super::rulers::RulerCache,
     /// Page rectangle the rulers were last drawn against.
     pub ruler_page: Option<Rect>,
     pub dialog: Option<Dialog>,
-    /// First key of a Hangul two-key shortcut (Ctrl+N, Ctrl+G, Ctrl+Q).
+    /// First key of a Hangul two-key shortcut (Ctrl+N, Ctrl+G, Ctrl+K, Ctrl+Q).
     chord: Option<char>,
+    /// Command the last two-key shortcut resolved to (tests compare it with the list).
+    pub last_chord: Option<&'static str>,
+    /// Resolve two-key shortcuts without running them (tests: some open file pickers).
+    pub chords_record_only: bool,
+    /// `--view tooltip-<command id>`: keep that ribbon command's tooltip open (captures).
+    pub pinned_tip: Option<String>,
     /// Selected object kind last frame, to open its context tab once.
     pub object_kind: Option<&'static str>,
     /// 문단 부호 · 조판 부호 · 투명 선 (screen only; re-applied after a document is replaced).
@@ -208,6 +217,16 @@ pub(crate) struct State {
     selection: Option<SelectionHighlight>,
     /// Page redraw queue: the document generation each cached page texture shows.
     pub page_drawn: std::collections::BTreeMap<u32, u64>,
+    /// Raster scale (hundredths) each cached page texture was drawn at.
+    page_scale: std::collections::BTreeMap<u32, u16>,
+    /// The caret paragraph as it appears in its page texture, for band redraws.
+    caret_extent: Option<CaretExtent>,
+    /// Debug builds only: the CPU copy of each page texture, to verify band redraws
+    /// against a full render of the whole page.
+    page_images: std::collections::BTreeMap<u32, egui::ColorImage>,
+    /// Band redraws done and band redraws rejected by the debug check (tests read these).
+    pub band_redraws: u32,
+    pub band_rejected: u32,
     /// Pass in which a stale page was last redrawn (one stale page per pass).
     redraw_pass: Option<u64>,
     /// Pages the view asked for in the current and the previous pass.
@@ -220,16 +239,24 @@ pub(crate) struct State {
     caret_page: Option<(u64, u32)>,
     /// Print request waiting for its background PDF: file, copies, page count.
     print_after: Option<(PathBuf, u32, usize)>,
+    /// A PDF whose pages are being prepared a slice per frame.
+    pdf_preparing: Option<PdfPreparing>,
+    /// Preparation time per frame before the first restart (tests use zero: one page).
+    pdf_budget: std::time::Duration,
 }
 impl Default for State {
     fn default() -> Self {
         Self {
             show_status_bar: true,
+            show_unsupported: false,
             show_doc_tabs: true,
             rulers: Default::default(),
             ruler_page: None,
             dialog: None,
             chord: None,
+            last_chord: None,
+            chords_record_only: false,
+            pinned_tip: None,
             object_kind: None,
             marks: [false; 3],
             marks_applied: u64::MAX,
@@ -246,10 +273,17 @@ impl Default for State {
             hf_next: None,
             selection: None,
             page_drawn: Default::default(),
+            page_scale: Default::default(),
+            caret_extent: None,
+            page_images: Default::default(),
+            band_redraws: 0,
+            band_rejected: 0,
             redraw_pass: None,
             requested: (u64::MAX, Default::default(), Default::default()),
             caret_page: None,
             print_after: None,
+            pdf_preparing: None,
+            pdf_budget: PDF_PREPARE_BUDGET,
         }
     }
 }
@@ -276,6 +310,8 @@ impl HwpApp {
             | "view.status_bar"
             | "view.doc_tabs"
             | "view.rulers"
+            | "view.link_next"
+            | "view.link_prev"
             | "view.paragraph_marks"
             | "view.control_codes"
             | "view.transparent_lines" => true,
@@ -338,6 +374,14 @@ impl HwpApp {
             "view.zoom_out" => self.set_zoom(self.zoom - 0.1),
             "view.status_bar" => self.ext.shell.show_status_bar ^= true,
             "view.doc_tabs" => self.ext.shell.show_doc_tabs ^= true,
+            "view.link_next" | "view.link_prev" => {
+                let step = if id == "view.link_next" {
+                    "hyperlink.next"
+                } else {
+                    "hyperlink.prev"
+                };
+                self.run(step, json!({}));
+            }
             "view.rulers" => self.show_rulers ^= true,
             "view.paragraph_marks" | "view.control_codes" | "view.transparent_lines" => {
                 let i = match id {
@@ -570,6 +614,7 @@ impl HwpApp {
     /// Called every frame after the built-in dialogs.
     pub(crate) fn shell_ext_dialogs(&mut self, ctx: &egui::Context) {
         self.shell_ext_frame();
+        self.poll_pdf_prepare(ctx);
         let Some(mut dialog) = self.ext.shell.dialog.take() else {
             return;
         };
@@ -650,36 +695,43 @@ impl HwpApp {
             ctx.input_mut(|i| i.events.clear());
             self.ext.shell.chord = None;
             self.message.clear();
-            let id = match (prefix, key) {
-                ('N', Key::P) => "page.number",
-                ('N', Key::H) => "page.header",
-                ('N', Key::T) => "table.create",
-                ('G', Key::C) => "view.control_codes",
-                ('G', Key::T) => "view.paragraph_marks",
-                ('G', Key::L) => "view.page_outline",
-                ('G', Key::Q) => "view.zoom_100",
-                ('G', Key::P) => "view.zoom_fit_page",
-                ('G', Key::W) => "view.zoom_fit_width",
-                ('Q', Key::I) | ('Q', Key::D) => "file.doc_info",
-                _ => return true,
+            let Some(&(_, _, id)) = CHORDS.iter().find(|(p, k, _)| *p == prefix && *k == key)
+            else {
+                return true;
             };
-            if self.ext_enabled(id) {
-                self.ext_dispatch(id, ctx);
-            } else if id == "table.create" {
-                self.show_table = true;
-            } else {
-                self.message = format!("{id}: 아직 지원하지 않는 명령입니다.");
+            self.ext.shell.last_chord = Some(id);
+            if self.ext.shell.chords_record_only {
+                return true;
+            }
+            // The ribbon's own entry runs it (enabled check and reason included);
+            // dialogs that have no ribbon button go to their module.
+            if !self.run_ribbon_command(id, ctx) {
+                if self.ext_enabled(id) {
+                    self.ext_dispatch(id, ctx);
+                } else {
+                    self.message = format!("{id}: 지금은 쓸 수 없는 명령입니다.");
+                }
             }
             return true;
         }
         for (key, prefix, hint) in [
-            (Key::N, 'N', "Ctrl+N, (P 쪽 번호 · H 머리말/꼬리말 · T 표)"),
+            (
+                Key::N,
+                'N',
+                "Ctrl+N, (P 쪽 번호 · H 머리말/꼬리말 · T 표 · A 표 나누기 · Z 표 붙이기 · \
+                 I 그림 · N 각주 · E 미주 · M 수식)",
+            ),
             (
                 Key::G,
                 'G',
-                "Ctrl+G, (C 조판 부호 · L 쪽 윤곽 · Q 100% · P 쪽 맞춤 · W 폭 맞춤)",
+                "Ctrl+G, (C 조판 부호 · T 문단 부호 · L 쪽 윤곽 · Q 100% · P 쪽 맞춤 · W 폭 맞춤)",
             ),
-            (Key::Q, 'Q', "Ctrl+Q, (I 문서 정보)"),
+            (
+                Key::K,
+                'K',
+                "Ctrl+K, (H 하이퍼링크 · E 누름틀 · N 문단 번호 · O 개요 번호)",
+            ),
+            (Key::Q, 'Q', "Ctrl+Q, (I 문서 정보 · R 다음 하이퍼링크)"),
         ] {
             if ctx.input_mut(|i| i.consume_key(ctrl, key)) {
                 self.ext.shell.chord = Some(prefix);
@@ -723,6 +775,14 @@ impl HwpApp {
     }
     /// Start-up `--view` names owned by this module.
     pub(crate) fn shell_ext_view(&mut self, name: &str) -> bool {
+        if let Some(id) = name.strip_prefix("tooltip-") {
+            let Some(tab) = self.ribbon_tab_of(id) else {
+                return false;
+            };
+            self.tab = tab;
+            self.ext.shell.pinned_tip = Some(id.to_owned());
+            return true;
+        }
         let id = match name {
             "page-number" => "page.number",
             "header-footer" => "page.header",
@@ -1257,17 +1317,8 @@ impl HwpApp {
         copies: u32,
         to_file: bool,
     ) -> bool {
-        let job = self.session.print_pdf_job(range, self.page);
-        let count = job.as_ref().map_or(0, |(pages, _)| pages.len());
-        let prepared = job
-            .map(|(_, job)| -> PreparedPdf { (job.page_count(), Box::new(move || job.convert())) });
-        if !self.start_shell_pdf(target.clone(), prepared) {
-            return false;
-        }
-        if !to_file {
-            self.ext.shell.print_after = Some((target, copies, count));
-        }
-        true
+        let pages = PdfPages::Print(range.to_owned(), self.page);
+        self.begin_pdf_prepare(pages, target, (!to_file).then_some(copies))
     }
     /// After the background PDF for a print request is written, hand it to the printer.
     fn shell_print_when_ready(&mut self) {
@@ -1346,8 +1397,16 @@ impl HwpApp {
     }
 }
 
-/// Hangul dialog frame: title bar, content on the left and 80×28 command
-/// buttons on the right. Returns the clicked button; closing counts as the last.
+/// Hangul dialog frame shared by every area: title bar with ×, content on the left
+/// and 80×28 command buttons on the right (`buttons[0]` is the default, drawn with
+/// the accent border; the last one cancels or closes). Returns the clicked button.
+/// Keyboard: Esc and × count as the last button; Enter counts as the default unless
+/// a text field keeps the keyboard (a multi-line editor gets its newline; a
+/// single-line field gives up focus on Enter, as in Hangul).
+/// Window state is keyed by the title and the calling source location, so two
+/// dialogs with the same title (the format area's 스타일 and the object area's
+/// 스타일 window) never share position or size; callers pass nothing extra.
+#[track_caller]
 pub(crate) fn dialog(
     ctx: &egui::Context,
     title: &str,
@@ -1356,7 +1415,15 @@ pub(crate) fn dialog(
     body: impl FnOnce(&mut egui::Ui),
 ) -> Option<usize> {
     let mut clicked = None;
-    let response = chrome::modal(("hwp-shell-dialog", title)).show(ctx, |ui| {
+    let site = std::panic::Location::caller();
+    let id = (
+        "hwp-shell-dialog",
+        title,
+        site.file(),
+        site.line(),
+        site.column(),
+    );
+    let response = chrome::modal(id).show(ctx, |ui| {
         ui.set_width(width - 24.0);
         if chrome::title(ui, title) {
             clicked = Some(buttons.len() - 1);
@@ -1392,7 +1459,31 @@ pub(crate) fn dialog(
     if response.should_close() && clicked.is_none() {
         clicked = Some(buttons.len() - 1);
     }
+    if clicked.is_none()
+        && !ctx.egui_wants_keyboard_input()
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+    {
+        clicked = Some(0);
+    }
     clicked
+}
+
+/// Guidance box at the bottom of a dialog for limits and unsupported parts: honest,
+/// readable and set apart from the controls, instead of small red text.
+pub(crate) fn notice(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(8.0);
+    egui::Frame::NONE
+        .fill(Color32::from_rgb(243, 246, 251))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(214, 224, 240)))
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("ⓘ").color(Tokens::ACCENT).size(13.0));
+                ui.label(RichText::new(text).size(12.0).color(Color32::from_gray(70)));
+            });
+        });
 }
 
 /// Group heading with Hangul's trailing rule.
@@ -1704,12 +1795,9 @@ fn master_page_dialog(ctx: &egui::Context, kind: &mut usize, list: &serde_json::
                     .collect::<String>()
             ));
         }
-        ui.label(
-            RichText::new(
-                "바탕쪽 만들기·편집은 아직 지원하지 않습니다. 기존 문서의 바탕쪽은 그대로 표시·저장됩니다.",
-            )
-            .size(11.0)
-            .color(Color32::from_rgb(170, 60, 40)),
+        notice(
+            ui,
+            "바탕쪽 만들기·편집은 아직 지원하지 않습니다. 기존 문서의 바탕쪽은 그대로 표시·저장됩니다.",
         );
     });
     // 만들기 stays unavailable: RHWP keeps master pages as render-only data.
@@ -1889,6 +1977,36 @@ pub(crate) fn join_hf_tokens(text: &str, fields: &[(usize, String)]) -> String {
     out
 }
 
+/// Hangul two-key shortcuts: Ctrl+prefix, then the key, and the command it runs.
+/// The command list (`COMMANDS`) shows the same keys; a test keeps the two in step.
+const CHORDS: &[(char, egui::Key, &str)] = {
+    use egui::Key;
+    &[
+        ('N', Key::P, "page.number"),
+        ('N', Key::H, "page.header"),
+        ('N', Key::T, "table.create"),
+        ('N', Key::A, "table.split_table"),
+        ('N', Key::Z, "table.merge_table"),
+        ('N', Key::I, "insert.picture_dialog"),
+        ('N', Key::N, "insert.footnote"),
+        ('N', Key::E, "insert.endnote"),
+        ('N', Key::M, "insert.equation"),
+        ('G', Key::C, "view.control_codes"),
+        ('G', Key::T, "view.paragraph_marks"),
+        ('G', Key::L, "view.page_outline"),
+        ('G', Key::Q, "view.zoom_100"),
+        ('G', Key::P, "view.zoom_fit_page"),
+        ('G', Key::W, "view.zoom_fit_width"),
+        ('K', Key::H, "insert.hyperlink"),
+        ('K', Key::E, "insert.field"),
+        ('K', Key::N, "format.numbering.dialog"),
+        ('K', Key::O, "format.outline.dialog"),
+        ('Q', Key::I, "file.doc_info"),
+        ('Q', Key::D, "file.doc_info"),
+        ('Q', Key::R, "view.link_next"),
+    ]
+};
+
 /// Settings folder shared with the engine (`hwpcraft_engine::config_dir`: Windows
 /// `%APPDATA%`, macOS `~/Library/Application Support`, Linux `$XDG_CONFIG_HOME`).
 /// `None` means settings are not persisted.
@@ -1898,19 +2016,84 @@ pub(crate) fn config_dir() -> Option<PathBuf> {
 fn recent_file() -> Option<PathBuf> {
     config_dir().map(|d| d.join("recent.txt"))
 }
+/// Screen settings kept between runs (`key=value` lines).
+fn view_file() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("view.txt"))
+}
+const SHOW_UNSUPPORTED: &str = "show_unsupported_commands";
+/// 지원하지 않는 명령 보기 from `view.txt`; anything unreadable means off.
+pub(crate) fn parse_view(text: &str) -> bool {
+    text.lines()
+        .filter_map(|l| l.split_once('='))
+        .any(|(k, v)| k.trim() == SHOW_UNSUPPORTED && v.trim() == "1")
+}
+/// Recent documents are kept as absolute paths with one separator style, so a
+/// document opened from a relative path or with `/` is still found (and not listed
+/// twice) after the working folder changes.
+pub(crate) fn recent_path(path: &std::path::Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_owned())
+}
 /// Move `path` to the front, dropping duplicates and anything past `RECENT_LIMIT`.
 pub(crate) fn push_recent(list: &mut Vec<PathBuf>, path: &std::path::Path) {
-    list.retain(|p| p != path);
-    list.insert(0, path.to_owned());
+    let path = recent_path(path);
+    list.retain(|p| recent_path(p) != path);
+    list.insert(0, path);
     list.truncate(RECENT_LIMIT);
 }
 pub(crate) fn parse_recent(text: &str) -> Vec<PathBuf> {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(PathBuf::from)
-        .take(RECENT_LIMIT)
-        .collect()
+    let mut list: Vec<PathBuf> = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let path = recent_path(std::path::Path::new(line));
+        if !list.contains(&path) {
+            list.push(path);
+        }
+    }
+    list.truncate(RECENT_LIMIT);
+    list
+}
+/// Folder of a recent document for display: the platform separator only, and the
+/// middle elided (`C:\…\reports`) when longer than `max_chars`.
+pub(crate) fn recent_folder(path: &std::path::Path, max_chars: usize) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
+    let folder = path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let folder = if cfg!(windows) {
+        folder.replace('/', "\\")
+    } else {
+        folder
+    };
+    if folder.chars().count() <= max_chars {
+        return folder;
+    }
+    let parts: Vec<&str> = folder.split(sep).collect();
+    let head = parts.first().copied().unwrap_or("");
+    let mut tail: Vec<&str> = Vec::new();
+    for part in parts.iter().skip(1).rev() {
+        let used = head.chars().count()
+            + 2
+            + tail.iter().map(|t| t.chars().count() + 1).sum::<usize>()
+            + part.chars().count();
+        if !tail.is_empty() && used > max_chars {
+            break;
+        }
+        tail.push(part);
+    }
+    tail.reverse();
+    format!("{head}{sep}…{sep}{}", tail.join(&sep.to_string()))
+}
+/// File name of a recent document, shortened at the end when longer than `max_chars`.
+pub(crate) fn recent_name(path: &std::path::Path, max_chars: usize) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    if name.chars().count() <= max_chars {
+        return name;
+    }
+    let keep: String = name.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{keep}…")
 }
 pub(crate) fn serialize_recent(list: &[PathBuf]) -> String {
     list.iter()
@@ -2081,12 +2264,32 @@ pub(crate) fn alt_letter(tab: usize, id: &str) -> Option<char> {
 }
 
 impl HwpApp {
+    /// 보기 → 지원하지 않는 명령: flip it and keep the choice for the next run.
+    pub(crate) fn toggle_unsupported_commands(&mut self) {
+        let show = !self.ext.shell.show_unsupported;
+        self.ext.shell.show_unsupported = show;
+        self.message = if show {
+            "지원하지 않는 명령을 리본에 회색으로 보입니다.".into()
+        } else {
+            "지원하지 않는 명령을 리본에서 숨겼습니다. 탭 끝의 [지원 안 함]에서 목록을 볼 수 있습니다."
+                .into()
+        };
+        if let Some(file) = view_file() {
+            if let Some(dir) = file.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(file, format!("{SHOW_UNSUPPORTED}={}\n", u8::from(show)));
+        }
+    }
     /// Per-frame bookkeeping: recent documents and view marks that follow document replacement.
     fn shell_ext_frame(&mut self) {
         if !self.ext.shell.recent_loaded {
             self.ext.shell.recent_loaded = true;
             if let Some(text) = recent_file().and_then(|p| std::fs::read_to_string(p).ok()) {
                 self.ext.shell.recent = parse_recent(&text);
+            }
+            if let Some(text) = view_file().and_then(|p| std::fs::read_to_string(p).ok()) {
+                self.ext.shell.show_unsupported = parse_view(&text);
             }
         }
         if self.session.path != self.ext.shell.last_path {
@@ -2642,7 +2845,7 @@ impl HwpApp {
             match self
                 .session
                 .render_page_svg(*page)
-                .and_then(|svg| self.renderer.svg(&svg, scale))
+                .and_then(|svg| self.renderer.screen(&svg, scale))
             {
                 Ok(p) => {
                     let image = egui::ColorImage::from_rgba_premultiplied(
@@ -2916,6 +3119,181 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recent_paths_are_absolute_deduped_and_shortened_for_display() {
+        // A relative path becomes absolute and matches the same file given absolutely.
+        let mut list = Vec::new();
+        push_recent(&mut list, std::path::Path::new("samples/a.hwpx"));
+        assert!(list[0].is_absolute(), "{:?}", list[0]);
+        let absolute = list[0].clone();
+        push_recent(&mut list, &absolute);
+        assert_eq!(list.len(), 1);
+        assert!(parse_recent("samples/a.hwpx\n\nsamples/a.hwpx").len() == 1);
+        // Long folders keep their start and end; names are cut at the end.
+        let sep = std::path::MAIN_SEPARATOR;
+        let deep = PathBuf::from(
+            [
+                "D:",
+                "work",
+                "2026",
+                "planning",
+                "quarterly",
+                "drafts",
+                "review",
+                "regional-office-reports",
+                "body.hwpx",
+            ]
+            .join(&sep.to_string()),
+        );
+        let folder = recent_folder(&deep, 40);
+        assert!(folder.chars().count() <= 40, "{folder}");
+        assert!(folder.starts_with(&format!("D:{sep}…{sep}")), "{folder}");
+        assert!(folder.ends_with("regional-office-reports"), "{folder}");
+        let short = PathBuf::from(["C:", "docs", "a.hwpx"].join(&sep.to_string()));
+        assert_eq!(recent_folder(&short, 40), format!("C:{sep}docs"));
+        assert_eq!(recent_name(&short, 40), "a.hwpx");
+        let long = PathBuf::from(
+            "02. 2026년도 상반기 사업 추진 실적 및 하반기 세부 운영 계획 보고서.hwpx",
+        );
+        let name = recent_name(&long, 24);
+        assert_eq!(name.chars().count(), 24);
+        assert!(name.ends_with('…'));
+    }
+
+    /// Press each key in its own frame through the app's shortcut handling.
+    fn press(a: &mut HwpApp, keys: &[(egui::Modifiers, egui::Key)]) {
+        for &(modifiers, key) in keys {
+            let ctx = a.ctx.clone();
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| a.shortcuts(ui.ctx()));
+            output.textures_delta.clear();
+        }
+    }
+    const CTRL: egui::Modifiers = egui::Modifiers {
+        alt: false,
+        ctrl: true,
+        shift: false,
+        mac_cmd: false,
+        command: true,
+    };
+
+    /// The command list names some commands differently from the ribbon entry that
+    /// runs them (one Hangul dialog, or the screen-only twin of an engine command).
+    const SAME_COMMAND: &[(&str, &str)] = &[
+        ("page.footer", "page.header"),
+        ("picture.insert", "insert.picture_dialog"),
+        ("note.insert", "insert.footnote"),
+        ("note.insert", "insert.endnote"),
+        ("equation.insert", "insert.equation"),
+        ("view.marks", "view.paragraph_marks"),
+        ("view.marks", "view.control_codes"),
+        ("hyperlink.next", "view.link_next"),
+    ];
+
+    #[test]
+    fn every_two_key_shortcut_in_the_command_list_runs_its_command() -> anyhow::Result<()> {
+        let listed: Vec<(&str, &str)> = hwpcraft_engine::COMMANDS
+            .iter()
+            .chain(hwpcraft_engine::extension_commands())
+            .flat_map(|(id, _, keys)| keys.split(" / ").map(move |k| (*id, k.trim())))
+            .filter(|(_, k)| k.starts_with("Ctrl+") && k.contains(','))
+            .collect();
+        assert!(listed.len() >= 15, "{listed:?}");
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        // Resolve only: Ctrl+N,I would open the system file picker.
+        a.ext.shell.chords_record_only = true;
+        for (id, keys) in &listed {
+            let (prefix, second) = keys["Ctrl+".len()..].split_once(',').unwrap();
+            let key = |name: &str| egui::Key::from_name(name).unwrap();
+            a.ext.shell.last_chord = None;
+            press(
+                &mut a,
+                &[(CTRL, key(prefix)), (egui::Modifiers::NONE, key(second))],
+            );
+            let ran = a.ext.shell.last_chord;
+            assert!(
+                ran.is_some_and(|r| r == *id || SAME_COMMAND.contains(&(*id, r))),
+                "{keys} is listed for {id} but runs {ran:?}"
+            );
+        }
+        // And no bound chord contradicts what the list shows for its command (Ctrl+Q,D
+        // is a second key HwpCraft also takes for 문서 정보).
+        for (prefix, key, run) in CHORDS
+            .iter()
+            .filter(|(p, k, _)| (*p, *k) != ('Q', egui::Key::D))
+        {
+            let chord = format!("Ctrl+{prefix},{}", key.name());
+            let shown: Vec<_> = listed
+                .iter()
+                .filter(|(id, _)| id == run || SAME_COMMAND.contains(&(*id, *run)))
+                .map(|(_, k)| *k)
+                .collect();
+            assert!(
+                shown.is_empty() || shown.contains(&chord.as_str()),
+                "{chord}: {shown:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ctrl_k_chords_still_open_their_dialogs() -> anyhow::Result<()> {
+        use egui::Key;
+        let chord = |second| -> anyhow::Result<HwpApp> {
+            let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+            press(&mut a, &[(CTRL, Key::K)]);
+            assert!(a.message.starts_with("Ctrl+K,"), "{}", a.message);
+            press(&mut a, &[(egui::Modifiers::NONE, second)]);
+            Ok(a)
+        };
+        let a = chord(Key::H)?;
+        assert_eq!(a.ext.shell.last_chord, Some("insert.hyperlink"));
+        assert!(matches!(
+            a.feature_dialog,
+            Some(super::super::feature_dialogs::FeatureDialog::Link { .. })
+        ));
+        for (second, id) in [
+            (Key::N, "format.numbering.dialog"),
+            (Key::O, "format.outline.dialog"),
+        ] {
+            let a = chord(second)?;
+            assert_eq!(a.ext.shell.last_chord, Some(id));
+            assert!(a.format_ext_modal_open(), "{id} opens its dialog");
+        }
+        let a = chord(Key::E)?;
+        assert_eq!(a.ext.shell.last_chord, Some("insert.field"));
+        assert!(a.object_ext_modal_open(), "누름틀 넣기 opens its dialog");
+        // Ctrl+K then an unbound key ends the chord without running anything.
+        let a = chord(Key::X)?;
+        assert_eq!(a.ext.shell.last_chord, None);
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_commands_setting_reads_only_an_explicit_on() {
+        assert!(parse_view("show_unsupported_commands=1\n"));
+        assert!(parse_view("other=0\r\n show_unsupported_commands = 1 \r\n"));
+        for text in [
+            "",
+            "show_unsupported_commands=0",
+            "show_unsupported_commands",
+            "x=1",
+        ] {
+            assert!(!parse_view(text), "{text:?}");
+        }
+        // Off by default: the ribbon hides what nothing implements.
+        assert!(!State::default().show_unsupported);
+    }
+
+    #[test]
     fn recent_list_moves_to_front_dedupes_and_keeps_nine() {
         let mut list = Vec::new();
         for i in 0..12 {
@@ -3143,11 +3521,26 @@ impl HwpApp {
         index: u32,
         scale: f32,
     ) -> anyhow::Result<egui::ColorImage> {
+        self.shell_page_band_image(index, scale, None)
+    }
+    /// Page bitmap, or only the pixel rows `band` (start, end) of it: the SVG view box is
+    /// cropped to those rows, so the renderer draws just that strip at the same scale.
+    fn shell_page_band_image(
+        &self,
+        index: u32,
+        scale: f32,
+        band: Option<(usize, usize)>,
+    ) -> anyhow::Result<egui::ColorImage> {
         let mut svg = self.session.render_page_svg(index)?;
         if !self.ext.shell.show_pictures {
             svg = picture_placeholders(&svg);
         }
-        let page = self.renderer.svg(&svg, scale)?;
+        if let Some((y0, y1)) = band {
+            svg = crop_rows(&svg, y0 as f32 / scale, (y1 - y0) as f32 / scale)
+                .ok_or_else(|| anyhow::anyhow!("쪽 그림의 크기를 읽지 못했습니다."))?;
+        }
+        // Screen raster: large embedded pictures come from pixel-identical stand-ins.
+        let page = self.renderer.screen(&svg, scale)?;
         let mut rgba = page.rgba;
         if let Some((paper, text)) = self
             .ext
@@ -3644,6 +4037,109 @@ mod selection_tests {
 
 // ----- 쪽 다시 그리기 대기열: 편집 뒤 이전 그림을 두고 한 프레임에 한 쪽씩 -----
 
+/// Raster steps: the smallest one at or above the screen scale, so pages are never
+/// drawn blurrier than the display, and a small zoom change does not redraw. The
+/// renderer accepts 0.25–2.0; above 2.0 the texture is enlarged.
+const RASTER_STEPS: [f32; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+
+/// Raster scale for a zoom (1.0 = 100 %) on a display with `pixels_per_point`.
+pub(crate) fn raster_scale(zoom: f32, pixels_per_point: f32) -> f32 {
+    let target = zoom * pixels_per_point;
+    RASTER_STEPS
+        .iter()
+        .copied()
+        .find(|step| *step + 0.005 >= target)
+        .unwrap_or(2.0)
+}
+
+/// Lower `scale` so the page's longer side stays within the GPU texture limit
+/// (egui refuses larger textures). `page` is the page size in points, if known.
+pub(crate) fn fit_texture(scale: f32, page: Option<Vec2>, max_side: usize) -> f32 {
+    let Some(page) = page else {
+        return scale;
+    };
+    let longest = page.x.max(page.y);
+    if longest <= 0.0 || max_side == 0 {
+        return scale;
+    }
+    // One pixel of slack for the renderer's rounding up to whole pixels.
+    let limit = (max_side as f32 - 1.0) / longest;
+    scale.min(limit).max(0.25)
+}
+
+/// Where the caret paragraph sits on its page and what would move the rest of the
+/// page if it changed. A band redraw is safe only when all of this is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CaretExtent {
+    generation: u64,
+    page: u32,
+    section: usize,
+    paragraph: usize,
+    top: f32,
+    bottom: f32,
+    lines: usize,
+    controls: usize,
+    paragraphs: usize,
+    pages: u32,
+}
+impl CaretExtent {
+    fn same_layout(&self, other: &Self) -> bool {
+        self.page == other.page
+            && (self.section, self.paragraph) == (other.section, other.paragraph)
+            && (self.top - other.top).abs() < 0.01
+            && (self.bottom - other.bottom).abs() < 0.01
+            && (self.lines, self.controls, self.paragraphs, self.pages)
+                == (other.lines, other.controls, other.paragraphs, other.pages)
+    }
+}
+
+/// `svg` with its view box narrowed to `height` units starting at `top`, keeping the
+/// width, so the renderer draws one horizontal strip of the page.
+pub(crate) fn crop_rows(svg: &str, top: f32, height: f32) -> Option<String> {
+    let end = svg.find('>')?;
+    let root = &svg[..end];
+    let attr = |name: &str| -> Option<(usize, usize)> {
+        let key = format!(" {name}=\"");
+        let start = root.find(&key)? + key.len();
+        Some((start, root[start..].find('"')? + start))
+    };
+    let (vb0, vb1) = attr("viewBox")?;
+    let parts: Vec<f32> = root[vb0..vb1]
+        .split([' ', ','])
+        .filter(|p| !p.is_empty())
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let [x, y, w, _] = parts[..] else {
+        return None;
+    };
+    let (h0, h1) = attr("height")?;
+    let mut out = String::with_capacity(svg.len() + 32);
+    // Replace the later attribute first so the earlier offsets stay valid.
+    let (first, second) = if vb0 < h0 {
+        (
+            (vb0, vb1, format!("{x} {} {w} {height}", y + top)),
+            (h0, h1, format!("{height}")),
+        )
+    } else {
+        (
+            (h0, h1, format!("{height}")),
+            (vb0, vb1, format!("{x} {} {w} {height}", y + top)),
+        )
+    };
+    out.push_str(&root[..first.0]);
+    out.push_str(&first.2);
+    out.push_str(&root[first.1..second.0]);
+    out.push_str(&second.2);
+    out.push_str(&root[second.1..]);
+    out.push_str(&svg[end..]);
+    Some(out)
+}
+
+fn scale_key(scale: f32) -> u16 {
+    (scale * 100.0).round() as u16
+}
+
 impl HwpApp {
     /// Texture for page `index`, used by the canvas instead of clearing every page on
     /// each edit. A page drawn for an older document generation stays on screen and at
@@ -3663,12 +4159,27 @@ impl HwpApp {
             requested.0 = pass;
         }
         requested.1.insert(index);
+        let scale = fit_texture(
+            raster_scale(self.zoom, ctx.pixels_per_point()),
+            self.page_sizes.1.get(index as usize).copied(),
+            ctx.input(|i| i.max_texture_side),
+        );
         let drawn = self.ext.shell.page_drawn.get(&index).copied();
         let cached = self.pages.get(&index).map(|(texture, _)| texture.clone());
         let stale = match (&cached, drawn) {
-            (Some(texture), Some(at)) if at == generation => return Ok(texture.clone()),
+            (Some(texture), Some(_)) if self.page_current(index, generation, scale) => {
+                let texture = texture.clone();
+                let c = self.session.cursor;
+                if self.ext.shell.caret_extent.is_none_or(|e| {
+                    e.generation != generation
+                        || (e.section, e.paragraph) != (c.section, c.paragraph)
+                }) {
+                    self.note_caret_extent(index, generation);
+                }
+                return Ok(texture);
+            }
             (Some(texture), Some(_)) => {
-                if !self.may_redraw_page(pass, index, generation) {
+                if !self.may_redraw_page(pass, index, generation, scale) {
                     ctx.request_repaint();
                     return Ok(texture.clone());
                 }
@@ -3676,10 +4187,21 @@ impl HwpApp {
             }
             _ => false,
         };
+        if stale
+            && self.ext.shell.page_scale.get(&index) == Some(&scale_key(scale))
+            && let Some(texture) = cached.clone()
+            && self.band_redraw(index, generation, scale, texture.clone())
+        {
+            self.ext.shell.redraw_pass = Some(pass);
+            return Ok(texture);
+        }
         // The shell-page area applies the document view colour and picture
         // placeholder options on top of the renderer's bitmap.
-        let image = self.shell_page_image(index, 1.25)?;
-        let size = Vec2::new(image.size[0] as f32 / 1.25, image.size[1] as f32 / 1.25);
+        let image = self.shell_page_image(index, scale)?;
+        if cfg!(debug_assertions) {
+            self.ext.shell.page_images.insert(index, image.clone());
+        }
+        let size = Vec2::new(image.size[0] as f32 / scale, image.size[1] as f32 / scale);
         let texture = ctx.load_texture(
             format!("page-{index}-{generation}"),
             image,
@@ -3691,15 +4213,19 @@ impl HwpApp {
         {
             self.pages.remove(&far);
             self.ext.shell.page_drawn.remove(&far);
+            self.ext.shell.page_scale.remove(&far);
+            self.ext.shell.page_images.remove(&far);
         }
         self.pages.insert(index, (texture.clone(), size));
         self.ext.shell.page_drawn.insert(index, generation);
+        self.ext.shell.page_scale.insert(index, scale_key(scale));
+        self.note_caret_extent(index, generation);
         if stale {
             self.ext.shell.redraw_pass = Some(pass);
             if self
                 .pages
-                .iter()
-                .any(|(page, _)| self.ext.shell.page_drawn.get(page) != Some(&generation))
+                .keys()
+                .any(|page| !self.page_current(*page, generation, scale))
             {
                 ctx.request_repaint();
             }
@@ -3707,8 +4233,129 @@ impl HwpApp {
         Ok(texture)
     }
 
+    /// Measure the caret paragraph if it lies on `page` (body text only).
+    fn caret_extent(&self, page: u32) -> Option<CaretExtent> {
+        let c = self.session.cursor;
+        if c.cell.is_some() {
+            return None;
+        }
+        let start = Cursor { offset: 0, ..c };
+        let p = self.session.paragraph(start).ok()?;
+        let len = p.text.chars().count();
+        let (lines, controls) = (p.line_segs.len(), p.controls.len());
+        let a = self.session.caret_at(start).ok()?;
+        let b = self.session.caret_at(Cursor { offset: len, ..c }).ok()?;
+        let page_of =
+            |v: &serde_json::Value| v["pageIndex"].as_u64().and_then(|p| u32::try_from(p).ok());
+        let (pa, pb) = (page_of(&a)?, page_of(&b)?);
+        if pa != page || pb != page {
+            return None;
+        }
+        let num = |v: &serde_json::Value, k: &str| v[k].as_f64().map(|x| x as f32);
+        Some(CaretExtent {
+            generation: self.session.generation,
+            page,
+            section: c.section,
+            paragraph: c.paragraph,
+            top: num(&a, "y")?,
+            bottom: num(&b, "y")? + num(&b, "height")?,
+            lines,
+            controls,
+            paragraphs: self
+                .session
+                .core
+                .document()
+                .sections
+                .get(c.section)?
+                .paragraphs
+                .len(),
+            pages: self.session.page_count().ok()?,
+        })
+    }
+    fn note_caret_extent(&mut self, page: u32, generation: u64) {
+        if let Some(extent) = self.caret_extent(page)
+            && extent.generation == generation
+        {
+            self.ext.shell.caret_extent = Some(extent);
+        }
+    }
+    /// Redraw only the caret paragraph's rows of `page` when the edit kept its lines,
+    /// its place and everything that could move the rest of the page. True when done.
+    fn band_redraw(
+        &mut self,
+        page: u32,
+        generation: u64,
+        scale: f32,
+        mut texture: egui::TextureHandle,
+    ) -> bool {
+        let Some(before) = self.ext.shell.caret_extent else {
+            return false;
+        };
+        if Some(&before.generation) != self.ext.shell.page_drawn.get(&page) || before.page != page {
+            return false;
+        }
+        let Some(now) = self.caret_extent(page) else {
+            return false;
+        };
+        if !before.same_layout(&now) {
+            return false;
+        }
+        let [width, height] = texture.size();
+        let y0 = ((now.top * scale).floor() as usize).saturating_sub(2);
+        let y1 = (((now.bottom * scale).ceil() as usize) + 2).min(height);
+        if y1 <= y0 || (y1 - y0) * 2 > height {
+            return false;
+        }
+        let Ok(band) = self.shell_page_band_image(page, scale, Some((y0, y1))) else {
+            return false;
+        };
+        if band.size[0] != width || y0 + band.size[1] > height {
+            return false;
+        }
+        if cfg!(debug_assertions) {
+            // Patch the stored copy and require it to equal a full render everywhere.
+            let Some(mut patched) = self.ext.shell.page_images.get(&page).cloned() else {
+                return false;
+            };
+            for row in 0..band.size[1] {
+                let at = (y0 + row) * width;
+                patched.pixels[at..at + width]
+                    .copy_from_slice(&band.pixels[row * width..(row + 1) * width]);
+            }
+            let Ok(full) = self.shell_page_image(page, scale) else {
+                return false;
+            };
+            // Byte comparison first (fast even in debug builds); a per-channel
+            // tolerance of 2 only when the bytes differ (anti-aliasing at the edges).
+            let close = full.size == patched.size
+                && (full.as_raw() == patched.as_raw()
+                    || full
+                        .as_raw()
+                        .iter()
+                        .zip(patched.as_raw())
+                        .all(|(x, y)| x.abs_diff(*y) <= 2));
+            if !close {
+                eprintln!("page band redraw differed from a full render; drawing the whole page");
+                self.ext.shell.band_rejected += 1;
+                return false;
+            }
+            self.ext.shell.page_images.insert(page, patched);
+        }
+        texture.set_partial([0, y0], band, egui::TextureOptions::LINEAR);
+        self.ext.shell.page_drawn.insert(page, generation);
+        self.ext.shell.caret_extent = Some(now);
+        self.ext.shell.band_redraws += 1;
+        true
+    }
+
+    /// Drawn for this document generation at this raster scale.
+    fn page_current(&self, page: u32, generation: u64, scale: f32) -> bool {
+        self.ext.shell.page_drawn.get(&page) == Some(&generation)
+            && self.ext.shell.page_scale.get(&page) == Some(&scale_key(scale))
+    }
+
     /// One stale page per pass; while the caret's page is visible and stale, it goes first.
-    fn may_redraw_page(&mut self, pass: u64, index: u32, generation: u64) -> bool {
+    fn may_redraw_page(&mut self, pass: u64, index: u32, generation: u64, scale: f32) -> bool {
         if self.ext.shell.redraw_pass == Some(pass) {
             return false;
         }
@@ -3718,8 +4365,8 @@ impl HwpApp {
         if caret == index {
             return true;
         }
-        let caret_stale = self.pages.contains_key(&caret)
-            && self.ext.shell.page_drawn.get(&caret) != Some(&generation);
+        let caret_stale =
+            self.pages.contains_key(&caret) && !self.page_current(caret, generation, scale);
         let (_, now, before) = &self.ext.shell.requested;
         let caret_visible = now.contains(&caret) || before.contains(&caret);
         !(caret_stale && caret_visible)
@@ -3769,6 +4416,127 @@ mod redraw_tests {
         (0..4)
             .map(|p| a.ext.shell.page_drawn.get(&p) == Some(&g))
             .collect()
+    }
+
+    #[test]
+    fn crop_rows_narrows_only_the_view_box_and_height() {
+        let svg = r#"<svg xmlns="x" width="100" height="200" viewBox="0 0 100 200"><rect/></svg>"#;
+        let band = crop_rows(svg, 50.0, 20.0).unwrap();
+        assert!(band.contains(r#"width="100""#), "{band}");
+        assert!(band.contains(r#"height="20""#), "{band}");
+        assert!(band.contains(r#"viewBox="0 50 100 20""#), "{band}");
+        assert!(band.ends_with("<rect/></svg>"));
+        assert!(crop_rows("<svg>", 0.0, 1.0).is_none());
+    }
+
+    fn typing_app() -> anyhow::Result<HwpApp> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        for i in 0..6 {
+            a.session.execute(Command::Insert(format!(
+                "{i}번째 문단입니다. 한 줄 안에 들어가는 짧은 글입니다."
+            )))?;
+            a.session.execute(Command::Split)?;
+        }
+        a.session.select(
+            Cursor {
+                paragraph: 2,
+                offset: 3,
+                ..Default::default()
+            },
+            false,
+        )?;
+        a.zoom = 1.0;
+        pass(&mut a, &[0]);
+        pass(&mut a, &[0]);
+        Ok(a)
+    }
+
+    /// Typing that keeps the paragraph's lines redraws only its rows, and (debug check)
+    /// the patched page equals a full render.
+    #[test]
+    fn typing_within_a_line_redraws_only_the_caret_band() -> anyhow::Result<()> {
+        let mut a = typing_app()?;
+        for _ in 0..3 {
+            a.session.execute(Command::Insert("가".into()))?;
+            pass(&mut a, &[0]);
+        }
+        assert_eq!(a.ext.shell.band_rejected, 0, "band equals a full render");
+        assert_eq!(a.ext.shell.band_redraws, 3);
+        assert_eq!(a.ext.shell.page_drawn.get(&0), Some(&a.session.generation));
+        Ok(())
+    }
+
+    /// A change that adds a line or a paragraph draws the whole page.
+    #[test]
+    fn new_lines_and_paragraphs_redraw_the_whole_page() -> anyhow::Result<()> {
+        let mut a = typing_app()?;
+        a.session.execute(Command::Insert(
+            "아주 긴 글을 넣어 이 문단이 다음 줄로 넘어가게 만듭니다. ".repeat(4),
+        ))?;
+        pass(&mut a, &[0]);
+        assert_eq!(
+            a.ext.shell.band_redraws, 0,
+            "a new line moves the rest of the page"
+        );
+        a.session.execute(Command::Split)?;
+        pass(&mut a, &[0]);
+        assert_eq!(
+            a.ext.shell.band_redraws, 0,
+            "a new paragraph moves the rest of the page"
+        );
+        assert_eq!(a.ext.shell.page_drawn.get(&0), Some(&a.session.generation));
+        Ok(())
+    }
+
+    #[test]
+    fn raster_scale_follows_zoom_and_display_density() {
+        assert_eq!(raster_scale(0.9, 1.0), 1.0);
+        assert_eq!(raster_scale(1.0, 1.0), 1.0);
+        assert_eq!(raster_scale(1.25, 1.0), 1.25);
+        assert_eq!(raster_scale(1.3, 1.0), 1.5);
+        assert_eq!(raster_scale(0.9, 1.5), 1.5);
+        assert_eq!(raster_scale(0.2, 1.0), 0.5);
+        assert_eq!(raster_scale(5.0, 1.0), 2.0);
+    }
+
+    #[test]
+    fn page_textures_stay_within_the_gpu_limit() -> anyhow::Result<()> {
+        let a4 = Some(Vec2::new(794.0, 1123.0));
+        assert_eq!(fit_texture(1.0, a4, 2048), 1.0);
+        let capped = fit_texture(2.0, a4, 2048);
+        assert!(capped < 2.0 && 1123.0 * capped <= 2047.0, "{capped}");
+        assert_eq!(fit_texture(2.0, None, 2048), 2.0);
+        // At the largest zoom the drawn page still fits (egui would panic otherwise).
+        let mut a = app_with_pages(1)?;
+        a.zoom = 5.0;
+        a.page_sizes();
+        pass(&mut a, &[0]);
+        let size = a.pages[&0].0.size();
+        assert!(size[0].max(size[1]) <= 2048, "{size:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_zoom_step_change_redraws_through_the_queue_at_the_new_scale() -> anyhow::Result<()> {
+        let mut a = app_with_pages(3)?;
+        a.zoom = 0.9;
+        pass(&mut a, &[0, 1, 2]);
+        let width = |a: &HwpApp, p: u32| a.pages[&p].0.size()[0];
+        let at_one = width(&a, 0);
+        // Within the same step: nothing is redrawn.
+        a.zoom = 0.95;
+        pass(&mut a, &[0, 1, 2]);
+        assert_eq!(width(&a, 0), at_one);
+        // Next step: the pages become stale and the queue redraws them one per pass.
+        a.zoom = 1.4;
+        pass(&mut a, &[0, 1, 2]);
+        let redrawn = (0..3).filter(|p| width(&a, *p) > at_one).count();
+        assert_eq!(redrawn, 1, "one page per pass");
+        pass(&mut a, &[0, 1, 2]);
+        pass(&mut a, &[0, 1, 2]);
+        assert!((0..3).all(|p| width(&a, p) > at_one), "all redrawn at 1.5x");
+        assert!((width(&a, 0) as f32 / at_one as f32 - 1.5).abs() < 0.02);
+        Ok(())
     }
 
     #[test]
@@ -3845,46 +4613,194 @@ mod redraw_tests {
 
 // ----- PDF 저장을 백그라운드로: 인쇄 → PDF·쪽 범위 저장·블록 저장 (파일 메뉴와 같은 PdfSlot) -----
 
-/// Pages and the conversion of a prepared PDF (`Session::pdf_job` and friends).
-type PreparedPdf = (usize, Box<dyn FnOnce() -> anyhow::Result<Vec<u8>> + Send>);
+/// Pages of a PDF prepared a slice per frame. Kept as a request rather than a page
+/// list, so a restart after an edit asks the edited document again.
+pub(crate) enum PdfPages {
+    /// The whole document (파일 → PDF로 저장).
+    All,
+    /// 쪽 범위 저장: 1-based, inclusive.
+    Range(u32, u32),
+    /// A Hangul 인쇄 범위 and the caret page it was asked from.
+    Print(String, u32),
+    /// 블록 저장: the selected block as its own session, a copy that edits never change.
+    Block(Box<Session>),
+}
+
+impl PdfPages {
+    fn session<'a>(&'a self, document: &'a Session) -> &'a Session {
+        match self {
+            PdfPages::Block(block) => block,
+            _ => document,
+        }
+    }
+    fn pages(&self, document: &Session) -> anyhow::Result<Vec<u32>> {
+        match self {
+            PdfPages::All => Ok((0..document.page_count()?).collect()),
+            PdfPages::Range(from, to) => {
+                let count = document.page_count()?;
+                if *from == 0 || to < from || *to > count {
+                    anyhow::bail!("쪽 범위는 1–{count} 안에서 작은 번호부터 적으세요: {from}–{to}");
+                }
+                Ok(((from - 1)..*to).collect())
+            }
+            PdfPages::Print(range, current) => document.print_pdf_pages(range, *current),
+            PdfPages::Block(block) => Ok((0..block.page_count()?).collect()),
+        }
+    }
+}
+
+/// A PDF whose page SVGs are built a slice per frame, then converted in the shared
+/// background slot. Building all 381 pages of a long document at once held the window
+/// for about 1.8 s. The pages come from one document generation: an edit in between
+/// starts the preparation over (two versions never mix in one file), with twice the
+/// time per frame each time, so continued typing cannot keep it from finishing.
+pub(crate) struct PdfPreparing {
+    pages: PdfPages,
+    path: PathBuf,
+    prep: hwpcraft_engine::PdfPrep,
+    budget: std::time::Duration,
+    restarts: u32,
+    /// Copies to print once the file is written (인쇄 to paper).
+    print: Option<u32>,
+    /// The progress line last shown; refreshed only while nothing replaced it.
+    progress: String,
+}
+
+/// Preparation time per frame before the first restart.
+const PDF_PREPARE_BUDGET: std::time::Duration = std::time::Duration::from_millis(25);
+const PDF_BUSY: &str = "이전 PDF 저장이 아직 진행 중입니다. 끝난 뒤 다시 저장해 주세요.";
+
+impl PdfPreparing {
+    fn line(&self) -> String {
+        let (ready, total) = (self.prep.ready(), self.prep.total());
+        if self.restarts == 0 {
+            format!("PDF 준비 중… {ready}/{total}쪽 · 준비 중에 편집하면 처음부터 다시 준비합니다")
+        } else {
+            format!(
+                "PDF 준비 중… {ready}/{total}쪽 · 문서가 바뀌어 처음부터 다시 준비하는 중 ({}번째)",
+                self.restarts + 1
+            )
+        }
+    }
+}
 
 impl HwpApp {
-    /// Hand a prepared PDF to the shared background slot (one export at a time), so the
-    /// slow font layout and embedding never run on the UI thread. True when started.
-    fn start_shell_pdf(&mut self, path: PathBuf, prepared: anyhow::Result<PreparedPdf>) -> bool {
-        // Checked before `prepared` is used: a busy slot should not cost the page
-        // preparation (seconds on long documents) only to be refused afterwards.
-        if self.pdf.busy() {
-            self.error =
-                Some("이전 PDF 저장이 아직 진행 중입니다. 끝난 뒤 다시 저장해 주세요.".into());
+    /// A PDF is being prepared or converted; a new one is refused until it is done.
+    pub(crate) fn pdf_busy(&self) -> bool {
+        self.pdf.busy() || self.ext.shell.pdf_preparing.is_some()
+    }
+
+    /// Start a PDF of `pages`: the pages are prepared a slice per frame (progress in
+    /// the status bar), then converted in the background slot shared with the file
+    /// menu. `print` sends the written file to the printer. True when started.
+    pub(crate) fn begin_pdf_prepare(
+        &mut self,
+        pages: PdfPages,
+        path: PathBuf,
+        print: Option<u32>,
+    ) -> bool {
+        if self.pdf_busy() {
+            self.error = Some(PDF_BUSY.into());
             return false;
         }
-        let Some((pages, convert)) = self.result(prepared) else {
+        let prep = pages
+            .pages(&self.session)
+            .and_then(|list| pages.session(&self.session).pdf_prepare(&list));
+        let Some(prep) = self.result(prep) else {
             return false;
         };
-        // Same status line as the file menu, refreshed with the elapsed seconds.
-        self.begin_pdf_export(pages, path, convert)
+        self.ext.shell.pdf_preparing = Some(PdfPreparing {
+            pages,
+            path,
+            prep,
+            budget: self.ext.shell.pdf_budget,
+            restarts: 0,
+            print,
+            progress: String::new(),
+        });
+        // The first slice at once: a short document goes straight to conversion.
+        self.step_pdf_prepare()
     }
+
+    /// Every frame while a PDF is being prepared: one slice, and another frame soon.
+    pub(crate) fn poll_pdf_prepare(&mut self, ctx: &egui::Context) {
+        if self.ext.shell.pdf_preparing.is_some() {
+            self.step_pdf_prepare();
+            if self.ext.shell.pdf_preparing.is_some() {
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// Prepare one slice; hand the finished pages to the background slot. False when the
+    /// export failed (the error is shown and nothing is written).
+    fn step_pdf_prepare(&mut self) -> bool {
+        let Some(mut job) = self.ext.shell.pdf_preparing.take() else {
+            return true;
+        };
+        let stale = job.prep.generation() != job.pages.session(&self.session).generation;
+        if stale {
+            let restarted = job
+                .pages
+                .pages(&self.session)
+                .and_then(|list| job.pages.session(&self.session).pdf_prepare(&list));
+            let Some(prep) = self.result(restarted) else {
+                return false;
+            };
+            job.prep = prep;
+            job.restarts += 1;
+            job.budget = job.budget.saturating_mul(2);
+        }
+        let step = job
+            .pages
+            .session(&self.session)
+            .pdf_prepare_step(&mut job.prep, job.budget);
+        match step {
+            Ok(false) => {
+                let line = job.line();
+                if stale || job.progress.is_empty() || self.message == job.progress {
+                    self.message = line.clone();
+                }
+                job.progress = line;
+                self.ext.shell.pdf_preparing = Some(job);
+                true
+            }
+            Ok(true) => {
+                let finished = job.pages.session(&self.session).pdf_finish(job.prep);
+                let Some(pdf) = self.result(finished) else {
+                    return false;
+                };
+                let count = pdf.page_count();
+                if !self.begin_pdf_export(count, job.path.clone(), move || pdf.convert()) {
+                    return false;
+                }
+                if let Some(copies) = job.print {
+                    self.ext.shell.print_after = Some((job.path, copies, count));
+                }
+                true
+            }
+            Err(e) => {
+                self.result::<()>(Err(e.context("PDF로 저장하지 못했습니다")));
+                false
+            }
+        }
+    }
+
     /// 쪽 범위 저장 as PDF (1-based, inclusive), in the background. True when started.
     pub(crate) fn start_pages_pdf(&mut self, path: PathBuf, from: u32, to: u32) -> bool {
-        let prepared = self.session.page_count().and_then(|count| {
-            if from == 0 || to < from || to > count {
-                anyhow::bail!("쪽 범위는 1–{count} 안에서 작은 번호부터 적으세요: {from}–{to}");
-            }
-            let job = self
-                .session
-                .pdf_job(&((from - 1)..to).collect::<Vec<_>>())?;
-            Ok((job.page_count(), Box::new(move || job.convert()) as Box<_>))
-        });
-        self.start_shell_pdf(path, prepared)
+        self.begin_pdf_prepare(PdfPages::Range(from, to), path, None)
     }
     /// 블록 저장 as PDF, in the background. True when started.
     pub(crate) fn start_block_pdf(&mut self, path: PathBuf) -> bool {
-        let prepared = self
-            .session
-            .save_block_pdf_job()
-            .map(|job| -> PreparedPdf { (job.page_count(), Box::new(move || job.convert())) });
-        self.start_shell_pdf(path, prepared)
+        if self.pdf_busy() {
+            self.error = Some(PDF_BUSY.into());
+            return false;
+        }
+        let block = self.session.block_pdf_session();
+        match self.result(block) {
+            Some(block) => self.begin_pdf_prepare(PdfPages::Block(Box::new(block)), path, None),
+            None => false,
+        }
     }
 }
 
@@ -3906,12 +4822,13 @@ mod pdf_tests {
     fn wait(a: &mut HwpApp) {
         let ctx = a.ctx.clone();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while a.pdf.busy() {
+        while a.pdf_busy() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "PDF export did not finish"
             );
             let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+                a.poll_pdf_prepare(&ctx);
                 a.poll_pdf_export(&ctx);
                 a.shell_print_when_ready();
             });
@@ -3922,6 +4839,41 @@ mod pdf_tests {
 
     fn is_pdf(path: &std::path::Path) -> bool {
         std::fs::read(path).is_ok_and(|b| b.starts_with(b"%PDF"))
+    }
+
+    #[test]
+    fn pdf_pages_are_prepared_across_frames_and_restart_after_an_edit() -> anyhow::Result<()> {
+        let dir = tempfile_dir("bg-pdf-prepare")?;
+        let mut a = three_pages()?;
+        // One page per slice, so the preparation spans frames even on three pages.
+        a.ext.shell.pdf_budget = std::time::Duration::ZERO;
+        let path = dir.join("all.pdf");
+        // The file menu's PDF goes through the same preparation.
+        assert!(a.start_pdf_export(path.clone()));
+        assert!(
+            a.pdf_busy() && !a.pdf.busy(),
+            "preparing, not converting yet"
+        );
+        assert!(a.message.contains("PDF 준비 중… 1/3쪽"), "{}", a.message);
+        assert!(!a.start_pages_pdf(dir.join("second.pdf"), 1, 1));
+        assert!(a.error.take().is_some_and(|e| e.contains("진행 중")));
+        // An edit before the pages are ready starts over on the edited document.
+        a.session.execute(Command::Insert("편집 ".into()))?;
+        let ctx = a.ctx.clone();
+        a.poll_pdf_prepare(&ctx);
+        let Some(job) = a.ext.shell.pdf_preparing.as_ref() else {
+            anyhow::bail!("still preparing");
+        };
+        assert_eq!(job.restarts, 1);
+        assert_eq!(job.prep.generation(), a.session.generation);
+        assert_eq!(job.prep.ready(), 1, "only pages of the edited document");
+        assert!(a.message.contains("다시 준비"), "{}", a.message);
+        wait(&mut a);
+        assert!(is_pdf(&path));
+        assert!(a.message.contains("PDF 저장 완료"), "{}", a.message);
+        assert!(!dir.join("second.pdf").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]
@@ -4001,5 +4953,103 @@ mod pdf_tests {
         let dir = std::env::temp_dir().join(format!("hwpcraft-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+}
+
+#[cfg(test)]
+mod dialog_tests {
+    use super::*;
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// One frame of a dialog whose body may hold a text field; returns the button.
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>, field: Option<bool>) -> Option<usize> {
+        let mut clicked = None;
+        let mut text = String::from("줄");
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |_| {
+                clicked = dialog(ctx, "시험", 400.0, &["설정(D)", "취소"], |ui| match field {
+                    Some(true) => {
+                        ui.add(egui::TextEdit::multiline(&mut text).id(egui::Id::new("multi")));
+                    }
+                    Some(false) => {
+                        ui.add(egui::TextEdit::singleline(&mut text).id(egui::Id::new("single")));
+                    }
+                    None => {}
+                });
+            },
+        );
+        output.textures_delta.clear();
+        clicked
+    }
+
+    /// Layers shown by one frame of a fresh context that draws `draw`.
+    fn layers(draw: impl Fn(&egui::Context)) -> Vec<egui::LayerId> {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| draw(&ctx));
+        output.textures_delta.clear();
+        let mut ids: Vec<egui::LayerId> = ctx
+            .memory(|m| m.areas().visible_layer_ids())
+            .into_iter()
+            .collect();
+        ids.sort_by_key(|l| (l.order as u8, l.id.value()));
+        ids
+    }
+
+    fn styles_a(ctx: &egui::Context) {
+        dialog(ctx, "스타일", 784.0, &["설정(D)", "취소"], |_| {});
+    }
+
+    fn styles_b(ctx: &egui::Context) {
+        dialog(ctx, "스타일", 420.0, &["설정(D)", "취소"], |_| {});
+    }
+
+    #[test]
+    fn same_titled_dialogs_from_different_places_keep_separate_window_state() {
+        let a = layers(styles_a);
+        assert!(!a.is_empty());
+        // The same call site keeps its id from frame to frame and run to run…
+        assert_eq!(a, layers(styles_a));
+        // …while another call site with the same title gets its own window.
+        let b = layers(styles_b);
+        assert!(a.iter().any(|layer| !b.contains(layer)), "{a:?} / {b:?}");
+    }
+
+    #[test]
+    fn enter_is_the_default_button_and_escape_cancels() {
+        let ctx = egui::Context::default();
+        assert_eq!(frame(&ctx, vec![], None), None);
+        assert_eq!(frame(&ctx, vec![key(egui::Key::Enter)], None), Some(0));
+        assert_eq!(frame(&ctx, vec![key(egui::Key::Escape)], None), Some(1));
+    }
+
+    #[test]
+    fn enter_in_a_multi_line_field_stays_a_newline() {
+        let ctx = egui::Context::default();
+        frame(&ctx, vec![], Some(true));
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("multi")));
+        frame(&ctx, vec![], Some(true));
+        assert_eq!(frame(&ctx, vec![key(egui::Key::Enter)], Some(true)), None);
+        // A single-line field gives up focus on Enter, so Enter confirms.
+        let ctx = egui::Context::default();
+        frame(&ctx, vec![], Some(false));
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("single")));
+        frame(&ctx, vec![], Some(false));
+        assert_eq!(
+            frame(&ctx, vec![key(egui::Key::Enter)], Some(false)),
+            Some(0)
+        );
     }
 }

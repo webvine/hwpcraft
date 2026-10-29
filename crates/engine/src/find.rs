@@ -172,19 +172,6 @@ fn matches(text: &str, query: &str, o: FindOptions) -> Vec<usize> {
 }
 
 impl Session {
-    /// Run many edits with RHWP pagination deferred to one pass at the end.
-    /// RHWP otherwise repaginates after every edit, which made 모두 바꾸기 of about
-    /// 1,300 matches in a 381-page document take over 80 seconds (mostly table cells).
-    /// Call inside `transaction`, so a failed edit still rolls everything back.
-    pub(crate) fn with_deferred_layout(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> Result<()>,
-    ) -> Result<()> {
-        self.core.begin_batch_native().map_err(err)?;
-        let result = f(self);
-        let ended = self.core.end_batch_native().map_err(err);
-        result.and(ended.map(|_| ()))
-    }
     /// Character-shape ids per scalar offset of a paragraph, for 서식 찾기.
     fn shape_ok(&self, c: Cursor, range: &Range<usize>, o: FindOptions) -> bool {
         if !o.has_format() {
@@ -388,7 +375,9 @@ impl Session {
         }
         let caret = self.cursor;
         self.transaction(|s| {
-            s.with_deferred_layout(|s| {
+            // RHWP repaginates after every edit; about 1,300 replacements in a 381-page
+            // document took over 80 seconds that way, mostly in table cells.
+            s.deferred_layout(|s| {
                 // Apply backwards so earlier addresses stay valid.
                 for (cursor, r) in planned.into_iter().rev() {
                     s.clear_selection();

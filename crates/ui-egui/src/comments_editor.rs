@@ -2,9 +2,15 @@
 use super::*;
 use serde_json::Value;
 
+/// The memo pane docks on the right like Hangul's task panes; the page view narrows.
+const MEMO_WIDTH: f32 = 400.0;
+
 /// Disabled-control reasons shown as tooltips in the memo panel.
 const NEW_MEMO_REASON: &str = "새 메모는 본문의 한 문단 안에서만 만들 수 있습니다. 표 밖 본문에 커서를 두거나 한 문단 안에서만 선택하세요.";
 const STALE_REASON: &str = "문서가 바뀌었습니다. 새로 고침으로 메모를 다시 불러온 뒤 저장하세요.";
+/// Memo input fields; document shortcuts pause only while one of them has focus.
+const AUTHOR_FIELD: &str = "memo-author";
+const TEXT_FIELD: &str = "memo-text";
 
 pub(crate) struct State {
     pub open: bool,
@@ -16,6 +22,8 @@ pub(crate) struct State {
     loaded_generation: Option<u64>,
     dirty: bool,
     notice: Option<String>,
+    /// A new memo is being written; the input fields show only then or for a chosen memo.
+    composing: bool,
 }
 
 impl Default for State {
@@ -30,6 +38,7 @@ impl Default for State {
             loaded_generation: None,
             dirty: false,
             notice: None,
+            composing: false,
         }
     }
 }
@@ -42,16 +51,27 @@ impl State {
         self.notice = None;
         self.loaded_generation = self.generation;
         self.dirty = false;
+        self.composing = false;
     }
+    /// Start writing a new memo (the input fields appear).
     fn new_memo(&mut self) {
+        self.idle();
+        self.composing = true;
+    }
+    /// No memo chosen and none being written: only the list and 새 메모 show.
+    fn idle(&mut self) {
         self.selected = None;
         self.text.clear();
         self.notice = None;
         self.loaded_generation = self.generation;
         self.dirty = false;
+        self.composing = false;
         if self.author.is_empty() {
             self.author = "사용자".into();
         }
+    }
+    fn editing(&self) -> bool {
+        self.selected.is_some() || self.composing
     }
     fn refresh(&mut self, session: &Session) {
         if self.generation == Some(session.generation) {
@@ -72,7 +92,7 @@ impl State {
             if let Some(item) = self.items.iter().find(|item| item["id"] == id).cloned() {
                 self.load(&item);
             } else {
-                self.new_memo();
+                self.idle();
             }
         } else {
             self.loaded_generation = self.generation;
@@ -130,7 +150,7 @@ impl HwpApp {
             if let Some(item) = item {
                 self.ext.comments.load(&item);
             } else {
-                self.ext.comments.new_memo();
+                self.ext.comments.idle();
             }
         }
         true
@@ -148,10 +168,19 @@ impl HwpApp {
             _ => false,
         }
     }
+    /// The docked pane leaves document shortcuts working; they pause only while a
+    /// memo input field has keyboard focus.
     pub(crate) fn comments_ext_modal_open(&self) -> bool {
         self.ext.comments.open
+            && self.ctx.memory(|m| {
+                m.focused().is_some_and(|id| {
+                    id == egui::Id::new(AUTHOR_FIELD) || id == egui::Id::new(TEXT_FIELD)
+                })
+            })
     }
-    pub(crate) fn comments_ext_dialogs(&mut self, ctx: &egui::Context) {
+    /// The memo pane, added before the page view so it narrows the view instead of
+    /// covering the text.
+    pub(crate) fn comments_panel(&mut self, ui: &mut egui::Ui) {
         if !self.ext.comments.open {
             return;
         }
@@ -162,35 +191,46 @@ impl HwpApp {
             .selected
             .and_then(|id| state.items.iter().find(|item| item["id"] == id))
             .cloned();
-        let mut open = state.open;
+        let open = state.open;
+        let mut close_clicked = false;
         let mut action = None;
-        egui::Window::new("메모")
-            .id(egui::Id::new("native-memo-editor"))
-            .open(&mut open)
-            .default_width(680.0)
-            .default_height(520.0)
+        egui::Panel::right("native-memo-editor")
+            .default_size(MEMO_WIDTH)
+            .size_range(320.0..=640.0)
             .resizable(true)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(format!("메모 {}개", state.items.len()));
-                    if ui
-                        .add_enabled(can_create, egui::Button::new("새 메모"))
+            .show(ui, |ui| {
+                if chrome::title(ui, "메모") {
+                    close_clicked = true;
+                }
+                let new_memo = |ui: &mut egui::Ui| {
+                    ui.add_enabled(can_create, egui::Button::new("새 메모"))
                         .on_disabled_hover_text(NEW_MEMO_REASON)
                         .clicked()
-                    {
-                        state.new_memo();
-                    }
-                    if ui.button("새로 고침").clicked() {
-                        state.generation = None;
-                        state.refresh(&self.session);
-                    }
-                });
+                };
                 if state.items.is_empty() {
-                    ui.weak("본문에서 글을 선택하거나 커서를 둔 위치에 메모를 만드세요.");
+                    if !state.composing {
+                        super::ext_shell::note(
+                            ui,
+                            "이 문서에 메모가 없습니다. 본문에서 글을 선택하거나 커서를 둔 뒤 새 메모를 누르세요.",
+                        );
+                        if new_memo(ui) {
+                            state.new_memo();
+                        }
+                    }
                 } else {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("메모 {}개", state.items.len()));
+                        if !state.composing && new_memo(ui) {
+                            state.new_memo();
+                        }
+                        if ui.button("새로 고침").clicked() {
+                            state.generation = None;
+                            state.refresh(&self.session);
+                        }
+                    });
                     egui::ScrollArea::vertical()
                         .id_salt("memo-list")
-                        .max_height(150.0)
+                        .max_height(180.0)
                         .show(ui, |ui| {
                             let mut choose = None;
                             for item in &state.items {
@@ -221,7 +261,10 @@ impl HwpApp {
                                     format!("{author}: {title}  ({anchor})")
                                 };
                                 if ui
-                                    .selectable_label(state.selected == Some(id), label)
+                                    .add(
+                                        egui::Button::selectable(state.selected == Some(id), label)
+                                            .truncate(),
+                                    )
                                     .clicked()
                                 {
                                     choose = Some(item.clone());
@@ -236,10 +279,15 @@ impl HwpApp {
                     .selected
                     .and_then(|id| state.items.iter().find(|item| item["id"] == id))
                     .cloned();
+                if !state.editing() {
+                    return;
+                }
                 let editable = selected
                     .as_ref()
                     .map_or(can_create, |item| item["editable"].as_bool() == Some(true));
-                ui.separator();
+                if !state.items.is_empty() {
+                    ui.separator();
+                }
                 if let Some(item) = &selected {
                     let anchor = item["anchor"].as_str().unwrap_or("");
                     ui.horizontal_wrapped(|ui| {
@@ -272,7 +320,9 @@ impl HwpApp {
                     if ui
                         .add_enabled(
                             editable,
-                            egui::TextEdit::singleline(&mut state.author).desired_width(220.0),
+                            egui::TextEdit::singleline(&mut state.author)
+                                .id(egui::Id::new(AUTHOR_FIELD))
+                                .desired_width(f32::INFINITY),
                         )
                         .changed()
                     {
@@ -283,6 +333,7 @@ impl HwpApp {
                     .add_enabled(
                         editable,
                         egui::TextEdit::multiline(&mut state.text)
+                            .id(egui::Id::new(TEXT_FIELD))
                             .desired_width(f32::INFINITY)
                             .desired_rows(10)
                             .hint_text("메모 내용"),
@@ -297,7 +348,7 @@ impl HwpApp {
                     NEW_MEMO_REASON
                 };
                 if !editable {
-                    ui.weak(readonly_reason);
+                    super::ext_shell::notice(ui, readonly_reason);
                 }
                 if let Some(notice) = &state.notice {
                     ui.label(notice);
@@ -306,6 +357,7 @@ impl HwpApp {
                 if !current && ui.button("작성 내용 유지하고 새 메모로 연결").clicked()
                 {
                     state.selected = None;
+                    state.composing = true;
                     state.loaded_generation = Some(self.session.generation);
                     state.notice = None;
                 }
@@ -316,7 +368,7 @@ impl HwpApp {
                             egui::Button::new(if state.selected.is_some() {
                                 "변경 저장"
                             } else {
-                                "메모 만들기"
+                                "저장"
                             }),
                         )
                         .on_disabled_hover_text(if !editable {
@@ -328,14 +380,14 @@ impl HwpApp {
                     {
                         action = Some(Action::Save);
                     }
-                    if ui
-                        .add_enabled(
-                            editable && current && state.selected.is_some(),
-                            egui::Button::new("메모 삭제"),
-                        )
-                        .on_disabled_hover_text(if state.selected.is_none() {
-                            "지울 메모를 목록에서 고르세요."
-                        } else if !editable {
+                    if state.selected.is_none() {
+                        // Discard the unsaved new memo and hide the input fields.
+                        if ui.button("취소").clicked() {
+                            state.idle();
+                        }
+                    } else if ui
+                        .add_enabled(editable && current, egui::Button::new("메모 삭제"))
+                        .on_disabled_hover_text(if !editable {
                             readonly_reason
                         } else {
                             STALE_REASON
@@ -344,10 +396,12 @@ impl HwpApp {
                     {
                         action = Some(Action::Delete);
                     }
-                    ui.weak("삭제 후 실행 취소로 복원할 수 있습니다.");
                 });
+                if state.selected.is_some() {
+                    super::ext_shell::note(ui, "삭제 후 실행 취소로 복원할 수 있습니다.");
+                }
             });
-        state.open = open;
+        state.open = open && !close_clicked;
         match action {
             Some(Action::Save) => {
                 let result = if let Some(id) = state.selected {
@@ -378,7 +432,7 @@ impl HwpApp {
                     if self.result(result).is_some() {
                         state.generation = None;
                         state.refresh(&self.session);
-                        state.new_memo();
+                        state.idle();
                         state.notice = Some("메모를 삭제했습니다. 본문은 유지됩니다.".into());
                     }
                 }
@@ -424,6 +478,84 @@ impl HwpApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One frame of the memo pane beside a page view; the page view's width.
+    fn page_width(app: &mut HwpApp) -> f32 {
+        let ctx = app.ctx.clone();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1500.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut width = 0.0;
+        let mut output = ctx.run_ui(input, |ui| {
+            app.comments_panel(ui);
+            egui::CentralPanel::default().show(ui, |ui| width = ui.max_rect().width());
+        });
+        output.textures_delta.clear();
+        width
+    }
+
+    #[test]
+    fn the_memo_pane_docks_on_the_right_and_narrows_the_page_view() -> anyhow::Result<()> {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let full = page_width(&mut app);
+        assert!(app.comments_ext_dispatch("view.memo", &app.ctx.clone()));
+        let beside = page_width(&mut app);
+        // The pane takes its own strip instead of floating over the text.
+        assert!(full - beside >= 320.0, "{full} → {beside}");
+        assert!(full - beside <= 660.0, "{full} → {beside}");
+        // No floating window is left over the page.
+        let window = egui::Id::new("native-memo-editor");
+        assert!(app.ctx.memory(|m| {
+            m.areas()
+                .visible_layer_ids()
+                .iter()
+                .all(|layer| layer.id != window)
+        }));
+        app.ext.comments.open = false;
+        assert_eq!(page_width(&mut app), full);
+        Ok(())
+    }
+    #[test]
+    fn memo_inputs_appear_only_after_new_memo_and_shortcuts_pause_only_while_typing()
+    -> anyhow::Result<()> {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        app.session.execute(Command::Insert("메모 대상".into()))?;
+        let text_field = egui::Id::new(TEXT_FIELD);
+        let shown = |app: &HwpApp| egui::TextEdit::load_state(&app.ctx, text_field).is_some();
+        // No memos: the pane opens without input fields and keeps shortcuts working.
+        assert!(app.comments_ext_dispatch("view.memo", &app.ctx.clone()));
+        page_width(&mut app);
+        assert!(!app.ext.comments.editing());
+        assert!(!shown(&app), "no input fields before 새 메모");
+        assert!(!app.comments_ext_modal_open());
+        // 새 메모 (same as memo.create) shows them; focus in the text pauses shortcuts.
+        assert!(app.comments_ext_dispatch("memo.create", &app.ctx.clone()));
+        page_width(&mut app);
+        assert!(shown(&app));
+        assert!(
+            !app.comments_ext_modal_open(),
+            "open pane alone does not block keys"
+        );
+        app.ctx.memory_mut(|m| m.request_focus(text_field));
+        assert!(app.comments_ext_modal_open());
+        app.ctx.memory_mut(|m| m.surrender_focus(text_field));
+        // Saving lists the memo; 취소-equivalent idle hides the fields again.
+        app.ext.comments.text = "검토 필요".into();
+        let generation = app.ext.comments.loaded_generation;
+        app.session.run(
+            "memo.create",
+            json!({"text":"검토 필요","expected_generation":generation}),
+        )?;
+        app.ext.comments.idle();
+        page_width(&mut app);
+        assert_eq!(app.ext.comments.items.len(), 1);
+        assert!(!app.ext.comments.editing());
+        Ok(())
+    }
     #[test]
     fn list_refresh_keeps_a_dirty_draft_and_its_original_generation() -> anyhow::Result<()> {
         let mut session = Session::new()?;

@@ -154,6 +154,8 @@ impl HwpApp {
                 .show(ui, |ui| self.horizontal_scrollbar(ui, ui.max_rect()));
         }
         if self.tab != 0 {
+            // The memo pane docks beside the document, outside its scroll rail and rulers.
+            self.comments_panel(ui);
             self.vertical_scroll_panel(ui);
         }
         if self.show_rulers && self.tab != 0 {
@@ -255,13 +257,16 @@ impl HwpApp {
                     if cell(ui, mode.into(), "삽입/수정 전환 (Insert)").clicked() {
                         self.session.overwrite = !self.session.overwrite;
                     }
-                    ui.add_enabled_ui(false, |ui| {
-                        cell(
-                            ui,
-                            "변경 내용 [기록 중지]".into(),
-                            "변경 내용 추적은 지원하지 않습니다.",
-                        );
-                    });
+                    if self.session.has_track_change_records() {
+                        ui.add_enabled_ui(false, |ui| {
+                            cell(
+                                ui,
+                                "변경 기록 보존됨(표시 미지원)".into(),
+                                "이 문서에는 변경 내용 추적 기록이 있습니다. 저장할 때 그대로 \
+                                 보존하지만, 본문에 변경 표시를 그리지는 못합니다.",
+                            );
+                        });
+                    }
                     if !self.message.is_empty() && !start_hint_is_stale(self) {
                         ui.add_space(12.0);
                         ui.add(
@@ -791,6 +796,43 @@ fn start_hint_is_stale(app: &HwpApp) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scroll_rail_stays_beside_the_page_from_the_memo_panes_first_frame() -> anyhow::Result<()>
+    {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = app.ctx.clone();
+        assert!(app.comments_ext_dispatch("view.memo", &ctx));
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1500.0, 900.0))),
+            ..Default::default()
+        };
+        // One frame, the first with the pane open, in the app's panel order.
+        let mut output = ctx.run_ui(input, |ui| {
+            app.status_bar(ui);
+            egui::CentralPanel::default().show(ui, |_| {});
+        });
+        output.textures_delta.clear();
+        let rect = |id: &str| {
+            egui::containers::panel::PanelState::load(&ctx, egui::Id::new(id))
+                .map(|state| state.outer_rect)
+        };
+        let (Some(memo), Some(rail)) =
+            (rect("native-memo-editor"), rect("hwp-document-scroll-rail"))
+        else {
+            panic!("memo pane and scroll rail are both laid out");
+        };
+        // The document's scroll rail belongs to the page view, left of the pane.
+        assert!(
+            rail.max.x <= memo.min.x + 0.5,
+            "rail {rail:?} memo {memo:?}"
+        );
+        assert!(
+            memo.max.x >= 1499.0,
+            "the pane docks at the window edge: {memo:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn start_hint_hides_once_a_document_is_in_use() -> anyhow::Result<()> {

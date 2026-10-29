@@ -57,6 +57,8 @@ enum Action {
     Ext(&'static str),
     /// The module command when its owner provides it, otherwise the built-in one.
     Or(&'static str, &'static Action),
+    /// 보기 → 지원하지 않는 명령: show the commands in `UNSUPPORTED` (grey) in the ribbon.
+    ShowUnsupported,
 }
 
 /// Small 24 px tool inside a stacked column.
@@ -271,7 +273,7 @@ const EDIT: &[Item] = &[
 ];
 /// Tooltips for ribbon commands that no module implements yet, shown while they are grey.
 /// `unsupported_reasons_name_only_unimplemented_commands` keeps this list honest.
-const WHY_TRACK: &str = "변경 내용 추적은 지원하지 않습니다. 변경 추적 기록은 파일에 그대로 보존하지만 본문의 변경 표시는 읽지 못합니다. 두 파일의 차이는 [문서 비교]로 볼 수 있습니다.";
+const WHY_TRACK: &str = "변경 내용 추적은 지원하지 않습니다. HWP 파일의 변경 추적 기록은 보존하고, HWPX의 변경 추적 기록은 아직 읽거나 보존하지 못합니다. 본문에 변경 표시는 그리지 않습니다. 두 파일의 차이는 [문서 비교]로 볼 수 있습니다.";
 const WHY_SPELLING: &str = "맞춤법 검사는 지원하지 않습니다. 내장 맞춤법 사전이 없습니다.";
 const WHY_DICTIONARY: &str = "사전 찾기는 지원하지 않습니다. 내장 국어·한자 사전이 없습니다. 한자의 음과 뜻 후보는 [한자로 바꾸기](F9)에서 볼 수 있습니다.";
 const WHY_PROOF: &str = "교정 부호 넣기와 보기는 지원하지 않습니다.";
@@ -281,7 +283,6 @@ const WHY_OUTLINE: &str =
     "쪽 윤곽 끄기(본문만 이어 보기)는 지원하지 않습니다. 문서는 항상 쪽 모양으로 보입니다.";
 const WHY_DISTRIBUTION: &str = "배포용 문서 저장·편집은 지원하지 않습니다.";
 const WHY_WINDOWS: &str = "한 창에 문서 하나만 엽니다. 창 나누기·배열·전환은 지원하지 않습니다.";
-const WHY_CHART: &str = "새 차트 만들기는 지원하지 않습니다. 조판 엔진(RHWP)에 차트 생성 기능이 없습니다. 문서에 있는 차트는 그대로 보존합니다.";
 const WHY_NOT_YET: &str = "아직 지원하지 않는 기능입니다.";
 const UNSUPPORTED: &[(&str, &str)] = &[
     ("review.history", WHY_TRACK),
@@ -309,15 +310,15 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("view.split", WHY_WINDOWS),
     ("view.arrange", WHY_WINDOWS),
     ("view.switch_window", WHY_WINDOWS),
-    ("insert.chart", WHY_CHART),
     ("view.guides", WHY_NOT_YET),
+    ("format.style.gallery", WHY_NOT_YET),
+    ("format.drop_cap", WHY_NOT_YET),
+    ("format.picture_bullet", WHY_NOT_YET),
     ("view.hanja_pronounce", WHY_NOT_YET),
     ("insert.shape.freeline", WHY_NOT_YET),
     ("insert.textart", WHY_NOT_YET),
     ("insert.ole", WHY_NOT_YET),
     ("insert.cross_reference", WHY_NOT_YET),
-    ("view.link_prev", WHY_NOT_YET),
-    ("view.link_next", WHY_NOT_YET),
     ("insert.helper", WHY_NOT_YET),
     ("page.text_direction", WHY_NOT_YET),
     ("page.column_def_break", WHY_NOT_YET),
@@ -334,7 +335,6 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("tools.bibliography", WHY_NOT_YET),
     ("tools.bibliography_style", WHY_NOT_YET),
     ("tools.bibliography_refresh", WHY_NOT_YET),
-    ("table.block_calc", WHY_NOT_YET),
     ("tools.macro", WHY_NOT_YET),
     ("tools.autocorrect", WHY_NOT_YET),
     ("tools.translate", WHY_NOT_YET),
@@ -356,12 +356,96 @@ fn unsupported_reason(action: Action) -> Option<&'static str> {
         .map(|(_, why)| *why)
 }
 
-/// Attach the reason a grey command is unavailable (enabled or disabled hover).
-fn explain(response: egui::Response, action: Action, enabled: bool) -> egui::Response {
-    match unsupported_reason(action) {
-        Some(why) if !enabled => response.on_hover_text(why).on_disabled_hover_text(why),
-        _ => response,
+/// Why a supported command is grey: what to do first.
+const IN_TABLE: &str = "표 안에 커서를 두면 쓸 수 있습니다.";
+const OUT_OF_TABLE: &str = "표 안에서는 쓸 수 없습니다. 표 밖 본문에 커서를 두세요.";
+const SELECT_TEXT: &str = "글자를 먼저 선택하세요.";
+const SELECT_OBJECT: &str = "개체(그림·도형·글상자)를 먼저 선택하세요.";
+const NOT_FOR_OBJECT: &str =
+    "선택한 개체에는 쓸 수 없습니다. 보호된 개체라면 [개체 보호]를 먼저 푸세요.";
+const NO_SELECTION: &str = "선택을 풀고 넣을 자리에 커서를 두세요.";
+const CELL_BLOCK: &str = "셀 블록을 먼저 잡으세요(F5).";
+const NOT_NOW: &str = "지금 상태에서는 쓸 수 없습니다.";
+
+/// Shortcut of a command as the command list (help, MCP catalog) gives it.
+fn shortcut(action: Action) -> Option<&'static str> {
+    static KEYS: std::sync::OnceLock<std::collections::HashMap<&str, &str>> =
+        std::sync::OnceLock::new();
+    let id = HwpApp::action_id(action)?;
+    let keys = KEYS.get_or_init(|| {
+        let mut keys = std::collections::HashMap::new();
+        for (id, _, key) in hwpcraft_engine::COMMANDS
+            .iter()
+            .chain(hwpcraft_engine::extension_commands())
+        {
+            if !key.is_empty() {
+                keys.entry(*id).or_insert(*key);
+            }
+        }
+        keys
+    });
+    keys.get(id).copied()
+}
+
+/// A stack whose rows were thinned to one tool by hiding unsupported commands; that
+/// tool is drawn as a big button so no empty row is left beside it.
+fn lone_mini(rows: &[&[Mini]], hide: bool) -> Option<Mini> {
+    let all: Vec<Mini> = rows.iter().flat_map(|r| r.iter()).copied().collect();
+    let shown: Vec<Mini> = all
+        .iter()
+        .copied()
+        .filter(|m| match m {
+            I(_, _, a, _) | T(_, _, a, _) => !(hide && unsupported_reason(*a).is_some()),
+            W(..) => true,
+        })
+        .collect();
+    match shown[..] {
+        [one @ (I(..) | T(..))] if all.len() > 1 => Some(one),
+        _ => None,
     }
+}
+
+/// An item with nothing left to draw when unsupported commands are hidden.
+fn item_hidden(item: &Item) -> bool {
+    let gone = |a: &Action| unsupported_reason(*a).is_some();
+    match item {
+        Big(_, _, action, _) => gone(action),
+        Item::Menu(_, _, list) | Checks(list) => list.iter().all(|(_, a)| gone(a)),
+        Stack(rows) => rows.iter().flat_map(|r| r.iter()).all(|m| match m {
+            I(_, _, a, _) | T(_, _, a, _) => gone(a),
+            W(..) => false,
+        }),
+        Item::Custom(_, _, inner) => item_hidden(inner),
+        Item::Shapes | Item::StyleGallery | Sep => false,
+    }
+}
+
+/// A tab's ribbon groups (the runs between separators). With `hide`, items that only
+/// hold unsupported commands are left out and a group left empty is dropped.
+fn ribbon_groups(items: &[Item], hide: bool) -> Vec<Vec<Item>> {
+    items
+        .split(|i| matches!(i, Sep))
+        .map(|g| {
+            g.iter()
+                .filter(|i| !(hide && item_hidden(i)))
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .filter(|g| !g.is_empty())
+        .collect()
+}
+
+/// Unsupported commands of a tab with their reasons, one entry per command id.
+fn unsupported_in(items: &[Item]) -> Vec<(String, &'static str)> {
+    let mut seen = std::collections::BTreeSet::new();
+    HwpApp::tools(items)
+        .into_iter()
+        .filter_map(|(_, label, action)| {
+            let why = unsupported_reason(action)?;
+            seen.insert(HwpApp::action_id(action)?)
+                .then_some((label, why))
+        })
+        .collect()
 }
 
 /// Hangul 쪽 여백 gallery (measured values live in the engine's `page.margins.preset`).
@@ -416,6 +500,7 @@ const VIEW: &[Item] = &[
         ("문서 탭", A::Ext("view.doc_tabs")),
         ("눈금자", A::Rulers),
     ]),
+    Checks(&[("지원하지 않는 명령", A::ShowUnsupported)]),
     Big(Icon::Grid, "격자", A::Ext("view.grid"), true),
     Big(Icon::Eye, "안내선", A::Ext("view.guides"), true),
     Sep,
@@ -1021,6 +1106,12 @@ const REVIEW: &[Item] = &[
     Big(Icon::Memo, "새 메모", A::Ext("insert.memo"), false),
     Big(Icon::MemoList, "메모", A::Ext("memo.list"), true),
 ];
+/// 블록 계산: the cell-block commands of the 표 레이아웃 tab (usable inside a table).
+const BLOCK_CALC: &[(&str, Action)] = &[
+    ("블록 합계", A::Ext("table.block_sum")),
+    ("블록 평균", A::Ext("table.block_average")),
+    ("블록 곱", A::Ext("table.block_product")),
+];
 const TOOLS: &[Item] = &[
     Big(Icon::Index, "색인", A::Ext("tools.index"), true),
     Big(Icon::Toc, "제목\n차례", A::Ext("tools.toc"), true),
@@ -1047,12 +1138,7 @@ const TOOLS: &[Item] = &[
         )],
     ]),
     Sep,
-    Big(
-        Icon::BlockCalc,
-        "블록\n계산",
-        A::Ext("table.block_calc"),
-        true,
-    ),
+    Item::Menu(Icon::BlockCalc, "블록\n계산", BLOCK_CALC),
     Sep,
     Big(Icon::Macro, "스크립트\n매크로", A::Ext("tools.macro"), true),
     Sep,
@@ -1768,6 +1854,8 @@ const TABS: &[(&str, char, &[Item])] = &[
     ("그림", 'P', PICTURE),
     ("도형", 'X', SHAPE),
 ];
+/// Space after a column of check boxes (보기 tab), so neighbouring columns do not touch.
+const CHECK_GAP: f32 = 10.0;
 /// Context tabs shown only while a table cell or an object is current.
 const CONTEXT_TABS: std::ops::RangeInclusive<usize> = 9..=12;
 const ACCENT: Color32 = Color32::from_rgb(0, 150, 250);
@@ -1898,6 +1986,7 @@ impl HwpApp {
                 .unwrap_or(false),
             A::Ext(id) => self.pen_checked(id) || self.shell_ext_checked(id),
             A::Or(id, base) => self.shell_ext_checked(id) || self.checked(*base),
+            A::ShowUnsupported => self.ext.shell.show_unsupported,
             _ => false,
         }
     }
@@ -2040,6 +2129,122 @@ impl HwpApp {
                     query: String::new(),
                 })
             }
+            A::ShowUnsupported => self.toggle_unsupported_commands(),
+        }
+    }
+    /// Run a command by id the way its ribbon or 파일 entry does, including the enabled
+    /// check (a grey one only says why). False when no entry has this id.
+    pub(crate) fn run_ribbon_command(&mut self, id: &str, ctx: &egui::Context) -> bool {
+        let found = TABS
+            .iter()
+            .flat_map(|(_, _, items)| Self::tools(items))
+            .chain(SHAPES.iter().map(|(i, l, a)| (*i, (*l).to_owned(), *a)))
+            .chain(
+                FILE_MENU
+                    .iter()
+                    .flatten()
+                    .map(|(l, _, a)| (Icon::Eye, (*l).to_owned(), *a)),
+            )
+            .find(|(_, _, action)| Self::action_id(*action) == Some(id));
+        let Some((_, label, action)) = found else {
+            return false;
+        };
+        if self.enabled(action) {
+            self.dispatch(action, ctx);
+        } else {
+            self.message = format!("{label}: {}", self.disabled_reason(action));
+        }
+        true
+    }
+    /// First ribbon tab that holds the command `id`.
+    pub(crate) fn ribbon_tab_of(&self, id: &str) -> Option<usize> {
+        TABS.iter().position(|(_, _, items)| {
+            Self::tools(items)
+                .iter()
+                .any(|(_, _, a)| Self::action_id(*a) == Some(id))
+        })
+    }
+    /// Keep the tooltip of the command named by `--view tooltip-<id>` open.
+    fn pin_tip(&self, response: &egui::Response, action: Action, tip: &str) {
+        if self.ext.shell.pinned_tip.as_deref().is_some()
+            && self.ext.shell.pinned_tip.as_deref() == Self::action_id(action)
+        {
+            response.show_tooltip_text(tip.to_owned());
+        }
+    }
+    /// A command the ribbon leaves out: unsupported, and 지원하지 않는 명령 is off.
+    fn hides(&self, action: Action) -> bool {
+        !self.ext.shell.show_unsupported && unsupported_reason(action).is_some()
+    }
+    /// Why a command is grey: not implemented, or what the user has to do first.
+    fn disabled_reason(&self, action: Action) -> &'static str {
+        if let Some(why) = unsupported_reason(action) {
+            return why;
+        }
+        let in_table = self.session.cursor.cell.is_some();
+        match action {
+            A::Cut | A::Copy => return SELECT_TEXT,
+            A::Undo => return "되돌릴 작업이 없습니다.",
+            A::Redo => return "다시 실행할 작업이 없습니다.",
+            A::PasteFormat => return "[모양 복사]로 글자 모양을 먼저 복사하세요.",
+            A::TableEdit(_) => return IN_TABLE,
+            _ => {}
+        }
+        let id = Self::action_id(action).unwrap_or("");
+        match id {
+            "edit.sort" if !in_table => "정렬할 문단들을 먼저 블록으로 선택하세요.",
+            "note.convert" | "note.delete" => "각주나 미주 안에 커서를 두세요.",
+            "page.delete" => "쪽이 하나뿐이라 지울 쪽이 없습니다.",
+            "security.password_change" => {
+                "암호가 걸린 문서가 아닙니다. [문서 암호 설정]으로 먼저 거세요."
+            }
+            "object.select" | "object.next" | "object.prev" | "picture.save_all" => {
+                "문서에 개체가 없습니다."
+            }
+            "object.format.paste" => "개체의 [모양 복사]를 먼저 하세요.",
+            "insert.memo" | "memo.create" if !in_table => {
+                "메모는 본문의 한 문단 안에서만 만들 수 있습니다. 한 문단 안에서만 선택하세요."
+            }
+            "table.create" | "table.from_text" if in_table => OUT_OF_TABLE,
+            "table.merge" | "table.equal_height" | "table.equal_width" if in_table => CELL_BLOCK,
+            _ if id.starts_with("table.") && !in_table => IN_TABLE,
+            _ if in_table && !id.starts_with("table.") => OUT_OF_TABLE,
+            _ if ["object.", "picture.", "textbox."]
+                .iter()
+                .any(|p| id.starts_with(p)) =>
+            {
+                if self.object_ext_selected_kind().is_none() {
+                    SELECT_OBJECT
+                } else {
+                    NOT_FOR_OBJECT
+                }
+            }
+            _ if self.session.has_selection() => NO_SELECTION,
+            _ => NOT_NOW,
+        }
+    }
+    /// Tooltip of a ribbon command: its name and shortcut, and when grey, why.
+    fn tip(&self, label: &str, action: Action, enabled: bool) -> String {
+        let label = label.replace('\n', " ");
+        // A label that already names one of the keys (진하게 (Ctrl+B)) keeps its text.
+        let mut tip = match shortcut(action) {
+            Some(keys) if !keys.split(" / ").any(|k| label.contains(k.trim())) => {
+                format!("{label} ({keys})")
+            }
+            _ => label,
+        };
+        if !enabled {
+            tip.push('\n');
+            tip.push_str(self.disabled_reason(action));
+        }
+        tip
+    }
+    /// The reason on a grey list entry, check box or menu row (`add_enabled(false)`).
+    fn explain(&self, response: egui::Response, action: Action, enabled: bool) -> egui::Response {
+        if enabled {
+            response
+        } else {
+            response.on_disabled_hover_text(self.disabled_reason(action))
         }
     }
     fn copy_format(&mut self) {
@@ -2135,13 +2340,14 @@ impl HwpApp {
                         {
                             continue;
                         }
-                        if ui
-                            .add_enabled(
-                                self.enabled(action),
-                                egui::Button::new(format!("{tab}  /  {label}")).frame(false),
-                            )
-                            .clicked()
-                        {
+                        let enabled = self.enabled(action);
+                        let entry = ui.add_enabled(
+                            enabled,
+                            egui::Button::new(format!("{tab}  /  {label}"))
+                                .shortcut_text(shortcut(action).unwrap_or(""))
+                                .frame(false),
+                        );
+                        if self.explain(entry, action, enabled).clicked() {
                             self.dispatch(action, &ctx);
                             close = true;
                         }
@@ -2204,7 +2410,7 @@ impl HwpApp {
                                 .frame(false)
                                 .min_size(Vec2::new(262.0, 28.0)),
                         );
-                        if explain(response, action, enabled).clicked() {
+                        if self.explain(response, action, enabled).clicked() {
                             self.dispatch(action, &ctx);
                         }
                     }
@@ -2219,7 +2425,7 @@ impl HwpApp {
                 self.session
                     .path
                     .as_ref()
-                    .map(|p| p.display().to_string())
+                    .map(|p| super::ext_shell::recent_path(p).display().to_string())
                     .unwrap_or_else(|| "아직 저장하지 않은 문서".into()),
             );
             ui.label(format!(
@@ -2244,27 +2450,40 @@ impl HwpApp {
                     RichText::new("최근에 연 문서가 없습니다.").color(Color32::from_gray(110)),
                 );
             }
-            for (i, path) in self.ext.shell.recent.iter().enumerate() {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let folder = path
-                    .parent()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                if ui
-                    .add(
-                        egui::Button::new(format!("{}  {name}    {folder}", i + 1))
-                            .frame(false)
-                            .min_size(Vec2::new(560.0, 26.0)),
-                    )
-                    .on_hover_text(path.display().to_string())
-                    .clicked()
-                {
-                    open_recent = Some(i);
-                }
-            }
+            egui::Grid::new("hwp-file-recent")
+                .num_columns(2)
+                .spacing([24.0, 6.0])
+                .show(ui, |ui| {
+                    for (i, path) in self.ext.shell.recent.iter().enumerate() {
+                        let exists = path.is_file();
+                        let name = super::ext_shell::recent_name(path, 32);
+                        let folder = super::ext_shell::recent_folder(path, 64);
+                        let (label, color) = if exists {
+                            (format!("{}  {name}", i + 1), ui.visuals().text_color())
+                        } else {
+                            (
+                                format!("{}  {name}  (찾을 수 없음)", i + 1),
+                                Color32::from_gray(150),
+                            )
+                        };
+                        let response = ui
+                            .add(egui::Button::new(RichText::new(label).color(color)).frame(false));
+                        ui.label(RichText::new(folder).color(Color32::from_gray(120)));
+                        ui.end_row();
+                        let tip = if exists {
+                            path.display().to_string()
+                        } else {
+                            format!(
+                                "파일을 찾을 수 없습니다. 누르면 목록에서 지웁니다.
+{}",
+                                path.display()
+                            )
+                        };
+                        if response.on_hover_text(tip).clicked() {
+                            open_recent = Some(i);
+                        }
+                    }
+                });
         });
         if let Some(i) = open_recent {
             self.tab = 1;
@@ -2397,7 +2616,9 @@ impl HwpApp {
             A::Char("italic") => "format.italic",
             A::Char("underline") => "format.underline",
             A::Char("strikethrough") => "format.strikethrough",
-            A::Shape(_) | A::TableEdit(_) | A::Char(_) | A::Align(_) => return None,
+            A::Shape(_) | A::TableEdit(_) | A::Char(_) | A::Align(_) | A::ShowUnsupported => {
+                return None;
+            }
         })
     }
     /// Draw the Alt key tip for an action over its widget when tips are showing.
@@ -2423,14 +2644,20 @@ impl HwpApp {
         };
         ui.set_min_width(220.0);
         for (icon, label, action) in Self::tools(items) {
+            if self.hides(action) {
+                continue;
+            }
             let enabled = self.enabled(action);
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
                 self.icons.paint(ui, rect, icon, enabled);
-                if ui
-                    .add_enabled(enabled, egui::Button::new(label).frame(false))
-                    .clicked()
-                {
+                let entry = ui.add_enabled(
+                    enabled,
+                    egui::Button::new(label)
+                        .shortcut_text(shortcut(action).unwrap_or(""))
+                        .frame(false),
+                );
+                if self.explain(entry, action, enabled).clicked() {
                     ui.close();
                     self.dispatch(action, &ctx);
                 }
@@ -2587,7 +2814,8 @@ impl HwpApp {
         });
     }
     /// Layout width of an item at a ribbon level (full, compact, collapsed).
-    fn item_width(ui: &egui::Ui, item: &Item) -> [f32; 3] {
+    fn item_width(ui: &egui::Ui, item: &Item, hide: bool) -> [f32; 3] {
+        let shown = |a: &Action| !(hide && unsupported_reason(*a).is_some());
         let font = egui::FontId::proportional(12.0);
         let text = |s: &str| {
             ui.painter()
@@ -2612,6 +2840,7 @@ impl HwpApp {
             (w + 12.0).max(38.0).round()
         };
         let mini = |m: &Mini| match *m {
+            I(_, _, a, _) | T(_, _, a, _) if !shown(&a) => 0.0,
             I(_, _, _, menu) => 23.0 + if menu { 16.0 } else { 0.0 },
             T(_, label, _, menu) => 29.0 + text(label) + if menu { 16.0 } else { 0.0 },
             W(_, width) => width + 4.0,
@@ -2620,6 +2849,9 @@ impl HwpApp {
             Big(_, label, _, menu) => [big(label, *menu), 34.0, 34.0],
             Item::Menu(_, label, _) => [big(label, true), 34.0, 34.0],
             Stack(rows) => {
+                if let Some(I(_, label, _, menu) | T(_, label, _, menu)) = lone_mini(rows, hide) {
+                    return [big(label, menu), 34.0, 34.0];
+                }
                 let w = rows
                     .iter()
                     .map(|r| r.iter().map(mini).sum::<f32>())
@@ -2629,8 +2861,10 @@ impl HwpApp {
             Checks(list) => {
                 let w = list
                     .iter()
+                    .filter(|(_, a)| shown(a))
                     .map(|(l, _)| text(l) + 24.0)
-                    .fold(0.0_f32, f32::max);
+                    .fold(0.0_f32, f32::max)
+                    + CHECK_GAP;
                 [w, w, w]
             }
             Item::Shapes => [139.0, 139.0, 139.0],
@@ -2644,13 +2878,14 @@ impl HwpApp {
             return;
         };
         // Groups are the runs between separators; WordCraft's planner shrinks from the right.
-        let groups: Vec<&[Item]> = items.split(|i| matches!(i, Sep)).collect();
+        let hide = !self.ext.shell.show_unsupported;
+        let groups = ribbon_groups(items, hide);
         let widths: Vec<[f32; 3]> = groups
             .iter()
             .map(|g| {
                 let mut w = [13.0_f32; 3];
                 for item in g.iter() {
-                    let iw = Self::item_width(ui, item);
+                    let iw = Self::item_width(ui, item, hide);
                     for level in 0..3 {
                         w[level] += iw[level];
                     }
@@ -2689,7 +2924,70 @@ impl HwpApp {
                     }
                 });
             }
+            if hide {
+                self.unsupported_chip(ui, items);
+            }
         });
+    }
+    /// 지원 안 함 n: what this tab leaves out, with the reasons and the switch to show them.
+    fn unsupported_chip(&mut self, ui: &mut egui::Ui, items: &[Item]) {
+        let list = unsupported_in(items);
+        if list.is_empty() {
+            return;
+        }
+        ui.add_space(13.0);
+        let response = ui
+            .vertical(|ui| {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Button::new(
+                        RichText::new(format!("지원 안 함 {}", list.len()))
+                            .size(11.0)
+                            .color(Color32::from_gray(90)),
+                    )
+                    .fill(Color32::from_gray(240))
+                    .corner_radius(8.0),
+                )
+            })
+            .inner
+            .on_hover_text("이 탭에서 숨긴, 아직 지원하지 않는 명령");
+        let popup = egui::Id::new(("hwp-unsupported", self.tab));
+        if response.clicked() {
+            egui::Popup::toggle_id(ui.ctx(), popup);
+        }
+        egui::Popup::from_response(&response)
+            .id(popup)
+            .open_memory(None)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_max_width(420.0);
+                ui.label(RichText::new("이 탭에서 숨긴 명령").strong());
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("hwp-unsupported-list")
+                            .num_columns(2)
+                            .spacing([12.0, 6.0])
+                            .show(ui, |ui| {
+                                for (label, why) in &list {
+                                    ui.label(label);
+                                    ui.add(egui::Label::new(
+                                        RichText::new(*why).color(Color32::from_gray(100)),
+                                    ));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                ui.separator();
+                let mut show = self.ext.shell.show_unsupported;
+                if ui
+                    .checkbox(&mut show, "지원하지 않는 명령도 리본에 보이기")
+                    .clicked()
+                {
+                    ui.close();
+                    self.toggle_unsupported_commands();
+                }
+            });
     }
     fn collapsed_group(&mut self, ui: &mut egui::Ui, group: &[Item]) {
         let ctx = ui.ctx().clone();
@@ -2701,6 +2999,7 @@ impl HwpApp {
         };
         let label = label.split('\n').next().unwrap_or(label);
         let response = self.icons.large(ui, icon, label, true, true, false);
+        let response = response.on_hover_text(label);
         let popup = egui::Id::new(("hwp-group", label, self.tab));
         if response.clicked() {
             egui::Popup::toggle_id(&ctx, popup);
@@ -2711,14 +3010,18 @@ impl HwpApp {
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
                 for (icon, label, action) in Self::tools(group) {
+                    if self.hides(action) {
+                        continue;
+                    }
                     let enabled = self.enabled(action);
+                    let tip = self.tip(&label, action, enabled);
                     if self
                         .icons
                         .small(
                             ui,
                             icon,
                             Some(&label),
-                            &label,
+                            &tip,
                             enabled,
                             false,
                             self.checked(action),
@@ -2737,17 +3040,19 @@ impl HwpApp {
             Big(icon, label, action, menu) => {
                 let enabled = self.enabled(action);
                 let checked = self.checked(action);
+                let tip = self.tip(label, action, enabled);
                 let response = if full {
-                    self.icons.large(ui, icon, label, enabled, menu, checked)
+                    let response = self.icons.large(ui, icon, label, enabled, menu, checked);
+                    self.pin_tip(&response, action, &tip);
+                    response.on_hover_text(tip)
                 } else {
                     ui.vertical(|ui| {
                         ui.add_space(26.0);
                         self.icons
-                            .small(ui, icon, None, label, enabled, false, checked)
+                            .small(ui, icon, None, &tip, enabled, false, checked)
                     })
                     .inner
                 };
-                let response = explain(response, action, enabled);
                 self.keytip_badge(ui, response.rect, action);
                 if response.clicked() {
                     self.dispatch(action, &ctx);
@@ -2756,11 +3061,14 @@ impl HwpApp {
             Item::Menu(icon, label, list) => {
                 // Grey out (and ignore clicks on) a menu whose every entry is unavailable.
                 let any = self.menu_enabled(list);
-                let response = self.icons.large(ui, icon, label, any, true, false);
-                let response = match list.first() {
-                    Some((_, first)) => explain(response, *first, any),
-                    None => response,
-                };
+                let mut tip = label.replace('\n', " ");
+                if !any && let Some((_, first)) = list.iter().find(|(_, a)| !self.hides(*a)) {
+                    tip = format!("{tip}\n{}", self.disabled_reason(*first));
+                }
+                let response = self
+                    .icons
+                    .large(ui, icon, label, any, true, false)
+                    .on_hover_text(tip);
                 let popup = egui::Id::new(("hwp-menu", label, self.tab));
                 if response.clicked() {
                     egui::Popup::toggle_id(&ctx, popup);
@@ -2771,12 +3079,16 @@ impl HwpApp {
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                     .show(|ui| {
                         for (label, action) in list {
+                            if self.hides(*action) {
+                                continue;
+                            }
                             let enabled = self.enabled(*action);
                             let entry = ui.add_enabled(
                                 enabled,
-                                egui::Button::selectable(self.checked(*action), *label),
+                                egui::Button::selectable(self.checked(*action), *label)
+                                    .shortcut_text(shortcut(*action).unwrap_or("")),
                             );
-                            if explain(entry, *action, enabled).clicked() {
+                            if self.explain(entry, *action, enabled).clicked() {
                                 ui.close();
                                 self.dispatch(*action, &ctx);
                             }
@@ -2784,6 +3096,11 @@ impl HwpApp {
                     });
             }
             Stack(rows) => {
+                if let Some(I(icon, label, action, menu) | T(icon, label, action, menu)) =
+                    lone_mini(rows, !self.ext.shell.show_unsupported)
+                {
+                    return self.ribbon_item(ui, &Big(icon, label, action, menu), full);
+                }
                 let pitch = if rows.len() >= 3 { 26.0 } else { 40.0 };
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = pitch - icons::SMALL;
@@ -2791,6 +3108,12 @@ impl HwpApp {
                         ui.add_space(6.0);
                     }
                     for row in rows {
+                        if row.iter().all(|m| match *m {
+                            I(_, _, a, _) | T(_, _, a, _) => self.hides(a),
+                            W(..) => false,
+                        }) {
+                            continue;
+                        }
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
                             for mini in row.iter() {
@@ -2805,11 +3128,21 @@ impl HwpApp {
                     ui.spacing_mut().item_spacing.y = 8.0;
                     ui.add_space(3.0);
                     for (label, action) in list {
+                        if self.hides(*action) {
+                            continue;
+                        }
                         let enabled = self.enabled(*action);
                         let mut on = self.checked(*action);
                         let response =
                             ui.add_enabled(enabled, egui::Checkbox::new(&mut on, *label));
-                        let response = explain(response, *action, enabled);
+                        let response = if enabled {
+                            match shortcut(*action) {
+                                Some(key) => response.on_hover_text(format!("{label} ({key})")),
+                                None => response,
+                            }
+                        } else {
+                            response.on_disabled_hover_text(self.tip(label, *action, false))
+                        };
                         self.keytip_badge(
                             ui,
                             response.rect.translate(Vec2::new(-4.0, 6.0)),
@@ -2820,6 +3153,8 @@ impl HwpApp {
                         }
                     }
                 });
+                // Keep the next check column's boxes clear of this column's labels.
+                ui.add_space(CHECK_GAP);
             }
             Item::Shapes => self.shape_gallery(ui),
             Item::StyleGallery => self.style_gallery(ui, if full { 407.0 } else { 200.0 }),
@@ -2847,17 +3182,15 @@ impl HwpApp {
                 return;
             }
         };
+        if self.hides(action) {
+            return;
+        }
         let enabled = self.enabled(action);
-        let response = self.icons.small(
-            ui,
-            icon,
-            label,
-            tooltip,
-            enabled,
-            menu,
-            self.checked(action),
-        );
-        let response = explain(response, action, enabled);
+        let tip = self.tip(tooltip, action, enabled);
+        let response = self
+            .icons
+            .small(ui, icon, label, &tip, enabled, menu, self.checked(action));
+        self.pin_tip(&response, action, &tip);
         self.keytip_badge(ui, response.rect, action);
         if response.clicked() {
             self.dispatch(action, &ctx);
@@ -2873,12 +3206,14 @@ impl HwpApp {
             Stroke::new(1.0, LINE),
             egui::StrokeKind::Inside,
         );
-        for (i, (icon, label, action)) in SHAPES.iter().enumerate() {
+        let shapes: Vec<_> = SHAPES.iter().filter(|(_, _, a)| !self.hides(*a)).collect();
+        for (i, (icon, label, action)) in shapes.into_iter().enumerate() {
             let cell = Rect::from_min_size(
                 rect.min + Vec2::new(1.0 + (i % 5) as f32 * 24.0, 2.0 + (i / 5) as f32 * 24.0),
                 Vec2::splat(24.0),
             );
             let enabled = self.enabled(*action);
+            let tip = self.tip(label, *action, enabled);
             let response = ui
                 .interact(
                     cell,
@@ -2889,7 +3224,7 @@ impl HwpApp {
                         egui::Sense::hover()
                     },
                 )
-                .on_hover_text(*label);
+                .on_hover_text(tip);
             if response.hovered() && enabled {
                 ui.painter()
                     .rect_filled(cell, 0.0, Color32::from_rgb(229, 241, 251));
@@ -3382,10 +3717,13 @@ mod tests {
     #[test]
     fn unsupported_reasons_name_only_unimplemented_commands() {
         let app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
-        // A command that gained a handler must lose its "not supported" tooltip.
+        let mut table = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        enter_table(&mut table);
+        // A command that gained a handler must lose its "not supported" tooltip. An
+        // owner that keeps an id always grey (the format area's own list) has not.
         for (id, _) in UNSUPPORTED {
             assert!(
-                !owned(&app, id),
+                !(owned(&app, id) && (app.ext_enabled(id) || table.ext_enabled(id))),
                 "{id} is implemented now; remove it from UNSUPPORTED"
             );
         }
@@ -3410,6 +3748,157 @@ mod tests {
                 assert!(unsupported_reason(*action).is_some(), "file menu {id}");
             }
         }
+    }
+
+    #[test]
+    fn hidden_unsupported_commands_leave_no_empty_groups() {
+        let shown = |items: &[Item]| -> Vec<&'static str> {
+            ribbon_groups(items, true)
+                .iter()
+                .flat_map(|g| HwpApp::tools(g))
+                .filter_map(|(_, _, a)| HwpApp::action_id(a))
+                .collect()
+        };
+        for (tab, _, items) in TABS {
+            let groups = ribbon_groups(items, true);
+            assert!(groups.iter().all(|g| !g.is_empty()), "{tab}");
+            // Every whole item left holds at least one supported command.
+            assert!(groups.iter().flatten().all(|i| !item_hidden(i)), "{tab}");
+            let all = ribbon_groups(items, false);
+            let runs = items.split(|i| matches!(i, Sep)).filter(|g| !g.is_empty());
+            assert_eq!(all.len(), runs.count(), "{tab}");
+        }
+        // 도구: the reference tools go entirely; 블록 계산 (supported now) and help stay.
+        let tools = shown(TOOLS);
+        assert!(!tools.contains(&"tools.citation") && !tools.contains(&"tools.macro"));
+        assert!(tools.contains(&"table.block_sum") && tools.contains(&"help"));
+        assert_eq!(ribbon_groups(TOOLS, true).len(), 2);
+        // The 지원 안 함 list names each hidden command once, with its reason.
+        let list = unsupported_in(REVIEW);
+        assert!(list.iter().all(|(_, why)| !why.is_empty()));
+        assert_eq!(
+            list.len(),
+            HwpApp::tools(REVIEW)
+                .iter()
+                .filter_map(|(_, _, a)| unsupported_reason(*a).and(HwpApp::action_id(*a)))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
+        let format: Vec<_> = unsupported_in(FORMAT).into_iter().map(|(l, _)| l).collect();
+        assert_eq!(format, ["스타일마당", "문단 첫 글자 장식", "그림 글머리표"]);
+        assert!(unsupported_in(TABLE_LAYOUT).is_empty());
+    }
+
+    /// Put the caret in the first cell of a new 2×2 table.
+    fn enter_table(app: &mut HwpApp) {
+        app.session
+            .execute(Command::Table {
+                rows: 2,
+                columns: 2,
+            })
+            .unwrap();
+        let cell = (0..4)
+            .flat_map(|paragraph| (0..3).map(move |control| (paragraph, control)))
+            .map(|(paragraph, control)| hwpcraft_engine::Cursor {
+                section: 0,
+                paragraph,
+                offset: 0,
+                cell: Some(hwpcraft_engine::Cell {
+                    control,
+                    index: 0,
+                    paragraph: 0,
+                }),
+            })
+            .find(|at| app.session.select(*at, false).is_ok());
+        assert!(cell.is_some() && app.session.cursor.cell.is_some());
+    }
+
+    #[test]
+    fn grey_commands_say_why_and_tooltips_show_shortcuts() {
+        let blank = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        let mut table = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        enter_table(&mut table);
+        let mut grey = 0;
+        for app in [&blank, &table] {
+            for (tab, _, items) in TABS {
+                for (_, label, action) in HwpApp::tools(items) {
+                    if app.enabled(action) || unsupported_reason(action).is_some() {
+                        continue;
+                    }
+                    grey += 1;
+                    // A supported command says what to do, never "not supported yet".
+                    let why = app.disabled_reason(action);
+                    assert!(
+                        why != NOT_NOW && !why.contains("지원하지"),
+                        "{tab} {label}: {why}"
+                    );
+                    assert!(app.tip(&label, action, false).ends_with(why));
+                }
+            }
+        }
+        assert!(grey > 40, "{grey}");
+        assert_eq!(blank.disabled_reason(A::Copy), SELECT_TEXT);
+        assert_eq!(table.disabled_reason(A::Table), OUT_OF_TABLE);
+        assert_eq!(blank.disabled_reason(A::Ext("table.merge")), IN_TABLE);
+        assert_eq!(table.disabled_reason(A::Ext("table.merge")), CELL_BLOCK);
+        assert_eq!(blank.disabled_reason(A::Ext("object.lock")), SELECT_OBJECT);
+        // Shortcuts from the command list, once, after the name.
+        assert_eq!(blank.tip("오려\n두기", A::Cut, true), "오려 두기 (Ctrl+X)");
+        assert_eq!(
+            blank.tip("하이퍼링크", A::Link, true),
+            "하이퍼링크 (Ctrl+K,H)"
+        );
+        assert_eq!(
+            blank.tip("진하게 (Ctrl+B)", A::Char("bold"), true),
+            "진하게 (Ctrl+B)"
+        );
+        assert_eq!(blank.tip("바탕쪽", A::Ext("page.master"), true), "바탕쪽");
+    }
+
+    #[test]
+    fn a_stack_thinned_to_one_tool_becomes_a_big_button() {
+        let stack = INSERT
+            .iter()
+            .find_map(|item| match item {
+                Stack(rows)
+                    if HwpApp::tools(std::slice::from_ref(item)).len() == 2
+                        && rows
+                            .iter()
+                            .flat_map(|r| r.iter())
+                            .any(|m| matches!(m, T(_, "한자 입력", ..))) =>
+                {
+                    Some(*rows)
+                }
+                _ => None,
+            })
+            .expect("입력 도우미 / 한자 입력 stack");
+        assert!(matches!(
+            lone_mini(stack, true),
+            Some(T(_, "한자 입력", ..))
+        ));
+        assert!(lone_mini(stack, false).is_none());
+        // A full stack keeps its rows.
+        let notes = INSERT.iter().find_map(|item| match item {
+            Stack(rows) if rows.len() == 3 => Some(*rows),
+            _ => None,
+        });
+        assert!(notes.is_some_and(|rows| lone_mini(rows, true).is_none()));
+    }
+
+    #[test]
+    fn block_calc_and_new_chart_are_ribbon_commands_now() {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        let ids: Vec<_> = HwpApp::tools(TOOLS)
+            .into_iter()
+            .filter_map(|(_, _, a)| HwpApp::action_id(a))
+            .collect();
+        assert!(ids.contains(&"table.block_average") && !ids.contains(&"table.block_calc"));
+        // Body caret: the new-chart window opens; block calculation waits for a table.
+        assert!(app.enabled(A::Ext("insert.chart")));
+        assert!(unsupported_reason(A::Ext("insert.chart")).is_none());
+        assert!(!app.menu_enabled(BLOCK_CALC));
+        enter_table(&mut app);
+        assert!(app.menu_enabled(BLOCK_CALC));
     }
 
     #[test]

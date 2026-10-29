@@ -1145,3 +1145,189 @@ fn native_chart_authoring_via_mcp_preserves_state_and_roundtrips_real_doughnut_o
     cli.ok("close_document", json!({"document_id":id}))?;
     cli.finish()
 }
+
+#[test]
+fn actual_atomic_failures_preserve_old_redo_and_password_save_state() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut cli = Cli::start(root.path(), true)?;
+    let id = cli.doc()?;
+    cli.execute(&id, "text.insert", json!({"text":"A"}))?;
+    cli.execute(&id, "text.insert", json!({"text":" B"}))?;
+    cli.execute(&id, "edit.undo", json!({}))?;
+    let failed = cli.tool(
+        "batch",
+        json!({"document_id":id,"atomic":true,"commands":[
+            {"command":"text.insert","params":{"text":"ROLLBACK"}},
+            {"command":"not.a.command"}
+        ]}),
+    )?;
+    assert_eq!(failed["isError"], true);
+    assert_eq!(failed["structuredContent"]["rolledBack"], true);
+    assert_eq!(cli.text(&id)?["text"], "A");
+    cli.execute(&id, "edit.redo", json!({}))?;
+    assert_eq!(cli.text(&id)?["text"], "A B");
+    cli.execute(&id, "edit.undo", json!({}))?;
+    cli.execute(&id, "edit.undo", json!({}))?;
+    assert_eq!(cli.text(&id)?["text"], "");
+    cli.ok("close_document", json!({"document_id":id}))?;
+    for ext in ["hwp", "hwpx"] {
+        for (case, original, changed) in [
+            ("set", None, Some("new-fixture-key")),
+            ("change", Some("old-fixture-key"), Some("new-fixture-key")),
+            ("clear", Some("old-fixture-key"), None),
+        ] {
+            let id = cli.doc()?;
+            cli.execute(&id, "text.insert", json!({"text":"실제 MCP 암호 보존😀"}))?;
+            cli.execute(&id, "file.password", json!({"password":original}))?;
+            let before = root.path().join(format!("{case}-before.{ext}"));
+            cli.ok("save_document", json!({"document_id":id,"path":before}))?;
+            let before_bytes = std::fs::read(&before)?;
+            let failed = cli.tool(
+                "batch",
+                json!({"document_id":id,"atomic":true,"commands":[
+                    {"command":"file.password","params":{"password":changed}},
+                    {"command":"not.a.command"}
+                ]}),
+            )?;
+            assert_eq!(failed["isError"], true);
+            assert_eq!(failed["structuredContent"]["rolledBack"], true);
+            assert_eq!(std::fs::read(&before)?, before_bytes);
+            let after = root.path().join(format!("{case}-after.{ext}"));
+            cli.ok("save_document", json!({"document_id":id,"path":after}))?;
+            cli.ok("close_document", json!({"document_id":id}))?;
+            let reopened = if let Some(key) = original {
+                let wrong = cli.tool(
+                    "open_protected_document",
+                    json!({"path":after,"password":"wrong-fixture-key"}),
+                )?;
+                assert_eq!(wrong["isError"], true);
+                assert!(wrong["structuredContent"].get("document_id").is_none());
+                cli.ok(
+                    "open_protected_document",
+                    json!({"path":after,"password":key}),
+                )?
+            } else {
+                cli.ok("open_document", json!({"path":after}))?
+            };
+            let handle = reopened["document_id"]
+                .as_str()
+                .context("reopened password fixture")?;
+            assert_eq!(cli.text(handle)?["text"], "실제 MCP 암호 보존😀");
+            cli.ok("close_document", json!({"document_id":handle}))?;
+        }
+    }
+    cli.finish()
+}
+
+#[test]
+fn actual_thousand_command_atomic_failure_preserves_oldest_forty_undo_steps() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut cli = Cli::start(root.path(), true)?;
+    let id = cli.doc()?;
+    let original: Vec<Value> = (0..40)
+        .map(|_| json!({"command":"text.insert","params":{"text":" a"}}))
+        .collect();
+    cli.ok(
+        "batch",
+        json!({"document_id":id,"atomic":true,"commands":original}),
+    )?;
+    let mut edits: Vec<Value> = (0..999)
+        .map(|_| json!({"command":"text.insert","params":{"text":" b"}}))
+        .collect();
+    edits.push(json!({"command":"not.a.command"}));
+    let result = cli.tool(
+        "batch",
+        json!({"document_id":id,"atomic":true,"commands":edits}),
+    )?;
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["structuredContent"]["rolledBack"], true);
+    assert_eq!(
+        result["structuredContent"]["results"]
+            .as_array()
+            .context("1000 results")?
+            .len(),
+        1000
+    );
+    assert_eq!(cli.text(&id)?["text"], " a".repeat(40));
+    for remaining in (0..40).rev() {
+        cli.execute(&id, "edit.undo", json!({}))?;
+        assert_eq!(cli.text(&id)?["text"], " a".repeat(remaining));
+    }
+    for count in 1..=40 {
+        cli.execute(&id, "edit.redo", json!({}))?;
+        assert_eq!(cli.text(&id)?["text"], " a".repeat(count));
+    }
+    cli.ok("close_document", json!({"document_id":id,"force":true}))?;
+    cli.finish()
+}
+
+#[test]
+fn actual_rich_and_page_clipboards_are_isolated_and_restored_after_failed_atomic_copy() -> Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let mut cli = Cli::start(root.path(), true)?;
+    let a = cli.doc()?;
+    cli.execute(&a, "text.insert", json!({"text":"ORIGINAL"}))?;
+    cli.ok("select_text", json!({"document_id":a,"text":"ORIGINAL"}))?;
+    cli.execute(&a, "format.character", json!({"bold":true}))?;
+    cli.execute(&a, "edit.copy", json!({}))?;
+    cli.execute(&a, "page.copy", json!({"page":1}))?;
+    let b = cli.doc()?;
+    let refused = cli.tool(
+        "execute",
+        json!({"document_id":b,"command":"page.paste","params":{"page":1}}),
+    )?;
+    assert_eq!(refused["isError"], true);
+    assert_eq!(cli.text(&b)?["text"], "");
+    cli.execute(&a, "text.insert", json!({"text":"CURRENT"}))?;
+    cli.ok("select_text", json!({"document_id":a,"text":"CURRENT"}))?;
+    let failed = cli.tool(
+        "batch",
+        json!({"document_id":a,"atomic":true,"commands":[
+            {"command":"edit.copy"},
+            {"command":"page.copy","params":{"page":1}},
+            {"command":"text.insert","params":{"text":"BAD"}},
+            {"command":"not.a.command"}
+        ]}),
+    )?;
+    assert_eq!(failed["isError"], true);
+    assert_eq!(failed["structuredContent"]["rolledBack"], true);
+    assert_eq!(cli.text(&a)?["text"], "CURRENT");
+    assert_eq!(
+        cli.execute(&a, "edit.clipboard.get", json!({}))?["text"],
+        "ORIGINAL"
+    );
+    cli.execute(&a, "edit.paste", json!({}))?;
+    assert_eq!(cli.text(&a)?["text"], "ORIGINAL");
+    cli.ok("select_text", json!({"document_id":a,"text":"ORIGINAL"}))?;
+    assert_eq!(
+        cli.execute(&a, "format.character.get", json!({}))?["bold"],
+        true
+    );
+    cli.execute(&a, "page.paste", json!({"page":1}))?;
+    let text = cli.text(&a)?["text"]
+        .as_str()
+        .context("pasted page text")?
+        .to_owned();
+    assert_eq!(text.matches("ORIGINAL").count(), 2);
+    assert!(!text.contains("CURRENT") && !text.contains("BAD"));
+    for ext in ["hwp", "hwpx"] {
+        let path = root.path().join(format!("clipboard-report.{ext}"));
+        cli.ok("save_document", json!({"document_id":a,"path":path}))?;
+        let reopened = cli.ok("open_document", json!({"path":path}))?;
+        let handle = reopened["document_id"]
+            .as_str()
+            .context("clipboard report handle")?;
+        assert_eq!(cli.text(handle)?["text"], text);
+        let refused = cli.tool(
+            "execute",
+            json!({"document_id":handle,"command":"page.paste","params":{"page":1}}),
+        )?;
+        assert_eq!(refused["isError"], true);
+        cli.ok("close_document", json!({"document_id":handle}))?;
+    }
+    assert_eq!(cli.text(&b)?["text"], "");
+    cli.ok("close_document", json!({"document_id":a}))?;
+    cli.ok("close_document", json!({"document_id":b}))?;
+    cli.finish()
+}

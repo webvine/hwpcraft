@@ -1,7 +1,14 @@
 //! Current-protocol, stateless MCP adapter over isolated shared-engine workers.
-use crate::{catalog, document_workers::DocumentWorkers, sdk_catalog, tools};
+use crate::{
+    catalog, document_workers::DocumentWorkers, output_schemas, progress, sdk_catalog, tasks, tools,
+};
 use anyhow::{Context, Result, bail};
-use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, model::*, service::RequestContext};
+use rmcp::{
+    ErrorData as McpError, RoleServer, ServerHandler,
+    model::*,
+    service::RequestContext,
+    task_manager::{TaskExit, TaskManager},
+};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{
@@ -15,6 +22,9 @@ use tokio_util::sync::CancellationToken;
 const DOCUMENT: &str = "document_id";
 const VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 const DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
+/// Application error code, outside the JSON-RPC reserved range (-32768..=-32000)
+/// as MCP 2026-07-28 requires for codes it does not define.
+pub(crate) const COMPLETION_RATE_LIMITED: i32 = -31429;
 
 #[derive(Clone)]
 pub(crate) struct HwpService {
@@ -24,6 +34,7 @@ pub(crate) struct HwpService {
     validators: Arc<HashMap<String, jsonschema::Validator>>,
     capabilities: ServerCapabilities,
     completion_window: Arc<Mutex<VecDeque<Instant>>>,
+    tasks: TaskManager,
 }
 
 impl HwpService {
@@ -71,7 +82,13 @@ impl HwpService {
             }
             let validator = schema_validator(&Value::Object(schema.clone()))?;
             validators.insert(name.clone(), validator);
-            definition["outputSchema"] = json!({"$schema":DIALECT,"type":"object"});
+            match output_schemas::declared(&name, DIALECT) {
+                Some(schema) => {
+                    schema_validator(&schema)?;
+                    definition["outputSchema"] = schema;
+                }
+                None => bail!("tool {name} has no declared output schema"),
+            }
             if matches!(
                 name.as_str(),
                 "new_document" | "open_document" | "open_protected_document"
@@ -86,11 +103,13 @@ impl HwpService {
         Ok(Self {
             subscription_shutdown: None,
             completion_window: Arc::new(Mutex::new(VecDeque::new())),
+            tasks: TaskManager::new(),
             workers,
             tools: Arc::new(typed),
             validators: Arc::new(validators),
             capabilities: serde_json::from_value(
-                json!({"tools":{},"resources":{"subscribe":true},"prompts":{},"completions":{}}),
+                json!({"tools":{},"resources":{"subscribe":true},"prompts":{},"completions":{},
+                    "extensions":{"io.modelcontextprotocol/tasks":{}}}),
             )?,
         })
     }
@@ -98,6 +117,54 @@ impl HwpService {
     pub(crate) fn with_subscription_shutdown(mut self, shutdown: CancellationToken) -> Self {
         self.subscription_shutdown = Some(shutdown);
         self
+    }
+
+    /// Run a long file tool as an MCP task. The task owns its cancellation:
+    /// it outlives this request, and only `tasks/cancel` stops it.
+    fn spawn_task(&self, name: String, args: Value) -> CreateTaskResult {
+        let service = self.clone();
+        let task = self.tasks.spawn(tasks::options(), move |task| {
+            Box::pin(async move {
+                let cancel = CancellationToken::new();
+                let link = tokio::spawn({
+                    let (task, cancel) = (task.clone(), cancel.clone());
+                    async move {
+                        task.cancelled().await;
+                        cancel.cancel();
+                    }
+                });
+                let status = task.clone();
+                let outcome = progress::run(
+                    service.dispatch(&name, args, cancel),
+                    progress::HEARTBEAT,
+                    move |_, message| {
+                        if let Some(message) = message {
+                            status.set_status_message(message);
+                        }
+                        async {}
+                    },
+                )
+                .await;
+                link.abort();
+                if outcome.is_err() && task.is_cancel_requested() {
+                    return Err(TaskExit::Cancelled);
+                }
+                let (id, value) = outcome.unwrap_or_else(|error| {
+                    (
+                        None,
+                        tools::result(json!({"message":error.to_string()}), true),
+                    )
+                });
+                match tool_result(value, id.as_deref()).map_err(TaskExit::Error)? {
+                    CallToolResponse::Complete(result) => Ok(result),
+                    _ => Err(TaskExit::Error(McpError::internal_error(
+                        "task produced a non-final tool result",
+                        None,
+                    ))),
+                }
+            })
+        });
+        CreateTaskResult::new(task).with_meta(server_meta())
     }
 
     async fn dispatch(
@@ -160,7 +227,28 @@ fn schema_validator(schema: &Value) -> Result<jsonschema::Validator> {
         .build(schema)
         .context("invalid offline JSON Schema 2020-12 tool definition")
 }
-fn decode<T: DeserializeOwned>(value: Value) -> std::result::Result<T, McpError> {
+const SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+fn server_info() -> Implementation {
+    Implementation::new("hwpcraft", hwpcraft_engine::VERSION.trim())
+}
+
+fn server_meta() -> MetaObject {
+    let mut meta = MetaObject::default();
+    meta.0.insert(SERVER_INFO.to_owned(), json!(server_info()));
+    meta
+}
+
+/// Build a typed result. Every result names this server in `_meta` (2026-07-28
+/// per-response protocol field) so stateless clients need no prior discover.
+fn decode<T: DeserializeOwned>(mut value: Value) -> std::result::Result<T, McpError> {
+    if let Some(result) = value.as_object_mut() {
+        let meta = result.entry("_meta").or_insert_with(|| json!({}));
+        if let Some(meta) = meta.as_object_mut() {
+            meta.entry(SERVER_INFO)
+                .or_insert_with(|| json!(server_info()));
+        }
+    }
     serde_json::from_value(value).map_err(|error| McpError::internal_error(error.to_string(), None))
 }
 fn cursor(request: &Option<PaginatedRequestParams>) -> std::result::Result<(), McpError> {
@@ -175,10 +263,12 @@ fn cursor(request: &Option<PaginatedRequestParams>) -> std::result::Result<(), M
     }
     Ok(())
 }
-fn tool_result(value: Value, id: Option<&str>) -> std::result::Result<CallToolResponse, McpError> {
+fn tool_result(
+    mut value: Value,
+    id: Option<&str>,
+) -> std::result::Result<CallToolResponse, McpError> {
     let is_error = value["isError"].as_bool().unwrap_or(false);
-    let source_content = value.get("content").and_then(Value::as_array);
-    let text = source_content.and_then(|blocks| {
+    let text = value["content"].as_array().and_then(|blocks| {
         blocks
             .iter()
             .find_map(|block| block.get("text").and_then(Value::as_str))
@@ -195,15 +285,36 @@ fn tool_result(value: Value, id: Option<&str>) -> std::result::Result<CallToolRe
     if let Some(id) = id {
         structured[DOCUMENT] = json!(id);
     }
-    let mut content: Vec<Value> = source_content
-        .into_iter()
-        .flatten()
-        .filter(|block| block["type"] != "text")
-        .cloned()
-        .collect();
+    // A tool execution error always names its cause in `message`, the field the
+    // declared output schema requires of an error; other fields are kept.
+    if is_error && structured.get("message").is_none() {
+        let cause = structured["error"]
+            .as_str()
+            .or_else(|| {
+                structured["results"]
+                    .as_array()?
+                    .iter()
+                    .find_map(|entry| entry["error"].as_str())
+            })
+            .unwrap_or("tool execution failed")
+            .to_owned();
+        structured["message"] = json!(cause);
+    }
+    // Move non-text blocks (render_page's base64 PNG) instead of copying them.
+    let mut content: Vec<Value> = match value.get_mut("content").map(Value::take) {
+        Some(Value::Array(blocks)) => blocks
+            .into_iter()
+            .filter(|block| block["type"] != "text")
+            .collect(),
+        _ => Vec::new(),
+    };
     content.push(json!({"type":"text","text":structured.to_string()}));
-    let result: CallToolResult = decode(json!({"resultType":"complete","content":content,
-        "structuredContent":structured,"isError":is_error}))?;
+    let mut result = serde_json::Map::new();
+    result.insert("resultType".into(), json!("complete"));
+    result.insert("content".into(), Value::Array(content));
+    result.insert("structuredContent".into(), structured);
+    result.insert("isError".into(), json!(is_error));
+    let result: CallToolResult = decode(Value::Object(result))?;
     Ok(result.into())
 }
 
@@ -235,8 +346,8 @@ impl ServerHandler for HwpService {
     }
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(self.capabilities.clone()).with_protocol_version(VERSION)
-            .with_server_info(Implementation::new("hwpcraft",hwpcraft_engine::VERSION.trim()))
-            .with_instructions("MCP 2026-07-28 authoring server. Every request supplies protocolVersion and clientCapabilities in protocol _meta. new_document/open_document/open_protected_document return document_id; pass it on EVERY document-scoped tool call. No implicit current document. Discover all engine commands through list_commands; use execute, batch and hwp_action to author. Cursor offsets are Unicode scalars; render_page and page.layout.get pages are one-based. Query caret.get for generation before selection.range or addressed edits. Use context.v2 for supported nested regions and tools.autotext.body for formatted snippets. Atomic batches restore document edits and reject persistent file/settings writes. Save HWP/HWPX explicitly, inspect/reopen and render PNG/PDF for verification. Close documents explicitly. Unsupported operations report errors; do not infer full Hancom feature parity from command registration.")
+            .with_server_info(server_info())
+            .with_instructions("MCP 2026-07-28 authoring server. Every request supplies protocolVersion and clientCapabilities in protocol _meta. new_document/open_document/open_protected_document return document_id; pass it on EVERY document-scoped tool call. No implicit current document. Discover all engine commands through list_commands; use execute, batch and hwp_action to author. Cursor offsets are Unicode scalars; render_page and page.layout.get pages are one-based. Query caret.get for generation before selection.range or addressed edits. Use context.v2 for supported nested regions and tools.autotext.body for formatted snippets. Atomic batches restore document edits and reject persistent file/settings writes. Save HWP/HWPX explicitly, inspect/reopen and render PNG/PDF for verification. Close documents explicitly. Requests for one document run in order, so a long save or PDF export delays later calls on that document only; send progressToken to receive a heartbeat every 5 s. A save cancelled while running leaves the existing file unchanged. Clients that declare the io.modelcontextprotocol/tasks extension get a task for open/save/PDF tools (open_document, open_protected_document, save_document, execute file.*): poll tasks/get at pollIntervalMs; no task notifications are sent; tasks/cancel is cooperative and only prevents a file replacement that has not happened yet. Unsupported operations report errors; do not infer full Hancom feature parity from command registration.")
     }
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.tools.iter().find(|tool| tool.name == name).cloned()
@@ -278,20 +389,32 @@ impl ServerHandler for HwpService {
                 None,
             ));
         }
-        let progress = context.meta.get_progress_token();
-        if let Some(token) = progress.clone().filter(|_| !context.ct.is_cancelled()) {
-            let _ = context
-                .peer
-                .notify_progress(ProgressNotificationParam::new(token, 0.0))
-                .await;
+        let client_tasks = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
+        if client_tasks && tasks::eligible(name, &args) {
+            return Ok(CallToolResponse::Task(
+                self.spawn_task(name.to_owned(), args),
+            ));
         }
-        let outcome = self.dispatch(name, args, context.ct.clone()).await;
-        if let Some(token) = progress.filter(|_| !context.ct.is_cancelled()) {
-            let _ = context
-                .peer
-                .notify_progress(ProgressNotificationParam::new(token, 1.0))
-                .await;
-        }
+        let work = self.dispatch(name, args, context.ct.clone());
+        let outcome = match context.meta.get_progress_token() {
+            Some(token) => {
+                let (peer, cancel) = (context.peer.clone(), context.ct.clone());
+                progress::run(work, progress::HEARTBEAT, move |value, message| {
+                    let (peer, cancel) = (peer.clone(), cancel.clone());
+                    let mut param = ProgressNotificationParam::new(token.clone(), value);
+                    param.message = message;
+                    async move {
+                        if !cancel.is_cancelled() {
+                            let _ = peer.notify_progress(param).await;
+                        }
+                    }
+                })
+                .await
+            }
+            None => work.await,
+        };
         let (id, value) = outcome.unwrap_or_else(|error| {
             (
                 None,
@@ -299,6 +422,30 @@ impl ServerHandler for HwpService {
             )
         });
         tool_result(value, id.as_deref())
+    }
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<GetTaskResult, McpError> {
+        let mut result = GetTaskResult::new(self.tasks.get_task(&request.task_id)?);
+        result.meta = Some(server_meta());
+        Ok(result)
+    }
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<(), McpError> {
+        self.tasks
+            .update_task(&request.task_id, request.input_responses)
+    }
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<(), McpError> {
+        self.tasks.cancel_task(&request.task_id)
     }
     async fn list_resources(
         &self,
@@ -405,7 +552,7 @@ impl ServerHandler for HwpService {
             }
             if window.len() >= 30 {
                 return Err(McpError::new(
-                    ErrorCode(-32901),
+                    ErrorCode(COMPLETION_RATE_LIMITED),
                     "completion rate limit exceeded",
                     Some(json!({"retryAfterMs":1000})),
                 ));
@@ -510,6 +657,191 @@ mod tests {
             serde_json::to_value(ServerResult::from(response))?["isError"],
             true
         );
+        Ok(())
+    }
+
+    #[test]
+    fn application_error_codes_stay_outside_json_rpc_reserved_range() {
+        for code in [
+            COMPLETION_RATE_LIMITED,
+            crate::document_subscriptions::SUBSCRIPTION_CAPACITY_REACHED,
+        ] {
+            assert!(!(-32768..=-32000).contains(&code), "{code}");
+        }
+    }
+
+    /// Run every tool, successes and failures, and check each `structuredContent`
+    /// against the tool's declared output schema, as an SDK client would.
+    #[tokio::test]
+    async fn every_tool_result_conforms_to_its_declared_output_schema() -> Result<()> {
+        use hwpcraft_engine::{Command, Session};
+        let service = HwpService::new(Arc::new(DocumentWorkers::new(None)))?;
+        let mut validators = HashMap::new();
+        for tool in service.tools.iter() {
+            let schema = Value::Object(
+                tool.output_schema
+                    .as_deref()
+                    .cloned()
+                    .with_context(|| format!("{} declares no output schema", tool.name))?,
+            );
+            validators.insert(tool.name.to_string(), schema_validator(&schema)?);
+        }
+        let mut succeeded = std::collections::BTreeSet::new();
+        let mut failed = std::collections::BTreeSet::new();
+        let call = async |name: &str, args: Value| -> Result<(bool, Value)> {
+            // As in call_tool: a dispatch failure becomes a tool execution error.
+            let (id, value) = service
+                .dispatch(name, args, CancellationToken::new())
+                .await
+                .unwrap_or_else(|error| {
+                    (
+                        None,
+                        tools::result(json!({"message":error.to_string()}), true),
+                    )
+                });
+            let response = tool_result(value, id.as_deref()).map_err(anyhow::Error::msg)?;
+            let result = serde_json::to_value(ServerResult::from(response))?;
+            let structured = result["structuredContent"].clone();
+            let errors: Vec<_> = validators[name]
+                .iter_errors(&structured)
+                .map(|error| format!("{} ({})", error.instance_path(), error.schema_path()))
+                .collect();
+            assert!(errors.is_empty(), "{name}: {errors:?}\n{structured}");
+            Ok((result["isError"] == true, structured))
+        };
+        let dir = tempfile::tempdir()?;
+        let saved = dir.path().join("schema.hwpx");
+        let protected = dir.path().join("protected.hwpx");
+        let mut source = Session::new()?;
+        source.execute(Command::Insert("암호 문서".into()))?;
+        source.set_password(Some("schema-password".into()))?;
+        source.save(&protected)?;
+        let (_, created) = call("new_document", json!({})).await?;
+        let id = created[DOCUMENT]
+            .as_str()
+            .context("document_id")?
+            .to_owned();
+        succeeded.insert("new_document");
+        let doc = |extra: Value| {
+            let mut args = extra;
+            args[DOCUMENT] = json!(id);
+            args
+        };
+        let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let cases = [
+            ("list_commands", json!({"query":"표"}), false),
+            (
+                "type_text",
+                doc(json!({"text":"첫째 문단 😀\n둘째 문단"})),
+                false,
+            ),
+            ("select_text", doc(json!({"text":"둘째"})), false),
+            ("select_text", doc(json!({"text":"없는 글자"})), true),
+            ("get_selection", doc(json!({})), false),
+            ("get_text", doc(json!({"limit":1})), false),
+            ("get_text", doc(json!({"start":99})), true),
+            ("inspect_document", doc(json!({})), false),
+            ("execute", doc(json!({"command":"select.get"})), false),
+            ("execute", doc(json!({"command":"chart.types"})), false),
+            ("execute", doc(json!({"command":"no.such.command"})), true),
+            (
+                "batch",
+                doc(
+                    json!({"commands":[{"command":"text.insert","params":{"text":"!"}}],"atomic":true}),
+                ),
+                false,
+            ),
+            (
+                "batch",
+                doc(
+                    json!({"commands":[{"command":"text.insert","params":{"text":"?"}},{"command":"no.such","params":{}}],"atomic":true}),
+                ),
+                true,
+            ),
+            ("hwp_action", json!({"query":"Bold"}), false),
+            ("hwp_action", doc(json!({"id":"MoveLineEnd"})), false),
+            ("hwp_action", doc(json!({"id":"NoSuchAction"})), true),
+            ("render_page", doc(json!({"page":1,"scale":0.25})), false),
+            ("render_page", doc(json!({"page":99})), true),
+            // Unsaved changes refuse replacement and closing without force.
+            ("new_document", doc(json!({})), true),
+            ("close_document", doc(json!({})), true),
+            ("save_document", doc(json!({"path":path(&saved)})), false),
+            (
+                "save_document",
+                doc(json!({"path":path(&dir.path().join("x.docx"))})),
+                true,
+            ),
+            ("open_document", json!({"path":path(&saved)}), false),
+            (
+                "open_document",
+                json!({"path":path(&dir.path().join("missing.hwpx"))}),
+                true,
+            ),
+            (
+                "open_protected_document",
+                json!({"path":path(&protected),"password":"schema-password"}),
+                false,
+            ),
+            (
+                "open_protected_document",
+                json!({"path":path(&protected),"password":"wrong"}),
+                true,
+            ),
+            ("close_document", doc(json!({"force":true})), false),
+            ("get_text", doc(json!({})), true),
+        ];
+        for (name, args, expect_error) in cases {
+            let (is_error, structured) = call(name, args).await?;
+            assert_eq!(is_error, expect_error, "{name}: {structured}");
+            if is_error {
+                assert!(structured["message"].is_string(), "{name}: {structured}");
+                failed.insert(name);
+            } else {
+                succeeded.insert(name);
+            }
+        }
+        for tool in service.tools.iter() {
+            assert!(
+                succeeded.contains(tool.name.as_ref()),
+                "{} never succeeded",
+                tool.name
+            );
+        }
+        assert!(failed.len() >= 10, "{failed:?}");
+        Ok(())
+    }
+
+    fn built<T: DeserializeOwned>(value: Value) -> Result<T> {
+        decode(value).map_err(anyhow::Error::msg)
+    }
+
+    #[test]
+    fn every_built_result_names_the_server_in_meta() -> Result<()> {
+        let expected = json!({"name":"hwpcraft","version":hwpcraft_engine::VERSION.trim()});
+        let tool = tool_result(tools::result(json!({"pages":1}), false), None)
+            .map_err(anyhow::Error::msg)?;
+        let lists: Vec<ServerResult> = vec![
+            tool.into(),
+            ServerResult::ListToolsResult(built(
+                json!({"resultType":"complete","tools":[],"ttlMs":1,"cacheScope":"public"}),
+            )?),
+            ServerResult::ListResourcesResult(built(sdk_catalog::list_resources())?),
+            ServerResult::ListResourceTemplatesResult(built(
+                sdk_catalog::list_resource_templates(),
+            )?),
+            ServerResult::ListPromptsResult(built(sdk_catalog::list_prompts())?),
+        ];
+        for result in lists {
+            let value = serde_json::to_value(result)?;
+            assert_eq!(value["_meta"][SERVER_INFO], expected, "{value}");
+        }
+        // Existing protocol metadata is kept; the server entry is only added.
+        let kept: CallToolResult =
+            built(json!({"resultType":"complete","content":[],"_meta":{"com.example/trace":"t"}}))?;
+        let value = serde_json::to_value(kept)?;
+        assert_eq!(value["_meta"]["com.example/trace"], "t");
+        assert_eq!(value["_meta"][SERVER_INFO], expected);
         Ok(())
     }
 }

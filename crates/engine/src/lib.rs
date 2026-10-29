@@ -14,6 +14,8 @@ mod table_drawing;
 pub use autotext::{config_dir, set_config_dir};
 pub use ext_format::COLOR_PRESETS;
 pub use extensions::{command_help, command_help_entries, extension_commands};
+mod atomic_history;
+pub use atomic_history::FullCheckpoint;
 mod automation_context;
 mod autotext;
 mod body_autotext;
@@ -21,6 +23,8 @@ mod body_autotext_fragment;
 mod body_autotext_store;
 mod caret;
 mod chart_creation;
+mod chart_rendering;
+mod clipboard_history;
 mod editing;
 mod insertion_shape;
 use insertion_shape::InsertionShapeState;
@@ -48,6 +52,7 @@ mod page_fields;
 pub mod presentation_geometry;
 mod rendering;
 pub use highlights::{HighlightRect, markpen_ranges};
+pub use rendering::{PdfJob, PdfPrep};
 mod symbols;
 pub use symbols::{
     SpecialChar, SymbolGroup, SymbolInsert, SymbolSearch, SymbolSet, block_of, ks_code,
@@ -137,7 +142,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("paragraph.split", "문단 나누기", "Enter"),
     ("selection.set", "문단 / 표 셀 선택", ""),
     ("table.edit", "표 줄·칸 편집 / 본문 폭에 맞춤", ""),
-    ("insert.hyperlink", "하이퍼링크", "Ctrl+K"),
+    ("insert.hyperlink", "하이퍼링크", "Ctrl+K,H"),
     ("insert.picture", "PNG 그림 삽입", ""),
     ("bookmark.add", "책갈피 추가", ""),
     ("bookmark.list", "책갈피 목록", ""),
@@ -187,6 +192,7 @@ struct Snapshot {
 /// See [`Session::checkpoint`].
 pub struct Checkpoint {
     id: u32,
+    _lease: std::rc::Rc<()>,
     cursor: Cursor,
     anchor: Option<usize>,
     span_anchor: Option<Cursor>,
@@ -203,6 +209,8 @@ type CachedPageFields =
 
 pub struct Session {
     pub core: DocumentCore,
+    /// Nesting depth of `defer_layout`; RHWP batch mode is on while it is > 0.
+    deferred_depth: u32,
     pub cursor: Cursor,
     /// Selection is confined to the current paragraph, including table cells.
     pub anchor: Option<usize>,
@@ -219,6 +227,8 @@ pub struct Session {
     typing_chars: usize,
     insertion_shape: InsertionShapeState,
     clipboard_text: Option<String>,
+    clipboard_replay: Option<std::rc::Rc<clipboard_history::ClipboardReplay>>,
+    page_clipboard: Option<std::rc::Rc<hwpcraft_doc::model::document::Document>>,
     pub generation: u64,
     render_highlights: std::cell::RefCell<Option<(u64, Vec<HighlightRect>)>>,
     /// A failed layout is cached as its message so per-frame callers do not retry it.
@@ -239,6 +249,7 @@ pub struct Session {
     saved_revision: u64,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    history_scopes: atomic_history::HistoryScopes,
 }
 impl Session {
     pub fn new() -> Result<Self> {
@@ -247,6 +258,7 @@ impl Session {
     fn with_core(core: DocumentCore, path: Option<PathBuf>) -> Self {
         Self {
             core,
+            deferred_depth: 0,
             path,
             password: None,
             cursor: Cursor::default(),
@@ -257,6 +269,8 @@ impl Session {
             typing_chars: 0,
             insertion_shape: InsertionShapeState::default(),
             clipboard_text: None,
+            clipboard_replay: None,
+            page_clipboard: None,
             generation: 0,
             render_highlights: std::cell::RefCell::new(None),
             page_field_cache: std::cell::RefCell::new(None),
@@ -272,9 +286,11 @@ impl Session {
             saved_revision: 0,
             undo: vec![],
             redo: vec![],
+            history_scopes: atomic_history::HistoryScopes::default(),
         }
     }
     pub fn open(&mut self, path: &Path) -> Result<()> {
+        self.ensure_history_replacement_allowed()?;
         let mut core = hwpcraft_formats::open(path)?;
         comments::restore_memo_content(&mut core)?;
         let generation = self.generation + 1;
@@ -286,6 +302,7 @@ impl Session {
     }
     /// Open a password-protected document. The password is kept for later saves.
     pub fn open_with_password(&mut self, path: &Path, password: &str) -> Result<()> {
+        self.ensure_history_replacement_allowed()?;
         let mut core = hwpcraft_formats::open_with_password(path, password)?;
         comments::restore_memo_content(&mut core)?;
         let generation = self.generation + 1;
@@ -318,6 +335,7 @@ impl Session {
         self.password.is_some()
     }
     pub fn reset(&mut self) -> Result<()> {
+        self.ensure_history_replacement_allowed()?;
         let generation = self.generation + 1;
         *self = Self::new()?;
         self.generation = generation;
@@ -740,7 +758,7 @@ impl Session {
     }
     fn snapshot(&mut self) -> Snapshot {
         Snapshot {
-            id: self.core.save_snapshot_native(),
+            id: self.save_history_snapshot(),
             cursor: self.cursor,
             anchor: self.anchor,
             span_anchor: self.span_anchor,
@@ -749,13 +767,15 @@ impl Session {
             visual_hint: self.current_visual_hint(self.cursor),
         }
     }
-    /// Mark a point several commands can be rolled back to as one unit, for an
-    /// atomic MCP batch. Each command still records its own undo step; `rollback`
-    /// drops those steps again. The redo stack is not restored.
+    /// Legacy document/caret baseline. Each command still records its own undo
+    /// step; rollback drops later steps without restoring the full redo history.
+    /// Use `full_checkpoint` for atomic batches that preserve both history stacks.
     pub fn checkpoint(&mut self) -> Checkpoint {
         let snapshot = self.snapshot();
+        let lease = self.track_legacy_checkpoint(snapshot.id);
         Checkpoint {
             id: snapshot.id,
+            _lease: lease,
             cursor: snapshot.cursor,
             anchor: snapshot.anchor,
             span_anchor: snapshot.span_anchor,
@@ -774,10 +794,10 @@ impl Session {
         self.core
             .restore_snapshot_native(checkpoint.id)
             .map_err(err)?;
-        self.core.discard_snapshot_native(checkpoint.id);
+        self.retire_history_snapshot(checkpoint.id);
         while self.undo.len() > checkpoint.undo_len {
             if let Some(s) = self.undo.pop() {
-                self.core.discard_snapshot_native(s.id);
+                self.retire_history_snapshot(s.id);
             }
         }
         self.cursor = checkpoint.cursor;
@@ -796,7 +816,50 @@ impl Session {
     }
     /// Keep the work done since a checkpoint and free its snapshot.
     pub fn release(&mut self, checkpoint: Checkpoint) {
-        self.core.discard_snapshot_native(checkpoint.id);
+        self.retire_history_snapshot(checkpoint.id);
+    }
+    /// Defer RHWP pagination until the matching `resume_layout`. Nested calls are
+    /// counted; only the outermost pair enters and leaves RHWP batch mode, which
+    /// then paginates every dirty section once. While deferred, page counts, page
+    /// layouts and caret geometry describe the layout before the first deferral,
+    /// so only commands that edit the model without reading them may run inside.
+    pub fn defer_layout(&mut self) -> Result<()> {
+        if self.deferred_depth == 0 {
+            self.core.begin_batch_native().map_err(err)?;
+        }
+        self.deferred_depth = self
+            .deferred_depth
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("쪽 배치 지연이 너무 깊게 중첩되었습니다."))?;
+        Ok(())
+    }
+    /// End one `defer_layout`; the outermost call paginates once.
+    pub fn resume_layout(&mut self) -> Result<()> {
+        if self.deferred_depth == 0 {
+            bail!("쪽 배치 지연이 시작되지 않았습니다.");
+        }
+        self.deferred_depth -= 1;
+        if self.deferred_depth == 0 {
+            self.core.end_batch_native().map_err(err)?;
+        }
+        Ok(())
+    }
+    /// True while pagination is deferred (see `defer_layout`).
+    pub fn layout_deferred(&self) -> bool {
+        self.deferred_depth > 0
+    }
+    /// Run `f` with pagination deferred to one pass at the end, re-entrantly.
+    /// Call inside `transaction` so a failed edit still rolls everything back.
+    pub(crate) fn deferred_layout<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        self.defer_layout()?;
+        let result = f(self);
+        let resumed = self.resume_layout();
+        let value = result?;
+        resumed?;
+        Ok(value)
     }
     fn transaction(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
         let snapshot = self.snapshot();
@@ -812,7 +875,7 @@ impl Session {
             self.core
                 .restore_snapshot_native(snapshot.id)
                 .map_err(err)?;
-            self.core.discard_snapshot_native(snapshot.id);
+            self.retire_history_snapshot(snapshot.id);
             self.cursor = snapshot.cursor;
             self.anchor = snapshot.anchor;
             self.span_anchor = snapshot.span_anchor;
@@ -824,13 +887,13 @@ impl Session {
             self.insertion_shape.clear();
         }
         self.normalize_selection();
-        for s in self.redo.drain(..) {
-            self.core.discard_snapshot_native(s.id);
+        for s in std::mem::take(&mut self.redo) {
+            self.retire_history_snapshot(s.id);
         }
         self.undo.push(snapshot);
         if self.undo.len() > 40 {
             let old = self.undo.remove(0);
-            self.core.discard_snapshot_native(old.id);
+            self.retire_history_snapshot(old.id);
         }
         self.revision = self.next_revision;
         self.next_revision += 1;
@@ -849,7 +912,7 @@ impl Session {
         if let Some(target) = target {
             let current = self.snapshot();
             if let Err(e) = self.core.restore_snapshot_native(target.id) {
-                self.core.discard_snapshot_native(current.id);
+                self.retire_history_snapshot(current.id);
                 return Err(err(e));
             }
             if redo {
@@ -859,7 +922,7 @@ impl Session {
                 self.undo.pop();
                 self.redo.push(current);
             }
-            self.core.discard_snapshot_native(target.id);
+            self.retire_history_snapshot(target.id);
             self.cursor = target.cursor;
             self.revision = target.revision;
             self.anchor = target.anchor;
@@ -973,33 +1036,43 @@ impl Session {
         } else {
             ticket
         };
-        for (i, line) in text.split('\n').enumerate() {
-            if i > 0 {
-                self.split()?;
+        // Every line break would otherwise paginate the whole document again;
+        // a long multi-paragraph insert lays the document out once at the end.
+        let lines = |s: &mut Self| -> Result<()> {
+            for (i, line) in text.split('\n').enumerate() {
+                if i > 0 {
+                    s.split()?;
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                let c = s.cursor;
+                let old_len = s.len();
+                let r = if let Some(t) = c.cell {
+                    s.core.insert_text_in_cell_native(
+                        c.section,
+                        c.paragraph,
+                        t.control,
+                        t.index,
+                        t.paragraph,
+                        c.offset,
+                        line,
+                    )
+                } else {
+                    s.core
+                        .insert_text_native(c.section, c.paragraph, c.offset, line)
+                };
+                r.map_err(err)?;
+                s.repair_trailing_number_stride(c, old_len);
+                ticket.apply_range(&mut s.core, c, c.offset..c.offset + line.chars().count())?;
+                s.cursor.offset += line.chars().count();
             }
-            if line.is_empty() {
-                continue;
-            }
-            let c = self.cursor;
-            let old_len = self.len();
-            let r = if let Some(t) = c.cell {
-                self.core.insert_text_in_cell_native(
-                    c.section,
-                    c.paragraph,
-                    t.control,
-                    t.index,
-                    t.paragraph,
-                    c.offset,
-                    line,
-                )
-            } else {
-                self.core
-                    .insert_text_native(c.section, c.paragraph, c.offset, line)
-            };
-            r.map_err(err)?;
-            self.repair_trailing_number_stride(c, old_len);
-            ticket.apply_range(&mut self.core, c, c.offset..c.offset + line.chars().count())?;
-            self.cursor.offset += line.chars().count();
+            Ok(())
+        };
+        if text.contains('\n') {
+            self.deferred_layout(lines)?;
+        } else {
+            lines(self)?;
         }
         self.anchor = None;
         ticket.finish(&mut self.insertion_shape, self.cursor);

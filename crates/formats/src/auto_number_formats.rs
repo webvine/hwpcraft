@@ -8,6 +8,7 @@ use hwpcraft_doc::{
     DocumentCore,
     model::{
         control::{AutoNumber, Control},
+        document::Document,
         paragraph::Paragraph,
         shape::ShapeObject,
     },
@@ -376,7 +377,7 @@ fn shape(
 }
 
 fn document(
-    doc: &mut hwpcraft_doc::model::document::Document,
+    doc: &mut Document,
     mut visit: impl FnMut(&mut AutoNumber) -> Result<()>,
 ) -> Result<()> {
     for section in &mut doc.sections {
@@ -388,32 +389,96 @@ fn document(
     Ok(())
 }
 
+/// Marks other than AutoNumber that ride on the same package rewrite and parse.
+pub(crate) trait Marks {
+    fn mark(&mut self, xml: &[u8]) -> Result<Vec<u8>>;
+    fn is_empty(&self) -> bool;
+    fn restore(&self, doc: &mut Document) -> Result<()>;
+}
+
+impl Marks for () {
+    fn mark(&mut self, xml: &[u8]) -> Result<Vec<u8>> {
+        Ok(xml.to_vec())
+    }
+    fn is_empty(&self) -> bool {
+        true
+    }
+    fn restore(&self, _: &mut Document) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Open through the native parser, restoring canonical shapes before returning
 /// the editable model. Non-HWPX formats retain their native parsing path.
 pub fn open(bytes: &[u8], password: Option<&[u8]>) -> Result<DocumentCore> {
-    // Preserve the native password/error contract before inspecting XML.
-    let original = match password {
+    open_marked(bytes, password, &mut ())
+}
+
+fn native(bytes: &[u8], password: Option<&[u8]>) -> Result<DocumentCore> {
+    match password {
         Some(p) => DocumentCore::from_bytes_with_password(bytes, p),
         None => DocumentCore::from_bytes(bytes),
     }
-    .map_err(|e| anyhow!("{e}"))?;
-    if !bytes.starts_with(b"PK\x03\x04") {
-        return Ok(original);
+    .map_err(|e| anyhow!("{e}"))
+}
+
+/// A failure before the identity parse reports the native error first, as the
+/// native parse used to run before any XML was inspected.
+fn native_error(bytes: &[u8], password: Option<&[u8]>, error: anyhow::Error) -> anyhow::Error {
+    native(bytes, password).err().unwrap_or(error)
+}
+
+/// Open an HWPX package with AutoNumber identities and `extra` marks applied
+/// in one rewrite, and restore the public values inside RHWP's load before its
+/// first layout: one parse and one layout instead of a native parse, an
+/// identity parse and a `set_document` per mark kind. A package without any
+/// identity opens through the native parser alone.
+pub(crate) fn open_marked(
+    bytes: &[u8],
+    password: Option<&[u8]>,
+    extra: &mut impl Marks,
+) -> Result<DocumentCore> {
+    if !bytes.starts_with(b"PK") {
+        return native(bytes, password);
     }
     let decrypted = match password {
-        Some(p) => hwpcraft_doc::password_crypto::decrypt_hwpx_package(bytes, p)?,
+        Some(p) => match hwpcraft_doc::password_crypto::decrypt_hwpx_package(bytes, p) {
+            Ok(decrypted) => decrypted,
+            Err(error) => return Err(native_error(bytes, password, error.into())),
+        },
         None => None,
     };
     let plain = decrypted.as_deref().unwrap_or(bytes);
     let mut identities = Vec::new();
-    let marked = rewrite_package(plain, |xml| identity_xml(xml, &mut identities))?;
-    if identities.is_empty() {
-        return Ok(original);
+    let marked = match rewrite_package(plain, |xml| {
+        let xml = extra.mark(xml)?;
+        identity_xml(&xml, &mut identities)
+    }) {
+        Ok(marked) => marked,
+        Err(error) => return Err(native_error(bytes, password, error)),
+    };
+    if identities.is_empty() && extra.is_empty() {
+        return native(bytes, password);
     }
-    let mut core = DocumentCore::from_bytes(&marked).map_err(|e| anyhow!("{e}"))?;
-    let mut doc = core.document().clone();
+    let mut failure = None;
+    let core = DocumentCore::from_bytes_prepared(&marked, None, |doc| {
+        restore(doc, &identities)
+            .and_then(|()| extra.restore(doc))
+            .map_err(|error| {
+                let message = error.to_string();
+                failure = Some(error);
+                message
+            })
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    core.map_err(|e| native_error(bytes, password, anyhow!("{e}")))
+}
+
+fn restore(doc: &mut Document, identities: &[Identity]) -> Result<()> {
     let mut seen = BTreeSet::new();
-    document(&mut doc, |n| {
+    document(doc, |n| {
         let index = usize::from(n.assigned_number)
             .checked_sub(1)
             .filter(|i| *i < identities.len())
@@ -429,8 +494,7 @@ pub fn open(bytes: &[u8], password: Option<&[u8]>) -> Result<DocumentCore> {
         seen.len() == identities.len(),
         "HWPX 자동 번호 일부를 네이티브 모델에서 찾지 못했습니다. 원본을 보존하기 위해 열기를 중단했습니다."
     );
-    core.set_document(doc);
-    Ok(core)
+    Ok(())
 }
 
 /// Serialize a transient identity-bearing model, restore only the public XML

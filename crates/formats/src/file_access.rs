@@ -234,6 +234,33 @@ pub fn forbid_writes() -> ForbidWrites {
     ForbidWrites(())
 }
 
+thread_local! {
+    /// The cancellation check of the request this thread is serving, if any.
+    static CANCELLED: RefCell<Option<Box<dyn Fn() -> bool>>> = const { RefCell::new(None) };
+}
+
+/// Puts the previous cancellation check back when dropped.
+pub struct CancelScope(Option<Box<dyn Fn() -> bool>>);
+
+impl Drop for CancelScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        CANCELLED.with(|c| *c.borrow_mut() = previous);
+    }
+}
+
+/// While the scope lives, [`cancelled`] asks `is_cancelled`. A request cancelled
+/// before its file is replaced must leave the existing file untouched, so the final
+/// replace step checks it (see `atomic_write`).
+pub fn cancel_scope(is_cancelled: impl Fn() -> bool + 'static) -> CancelScope {
+    CancelScope(CANCELLED.with(|c| c.replace(Some(Box::new(is_cancelled)))))
+}
+
+/// Has the request this thread is serving been cancelled?
+pub fn cancelled() -> bool {
+    CANCELLED.with(|c| c.borrow().as_ref().is_some_and(|check| check()))
+}
+
 /// May `path` be written here? Always, without roots in force, unless writes are forbidden.
 pub fn check_write(path: &str) -> Result<(), String> {
     if WRITES_FORBIDDEN.with(Cell::get) > 0 {

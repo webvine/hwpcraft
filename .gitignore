@@ -26,3 +26,4 @@
 /tools/__pycache__/
 /docs/CODEX-ACTIVE-WORK.md
 /tools/test_gen_hwp_actions.py
+/.build/

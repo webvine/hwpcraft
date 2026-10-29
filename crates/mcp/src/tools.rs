@@ -138,6 +138,12 @@ fn empty() -> Value {
 }
 
 pub(crate) fn call(backend: &mut Headless, name: &str, args: Value) -> Value {
+    if !backend.usable {
+        return result(
+            json!({"error":"복원에 실패하여 닫힌 문서입니다. 새 문서를 열어 작업하세요."}),
+            true,
+        );
+    }
     match answer(backend, name, args) {
         Ok(value) => value,
         Err(e) => json!({"content":[{"type":"text","text":format!("{e:#}")}],"isError":true}),
@@ -204,7 +210,7 @@ fn answer(b: &mut Headless, name: &str, args: Value) -> Result<Value> {
             {
                 bail!("atomic batch에는 파일 또는 설정 쓰기 명령을 넣을 수 없습니다.");
             }
-            let checkpoint = p.atomic.then(|| b.session.checkpoint());
+            let checkpoint = p.atomic.then(|| b.session.full_checkpoint()).transpose()?;
             // Beyond the list above, any write a command attempts is refused while atomic.
             let _no_writes = p.atomic.then(hwpcraft_formats::file_access::forbid_writes);
             let mut results = Vec::new();
@@ -227,10 +233,10 @@ fn answer(b: &mut Headless, name: &str, args: Value) -> Result<Value> {
             let mut rolled_back = false;
             if let Some(checkpoint) = checkpoint {
                 if failed {
-                    b.session.rollback(checkpoint)?;
+                    crate::atomic_batch::rollback(b, checkpoint)?;
                     rolled_back = true;
                 } else {
-                    b.session.release(checkpoint);
+                    crate::atomic_batch::release(b, checkpoint)?;
                 }
             }
             return Ok(result(

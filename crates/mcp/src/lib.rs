@@ -2,15 +2,21 @@
 //! Each document operation carries an explicit handle; no desktop is required.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod atomic_batch;
 mod catalog;
 mod document_subscriptions;
 mod document_workers;
+mod output_schemas;
+mod page_png;
+mod progress;
 mod protected_open;
 mod sdk_catalog;
 mod sdk_http;
 mod sdk_runtime;
 mod sdk_service;
+mod staged_document;
 mod strict_stdio;
+mod tasks;
 mod tools;
 
 use anyhow::{Context, Result, bail};
@@ -22,6 +28,8 @@ use std::{path::PathBuf, sync::Arc};
 pub use tools::tool_definitions;
 
 pub struct Headless {
+    // False after a failed full-history restore; this backend must never be reused.
+    pub(crate) usable: bool,
     pub(crate) session: Session,
     roots: Option<Arc<AutomationRoots>>,
     renderer: Option<hwpcraft_render::Renderer>,
@@ -49,6 +57,7 @@ struct Save {
 impl Headless {
     pub fn new(roots: Option<Arc<AutomationRoots>>) -> Result<Self> {
         Ok(Self {
+            usable: true,
             session: Session::new()?,
             roots,
             renderer: None,
@@ -74,12 +83,20 @@ impl Headless {
                 "file.new" => {
                     let p: New = serde_json::from_value(params)?;
                     self.require_discard(p.force)?;
-                    self.session.reset()?;
+                    let prepared = staged_document::prepare_new(staged_document::next_generation(
+                        self.session.generation,
+                    ))?;
+                    return Ok(prepared.commit(&mut self.session));
                 }
                 "file.open" => {
                     let p: Open = serde_json::from_value(params)?;
                     self.require_discard(p.force)?;
-                    self.session.open(&p.path)?;
+                    let prepared = staged_document::prepare_open(
+                        p.path,
+                        None,
+                        staged_document::next_generation(self.session.generation),
+                    )?;
+                    return Ok(prepared.commit(&mut self.session));
                 }
                 "file.open_protected" => return protected_open::open(self, params),
                 "file.save" | "file.save_as" | "file.pdf" => {
@@ -109,7 +126,6 @@ impl Headless {
 
     fn render(&mut self, page: u32, scale: f32) -> Result<Value> {
         use base64::Engine;
-        use image::ImageEncoder;
         let count = self.session.page_count()?;
         if page == 0 || page > count {
             bail!("쪽 범위를 벗어났습니다.");
@@ -119,13 +135,7 @@ impl Headless {
         }
         let renderer = self.renderer.get_or_insert_with(Default::default);
         let image = renderer.svg(&self.session.render_page_svg(page - 1)?, scale)?;
-        let mut png = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut png).write_image(
-            &image.rgba,
-            image.width,
-            image.height,
-            image::ExtendedColorType::Rgba8,
-        )?;
+        let png = page_png::encode(&image.rgba, image.width, image.height)?;
         Ok(json!({"content":[
             {"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(png)},
             {"type":"text","text":json!({"page":page,"pages":count,"width":image.width,"height":image.height}).to_string()}

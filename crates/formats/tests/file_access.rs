@@ -98,3 +98,32 @@ fn forbidden_writes_override_any_scope_and_end_with_the_guard() {
     assert!(check_write(&path).is_ok());
     hwpcraft_formats::atomic_write(&target, b"x").unwrap();
 }
+
+#[test]
+fn a_cancelled_request_keeps_the_existing_file() {
+    use hwpcraft_formats::file_access::{cancel_scope, cancelled};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("report.pdf");
+    std::fs::write(&target, b"original").unwrap();
+    let flag = Arc::new(AtomicBool::new(false));
+    {
+        let check = flag.clone();
+        let _scope = cancel_scope(move || check.load(Ordering::SeqCst));
+        assert!(!cancelled());
+        hwpcraft_formats::atomic_write(&target, b"first").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"first");
+        flag.store(true, Ordering::SeqCst);
+        assert!(cancelled());
+        assert!(hwpcraft_formats::atomic_write(&target, b"second").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"first");
+    }
+    assert!(!cancelled());
+    let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
+    assert_eq!(leftovers, 1, "temporary file must not remain");
+    hwpcraft_formats::atomic_write(&target, b"third").unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"third");
+}

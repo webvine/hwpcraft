@@ -80,6 +80,11 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(bytes)?;
     file.as_file().sync_all()?;
+    // Last point before the existing file is replaced; the temporary file is
+    // removed when it drops.
+    if file_access::cancelled() {
+        bail!("요청이 취소되어 파일을 저장하지 않았습니다. 기존 파일은 그대로입니다.");
+    }
     file.persist(path)
         .map_err(|e| e.error)
         .context("파일을 교체하지 못했습니다. 다른 프로그램에서 열려 있는지 확인하세요.")?;
@@ -118,8 +123,10 @@ fn save_inner(core: &DocumentCore, path: &Path, password: Option<&[u8]>) -> Resu
         ("hwpx", password) => page_number_formats::export(core, password)?,
         ("pdf", _) => {
             let options = pdf_options();
-            core.render_document_pdf_native_with_options(&options)
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+            let pdf = core.render_document_pdf_native_with_options(&options);
+            // Every page's render tree stays cached otherwise (hundreds of MB).
+            core.release_page_render_caches();
+            pdf.map_err(|e| anyhow::anyhow!("{e}"))?
         }
         ("txt", _) => {
             let mut lines = Vec::new();

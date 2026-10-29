@@ -97,6 +97,18 @@ fn modern_request_error(message: &ClientJsonRpcMessage) -> Option<ErrorData> {
     let version = ProtocolVersion::V_2026_07_28;
     let meta = request.request.get_meta();
     let missing = meta.missing_required_keys(&version);
+    // A 2025-era client opens with `initialize` and no per-request metadata.
+    // Answer as the HTTP transport does, naming the requested and supported
+    // versions: it is the only diagnostic such a client can show its user.
+    if let ClientRequest::InitializeRequest(initialize) = &request.request
+        && !missing.is_empty()
+        && initialize.params.protocol_version != version
+    {
+        return Some(ErrorData::unsupported_protocol_version(
+            initialize.params.protocol_version.clone(),
+            &[version],
+        ));
+    }
     if !missing.is_empty() {
         return Some(ErrorData::invalid_params(
             format!(
@@ -366,6 +378,42 @@ impl<R: AsyncRead + Send + Unpin + 'static> Transport<RoleServer> for StrictStdi
         };
         self.closed = true;
         result
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod legacy_initialize_tests {
+    use super::*;
+
+    fn rejection(body: serde_json::Value) -> Option<ErrorData> {
+        let message: ClientJsonRpcMessage = serde_json::from_value(body).ok()?;
+        modern_request_error(&message)
+    }
+
+    #[test]
+    fn a_2025_initialize_learns_the_supported_version() {
+        let error = rejection(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"legacy","version":"1"}}}))
+        .expect("legacy initialize must be rejected");
+        assert_eq!(error.code.0, -32022);
+        let data = error.data.expect("versions");
+        assert_eq!(data["requested"], "2025-11-25");
+        assert_eq!(data["supported"], serde_json::json!(["2026-07-28"]));
+    }
+
+    #[test]
+    fn other_requests_without_metadata_keep_invalid_params() {
+        let error = rejection(
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        )
+        .expect("missing metadata must be rejected");
+        assert_eq!(error.code.0, -32602);
+        // An initialize naming the current version but lacking metadata is malformed, not old.
+        let error = rejection(serde_json::json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":{
+            "protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"x","version":"1"}}}))
+        .expect("must be rejected");
+        assert_eq!(error.code.0, -32602);
     }
 }
 

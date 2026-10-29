@@ -1,8 +1,27 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use anyhow::{Result, anyhow};
 use hwpcraft_doc::DocumentCore;
+mod screen_images;
+pub use screen_images::Stats as ScreenImageStats;
 pub struct Renderer {
     options: resvg::usvg::Options<'static>,
+    /// Screen-only stand-ins for large embedded images (see [`Renderer::screen`]).
+    screen: screen_images::ScreenImages,
+    /// Recently rasterized pages keyed by (SVG content hash, scale). After an edit
+    /// only the edited page's SVG changes, so the other visible pages come back
+    /// from here instead of being parsed and rasterized again.
+    recent: std::sync::Mutex<std::collections::VecDeque<Cached>>,
+}
+
+/// How many rasterized pages a renderer keeps (a page at 1.25x is about 6 MB).
+const RECENT_PAGES: usize = 6;
+
+struct Cached {
+    /// SVG hash and length, scale, and whether it is a screen raster.
+    key: (u64, usize, u32, bool),
+    width: u32,
+    height: u32,
+    rgba: std::sync::Arc<Vec<u8>>,
 }
 pub struct Page {
     pub width: u32,
@@ -12,25 +31,50 @@ pub struct Page {
 }
 impl Default for Renderer {
     fn default() -> Self {
+        let options = options(true);
         Self {
-            options: options(true),
+            screen: screen_images::ScreenImages::new(&options),
+            options,
+            recent: Default::default(),
         }
     }
 }
 
-/// Parse options with the system fonts and the Korean default family; `share` maps
-/// the font files once (see [`share_font_files`]).
+/// Parse options with the system fonts and the Korean default family; `share` uses
+/// the process-wide database whose font files are mapped once (see [`share_font_files`]).
 fn options(share: bool) -> resvg::usvg::Options<'static> {
-    let mut options = resvg::usvg::Options::default();
-    options.fontdb_mut().load_system_fonts();
-    if share {
-        share_font_files(options.fontdb_mut());
+    let (fontdb, family) = if share {
+        system_fonts().clone()
+    } else {
+        font_database(false)
+    };
+    resvg::usvg::Options {
+        fontdb,
+        font_family: family,
+        ..Default::default()
     }
-    let family = installed_korean_font(&options.fontdb);
-    options.fontdb_mut().set_sans_serif_family(family.clone());
-    options.fontdb_mut().set_serif_family(family.clone());
-    options.font_family = family;
-    options
+}
+
+/// The shared font database, built on first use and reused by every renderer in the
+/// process (one per MCP document worker, previews, the canvas): scanning and mapping
+/// the system fonts again for each renderer cost about 60 ms and several MB.
+fn system_fonts() -> &'static (std::sync::Arc<resvg::usvg::fontdb::Database>, String) {
+    static FONTS: std::sync::OnceLock<(std::sync::Arc<resvg::usvg::fontdb::Database>, String)> =
+        std::sync::OnceLock::new();
+    FONTS.get_or_init(|| font_database(true))
+}
+
+/// System fonts with the Korean family as the generic serif/sans-serif fallback.
+fn font_database(share: bool) -> (std::sync::Arc<resvg::usvg::fontdb::Database>, String) {
+    let mut db = resvg::usvg::fontdb::Database::new();
+    db.load_system_fonts();
+    if share {
+        share_font_files(&mut db);
+    }
+    let family = installed_korean_font(&db);
+    db.set_sans_serif_family(family.clone());
+    db.set_serif_family(family.clone());
+    (std::sync::Arc::new(db), family)
 }
 
 /// Map every system font file once for the renderer's lifetime.
@@ -195,9 +239,64 @@ impl Renderer {
         self.svg(&svg, scale)
     }
     pub fn svg(&self, svg: &str, scale: f32) -> Result<Page> {
+        self.cached(svg, scale, false)
+    }
+    /// Like [`Renderer::svg`] for the document canvas: large embedded images are drawn
+    /// from pre-rendered stand-ins that give the same pixels (measured largest channel
+    /// difference 0–1) without decoding the image again for every raster. MCP, CLI,
+    /// printing and PDF output use `svg` and never see a stand-in.
+    pub fn screen(&self, svg: &str, scale: f32) -> Result<Page> {
+        self.cached(svg, scale, true)
+    }
+    /// Stand-in counters (made, used, reparsed, evicted), for tests and measurements.
+    pub fn screen_image_stats(&self) -> ScreenImageStats {
+        self.screen.stats()
+    }
+    /// Wait up to `timeout` until no stand-in is being made in the background; true
+    /// when none is. Stand-ins are made on a worker thread so a first screen is not
+    /// held up; tests and measurements wait here to see them in use.
+    pub fn settle_screen_images(&self, timeout: std::time::Duration) -> bool {
+        self.screen.settle(timeout)
+    }
+    fn cached(&self, svg: &str, scale: f32, screen: bool) -> Result<Page> {
         let scale = scale.clamp(0.25, 2.0);
-        let screen = hairlines(svg, 1.0 / scale);
-        let tree = resvg::usvg::Tree::from_str(&screen, &self.options)?;
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            svg.hash(&mut hasher);
+            (hasher.finish(), svg.len(), scale.to_bits(), screen)
+        };
+        if let Ok(recent) = self.recent.lock()
+            && let Some(hit) = recent.iter().find(|c| c.key == key)
+        {
+            return Ok(Page {
+                width: hit.width,
+                height: hit.height,
+                rgba: hit.rgba.as_ref().clone(),
+                svg: svg.to_owned(),
+            });
+        }
+        let page = self.rasterize(svg, scale, screen)?;
+        if let Ok(mut recent) = self.recent.lock() {
+            if recent.len() >= RECENT_PAGES {
+                recent.pop_front();
+            }
+            recent.push_back(Cached {
+                key,
+                width: page.width,
+                height: page.height,
+                rgba: std::sync::Arc::new(page.rgba.clone()),
+            });
+        }
+        Ok(page)
+    }
+    fn rasterize(&self, svg: &str, scale: f32, screen: bool) -> Result<Page> {
+        let thin = hairlines(svg, 1.0 / scale);
+        let tree = if screen {
+            self.screen.parse(&thin, scale)?
+        } else {
+            resvg::usvg::Tree::from_str(&thin, &self.options)?
+        };
         let size = tree
             .size()
             .to_int_size()
@@ -285,15 +384,114 @@ mod tests {
 
     /// The renderer as it was before font files were shared.
     fn unshared() -> Renderer {
+        let options = options(false);
         Renderer {
-            options: options(false),
+            screen: screen_images::ScreenImages::new(&options),
+            options,
+            recent: Default::default(),
         }
+    }
+
+    #[test]
+    fn identical_pages_come_back_from_the_recent_cache() -> anyhow::Result<()> {
+        let renderer = Renderer::default();
+        let core = sample_core()?;
+        let svg = core
+            .render_page_svg_native(0)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let first = renderer.svg(&svg, 1.25)?;
+        let cached = renderer.svg(&svg, 1.25)?;
+        assert_eq!((first.width, first.height), (cached.width, cached.height));
+        assert!(first.rgba == cached.rgba);
+        // The cache must not answer for another scale or other content.
+        let fresh = Renderer::default();
+        for (text, scale) in [(svg.as_str(), 1.0), (svg.as_str(), 1.5)] {
+            let a = renderer.svg(text, scale)?;
+            let b = fresh.svg(text, scale)?;
+            assert_eq!((a.width, a.height), (b.width, b.height));
+            assert!(a.rgba == b.rgba);
+        }
+        let changed = svg.replacen(
+            "</svg>",
+            "<rect x=\"10\" y=\"10\" width=\"40\" height=\"40\" fill=\"#d00\"/></svg>",
+            1,
+        );
+        assert!(renderer.svg(&changed, 1.25)?.rgba != first.rgba);
+        let recent = renderer
+            .recent
+            .lock()
+            .map_err(|_| anyhow::anyhow!("poisoned"))?;
+        assert!(recent.len() <= RECENT_PAGES);
+        Ok(())
+    }
+
+    #[test]
+    fn the_recent_cache_is_bounded() -> anyhow::Result<()> {
+        let renderer = Renderer::default();
+        for i in 0..RECENT_PAGES + 3 {
+            let svg = format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\"><rect width=\"{}\" height=\"5\" fill=\"#000\"/></svg>",
+                i + 1
+            );
+            renderer.svg(&svg, 1.0)?;
+        }
+        let recent = renderer
+            .recent
+            .lock()
+            .map_err(|_| anyhow::anyhow!("poisoned"))?;
+        assert_eq!(recent.len(), RECENT_PAGES);
+        Ok(())
+    }
+
+    /// `HWPCRAFT_PERF_SAMPLE=<hwp> cargo test --release -p hwpcraft-render -- --ignored perf_recent`
+    #[test]
+    #[ignore = "measurement on a local sample document"]
+    fn perf_recent_page_cache() -> anyhow::Result<()> {
+        let Some(path) = std::env::var_os("HWPCRAFT_PERF_SAMPLE") else {
+            return Ok(());
+        };
+        let core = hwpcraft_formats::open(std::path::Path::new(&path))?;
+        let renderer = Renderer::default();
+        for page in [0_u32, 15, 64] {
+            let svg = core
+                .render_page_svg_native(page)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let start = std::time::Instant::now();
+            renderer.svg(&svg, 1.25)?;
+            let cold = start.elapsed();
+            let start = std::time::Instant::now();
+            renderer.svg(&svg, 1.25)?;
+            let warm = start.elapsed();
+            eprintln!(
+                "page {page}: svg {} KB, first {cold:?}, repeat {warm:?}",
+                svg.len() / 1024
+            );
+        }
+        Ok(())
     }
 
     fn sample_core() -> anyhow::Result<DocumentCore> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../samples/HwpCraft-시작하기.hwpx");
         hwpcraft_formats::open(&path)
+    }
+
+    #[test]
+    fn renderers_share_one_font_database() {
+        let (a, b) = (Renderer::default(), Renderer::default());
+        assert!(std::sync::Arc::ptr_eq(&a.options.fontdb, &b.options.fontdb));
+        assert_eq!(a.options.font_family, b.options.font_family);
+        assert_eq!(a.font_families(), unshared().font_families());
+        // The generic families point at the Korean default, as before sharing.
+        let db = &a.options.fontdb;
+        assert_eq!(
+            db.family_name(&resvg::usvg::fontdb::Family::SansSerif),
+            a.options.font_family
+        );
+        assert_eq!(
+            db.family_name(&resvg::usvg::fontdb::Family::Serif),
+            a.options.font_family
+        );
     }
 
     #[test]

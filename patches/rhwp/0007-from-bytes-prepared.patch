@@ -1,0 +1,55 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index cf2a293ee..ef75ff2c2 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -153,7 +153,21 @@ impl DocumentCore {
+     }
+ 
+     pub fn from_bytes(data: &[u8]) -> Result<DocumentCore, HwpError> {
+-        Self::from_bytes_inner(data, None)
++        Self::from_bytes_inner(data, None, None)
++    }
++
++    /// `from_bytes` / `from_bytes_with_password` 와 같되, 파싱과 로드 보정이 끝나고
++    /// 첫 조판(compose·paginate) 전에 `prepare` 가 문서 모델을 고친다.
++    ///
++    /// 로드 뒤 모델을 고치고 `set_document` 로 문서 전체를 다시 조판하던 호출자가
++    /// 조판을 한 번만 하도록 쓴다. `prepare` 가 `Err` 를 돌려주면 그 메시지를
++    /// `HwpError::InvalidFile` 로 돌려준다. 본문 봉인은 종전처럼 첫 조판 뒤에 한다.
++    pub fn from_bytes_prepared(
++        data: &[u8],
++        password: Option<&[u8]>,
++        mut prepare: impl FnMut(&mut Document) -> Result<(), String>,
++    ) -> Result<DocumentCore, HwpError> {
++        Self::from_bytes_inner(data, password, Some(&mut prepare))
+     }
+ 
+     /// 비밀번호로 보호된 HWP/HWPX 파일을 비밀번호와 함께 로드한다.
+@@ -165,10 +179,14 @@ impl DocumentCore {
+         data: &[u8],
+         password: &[u8],
+     ) -> Result<DocumentCore, HwpError> {
+-        Self::from_bytes_inner(data, Some(password))
++        Self::from_bytes_inner(data, Some(password), None)
+     }
+ 
+-    fn from_bytes_inner(data: &[u8], password: Option<&[u8]>) -> Result<DocumentCore, HwpError> {
++    fn from_bytes_inner(
++        data: &[u8],
++        password: Option<&[u8]>,
++        prepare: Option<&mut dyn FnMut(&mut Document) -> Result<(), String>>,
++    ) -> Result<DocumentCore, HwpError> {
+         let source_format = crate::parser::detect_format(data);
+         let parsed = match password {
+             Some(pwd) => crate::parser::parse_document_with_metadata_password(data, pwd),
+@@ -276,6 +294,10 @@ impl DocumentCore {
+         // (한컴에서 메모 추가 시 안내문 텍스트가 필드 값으로 삽입됨 — compose 전에 제거해야 정합성 유지)
+         Self::clear_initial_field_texts(&mut document);
+ 
++        if let Some(prepare) = prepare {
++            prepare(&mut document).map_err(HwpError::InvalidFile)?;
++        }
++
+         let sec_count = document.sections.len();
+         let mut doc = DocumentCore {
+             document,

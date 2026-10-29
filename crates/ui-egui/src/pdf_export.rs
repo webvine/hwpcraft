@@ -117,17 +117,9 @@ impl HwpApp {
             self.result::<()>(Err(anyhow::anyhow!(BUSY)));
             return false;
         }
-        let job = self
-            .session
-            .page_count()
-            .and_then(|count| self.session.pdf_job(&(0..count).collect::<Vec<_>>()));
-        match self.result(job) {
-            Some(job) => {
-                let pages = job.page_count();
-                self.begin_pdf_export(pages, path, move || job.convert())
-            }
-            None => false,
-        }
+        // Pages are prepared a slice per frame (progress in the status bar), then
+        // converted here in the background slot.
+        self.begin_pdf_prepare(super::ext_shell::PdfPages::All, path, None)
     }
     /// Start any prepared PDF (`convert` from `Session::pdf_job` or a page/block
     /// variant) in the shared slot and show its live progress in the status bar,
@@ -178,7 +170,8 @@ impl HwpApp {
     /// (the PDF is then not written; the atomic write never leaves a partial file).
     /// True when this close request was held back.
     pub(crate) fn hold_close_for_pdf(&mut self, ctx: &egui::Context) -> bool {
-        if !self.pdf.busy() || !ctx.input(|i| i.viewport().close_requested()) {
+        // Preparing pages counts too: the export then finishes before the window closes.
+        if !self.pdf_busy() || !ctx.input(|i| i.viewport().close_requested()) {
             return false;
         }
         if self.pdf.close_after {

@@ -113,8 +113,6 @@ pub struct HwpApp {
     /// Kept for start-up views and module hooks that run outside a frame.
     ctx: egui::Context,
     find_state: find_dialog::FindState,
-    /// Ctrl+K was pressed; the next key completes a Hangul chord (Ctrl+K,H …).
-    chord_k: bool,
     page_sizes: (u64, Vec<Vec2>),
     /// Page the scroll view last showed; a different `page` means "scroll there".
     shown_page: u32,
@@ -339,7 +337,6 @@ impl HwpApp {
             ext: extensions::ExtState::default(),
             ctx,
             find_state: find_dialog::FindState::default(),
-            chord_k: false,
             page_sizes: (u64::MAX, Vec::new()),
             shown_page: 0,
             scroll_to_caret: false,
@@ -1153,47 +1150,6 @@ impl HwpApp {
                 self.follow_cursor();
                 return;
             }
-        }
-        if self.chord_k {
-            // Hangul chord: Ctrl+K,H hyperlink · Ctrl+K,N numbering · Ctrl+K,O outline.
-            let second = ctx.input_mut(|i| {
-                [Key::H, Key::N, Key::O, Key::Escape].into_iter().find(|k| {
-                    i.consume_key(egui::Modifiers::NONE, *k)
-                        || i.consume_key(egui::Modifiers::COMMAND, *k)
-                })
-            });
-            let other = ctx.input(|i| {
-                i.events.iter().any(|e| {
-                    matches!(e, Event::Key { pressed: true, key, .. }
-                        if !matches!(key, Key::K))
-                })
-            });
-            match second {
-                Some(Key::H) => {
-                    self.feature_dialog = Some(feature_dialogs::FeatureDialog::Link {
-                        uri: String::new(),
-                        text: self.session.selected_text(),
-                    });
-                }
-                Some(Key::N) => self.ext_dispatch("format.numbering.dialog", ctx),
-                Some(Key::O) => self.ext_dispatch("format.outline.dialog", ctx),
-                _ => {}
-            }
-            if second.is_some() || other {
-                if second.is_some() {
-                    // The chord letter must not also be typed into the document.
-                    ctx.input_mut(|i| i.events.retain(|e| !matches!(e, Event::Text(_))));
-                }
-                self.chord_k = false;
-                self.message.clear();
-                return;
-            }
-        }
-        // COMMAND is Ctrl on Windows/Linux and Cmd on macOS.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::K)) {
-            self.chord_k = true;
-            self.message = "Ctrl+K, (H 하이퍼링크 · N 문단 번호 · O 개요 번호)".into();
-            return;
         }
         let focused = ctx.memory(|m| m.focused());
         let auxiliary = ["find-query", "find-replacement"]

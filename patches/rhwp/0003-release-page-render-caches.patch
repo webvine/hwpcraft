@@ -1,0 +1,20 @@
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index c435fd5fc..1c2d54f4b 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -7303,6 +7303,15 @@ impl DocumentCore {
+         })
+     }
+ 
++    /// 쪽 렌더 트리·레이어 트리 캐시를 모두 비워 그 메모리를 돌려준다. 문서와 쪽 나눔은
++    /// 그대로이고, 다음 렌더는 요청된 쪽만 다시 만든다.
++    ///
++    /// 캐시는 쪽마다 상한 없이 남으므로 모든 쪽을 한 번씩 만드는 작업(PDF 내보내기 등)
++    /// 뒤에는 쪽 수에 비례해 커진다(381쪽 문서에서 약 640MB). 그런 작업 뒤에 부른다.
++    pub fn release_page_render_caches(&self) {
++        self.invalidate_page_tree_cache();
++    }
++
+     /// 페이지 렌더 트리 캐시 전체 무효화.
+     pub(crate) fn invalidate_page_tree_cache(&self) {
+         self.page_tree_cache.borrow_mut().clear();

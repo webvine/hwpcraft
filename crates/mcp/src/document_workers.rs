@@ -11,9 +11,10 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
     thread,
+    time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -23,6 +24,10 @@ const QUEUE_CAPACITY: usize = 64;
 const STARTING: u8 = 0;
 const ACTIVE: u8 = 1;
 const CLOSED: u8 = 2;
+/// With every slot taken, a new document may replace the least recently used
+/// one that has been idle this long and has no unsaved changes. Modified
+/// documents are never closed automatically.
+const IDLE_EVICTION: Duration = Duration::from_secs(30 * 60);
 
 type Registry = Mutex<HashMap<String, Worker>>;
 
@@ -31,6 +36,54 @@ struct Worker {
     sender: mpsc::Sender<Job>,
     state: Arc<AtomicU8>,
     finished: CancellationToken,
+    activity: Arc<Activity>,
+}
+
+/// What the async side may know about a worker without asking its thread.
+/// Only a hint for choosing an eviction candidate: the worker thread itself
+/// re-checks idleness and unsaved changes before it closes.
+struct Activity {
+    /// Jobs accepted for this worker and not yet finished.
+    pending: AtomicUsize,
+    last_used: Mutex<Instant>,
+    dirty: AtomicBool,
+}
+impl Activity {
+    fn new() -> Self {
+        Self {
+            pending: AtomicUsize::new(0),
+            last_used: Mutex::new(Instant::now()),
+            dirty: AtomicBool::new(false),
+        }
+    }
+    fn last_used(&self) -> Instant {
+        self.last_used
+            .lock()
+            .map_or_else(|_| Instant::now(), |time| *time)
+    }
+    fn idle_for(&self) -> Duration {
+        self.last_used().elapsed()
+    }
+    fn evictable(&self, idle: Duration) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
+            && !self.dirty.load(Ordering::Acquire)
+            && self.idle_for() >= idle
+    }
+}
+/// Ends one job's accounting, however the job ends.
+struct JobDone<'a> {
+    activity: &'a Activity,
+    touch: bool,
+}
+impl Drop for JobDone<'_> {
+    fn drop(&mut self) {
+        if self.touch
+            && let Ok(mut time) = self.activity.last_used.lock()
+        {
+            *time = Instant::now();
+        }
+        self.activity.pending.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 enum Operation {
@@ -41,13 +94,28 @@ enum Operation {
     Close {
         force: bool,
     },
+    /// Close only if still idle for `idle`, nothing else is queued and the
+    /// document has no unsaved changes; decided on the worker thread.
+    /// Internal: replies a bare `{"closed": bool}`, not a tool result.
+    Evict {
+        idle: Duration,
+    },
     #[cfg(test)]
     Block {
         entered: oneshot::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,
     },
     #[cfg(test)]
+    BlockThenCall {
+        entered: oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        tool: String,
+        args: Value,
+    },
+    #[cfg(test)]
     Panic,
+    #[cfg(test)]
+    InvalidateRollback,
 }
 struct Job {
     operation: Operation,
@@ -60,6 +128,7 @@ pub(crate) struct DocumentWorkers {
     roots: Option<Arc<AutomationRoots>>,
     registry: Arc<Registry>,
     live: Arc<AtomicUsize>,
+    idle_eviction: Duration,
 }
 
 impl DocumentWorkers {
@@ -69,7 +138,58 @@ impl DocumentWorkers {
             roots,
             registry: Arc::new(Mutex::new(HashMap::new())),
             live: Arc::new(AtomicUsize::new(0)),
+            idle_eviction: IDLE_EVICTION,
         }
+    }
+
+    /// When every slot is taken, close the least recently used idle document
+    /// without unsaved changes so a new one can open. Otherwise do nothing;
+    /// allocation then reports the limit as before.
+    async fn make_room(&self, cancel: &CancellationToken) {
+        let candidates = {
+            let Ok(registry) = self.registry.lock() else {
+                return;
+            };
+            let open = registry
+                .values()
+                .filter(|worker| worker.state.load(Ordering::Acquire) != CLOSED)
+                .count();
+            if open < MAX_DOCUMENTS {
+                return;
+            }
+            let mut candidates: Vec<(Instant, String, Worker)> = registry
+                .iter()
+                .filter(|(_, worker)| {
+                    worker.state.load(Ordering::Acquire) == ACTIVE
+                        && worker.activity.evictable(self.idle_eviction)
+                })
+                .map(|(id, worker)| (worker.activity.last_used(), id.clone(), worker.clone()))
+                .collect();
+            candidates.sort_by_key(|(time, _, _)| *time);
+            candidates
+        };
+        for (_, id, worker) in candidates {
+            let operation = Operation::Evict {
+                idle: self.idle_eviction,
+            };
+            let Ok(value) = dispatch(&worker, operation, cancel.clone()).await else {
+                continue;
+            };
+            if value["closed"] == true {
+                // Wait for the thread to exit so its slot is really free.
+                let _ = cancel
+                    .run_until_cancelled(worker.finished.cancelled())
+                    .await;
+                remove(&self.registry, &id);
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn with_idle_eviction(mut self, idle: Duration) -> Self {
+        self.idle_eviction = idle;
+        self
     }
 
     pub(crate) fn subscriptions(&self) -> &DocumentSubscriptions {
@@ -101,6 +221,7 @@ impl DocumentWorkers {
             bail!("새 문서는 new_document/open_document/open_protected_document로 만드세요.");
         }
         check_cancel(&cancel)?;
+        self.make_room(&cancel).await;
         let (id, worker, ready) = self.allocate()?;
         let mut lease = CreationLease {
             registry: &self.registry,
@@ -238,9 +359,11 @@ impl DocumentWorkers {
             sender,
             state: Arc::new(AtomicU8::new(STARTING)),
             finished: CancellationToken::new(),
+            activity: Arc::new(Activity::new()),
         };
         let (ready_sender, ready_receiver) = oneshot::channel();
         let roots = self.roots.clone();
+        let activity = Arc::clone(&worker.activity);
         let exit = WorkerExit {
             subscriptions: Arc::clone(&self.subscriptions),
             registry: Arc::downgrade(&self.registry),
@@ -267,6 +390,7 @@ impl DocumentWorkers {
                         &_exit.state,
                         &_exit.subscriptions,
                         &_exit.id,
+                        &activity,
                     )
                 }));
             });
@@ -358,12 +482,16 @@ async fn dispatch(
         bail!("문서가 닫혔습니다.");
     }
     let (reply, receive) = oneshot::channel();
+    worker.activity.pending.fetch_add(1, Ordering::AcqRel);
     worker
         .sender
         .try_send(Job {
             operation,
             cancel: cancel.clone(),
             reply,
+        })
+        .inspect_err(|_| {
+            worker.activity.pending.fetch_sub(1, Ordering::AcqRel);
         })
         .map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => {
@@ -394,6 +522,7 @@ fn run(
     state: &AtomicU8,
     subscriptions: &DocumentSubscriptions,
     document_id: &str,
+    activity: &Activity,
 ) {
     let mut backend = match Headless::new(roots) {
         Ok(backend) => backend,
@@ -406,6 +535,11 @@ fn run(
         return;
     }
     while let Some(job) = receiver.blocking_recv() {
+        let _done = JobDone {
+            activity,
+            // An eviction check must not make the document look used.
+            touch: !matches!(job.operation, Operation::Evict { .. }),
+        };
         if state.load(Ordering::Acquire) == CLOSED {
             let _ = job.reply.send(Err(anyhow!("문서가 닫혔습니다.")));
             continue;
@@ -414,6 +548,12 @@ fn run(
             let _ = job.reply.send(Err(cancelled()));
             continue;
         }
+        // A request cancelled while its synchronous call runs must not replace
+        // a file: atomic writes check this scope just before they persist.
+        let _cancel_scope = hwpcraft_formats::file_access::cancel_scope({
+            let token = job.cancel.clone();
+            move || token.is_cancelled()
+        });
         let (result, closed) = match job.operation {
             Operation::Call { tool, args } => {
                 let before = DocumentStamp::capture(&backend.session);
@@ -421,7 +561,7 @@ fn run(
                 let result = hwpcraft_formats::file_access::confine(roots.as_ref(), || {
                     tools::call(&mut backend, &tool, args)
                 });
-                if before != DocumentStamp::capture(&backend.session) {
+                if backend.usable && before != DocumentStamp::capture(&backend.session) {
                     subscriptions.changed(document_id);
                 }
                 (result, false)
@@ -433,6 +573,16 @@ fn run(
                 }
                 Err(error) => (error_result(&error.to_string()), false),
             },
+            Operation::Evict { idle } => {
+                let quiet =
+                    activity.pending.load(Ordering::Acquire) == 1 && activity.idle_for() >= idle;
+                if quiet && backend.require_discard(false).is_ok() {
+                    state.store(CLOSED, Ordering::Release);
+                    (json!({"closed":true}), true)
+                } else {
+                    (json!({"closed":false}), false)
+                }
+            }
             #[cfg(test)]
             Operation::Block { entered, release } => {
                 let _ = entered.send(());
@@ -440,8 +590,44 @@ fn run(
                 (tools::result(json!({"blocked":false}), false), false)
             }
             #[cfg(test)]
+            Operation::BlockThenCall {
+                entered,
+                release,
+                tool,
+                args,
+            } => {
+                let _ = entered.send(());
+                let _ = release.recv();
+                (tools::call(&mut backend, &tool, args), false)
+            }
+            #[cfg(test)]
+            Operation::InvalidateRollback => {
+                let result = (|| -> Result<()> {
+                    let checkpoint = backend.session.full_checkpoint()?;
+                    backend
+                        .session
+                        .core
+                        .create_blank_document_native()
+                        .map_err(|e| anyhow!("{e}"))?;
+                    crate::atomic_batch::rollback(&mut backend, checkpoint)
+                })();
+                (
+                    match result {
+                        Ok(()) => tools::result(json!({"unexpectedRestoreSuccess":true}), false),
+                        Err(error) => error_result(&error.to_string()),
+                    },
+                    false,
+                )
+            }
+            #[cfg(test)]
             Operation::Panic => std::panic::resume_unwind(Box::new("private-test-panic-password")),
         };
+        if !backend.usable {
+            state.store(CLOSED, Ordering::Release);
+        }
+        activity
+            .dirty
+            .store(backend.usable && backend.session.dirty(), Ordering::Release);
         // Cancellation after a synchronous call does not rewind it: file side
         // effects and path/password replacement cannot be generally rolled back.
         if job.cancel.is_cancelled() {
@@ -525,6 +711,141 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_slots_reuse_only_the_oldest_idle_unmodified_document() {
+        let workers = DocumentWorkers::new(None).with_idle_eviction(Duration::from_millis(200));
+        // The oldest document has unsaved changes and must survive.
+        let modified = document(&workers).await;
+        let typed = workers
+            .call(
+                &modified,
+                "type_text",
+                json!({"text":"unsaved"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(typed["isError"], false, "{typed}");
+        let mut clean = Vec::new();
+        for _ in 1..MAX_DOCUMENTS {
+            clean.push(document(&workers).await);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // A recently used clean document is not idle and must survive too.
+        let recent = clean[0].clone();
+        workers
+            .call(&recent, "get_text", json!({}), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let replacement = document(&workers).await;
+        assert!(workers.lookup(&replacement).is_ok());
+        assert!(
+            workers.lookup(&modified).is_ok(),
+            "modified document closed"
+        );
+        assert!(workers.lookup(&recent).is_ok(), "recent document closed");
+        assert!(
+            workers.lookup(&clean[1]).is_err(),
+            "oldest idle clean document kept"
+        );
+        assert_eq!(workers.registry.lock().unwrap().len(), MAX_DOCUMENTS);
+
+        // Without an idle unmodified document the limit still applies.
+        for id in &clean[2..] {
+            workers
+                .call(
+                    id,
+                    "type_text",
+                    json!({"text":"x"}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+        workers
+            .call(
+                &replacement,
+                "type_text",
+                json!({"text":"x"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        workers
+            .call(
+                &recent,
+                "type_text",
+                json!({"text":"x"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let (id, refused) = workers
+            .create("new_document", json!({}), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(id.is_none());
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert!(workers.lookup(&modified).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn save_cancelled_while_running_keeps_the_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kept.hwpx");
+        std::fs::write(&path, b"original bytes").unwrap();
+        let target = path.to_str().unwrap().to_owned();
+        let workers = DocumentWorkers::new(None);
+        let id = document(&workers).await;
+        let worker = workers.lookup(&id).unwrap();
+        let (entered, started) = oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let cancel = CancellationToken::new();
+        let reply = enqueue(
+            &worker,
+            Operation::BlockThenCall {
+                entered,
+                release: gate,
+                tool: "save_document".into(),
+                args: json!({"path":target}),
+            },
+            cancel.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(10), started)
+            .await
+            .unwrap()
+            .unwrap();
+        // The save has started on the worker; the client now cancels it.
+        cancel.cancel();
+        release.send(()).unwrap();
+        // A cancelled request gets no tool result; the transport sends no response.
+        let outcome = tokio::time::timeout(Duration::from_secs(30), reply)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"original bytes");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "temp file left"
+        );
+        // The scope ends with the job: the next, live save does replace the file.
+        let saved = workers
+            .call(
+                &id,
+                "save_document",
+                json!({"path":target}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved["isError"], false, "{saved}");
+        assert_ne!(std::fs::read(&path).unwrap(), b"original bytes");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -892,6 +1213,61 @@ mod tests {
                     .unwrap()
             )["text"],
             "격리된 문서는 유지"
+        );
+        data(
+            workers
+                .close(&other, true, CancellationToken::new())
+                .await
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_atomic_restore_closes_only_its_document_and_pending_jobs() {
+        let workers = DocumentWorkers::new(None);
+        let first = document(&workers).await;
+        let other = document(&workers).await;
+        let (worker, release, blocked) = paused(&workers, &first).await;
+        let failure = enqueue(
+            &worker,
+            Operation::InvalidateRollback,
+            CancellationToken::new(),
+        );
+        let pending = enqueue(
+            &worker,
+            Operation::Call {
+                tool: "get_text".into(),
+                args: json!({}),
+            },
+            CancellationToken::new(),
+        );
+        release.send(()).unwrap();
+        data(blocked.await.unwrap().unwrap());
+        assert_eq!(failure.await.unwrap().unwrap()["isError"], true);
+        assert!(pending.await.is_err());
+        tokio::time::timeout(Duration::from_secs(10), worker.finished.cancelled())
+            .await
+            .unwrap();
+        assert!(workers.lookup(&first).is_err());
+        data(
+            workers
+                .call(
+                    &other,
+                    "type_text",
+                    json!({"text":"복원 오류와 격리된 문서"}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            data(
+                workers
+                    .call(&other, "get_text", json!({}), CancellationToken::new())
+                    .await
+                    .unwrap()
+            )["text"],
+            "복원 오류와 격리된 문서"
         );
         data(
             workers

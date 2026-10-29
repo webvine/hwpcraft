@@ -1,0 +1,335 @@
+diff --git a/src/renderer/pdf.rs b/src/renderer/pdf.rs
+index 045c49000..13646ad0e 100644
+--- a/src/renderer/pdf.rs
++++ b/src/renderer/pdf.rs
+@@ -1135,6 +1135,7 @@ fn convert_page_chunk<F>(
+     embed_text: bool,
+     page_index: usize,
+     to_chunk: &mut F,
++    warnings: &mut Vec<String>,
+ ) -> Result<Option<(pdf_writer::Chunk, pdf_writer::Ref)>, String>
+ where
+     F: FnMut(
+@@ -1147,18 +1148,18 @@ where
+         Err(err) => match classify_svg2pdf_page_error(&err, embed_text, false) {
+             Svg2pdfPageIsolation::Fatal => Err(format!("SVG→chunk 변환 실패: {:?}", err)),
+             Svg2pdfPageIsolation::RetryWithoutEmbedText => {
+-                eprintln!(
++                warnings.push(format!(
+                     "WARN: 페이지 {} svg2pdf SubsetError({err:?}) — embed_text=false 로 재시도합니다.",
+                     page_index + 1
+-                );
++                ));
+                 match to_chunk(tree, false) {
+                     Ok(ok) => Ok(Some(ok)),
+                     Err(err2) => match classify_svg2pdf_page_error(&err2, false, true) {
+                         Svg2pdfPageIsolation::SkipPage => {
+-                            eprintln!(
++                            warnings.push(format!(
+                                 "WARN: 페이지 {} svg2pdf SubsetError({err2:?}) — 이 페이지만 건너뛰고 PDF 를 계속합니다.",
+                                 page_index + 1
+-                            );
++                            ));
+                             Ok(None)
+                         }
+                         Svg2pdfPageIsolation::Fatal
+@@ -1169,10 +1170,10 @@ where
+                 }
+             }
+             Svg2pdfPageIsolation::SkipPage => {
+-                eprintln!(
++                warnings.push(format!(
+                     "WARN: 페이지 {} svg2pdf SubsetError({err:?}) — 이 페이지만 건너뛰고 PDF 를 계속합니다.",
+                     page_index + 1
+-                );
++                ));
+                 Ok(None)
+             }
+         },
+@@ -1251,7 +1252,101 @@ pub fn svgs_to_pdf_with_links(
+     links: &[Vec<super::hyperlinks::PdfLink>],
+     options: &PdfExportOptions,
+ ) -> Result<Vec<u8>, String> {
+-    svgs_to_pdf_with_links_and_to_chunk(svg_pages, links, options, svg2pdf_to_chunk)
++    let threads = pdf_page_threads(svg_pages.len());
++    if threads <= 1 {
++        return svgs_to_pdf_with_links_and_to_chunk(svg_pages, links, options, svg2pdf_to_chunk);
++    }
++    check_pdf_pages(svg_pages, links)?;
++    let usvg_options = pdf_usvg_options(options);
++    let page_datas = convert_pages_parallel(svg_pages, options, &usvg_options, threads)?;
++    assemble_pdf(page_datas, links)
++}
++
++/// 쪽 변환 스레드 수: `RHWP_PDF_THREADS`(1 이상), 없으면 min(코어 수, 8), 쪽 수 이하.
++///
++/// 쪽마다 usvg 트리와 svg2pdf 작업 버퍼가 동시에 살아 있으므로(381쪽 문서에서 쪽당
++/// 약 94MB) 기본 상한을 8로 둔다. 1이면 기존 순차 경로와 같다.
++#[cfg(not(target_arch = "wasm32"))]
++fn pdf_page_threads(pages: usize) -> usize {
++    let requested = std::env::var("RHWP_PDF_THREADS")
++        .ok()
++        .and_then(|value| value.trim().parse::<usize>().ok())
++        .filter(|threads| *threads >= 1);
++    let default = || {
++        std::thread::available_parallelism()
++            .map(std::num::NonZeroUsize::get)
++            .unwrap_or(1)
++            .min(8)
++    };
++    requested.unwrap_or_else(default).min(pages.max(1))
++}
++
++/// 쪽들을 여러 스레드에서 변환하고 결과를 쪽 순서대로 돌려준다.
++///
++/// 쪽 변환은 서로 독립이고 대체 글꼴 색인은 처리 순서와 무관하게 usvg 기본 순서와 같은
++/// 답을 내므로, 쪽별 chunk 와 최종 PDF 바이트는 순차 변환과 같다. 경고는 쪽 순서대로
++/// 출력하고, 오류는 순차 변환이 먼저 만났을 가장 앞 쪽의 것을 돌려준다.
++#[cfg(not(target_arch = "wasm32"))]
++fn convert_pages_parallel(
++    svg_pages: &[String],
++    export_options: &PdfExportOptions,
++    options: &usvg::Options<'_>,
++    threads: usize,
++) -> Result<Vec<PdfPageData>, String> {
++    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++    type Slot = std::sync::Mutex<Option<(Result<Option<PdfPageData>, String>, Vec<String>)>>;
++    let next = AtomicUsize::new(0);
++    let failed = AtomicBool::new(false);
++    let slots: Vec<Slot> = (0..svg_pages.len())
++        .map(|_| std::sync::Mutex::new(None))
++        .collect();
++    std::thread::scope(|scope| {
++        for _ in 0..threads {
++            scope.spawn(|| {
++                let mut to_chunk = svg2pdf_to_chunk;
++                loop {
++                    // 쪽 번호는 오름차순으로 나눠 가지므로, 실패가 알려진 뒤에 새로 집는
++                    // 쪽은 모두 그 실패보다 뒤다. 앞쪽은 이미 누군가 처리하고 있다.
++                    if failed.load(Ordering::Acquire) {
++                        break;
++                    }
++                    let page_index = next.fetch_add(1, Ordering::AcqRel);
++                    let Some(svg) = svg_pages.get(page_index) else {
++                        break;
++                    };
++                    let mut warnings = Vec::new();
++                    let result = convert_svg_page(
++                        page_index,
++                        svg,
++                        export_options,
++                        options,
++                        &mut to_chunk,
++                        &mut warnings,
++                    );
++                    if result.is_err() {
++                        failed.store(true, Ordering::Release);
++                    }
++                    if let Ok(mut slot) = slots[page_index].lock() {
++                        *slot = Some((result, warnings));
++                    }
++                }
++            });
++        }
++    });
++    let mut page_datas = Vec::with_capacity(svg_pages.len());
++    for slot in slots {
++        let Some((result, warnings)) = slot.into_inner().ok().flatten() else {
++            // 앞쪽 실패 뒤에 건너뛴 쪽: 그 실패는 이미 아래에서 반환됐다.
++            break;
++        };
++        for warning in warnings {
++            eprintln!("{warning}");
++        }
++        if let Some(page) = result? {
++            page_datas.push(page);
++        }
++    }
++    Ok(page_datas)
+ }
+ 
+ /// 페이지 변환 실패 시 링크 귀속도 검증하는 주입점.
+@@ -1269,15 +1364,46 @@ where
+         bool,
+     ) -> Result<(pdf_writer::Chunk, pdf_writer::Ref), svg2pdf::ConversionError>,
+ {
++    check_pdf_pages(svg_pages, links)?;
++    let options = pdf_usvg_options(export_options);
++    let mut page_datas: Vec<PdfPageData> = Vec::new();
++    for (page_index, svg) in svg_pages.iter().enumerate() {
++        let mut warnings = Vec::new();
++        let page = convert_svg_page(
++            page_index,
++            svg,
++            export_options,
++            &options,
++            &mut to_chunk,
++            &mut warnings,
++        );
++        for warning in warnings {
++            eprintln!("{warning}");
++        }
++        if let Some(page) = page? {
++            page_datas.push(page);
++        }
++    }
++    assemble_pdf(page_datas, links)
++}
++
++#[cfg(not(target_arch = "wasm32"))]
++fn check_pdf_pages(
++    svg_pages: &[String],
++    links: &[Vec<super::hyperlinks::PdfLink>],
++) -> Result<(), String> {
+     if links.len() != svg_pages.len() {
+         return Err("PDF 페이지와 링크 목록의 길이가 다릅니다".into());
+     }
+     if svg_pages.is_empty() {
+         return Err("페이지가 없습니다".to_string());
+     }
+-    use pdf_writer::{Finish, Pdf, Ref};
+-    use std::collections::HashMap;
++    Ok(())
++}
+ 
++/// PDF 변환용 usvg 옵션: 공유 글꼴 DB, 대체 글꼴 색인, 하위 SVG 그림 리졸버.
++#[cfg(not(target_arch = "wasm32"))]
++fn pdf_usvg_options(export_options: &PdfExportOptions) -> usvg::Options<'static> {
+     let fontdb = create_fontdb(export_options);
+     let mut options = usvg::Options::default();
+     options.fontdb = std::sync::Arc::new(fontdb);
+@@ -1286,60 +1412,87 @@ where
+         PDF_FONT_FALLBACK_INDEX_MAX_FACE_SLOTS,
+     );
+     options.image_href_resolver = pdf_image_href_resolver();
++    options
++}
+ 
+-    let mut alloc = Ref::new(1);
+-    let catalog_ref = alloc.bump();
+-    let page_tree_ref = alloc.bump();
++/// 쪽 하나의 변환 결과: chunk 와 쪽 크기(pt).
++#[cfg(not(target_arch = "wasm32"))]
++struct PdfPageData {
++    chunk: pdf_writer::Chunk,
++    svg_ref: pdf_writer::Ref,
++    width: f32,
++    height: f32,
++    source_index: usize,
++}
+ 
+-    // 각 페이지의 SVG를 파싱하여 chunk + page 정보 수집
+-    struct PageData {
+-        chunk: pdf_writer::Chunk,
+-        svg_ref: Ref,
+-        width: f32,
+-        height: f32,
+-        source_index: usize,
++/// 쪽 SVG 하나를 chunk 로 바꾼다. `None` 은 SubsetError 로 건너뛴 쪽이다.
++/// 경고는 출력하지 않고 `warnings` 에 모은다(호출자가 쪽 순서대로 출력).
++#[cfg(not(target_arch = "wasm32"))]
++fn convert_svg_page<F>(
++    page_index: usize,
++    svg: &str,
++    export_options: &PdfExportOptions,
++    options: &usvg::Options<'_>,
++    to_chunk: &mut F,
++    warnings: &mut Vec<String>,
++) -> Result<Option<PdfPageData>, String>
++where
++    F: FnMut(
++        &usvg::Tree,
++        bool,
++    ) -> Result<(pdf_writer::Chunk, pdf_writer::Ref), svg2pdf::ConversionError>,
++{
++    let svg_with_fallback = apply_pdf_font_options(svg, export_options);
++    let (svg_with_bold, bold_report) = prepare_svg_with_synthetic_bold(&svg_with_fallback, options)?;
++    if bold_report.unsupported_texts > 0 {
++        warnings.push(format!("경고: PDF {}페이지의 굵게 text {}개는 혼합 글꼴/복잡한 paint로 합성하지 못했습니다.", page_index + 1, bold_report.unsupported_texts));
++    }
++    let (tree, italic_report) = parse_svg_with_synthetic_italic(&svg_with_bold, options)
++        .map_err(|e| format!("SVG 파싱 실패: {}", e))?;
++    if italic_report.unsupported_texts > 0 {
++        warnings.push(format!(
++            "경고: PDF {}페이지의 기울임 text {}개는 혼합 글꼴/복잡한 배치로 합성하지 못했습니다.",
++            page_index + 1,
++            italic_report.unsupported_texts,
++        ));
+     }
+ 
+-    let mut page_datas: Vec<PageData> = Vec::new();
+-
+-    for (page_index, svg) in svg_pages.iter().enumerate() {
+-        let svg_with_fallback = apply_pdf_font_options(svg, export_options);
+-        let (svg_with_bold, bold_report) =
+-            prepare_svg_with_synthetic_bold(&svg_with_fallback, &options)?;
+-        if bold_report.unsupported_texts > 0 {
+-            eprintln!("경고: PDF {}페이지의 굵게 text {}개는 혼합 글꼴/복잡한 paint로 합성하지 못했습니다.", page_index + 1, bold_report.unsupported_texts);
+-        }
+-        let (tree, italic_report) = parse_svg_with_synthetic_italic(&svg_with_bold, &options)
+-            .map_err(|e| format!("SVG 파싱 실패: {}", e))?;
+-        if italic_report.unsupported_texts > 0 {
+-            eprintln!(
+-                "경고: PDF {}페이지의 기울임 text {}개는 혼합 글꼴/복잡한 배치로 합성하지 못했습니다.",
+-                page_index + 1,
+-                italic_report.unsupported_texts,
+-            );
+-        }
++    // [Task #2264] 텍스트 임베드(폰트 서브셋)가 PDF 변환 메모리의 지배항이다.
++    // `embed_text=false` 면 글리프를 path 로 변환해 서브셋 경로를 통째로 건너뛴다.
++    // [#3773] SubsetError 는 페이지 단위로 격리한다.
++    let Some((chunk, svg_ref)) = convert_page_chunk(
++        &tree,
++        export_options.embed_text,
++        page_index,
++        to_chunk,
++        warnings,
++    )?
++    else {
++        return Ok(None);
++    };
+ 
+-        // [Task #2264] 텍스트 임베드(폰트 서브셋)가 PDF 변환 메모리의 지배항이다.
+-        // `embed_text=false` 면 글리프를 path 로 변환해 서브셋 경로를 통째로 건너뛴다.
+-        // [#3773] SubsetError 는 페이지 단위로 격리한다.
+-        let Some((chunk, svg_ref)) =
+-            convert_page_chunk(&tree, export_options.embed_text, page_index, &mut to_chunk)?
+-        else {
+-            continue;
+-        };
++    let dpi_ratio = 72.0 / 96.0; // 96 DPI → 72 pt
++    Ok(Some(PdfPageData {
++        chunk,
++        svg_ref,
++        width: tree.size().width() * dpi_ratio,
++        height: tree.size().height() * dpi_ratio,
++        source_index: page_index,
++    }))
++}
+ 
+-        let dpi_ratio = 72.0 / 96.0; // 96 DPI → 72 pt
+-        let w = tree.size().width() * dpi_ratio;
+-        let h = tree.size().height() * dpi_ratio;
++/// 변환된 쪽들을 쪽 순서대로 재번호해 한 PDF 로 묶는다.
++#[cfg(not(target_arch = "wasm32"))]
++fn assemble_pdf(
++    page_datas: Vec<PdfPageData>,
++    links: &[Vec<super::hyperlinks::PdfLink>],
++) -> Result<Vec<u8>, String> {
++    use pdf_writer::{Finish, Pdf, Ref};
++    use std::collections::HashMap;
+ 
+-        page_datas.push(PageData {
+-            chunk,
+-            svg_ref,
+-            width: w,
+-            height: h,
+-            source_index: page_index,
+-        });
+-    }
++    let mut alloc = Ref::new(1);
++    let catalog_ref = alloc.bump();
++    let page_tree_ref = alloc.bump();
+ 
+     if page_datas.is_empty() {
+         return Err("모든 페이지의 SVG→PDF 변환이 SubsetError 로 건너뛰어졌습니다".to_string());

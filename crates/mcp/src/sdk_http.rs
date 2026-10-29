@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode, header},
+    http::{HeaderValue, Method, Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
@@ -25,6 +25,10 @@ use tokio_util::sync::CancellationToken;
 const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MIN_TOKEN_CHARS: usize = 32;
 const REJECTED_BODY_DRAIN_BYTES: usize = 64 * 1024;
+/// Largest answer to an unversioned request that is inspected; such answers are
+/// short JSON-RPC errors, anything larger is replaced.
+const UNVERSIONED_REPLY_BYTES: usize = 64 * 1024;
+const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
 /// Shared secret every HTTP request presents as `Authorization: Bearer <token>`.
 #[derive(Clone)]
@@ -116,6 +120,49 @@ async fn require_token(
         .into_response()
 }
 
+/// A server that supports only MCP 2026-07-28 MUST reject a POST without the
+/// `MCP-Protocol-Version` header with `400 Bad Request` (Streamable HTTP, server
+/// validation). The SDK treats such a request as legacy and answers HTTP 200, for
+/// example `-32022` to a 2025 client's `initialize`. Keep the SDK's JSON-RPC
+/// error, which names the supported version, and correct only the status; any
+/// other answer becomes a `-32020` header error. Origin, Host and size checks
+/// still run first in the SDK, so their 403/413 answers are unchanged.
+async fn require_protocol_version(request: Request<Body>, next: Next) -> Response {
+    let unversioned = request.method() == Method::POST
+        && !request.headers().contains_key(PROTOCOL_VERSION_HEADER);
+    let response = next.run(request).await;
+    if !unversioned || response.status() != StatusCode::OK {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, UNVERSIONED_REPLY_BYTES)
+        .await
+        .unwrap_or_default();
+    let reply: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    let body = if reply.get("error").is_some() {
+        bytes
+    } else {
+        serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": reply.get("id").cloned().unwrap_or(serde_json::Value::Null),
+            "error": {
+                "code": -32020,
+                "message": "MCP-Protocol-Version header is required; this server supports only MCP 2026-07-28",
+                "data": {"supported": ["2026-07-28"]}
+            }
+        }))
+        .unwrap_or_default()
+        .into()
+    };
+    parts.status = StatusCode::BAD_REQUEST;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Response::from_parts(parts, Body::from(body))
+}
+
 pub(crate) async fn serve<H: ServerHandler + Clone>(
     service: H,
     listen: SocketAddr,
@@ -186,6 +233,7 @@ where
     // about paths, methods or protocol versions.
     let router = axum::Router::new()
         .nest_service("/mcp", transport)
+        .layer(middleware::from_fn(require_protocol_version))
         .layer(middleware::from_fn_with_state(token, require_token));
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown.cancelled_owned())
@@ -572,6 +620,47 @@ mod tests {
             .await?;
         assert_eq!(reply.status, 404);
         assert_eq!(reply.json()?["error"]["code"], -32601);
+        server.finish().await
+    }
+
+    #[tokio::test]
+    async fn requests_without_protocol_version_header_are_bad_requests() -> Result<()> {
+        let server = Running::start().await?;
+        // A 2025-era client's handshake: no MCP-Protocol-Version header, no _meta.
+        let legacy = json!({"jsonrpc":"2.0","id":7,"method":"initialize","params":{
+            "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"legacy","version":"1"}}});
+        let reply = server
+            .request("POST", "/mcp", &[], &serde_json::to_vec(&legacy)?)
+            .await?;
+        assert_eq!(reply.status, 400);
+        let body = reply.json()?;
+        assert_eq!(body["id"], 7, "{body}");
+        let code = body["error"]["code"].as_i64();
+        assert!(matches!(code, Some(-32022 | -32020)), "{body}");
+        assert!(body.to_string().contains("2026-07-28"), "{body}");
+        // Other legacy-shaped requests are rejected the same way.
+        for method in ["ping", "tools/list"] {
+            let legacy = json!({"jsonrpc":"2.0","id":8,"method":method,"params":{}});
+            let reply = server
+                .request("POST", "/mcp", &[], &serde_json::to_vec(&legacy)?)
+                .await?;
+            assert_eq!(reply.status, 400, "{method}");
+            assert!(reply.json()?["error"]["code"].is_i64(), "{method}");
+        }
+        // Earlier checks keep their own answers.
+        let mut origin = vec![("Origin", "https://attacker.invalid")];
+        assert_eq!(
+            server
+                .request("POST", "/mcp", &origin, &serde_json::to_vec(&legacy)?)
+                .await?
+                .status,
+            403
+        );
+        origin.clear();
+        assert_eq!(
+            server.request("GET", "/mcp", &origin, &[]).await?.status,
+            405
+        );
         server.finish().await
     }
 

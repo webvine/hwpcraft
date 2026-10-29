@@ -1497,9 +1497,16 @@ impl Session {
         if map.is_empty() && borders.is_none_or(Map::is_empty) {
             return Ok(());
         }
-        self.transaction(|s| s.cell_properties_raw(a, r, props, borders))
+        self.deferred_transaction(|s| s.cell_properties_raw(a, r, props, borders))
     }
     /// Apply cell properties inside the caller's transaction.
+    /// A transaction whose RHWP pagination runs once at the end instead of after
+    /// every cell edit. Cell loops repaginated the whole document per cell: 표 마당
+    /// on a 206-cell table took 13.9 s on a 381-page file. Only for closures that
+    /// edit the model without reading page layout or caret geometry.
+    fn deferred_transaction(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        self.transaction(|s| s.deferred_layout(f))
+    }
     pub(super) fn cell_properties_raw(
         &mut self,
         a: ObjectAddress,
@@ -2121,7 +2128,7 @@ impl Session {
             bail!("결과를 쓸 수 있는 빈 셀이 없습니다.");
         }
         let count = jobs.len();
-        self.transaction(|s| {
+        self.deferred_transaction(|s| {
             for (row, col, formula) in &jobs {
                 s.core
                     .evaluate_table_formula(
@@ -2273,7 +2280,7 @@ impl Session {
         if count == 0 {
             return Ok(0);
         }
-        self.transaction(|s| {
+        self.deferred_transaction(|s| {
             for (cell, para, old, text) in &edits {
                 s.core
                     .delete_text_in_cell_native(
@@ -2506,7 +2513,7 @@ impl Session {
                     .collect::<Vec<_>>()
             })
             .collect();
-        self.transaction(|s| {
+        self.deferred_transaction(|s| {
             for (cell, old, text) in &edits {
                 s.replace_cell_text(a, *cell, *old, text)?;
             }
@@ -2591,7 +2598,7 @@ impl Session {
             bail!("블록의 첫 셀에서 이어 갈 값(숫자·월·요일 등)을 찾지 못했습니다.");
         }
         let count = edits.len();
-        self.transaction(|s| {
+        self.deferred_transaction(|s| {
             for (cell, old, text) in &edits {
                 s.replace_cell_text(a, *cell, *old, text)?;
             }
@@ -2785,7 +2792,7 @@ impl Session {
         if !background && !borders {
             bail!("테두리와 셀 배경을 모두 끄면 적용할 것이 없습니다.");
         }
-        self.transaction(|s| {
+        self.deferred_transaction(|s| {
             let base = if background {
                 json!({"fillType":"none"})
             } else {
@@ -2881,7 +2888,7 @@ impl Session {
             return Ok(0);
         }
         let count = edits.len();
-        self.transaction(|s| {
+        self.deferred_transaction(|s| {
             for (range, props) in &edits {
                 s.cell_properties_raw(a, *range, props, None)?;
             }
@@ -2938,7 +2945,7 @@ impl Session {
             return Ok(0);
         }
         let count = edits.len();
-        self.transaction(|s| {
+        self.deferred_transaction(|s| {
             for (cell, old, text) in &edits {
                 s.replace_cell_text(a, *cell, *old, text)?;
             }

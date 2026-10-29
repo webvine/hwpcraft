@@ -162,8 +162,8 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ("chart.data.get", "index → 계열·값", r##"{"index":0}"##),
     (
         "chart.data",
-        "index, series[{name, values[]}]",
-        r##"{"index":0,"series":[{"name":"1분기","values":[1,2,3]}]}"##,
+        "index, series[{name?, values[] (문자열)}], structure?(true일 때만 계열 이름·개수 변경)",
+        r##"{"index":0,"series":[{"name":"1분기","values":["1","2","3"]}]}"##,
     ),
     (
         "object.group",
@@ -838,6 +838,8 @@ impl Session {
                 struct Chart {
                     index: usize,
                     series: Vec<Series>,
+                    #[serde(default)]
+                    structure: bool,
                 }
                 let p: Chart = serde_json::from_value(params)?;
                 if p.series.is_empty()
@@ -846,12 +848,14 @@ impl Session {
                 {
                     bail!("차트 계열은 1–64개, 계열마다 값 1,000개 이하입니다.");
                 }
-                // Values only: RHWP rejects structural changes unless asked explicitly.
-                let edits = json!({"series":p.series.iter().map(|s| {
+                // Preserve the default value-only contract; names/structure change
+                // only when a caller explicitly requests the public native mode.
+                let edits = json!({"structure":p.structure,"series":p.series.iter().map(|s| {
                     let mut v = json!({"values":s.values});
                     if let Some(n) = &s.name { v["name"] = json!(n); }
                     v
                 }).collect::<Vec<_>>()});
+                self.validate_authored_chart_edit(p.index, &edits)?;
                 let mut report = Value::Null;
                 self.transaction(|s| {
                     let v: Value = serde_json::from_str(

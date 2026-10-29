@@ -15,6 +15,27 @@ fn page_number_controls(s: &Session) -> Vec<(u8, u8, char)> {
         .collect()
 }
 
+#[test]
+fn change_tracking_records_are_reported_only_when_present() {
+    let mut s = Session::new().unwrap();
+    assert!(!s.has_track_change_records());
+    // A TRACKCHANGE settings record alone (tag 32, written by every Hangul file) is not a record of changes.
+    let record = |tag_id| hwpcraft_doc::model::document::RawRecord {
+        tag_id,
+        level: 0,
+        data: vec![0; 4],
+    };
+    let extra = &mut s.core.document_mut().doc_info.extra_records;
+    extra.push(record(32));
+    assert!(!s.has_track_change_records());
+    s.core
+        .document_mut()
+        .doc_info
+        .extra_records
+        .push(record(97));
+    assert!(s.has_track_change_records());
+}
+
 fn line(kind: u8, width: u8, color: &str) -> serde_json::Value {
     json!({"type": kind, "width": width, "color": color})
 }
@@ -849,6 +870,16 @@ fn background_pdf_jobs_cover_print_ranges_and_blocks() -> anyhow::Result<()> {
         (generation, cursor),
         "document untouched"
     );
+    // Page lists for a PDF prepared a few pages per frame: the same pages, and the
+    // block as its own copy that later edits do not change.
+    assert_eq!(s.print_pdf_pages("2-3", 0)?, [1, 2]);
+    assert!(s.print_pdf_pages("9", 0).is_err());
+    let copy = s.block_pdf_session()?;
+    assert_eq!(copy.page_count()?, 1);
+    let mut prep = copy.pdf_prepare(&[0])?;
+    assert!(copy.pdf_prepare_step(&mut prep, std::time::Duration::ZERO)?);
+    assert!(copy.pdf_finish(prep)?.convert()?.starts_with(b"%PDF"));
+    assert_eq!((s.generation, s.cursor), (generation, cursor));
     // The synchronous command keeps its behaviour.
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("block.hwpx");

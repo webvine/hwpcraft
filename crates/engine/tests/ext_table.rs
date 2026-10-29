@@ -1046,3 +1046,55 @@ fn table_style_options_shade_and_user_auto_fill() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn deferred_table_edits_leave_layout_matching_a_fresh_reopen() -> anyhow::Result<()> {
+    // Cell loops (표 마당, 음영, 채우기, 정렬…) defer RHWP pagination to one pass at
+    // the end. The live layout afterwards must equal the layout of the saved file.
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("앞 문단".into()))?;
+    s.run("table.create", json!({"rows":120,"columns":3}))?;
+    s.run(
+        "table.style",
+        json!({"preset":"striped","first_column":true}),
+    )?;
+    s.run(
+        "table.cell_shade",
+        json!({"range":{"start_row":0,"start_col":0,"end_row":119,"end_col":0},"darker":true}),
+    )?;
+    let pages = s.page_count()?;
+    assert!(pages >= 2, "long table spans pages: {pages}");
+    let far = s
+        .entries()
+        .into_iter()
+        .rfind(|(c, _)| c.cell.is_some())
+        .ok_or_else(|| anyhow::anyhow!("cells"))?
+        .0;
+    let live = s.caret_at(far)?;
+    for ext in ["hwp", "hwpx"] {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(format!("deferred.{ext}"));
+        s.save(&path)?;
+        let mut r = Session::new()?;
+        r.open(&path)?;
+        assert_eq!(r.page_count()?, pages, "{ext}");
+        let reopened = r.caret_at(far)?;
+        assert_eq!(reopened["pageIndex"], live["pageIndex"], "{ext}");
+        let dy = (reopened["y"].as_f64().unwrap_or(0.0) - live["y"].as_f64().unwrap_or(0.0)).abs();
+        assert!(dy < 1.0, "{ext}: {live} vs {reopened}");
+    }
+    // One undo step per command; the first undo returns the shade, the second the style.
+    let fill = |s: &mut Session| -> anyhow::Result<Value> {
+        Ok(s.run(
+            "table.cell_properties.get",
+            json!({"range":{"start_row":5,"start_col":0,"end_row":5,"end_col":0}}),
+        )?["fillColor"]
+            .clone())
+    };
+    let shaded = fill(&mut s)?;
+    s.execute(Command::Undo)?;
+    assert_ne!(fill(&mut s)?, shaded);
+    s.execute(Command::Undo)?;
+    assert_eq!(s.run("table.info", json!({}))?["rows"], 120);
+    Ok(())
+}

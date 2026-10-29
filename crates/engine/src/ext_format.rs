@@ -967,9 +967,9 @@ impl Session {
     /// Rebuild derived layout state after direct model edits through public RHWP API:
     /// restoring a snapshot of the current document runs RHWP's full derived-state rebuild.
     fn refresh_layout(&mut self) -> Result<()> {
-        let id = self.core.save_snapshot_native();
+        let id = self.save_history_snapshot();
         let r = self.core.restore_snapshot_native(id).map_err(err);
-        self.core.discard_snapshot_native(id);
+        self.retire_history_snapshot(id);
         r.map(|_| ())
     }
 

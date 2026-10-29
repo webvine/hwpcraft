@@ -1,0 +1,43 @@
+diff --git a/src/document_core/commands/formatting.rs b/src/document_core/commands/formatting.rs
+index 95787f2..77a14b9 100644
+--- a/src/document_core/commands/formatting.rs
++++ b/src/document_core/commands/formatting.rs
+@@ -1199,6 +1199,38 @@ impl DocumentCore {
+         }
+     }
+ 
++    /// 호출자가 문서 모델에서 직접 고친 문단(글자 모양 런 등)의 파생 상태만 다시 만든다.
++    ///
++    /// 저장 줄(LineSeg)은 다시 계산하지 않는다 — 모델은 호출자가 고친 그대로 둔다.
++    /// `cell` 이 `Some(control)` 이면 `para_idx` 문단의 그 표 컨트롤 안 셀 문단을 고친
++    /// 것이다. 배치 중에는 쪽 나눔을 end_batch 로 미룬다. `set_document` 의 전체
++    /// 재조판(문서 크기에 비례) 대신 쓴다.
++    pub fn relayout_paragraph_native(
++        &mut self,
++        sec_idx: usize,
++        para_idx: usize,
++        cell: Option<usize>,
++    ) -> Result<String, HwpError> {
++        if sec_idx >= self.document.sections.len() {
++            return Err(HwpError::RenderError(format!("구역 {} 범위 초과", sec_idx)));
++        }
++        if para_idx >= self.document.sections[sec_idx].paragraphs.len() {
++            return Err(HwpError::RenderError(format!(
++                "문단 {} 범위 초과",
++                para_idx
++            )));
++        }
++        self.document.sections[sec_idx].raw_stream = None;
++        match cell {
++            Some(control_idx) => {
++                self.mark_cell_control_dirty(sec_idx, para_idx, control_idx);
++                self.rebuild_section_deferred_in_batch(sec_idx);
++            }
++            None => self.rebuild_paragraph_deferred_in_batch(sec_idx, para_idx),
++        }
++        Ok("{\"ok\":true}".to_string())
++    }
++
+     /// 글자 서식 적용 (네이티브) — 셀 내 문단
+     pub fn apply_char_format_in_cell_native(
+         &mut self,

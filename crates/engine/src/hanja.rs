@@ -509,7 +509,7 @@ impl Session {
         }
         let caret = self.cursor;
         self.transaction(|s| {
-            s.with_deferred_layout(|s| {
+            s.deferred_layout(|s| {
                 for (cursor, range, text) in planned.into_iter().rev() {
                     s.clear_selection();
                     s.cursor = Cursor {

@@ -779,9 +779,9 @@ impl Session {
     /// Rebuild RHWP's layout caches after a direct model edit (snapshot round trip,
     /// like the format area does).
     fn relayout_after_marker(&mut self) -> Result<()> {
-        let id = self.core.save_snapshot_native();
+        let id = self.save_history_snapshot();
         let r = self.core.restore_snapshot_native(id).map_err(err);
-        self.core.discard_snapshot_native(id);
+        self.retire_history_snapshot(id);
         r.map(|_| ())
     }
     /// RHWP root-list paragraph index and stream position of a body caret, counted

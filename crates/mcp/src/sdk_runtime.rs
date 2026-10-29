@@ -143,6 +143,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let options = options(args)?;
+    // RHWP prints layout diagnostics (overflow, table overlap) to stderr for every
+    // page it lays out; for an MCP server stderr is the client's log channel.
+    hwpcraft_doc::set_layout_diagnostics(false);
     // The token file is the operator's own setting, not automation input, so it
     // is read before the automation folders confine the process.
     let token = match options.transport {

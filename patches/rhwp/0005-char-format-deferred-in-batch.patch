@@ -1,0 +1,16 @@
+diff --git a/src/document_core/commands/formatting.rs b/src/document_core/commands/formatting.rs
+index 95cce1d58..95787f2a5 100644
+--- a/src/document_core/commands/formatting.rs
++++ b/src/document_core/commands/formatting.rs
+@@ -1083,7 +1083,10 @@ impl DocumentCore {
+         }
+ 
+         self.document.sections[sec_idx].raw_stream = None;
+-        self.rebuild_section(sec_idx);
++        // 배치 중에는 이 문단만 다시 조합하고 쪽 나눔은 end_batch 에서 한 번 한다
++        // (Undo 형제 set_char_shape_id_native 와 같은 꼬리). 배치 밖에서는 종전대로
++        // 전체 rebuild 이다.
++        self.rebuild_paragraph_deferred_in_batch(sec_idx, para_idx);
+         self.event_log.push(DocumentEvent::CharFormatChanged {
+             section: sec_idx,
+             para: para_idx,

@@ -7,6 +7,7 @@
 use super::*;
 use hwpcraft_engine::{EquationOptions, ObjectAddress};
 use serde_json::{Map, Value};
+mod chart_creation;
 
 const HU_PER_MM: f64 = 7200.0 / 25.4;
 /// RHWP page coordinates are 96 dpi pixels.
@@ -129,6 +130,7 @@ pub(crate) struct State {
     properties: Option<Box<Properties>>,
     equation: Option<Box<EquationEditor>>,
     chart: Option<Box<ChartEditor>>,
+    chart_authoring: Option<Box<chart_creation::Editor>>,
     memos: bool,
     /// 개체 모양 복사 (CopyShapeFormat): the look waiting to be pasted.
     format: Option<Value>,
@@ -468,6 +470,8 @@ impl HwpApp {
                 Some(self.doc_facts().0)
             }
             "picture.save" => Some(self.object_ext_selected_kind() == Some("picture")),
+            // A new chart goes at a body caret: not in a cell, nothing selected.
+            "insert.chart" => Some(body && !selected && !self.session.has_selection()),
             "note.convert" | "note.delete" => Some(self.session.note_at_caret().is_some()),
             "note.shape" | "note.shape.footnote" | "note.shape.endnote" | "field.delete" => {
                 Some(true)
@@ -497,7 +501,7 @@ impl HwpApp {
                     .is_some_and(|s| s.group && !s.locked),
             ),
             "object.lock" => Some(selected),
-            "chart.edit" => Some(self.doc_facts().1),
+            "chart.edit" => Some(true),
             "object.delete"
             | "object.placement.inline"
             | "object.placement.square"
@@ -639,6 +643,7 @@ impl HwpApp {
             }
             "insert.form_object" => self.open_form_editor(),
             "chart.edit" => self.open_chart_editor(0),
+            "insert.chart" => self.open_chart_creation(None),
             "memo.list" => self.ext.object.memos = true,
             "insert.picture_dialog" => {
                 if let Some(path) = rfd::FileDialog::new()
@@ -1633,6 +1638,7 @@ impl HwpApp {
             || self.ext.object.properties.is_some()
             || self.ext.object.equation.is_some()
             || self.ext.object.chart.is_some()
+            || self.ext.object.chart_authoring.is_some()
             || self.ext.object.memos
             || self.ext.object.field.is_some()
             || self.ext.object.forms.is_some()
@@ -1686,6 +1692,8 @@ impl HwpApp {
                 }
             }
             "chart-edit" => self.open_chart_editor(0),
+            "chart-create" => self.open_chart_creation(None),
+            "chart-configure" => self.open_chart_creation(Some(0)),
             "memo-list" => self.ext.object.memos = true,
             "picture-insert" => {
                 self.ext.object.picture = Some(PictureInsert {
@@ -1790,6 +1798,7 @@ impl HwpApp {
         self.object_properties_dialog(ctx);
         self.equation_editor_dialog(ctx);
         self.chart_editor_dialog(ctx);
+        self.chart_creation_dialog(ctx);
         self.memo_list_dialog(ctx);
         self.field_insert_dialog(ctx);
         self.note_shape_dialog(ctx);
@@ -1884,106 +1893,119 @@ impl HwpApp {
                 _ => "양식 개체",
             }
         }
-        let mut close = false;
-        let mut apply: Option<usize> = None;
-        let r = chrome::modal("ext-form-editor").show(ctx, |ui| {
-            ui.set_width(580.0);
-            close = chrome::title(ui, "양식 개체");
-            ui.label(
-                RichText::new(
-                    "RHWP에 양식 개체 생성 API가 없어 새 양식 개체는 넣을 수 없습니다. 문서에 있는 양식 개체의 값·캡션을 고칩니다.",
-                )
-                .small()
-                .weak(),
-            );
+        use super::ext_shell::{dialog, group, notice};
+        let changed = |d: &FormDraft| {
+            (d.text.as_str(), d.checked, d.caption.as_str())
+                != (d.original.0.as_str(), d.original.1, d.original.2.as_str())
+        };
+        let button = dialog(ctx, "양식 개체", 600.0, &["적용(D)", "닫기"], |ui| {
+            if drafts.is_empty() {
+                notice(ui, "이 문서에 양식 개체가 없습니다.");
+            }
             egui::ScrollArea::vertical()
                 .max_height(380.0)
                 .show(ui, |ui| {
-                    if drafts.is_empty() {
-                        ui.label("이 문서에 양식 개체가 없습니다.");
-                    }
                     for (i, d) in drafts.iter_mut().enumerate() {
                         ui.push_id(i, |ui| {
-                            ui.group(|ui| {
-                                ui.set_width(540.0);
-                                ui.label(format!(
-                                    "{} · {}{}",
+                            group(
+                                ui,
+                                &format!(
+                                    "{} · {}{}{}",
                                     kind_label(&d.kind),
-                                    if d.name.is_empty() { "(이름 없음)" } else { &d.name },
-                                    if d.at["cell"].is_object() { " (표 안)" } else { "" }
-                                ));
-                                match d.kind.as_str() {
-                                    "Edit" | "ComboBox" => {
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut d.text)
-                                                .desired_width(420.0),
-                                        );
-                                    }
-                                    "CheckBox" | "RadioButton" => {
+                                    if d.name.is_empty() {
+                                        "(이름 없음)"
+                                    } else {
+                                        &d.name
+                                    },
+                                    if d.at["cell"].is_object() {
+                                        " (표 안)"
+                                    } else {
+                                        ""
+                                    },
+                                    if changed(d) { " · 바뀜" } else { "" }
+                                ),
+                            );
+                            match d.kind.as_str() {
+                                "Edit" | "ComboBox" => {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut d.text)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                }
+                                "CheckBox" | "RadioButton" => {
+                                    ui.horizontal(|ui| {
                                         ui.checkbox(&mut d.checked, "선택");
-                                        ui.horizontal(|ui| {
-                                            ui.label("캡션");
-                                            ui.add(
-                                                egui::TextEdit::singleline(&mut d.caption)
-                                                    .desired_width(320.0),
-                                            );
-                                        });
-                                    }
-                                    _ => {
-                                        ui.horizontal(|ui| {
-                                            ui.label("캡션");
-                                            ui.add(
-                                                egui::TextEdit::singleline(&mut d.caption)
-                                                    .desired_width(320.0),
-                                            );
-                                        });
-                                    }
+                                        ui.label("캡션");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut d.caption)
+                                                .desired_width(f32::INFINITY),
+                                        );
+                                    });
                                 }
-                                let changed =
-                                    (d.text.as_str(), d.checked, d.caption.as_str())
-                                        != (d.original.0.as_str(), d.original.1, d.original.2.as_str());
-                                if ui.add_enabled(changed, egui::Button::new("적용")).clicked() {
-                                    apply = Some(i);
+                                _ => {
+                                    ui.horizontal(|ui| {
+                                        ui.label("캡션");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut d.caption)
+                                                .desired_width(f32::INFINITY),
+                                        );
+                                    });
                                 }
-                            });
+                            }
                         });
                     }
                 });
-            ui.add_space(6.0);
-            if ui.button("닫기").clicked() {
-                close = true;
-            }
+            notice(
+                ui,
+                "문서에 있는 양식 개체의 값과 캡션을 고칩니다. 새 양식 개체 넣기는 조판 엔진(RHWP)에 생성 기능이 없어 지원하지 않습니다.",
+            );
         });
-        if let Some(i) = apply
-            && let Some(d) = drafts.get_mut(i)
-        {
-            let mut params = json!({"at":d.at});
-            match d.kind.as_str() {
-                "Edit" | "ComboBox" => {
-                    if d.text != d.original.0 {
-                        params["text"] = json!(d.text);
+        let close = match button {
+            Some(0) => {
+                let mut applied = 0;
+                let mut failed = false;
+                for d in drafts.iter_mut().filter(|d| changed(d)) {
+                    let mut params = json!({"at":d.at});
+                    match d.kind.as_str() {
+                        "Edit" | "ComboBox" => {
+                            if d.text != d.original.0 {
+                                params["text"] = json!(d.text);
+                            }
+                        }
+                        "CheckBox" | "RadioButton" => {
+                            if d.checked != d.original.1 {
+                                params["value"] = json!(i64::from(d.checked));
+                            }
+                            if d.caption != d.original.2 {
+                                params["caption"] = json!(d.caption);
+                            }
+                        }
+                        _ => {
+                            if d.caption != d.original.2 {
+                                params["caption"] = json!(d.caption);
+                            }
+                        }
+                    }
+                    if self.run("form.set", params) {
+                        d.original = (d.text.clone(), d.checked, d.caption.clone());
+                        applied += 1;
+                    } else {
+                        failed = true;
+                        break;
                     }
                 }
-                "CheckBox" | "RadioButton" => {
-                    if d.checked != d.original.1 {
-                        params["value"] = json!(i64::from(d.checked));
-                    }
-                    if d.caption != d.original.2 {
-                        params["caption"] = json!(d.caption);
-                    }
-                }
-                _ => {
-                    if d.caption != d.original.2 {
-                        params["caption"] = json!(d.caption);
-                    }
-                }
+                self.message = if applied == 0 && !failed {
+                    "바뀐 값이 없습니다.".into()
+                } else {
+                    format!("양식 개체 {applied}개를 고쳤습니다.")
+                };
+                // Close only when everything applied; keep the drafts after an error.
+                !failed
             }
-            if self.run("form.set", params) {
-                d.original = (d.text.clone(), d.checked, d.caption.clone());
-                self.message = "양식 개체 값을 고쳤습니다.".into();
-            }
-        }
-        if !(close || r.should_close()) {
+            Some(_) => true,
+            None => false,
+        };
+        if !close {
             self.ext.object.forms = Some(drafts);
         }
     }
@@ -3149,6 +3171,7 @@ pub(crate) struct ChartEditor {
     names: Vec<String>,
     values: Vec<Vec<String>>,
     plot: String,
+    configurable: bool,
     error: Option<String>,
 }
 
@@ -3160,8 +3183,7 @@ impl HwpApp {
         };
         let count = list.as_array().map_or(0, Vec::len);
         if count == 0 {
-            self.message =
-                "문서에 차트가 없습니다. 새 차트 만들기는 아직 지원하지 않습니다.".into();
+            self.open_chart_creation(None);
             return;
         }
         let index = index.min(count - 1);
@@ -3177,6 +3199,7 @@ impl HwpApp {
                 .collect()
         };
         let series = data["series"].as_array().cloned().unwrap_or_default();
+        let configurable = chart_creation::can_configure(&mut self.session, index);
         self.ext.object.chart = Some(Box::new(ChartEditor {
             index,
             count,
@@ -3187,6 +3210,7 @@ impl HwpApp {
                 .collect(),
             values: series.iter().map(|s| strings(&s["values"])).collect(),
             plot: data["plot"].as_str().unwrap_or("").to_owned(),
+            configurable,
             error: None,
         }));
     }
@@ -3196,6 +3220,7 @@ impl HwpApp {
             return;
         };
         let (mut apply, mut close, mut switch) = (false, false, None);
+        let (mut create, mut configure) = (false, false);
         let r = chrome::modal("ext-chart-data").show(ctx, |ui| {
             ui.set_width(640.0);
             close = chrome::title(ui, "차트 데이터 편집");
@@ -3217,6 +3242,10 @@ impl HwpApp {
                                 }
                             });
                         ui.label(RichText::new(format!("종류: {}", d.plot)).weak());
+                        create = ui.button("새 차트").clicked();
+                        configure = ui.add_enabled(d.configurable, egui::Button::new("전체 구성"))
+                            .on_hover_text("HwpCraft에서 작성한 11종의 지원 본문 차트만 전체 구성을 바꿉니다.")
+                            .clicked();
                     });
                     ui.separator();
                     egui::ScrollArea::both().max_height(320.0).show(ui, |ui| {
@@ -3242,7 +3271,7 @@ impl HwpApp {
                     });
                     ui.label(
                         RichText::new(
-                            "값과 계열 이름만 고칩니다. 행·계열 추가와 차트 종류 변경은 아직 지원하지 않습니다.",
+                            "여기서는 값과 계열 이름을 고칩니다. 지원되는 자체 차트의 행·계열·종류는 전체 구성에서 바꿉니다.",
                         )
                         .small()
                         .weak(),
@@ -3258,21 +3287,17 @@ impl HwpApp {
                 });
             });
         });
+        if create || configure {
+            self.ext.object.chart = Some(d.clone());
+            self.open_chart_creation(if configure { Some(d.index) } else { None });
+            return;
+        }
         if let Some(i) = switch {
             self.open_chart_editor(i);
             return;
         }
         if apply {
-            let series: Vec<Value> = d
-                .names
-                .iter()
-                .zip(&d.values)
-                .map(|(n, v)| json!({"name":n,"values":v}))
-                .collect();
-            match self
-                .session
-                .run("chart.data", json!({"index":d.index,"series":series}))
-            {
+            match chart_creation::apply_legacy_data(&mut self.session, &d) {
                 Ok(_) => {
                     close = true;
                     self.message = "차트 데이터를 고쳤습니다.".into();
@@ -4021,10 +4046,36 @@ mod tests {
     }
 
     #[test]
+    fn insert_chart_opens_the_new_chart_dialog_at_a_body_caret() {
+        let ctx = egui::Context::default();
+        let mut a = HwpApp::with_context(ctx.clone(), None, None, false).unwrap();
+        a.session
+            .execute(hwpcraft_engine::Command::Insert("본문".into()))
+            .unwrap();
+        assert_eq!(a.object_ext_enabled("insert.chart"), Some(true));
+        assert!(a.object_ext_dispatch("insert.chart", &ctx));
+        assert!(a.ext.object.chart_authoring.is_some(), "{}", a.message);
+        a.ext.object.chart_authoring = None;
+        // A text selection or a table cell disables it.
+        let at = |offset| Cursor {
+            offset,
+            ..Default::default()
+        };
+        a.session.select(at(0), false).unwrap();
+        a.session.select(at(2), true).unwrap();
+        assert_eq!(a.object_ext_enabled("insert.chart"), Some(false));
+        a.session.select(at(2), false).unwrap();
+        a.session
+            .run("table.create", json!({"rows":1,"columns":1}))
+            .unwrap();
+        assert_eq!(a.object_ext_enabled("insert.chart"), Some(false));
+    }
+
+    #[test]
     fn object_ribbon_checks_scan_the_document_once_per_generation() {
         let mut a = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
         assert_eq!(a.object_ext_enabled("object.next"), Some(false));
-        assert_eq!(a.object_ext_enabled("chart.edit"), Some(false));
+        assert_eq!(a.object_ext_enabled("chart.edit"), Some(true));
         let cached = a.ext.object.doc_facts.get();
         assert_eq!(cached, Some((a.session.generation, false, false)));
         // Repeated frame checks reuse the cached scan.
