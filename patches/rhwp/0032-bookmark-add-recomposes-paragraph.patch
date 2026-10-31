@@ -1,0 +1,26 @@
+diff --git a/src/document_core/queries/bookmark_query.rs b/src/document_core/queries/bookmark_query.rs
+index 38e45f4..2c72376 100644
+--- a/src/document_core/queries/bookmark_query.rs
++++ b/src/document_core/queries/bookmark_query.rs
+@@ -106,12 +106,19 @@ impl DocumentCore {
+ 
+         // 원본 스트림 무효화 — serialize_section 은 raw_stream 이 있으면 IR 을 무시하고
+         // 원본 바이트를 그대로 반환하므로(serializer/body_text.rs), 비우지 않으면 방금
+-        // 삽입한 책갈피 컨트롤이 저장 시 통째로 사라진다. recompose_section 은 화면(구성)만
++        // 삽입한 책갈피 컨트롤이 저장 시 통째로 사라진다. recompose_paragraph 는 화면(구성)만
+         // 갱신할 뿐 raw_stream 을 건드리지 않는다. 누름틀·양식 쪽과 동일한 불변식이다.
+         if let Some(s) = self.document.sections.get_mut(sec) {
+             s.raw_stream = None;
+         }
+-        self.recompose_section(sec);
++        // 바뀐 것은 이 문단뿐이다. 구역 전체를 다시 구성하면 책갈피를 여럿 달 때
++        // (차례 항목 링크 등) 문단 수의 제곱으로 느려진다. 아직 구성 결과가 없는
++        // 구역(조판 전 문서)만 전체를 구성한다.
++        if self.composed.get(sec).is_some_and(|c| para < c.len()) {
++            self.recompose_paragraph(sec, para);
++        } else {
++            self.recompose_section(sec);
++        }
+ 
+         Ok(r#"{"ok":true}"#.to_string())
+     }

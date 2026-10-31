@@ -265,7 +265,7 @@ impl DocumentSubscriptions {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Ok(()),
-                _ = transport_end.cancelled() => return Ok(()),
+                    _ = transport_end.cancelled() => return Ok(()),
                     sent = sink.notify_resource_updated(uri.clone()) => {
                         if sent.is_err() { return Ok(()); }
                     }

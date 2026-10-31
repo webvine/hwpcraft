@@ -1,0 +1,30 @@
+diff --git a/src/document_core/commands/text_editing.rs b/src/document_core/commands/text_editing.rs
+index 5474174..139c0c4 100644
+--- a/src/document_core/commands/text_editing.rs
++++ b/src/document_core/commands/text_editing.rs
+@@ -1556,6 +1556,12 @@ impl DocumentCore {
+                 self.recompose_paragraph(section_idx, para_idx);
+                 self.paginate_if_needed();
+             }
++            // [0033] The Picture band is checked on the paragraph before the edit.
++            // A side-flow host that only now holds enough text to reach its
++            // object's bottom (e.g. a long run typed in one go beside a floating
++            // picture) re-projects its band on the edited text; a host that
++            // cannot form a band leaves the scalar rows as they are.
++            let _ = self.apply_body_edit_through_picture_band(section_idx, para_idx, |_| {});
+         }
+ 
+         let new_offset = char_offset + new_chars_count;
+@@ -1681,6 +1687,12 @@ impl DocumentCore {
+                 self.recompose_paragraph(section_idx, para_idx);
+                 self.paginate_if_needed();
+             }
++            // [0033] The Picture band is checked on the paragraph before the edit.
++            // A side-flow host that only now holds enough text to reach its
++            // object's bottom (e.g. a long run typed in one go beside a floating
++            // picture) re-projects its band on the edited text; a host that
++            // cannot form a band leaves the scalar rows as they are.
++            let _ = self.apply_body_edit_through_picture_band(section_idx, para_idx, |_| {});
+         }
+ 
+         // 캐럿 위치 갱신 (DocProperties)

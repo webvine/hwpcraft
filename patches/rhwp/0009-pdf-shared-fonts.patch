@@ -1,0 +1,556 @@
+diff --git a/vendor/svg2pdf/src/lib.rs b/vendor/svg2pdf/src/lib.rs
+index 0b6723775..b8d90ad82 100644
+--- a/vendor/svg2pdf/src/lib.rs
++++ b/vendor/svg2pdf/src/lib.rs
+@@ -367,3 +367,93 @@ pub fn to_chunk(
+     ctx.write_global_objects(&mut chunk)?;
+     Ok((chunk, x_ref))
+ }
++
++/// rhwp: references at or above this number belong to the chunk written by
++/// [`SharedFonts::write`]; a chunk from [`to_chunk_with_shared_fonts`] refers to
++/// them and allocates its own objects below it. A merger must map these
++/// references the same way in every chunk.
++#[cfg(feature = "text")]
++pub const SHARED_FONT_REF_START: i32 = 1 << 30;
++
++/// rhwp: fonts subset once for several trees (the pages of one document) instead
++/// of once per tree. Glyphs are added tree by tree in the order `to_chunk` would
++/// meet them, so the result does not depend on how the trees were produced.
++#[cfg(feature = "text")]
++pub struct SharedFonts {
++    fonts: std::collections::HashMap<usvg::fontdb::ID, Option<render::text::Font>>,
++    allocator: util::allocate::RefAllocator,
++}
++
++#[cfg(feature = "text")]
++impl Default for SharedFonts {
++    fn default() -> Self {
++        Self {
++            fonts: Default::default(),
++            allocator: util::allocate::RefAllocator::starting_at(SHARED_FONT_REF_START),
++        }
++    }
++}
++
++#[cfg(feature = "text")]
++impl SharedFonts {
++    /// The glyphs `tree` draws: (font, glyph id, text), in drawing order. Cheap to
++    /// keep for many trees; reads no font data.
++    pub fn glyph_usage(tree: &Tree) -> Vec<(usvg::fontdb::ID, u16, String)> {
++        let mut out = Vec::new();
++        render::text::glyph_usage(tree.root(), &mut out);
++        out
++    }
++
++    /// Add one tree's glyphs (from [`SharedFonts::glyph_usage`]) after those of
++    /// the trees added before.
++    pub fn add(
++        &mut self,
++        fontdb: &usvg::fontdb::Database,
++        usage: Vec<(usvg::fontdb::ID, u16, String)>,
++    ) {
++        for glyph in usage {
++            render::text::add_glyph(&mut self.fonts, &mut self.allocator, fontdb, glyph);
++        }
++    }
++
++    /// Whether every glyph of `tree` is in these fonts.
++    pub fn covers(&self, tree: &Tree) -> bool {
++        Self::glyph_usage(tree).iter().all(|(id, glyph, _)| match self.fonts.get(id) {
++            Some(Some(font)) => font.glyph_remapper.get(*glyph).is_some(),
++            // A font that could not be read is skipped, as `to_chunk` does.
++            Some(None) => true,
++            None => false,
++        })
++    }
++
++    /// Write every font once (subset to the glyphs of all trees). Its references
++    /// start at [`SHARED_FONT_REF_START`].
++    pub fn write(&mut self) -> Result<Chunk> {
++        let mut chunk = Chunk::new();
++        let mut fonts: Vec<_> = self.fonts.values_mut().flatten().collect();
++        fonts.sort_by_key(|font| font.reference);
++        for font in fonts {
++            render::text::write_font(&mut chunk, &mut self.allocator, font)?;
++        }
++        Ok(chunk)
++    }
++}
++
++/// rhwp: like [`to_chunk`], but text refers to `fonts`, which the caller writes
++/// once with [`SharedFonts::write`]. Fails with `MissingGlyphs` when a glyph of
++/// `tree` was not added to `fonts`.
++#[cfg(feature = "text")]
++pub fn to_chunk_with_shared_fonts(
++    tree: &Tree,
++    conversion_options: ConversionOptions,
++    fonts: &SharedFonts,
++) -> Result<(Chunk, Ref)> {
++    if !fonts.covers(tree) {
++        return Err(ConversionError::MissingGlyphs);
++    }
++    let mut chunk = Chunk::new();
++    let mut ctx = Context::with_shared_fonts(conversion_options, fonts.fonts.clone());
++    let x_ref = tree_to_xobject(tree, &mut chunk, &mut ctx)?;
++    ctx.write_global_objects(&mut chunk)?;
++    Ok((chunk, x_ref))
++}
+diff --git a/vendor/svg2pdf/src/render/text.rs b/vendor/svg2pdf/src/render/text.rs
+index 66cd7dd72..5bb5f2064 100644
+--- a/vendor/svg2pdf/src/render/text.rs
++++ b/vendor/svg2pdf/src/render/text.rs
+@@ -211,6 +211,60 @@ fn subset_font(
+     Ok(deflate(data))
+ }
+ 
++/// rhwp: every glyph a group draws, in the order `fill_fonts` would meet them:
++/// (font, glyph id, text). Font data is not read.
++pub fn glyph_usage(group: &Group, out: &mut Vec<(fontdb::ID, u16, String)>) {
++    for child in group.children() {
++        match child {
++            Node::Text(t) => {
++                for span in t.layouted() {
++                    for g in &span.positioned_glyphs {
++                        out.push((g.font, g.id.0, g.text.clone()));
++                    }
++                }
++            }
++            Node::Group(group) => glyph_usage(group, out),
++            Node::Image(image) => {
++                if let ImageKind::SVG(svg) = image.kind() {
++                    glyph_usage(svg.root(), out);
++                }
++            }
++            _ => {}
++        }
++        child.subroots(|subroot| glyph_usage(subroot, out));
++    }
++}
++
++/// rhwp: add one glyph to `fonts` exactly as `fill_fonts` does, allocating the
++/// font's reference from `allocator` the first time the font is seen.
++pub fn add_glyph(
++    fonts: &mut HashMap<fontdb::ID, Option<Font>>,
++    allocator: &mut RefAllocator,
++    fontdb: &fontdb::Database,
++    (id, glyph, text): (fontdb::ID, u16, String),
++) {
++    let font = fonts.entry(id).or_insert_with(|| {
++        fontdb
++            .with_face_data(id, |data, face_index| {
++                let ttf = ttf_parser::Face::parse(data, face_index).ok()?;
++                Some(Font {
++                    id,
++                    reference: allocator.alloc_ref(),
++                    face_data: Arc::new(Vec::from(data)),
++                    units_per_em: ttf.units_per_em(),
++                    glyph_set: BTreeMap::new(),
++                    glyph_remapper: GlyphRemapper::new(),
++                    face_index,
++                })
++            })
++            .flatten()
++    });
++    if let Some(font) = font {
++        font.glyph_set.insert(glyph, text);
++        font.glyph_remapper.remap(glyph);
++    }
++}
++
+ /// Render some text into a content stream.
+ pub fn render(
+     text: &usvg::Text,
+@@ -222,9 +276,6 @@ pub fn render(
+ ) -> Result<()> {
+     let mut font_names = HashMap::new();
+ 
+-    // TODO: Don't clone here...
+-    let fonts = ctx.fonts.clone();
+-
+     for span in text.layouted() {
+         for glyph in &span.positioned_glyphs {
+             let Some(font) = ctx.font_ref(glyph.font) else { continue };
+@@ -239,22 +290,35 @@ pub fn render(
+             continue;
+         }
+ 
++        // rhwp: look each glyph's font and CID up once instead of cloning every
++        // font (glyph set and remapper) for each text element; with fonts shared
++        // by a whole document those are large.
++        // TODO: Remove unwraps and switch to error-based handling.
++        // NOTE(laurmaedje): If it can't happen, I think a panic is
++        // better. There is no way to handle it as a consumer of
++        // svg2pdf.
++        let glyph_fonts: Vec<Option<(Ref, u16, u16)>> = span
++            .positioned_glyphs
++            .iter()
++            .map(|glyph| {
++                ctx.font_ref(glyph.font).map(|font| {
++                    let cid = font.glyph_remapper.get(glyph.id.0).unwrap();
++                    (font.reference, cid, font.units_per_em)
++                })
++            })
++            .collect();
++
+         let operation = |content: &mut Content| -> Result<()> {
+-            for glyph in &span.positioned_glyphs {
+-                let Some(font) = fonts.get(&glyph.font).and_then(|f| f.as_ref()) else {
++            for (glyph, font) in span.positioned_glyphs.iter().zip(&glyph_fonts) {
++                let Some((reference, cid, units_per_em)) = *font else {
+                     continue;
+                 };
+ 
+-                let name = font_names.get(&font.reference).unwrap();
++                let name = font_names.get(&reference).unwrap();
+ 
+-                // TODO: Remove unwraps and switch to error-based handling.
+-                // NOTE(laurmaedje): If it can't happen, I think a panic is
+-                // better. There is no way to handle it as a consumer of
+-                // svg2pdf.
+-                let cid = font.glyph_remapper.get(glyph.id.0).unwrap();
+                 let ts = glyph
+                     .outline_transform()
+-                    .pre_scale(font.units_per_em as f32, font.units_per_em as f32)
++                    .pre_scale(units_per_em as f32, units_per_em as f32)
+                     // The glyphs in usvg are already scaled according the font size, but
+                     // we want to leverage the native PDF font size feature instead, so we downscale
+                     // it to a font size of 1.
+diff --git a/vendor/svg2pdf/src/util/allocate.rs b/vendor/svg2pdf/src/util/allocate.rs
+index 033fcbe9e..3bc8b8627 100644
+--- a/vendor/svg2pdf/src/util/allocate.rs
++++ b/vendor/svg2pdf/src/util/allocate.rs
+@@ -13,6 +13,12 @@ impl RefAllocator {
+         Self { ref_alloc: Ref::new(1) }
+     }
+ 
++    /// rhwp: an allocator starting at `start`, for objects kept apart from the
++    /// per-tree chunks (see [`crate::SHARED_FONT_REF_START`]).
++    pub fn starting_at(start: i32) -> Self {
++        Self { ref_alloc: Ref::new(start) }
++    }
++
+     /// Allocate a new reference ID.
+     pub fn alloc_ref(&mut self) -> Ref {
+         self.ref_alloc.bump()
+diff --git a/vendor/svg2pdf/src/util/context.rs b/vendor/svg2pdf/src/util/context.rs
+index 9c29ff785..355cf6d21 100644
+--- a/vendor/svg2pdf/src/util/context.rs
++++ b/vendor/svg2pdf/src/util/context.rs
+@@ -24,6 +24,9 @@ pub struct Context {
+     srgb_ref: Option<Ref>,
+     sgray_ref: Option<Ref>,
+     pub ref_allocator: RefAllocator,
++    /// rhwp: the fonts belong to a [`crate::SharedFonts`] written once for many
++    /// trees, so this tree's chunk only refers to them.
++    shared_fonts: bool,
+ }
+ 
+ impl Context {
+@@ -39,6 +42,7 @@ impl Context {
+             fonts: HashMap::new(),
+             srgb_ref: None,
+             sgray_ref: None,
++            shared_fonts: false,
+         };
+ 
+         #[cfg(feature = "text")]
+@@ -49,6 +53,23 @@ impl Context {
+         Ok(ctx)
+     }
+ 
++    /// rhwp: a context whose fonts were collected for many trees and are written
++    /// once by their owner; `write_global_objects` does not write them.
++    #[cfg(feature = "text")]
++    pub fn with_shared_fonts(
++        options: ConversionOptions,
++        fonts: HashMap<ID, Option<Font>>,
++    ) -> Self {
++        Self {
++            ref_allocator: RefAllocator::new(),
++            options,
++            fonts,
++            srgb_ref: None,
++            sgray_ref: None,
++            shared_fonts: true,
++        }
++    }
++
+     /// Allocate a new reference.
+     pub fn alloc_ref(&mut self) -> Ref {
+         self.ref_allocator.alloc_ref()
+@@ -75,7 +96,7 @@ impl Context {
+ 
+     pub fn write_global_objects(&mut self, pdf: &mut Chunk) -> Result<()> {
+         #[cfg(feature = "text")]
+-        {
++        if !self.shared_fonts {
+             let allocator = &mut self.ref_allocator;
+ 
+             // Sort fonts by their object reference (assigned deterministically
+diff --git a/src/renderer/pdf.rs b/src/renderer/pdf.rs
+--- a/src/renderer/pdf.rs
++++ b/src/renderer/pdf.rs
+@@ -1253,13 +1253,154 @@ pub fn svgs_to_pdf_with_links(
+     options: &PdfExportOptions,
+ ) -> Result<Vec<u8>, String> {
+     let threads = pdf_page_threads(svg_pages.len());
++    if options.embed_text {
++        check_pdf_pages(svg_pages, links)?;
++        let usvg_options = pdf_usvg_options(options);
++        if let Some((page_datas, fonts)) =
++            convert_pages_with_shared_fonts(svg_pages, options, &usvg_options, threads)
++        {
++            return assemble_pdf(page_datas, links, Some(fonts));
++        }
++    }
+     if threads <= 1 {
+         return svgs_to_pdf_with_links_and_to_chunk(svg_pages, links, options, svg2pdf_to_chunk);
+     }
+     check_pdf_pages(svg_pages, links)?;
+     let usvg_options = pdf_usvg_options(options);
+     let page_datas = convert_pages_parallel(svg_pages, options, &usvg_options, threads)?;
+-    assemble_pdf(page_datas, links)
++    assemble_pdf(page_datas, links, None)
++}
++
++/// HwpCraft patch: subset each font once for the whole document.
++///
++/// `to_chunk` subsets every font per page, so a 381-page document carried 1,411
++/// subsets of the same few fonts (12.4 MB of a 24 MB file). Here every page is
++/// parsed once to list the glyphs it draws, the lists are added in page order
++/// (the same order a sequential `to_chunk` would meet them, whatever the thread
++/// count), the pages are converted against those fonts, and the fonts are written
++/// once. Any failure returns `None` and the caller uses the per-page path, which
++/// reports and isolates page errors as before. Documents of up to
++/// `SHARED_FONT_KEEP_TREES` pages keep their first parse instead of parsing again.
++#[cfg(not(target_arch = "wasm32"))]
++fn convert_pages_with_shared_fonts(
++    svg_pages: &[String],
++    export_options: &PdfExportOptions,
++    options: &usvg::Options<'_>,
++    threads: usize,
++) -> Option<(Vec<PdfPageData>, pdf_writer::Chunk)> {
++    let keep = svg_pages.len() <= SHARED_FONT_KEEP_TREES;
++    let first = map_pages_parallel(svg_pages.len(), threads, |page_index| {
++        let mut warnings = Vec::new();
++        let tree = pdf_page_tree(
++            page_index,
++            &svg_pages[page_index],
++            export_options,
++            options,
++            &mut warnings,
++        )
++        .ok()?;
++        let usage = svg2pdf::SharedFonts::glyph_usage(&tree);
++        Some((usage, keep.then_some((tree, warnings))))
++    })?;
++    let mut fonts = svg2pdf::SharedFonts::default();
++    let mut kept = Vec::with_capacity(if keep { svg_pages.len() } else { 0 });
++    for (usage, tree) in first {
++        fonts.add(&options.fontdb, usage);
++        kept.push(std::sync::Mutex::new(tree));
++    }
++    let pages = map_pages_parallel(svg_pages.len(), threads, |page_index| {
++        let parsed = kept
++            .get(page_index)
++            .and_then(|slot| slot.lock().ok().and_then(|mut tree| tree.take()));
++        let (tree, warnings) = match parsed {
++            Some(parsed) => parsed,
++            None => {
++                let mut warnings = Vec::new();
++                let tree = pdf_page_tree(
++                    page_index,
++                    &svg_pages[page_index],
++                    export_options,
++                    options,
++                    &mut warnings,
++                )
++                .ok()?;
++                (tree, warnings)
++            }
++        };
++        let mut conversion = svg2pdf::ConversionOptions::default();
++        conversion.embed_text = true;
++        let (chunk, svg_ref) =
++            svg2pdf::to_chunk_with_shared_fonts(&tree, conversion, &fonts).ok()?;
++        let dpi_ratio = 72.0 / 96.0; // 96 DPI → 72 pt
++        Some((
++            PdfPageData {
++                chunk,
++                svg_ref,
++                width: tree.size().width() * dpi_ratio,
++                height: tree.size().height() * dpi_ratio,
++                source_index: page_index,
++            },
++            warnings,
++        ))
++    })?;
++    let fonts_chunk = fonts.write().ok()?;
++    let mut page_datas = Vec::with_capacity(pages.len());
++    for (page, warnings) in pages {
++        for warning in warnings {
++            eprintln!("{warning}");
++        }
++        page_datas.push(page);
++    }
++    Some((page_datas, fonts_chunk))
++}
++
++/// Pages whose parsed trees are kept between the two passes of
++/// `convert_pages_with_shared_fonts`; longer documents parse every page twice so
++/// that only `threads` trees are alive at a time.
++#[cfg(not(target_arch = "wasm32"))]
++const SHARED_FONT_KEEP_TREES: usize = 64;
++
++/// Run `f` for every page on up to `threads` threads; results in page order, or
++/// `None` as soon as one page gives `None`.
++#[cfg(not(target_arch = "wasm32"))]
++fn map_pages_parallel<T: Send>(
++    pages: usize,
++    threads: usize,
++    f: impl Fn(usize) -> Option<T> + Sync,
++) -> Option<Vec<T>> {
++    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++    let next = AtomicUsize::new(0);
++    let failed = AtomicBool::new(false);
++    let slots: Vec<std::sync::Mutex<Option<T>>> =
++        (0..pages).map(|_| std::sync::Mutex::new(None)).collect();
++    std::thread::scope(|scope| {
++        for _ in 0..threads.max(1) {
++            scope.spawn(|| loop {
++                if failed.load(Ordering::Acquire) {
++                    break;
++                }
++                let page_index = next.fetch_add(1, Ordering::AcqRel);
++                if page_index >= pages {
++                    break;
++                }
++                match f(page_index) {
++                    Some(value) => {
++                        if let Ok(mut slot) = slots[page_index].lock() {
++                            *slot = Some(value);
++                        }
++                    }
++                    None => failed.store(true, Ordering::Release),
++                }
++            });
++        }
++    });
++    if failed.load(Ordering::Acquire) {
++        return None;
++    }
++    slots
++        .into_iter()
++        .map(|slot| slot.into_inner().ok().flatten())
++        .collect()
+ }
+ 
+ /// 쪽 변환 스레드 수: `RHWP_PDF_THREADS`(1 이상), 없으면 min(코어 수, 8), 쪽 수 이하.
+@@ -1384,7 +1525,7 @@ where
+             page_datas.push(page);
+         }
+     }
+-    assemble_pdf(page_datas, links)
++    assemble_pdf(page_datas, links, None)
+ }
+ 
+ #[cfg(not(target_arch = "wasm32"))]
+@@ -1442,20 +1583,7 @@ where
+         bool,
+     ) -> Result<(pdf_writer::Chunk, pdf_writer::Ref), svg2pdf::ConversionError>,
+ {
+-    let svg_with_fallback = apply_pdf_font_options(svg, export_options);
+-    let (svg_with_bold, bold_report) = prepare_svg_with_synthetic_bold(&svg_with_fallback, options)?;
+-    if bold_report.unsupported_texts > 0 {
+-        warnings.push(format!("경고: PDF {}페이지의 굵게 text {}개는 혼합 글꼴/복잡한 paint로 합성하지 못했습니다.", page_index + 1, bold_report.unsupported_texts));
+-    }
+-    let (tree, italic_report) = parse_svg_with_synthetic_italic(&svg_with_bold, options)
+-        .map_err(|e| format!("SVG 파싱 실패: {}", e))?;
+-    if italic_report.unsupported_texts > 0 {
+-        warnings.push(format!(
+-            "경고: PDF {}페이지의 기울임 text {}개는 혼합 글꼴/복잡한 배치로 합성하지 못했습니다.",
+-            page_index + 1,
+-            italic_report.unsupported_texts,
+-        ));
+-    }
++    let tree = pdf_page_tree(page_index, svg, export_options, options, warnings)?;
+ 
+     // [Task #2264] 텍스트 임베드(폰트 서브셋)가 PDF 변환 메모리의 지배항이다.
+     // `embed_text=false` 면 글리프를 path 로 변환해 서브셋 경로를 통째로 건너뛴다.
+@@ -1481,11 +1609,38 @@ where
+     }))
+ }
+ 
++/// 쪽 SVG 하나를 PDF 변환용 usvg 트리로 읽는다(글꼴 대체·합성 굵게/기울임 포함).
++#[cfg(not(target_arch = "wasm32"))]
++fn pdf_page_tree(
++    page_index: usize,
++    svg: &str,
++    export_options: &PdfExportOptions,
++    options: &usvg::Options<'_>,
++    warnings: &mut Vec<String>,
++) -> Result<usvg::Tree, String> {
++    let svg_with_fallback = apply_pdf_font_options(svg, export_options);
++    let (svg_with_bold, bold_report) = prepare_svg_with_synthetic_bold(&svg_with_fallback, options)?;
++    if bold_report.unsupported_texts > 0 {
++        warnings.push(format!("경고: PDF {}페이지의 굵게 text {}개는 혼합 글꼴/복잡한 paint로 합성하지 못했습니다.", page_index + 1, bold_report.unsupported_texts));
++    }
++    let (tree, italic_report) = parse_svg_with_synthetic_italic(&svg_with_bold, options)
++        .map_err(|e| format!("SVG 파싱 실패: {}", e))?;
++    if italic_report.unsupported_texts > 0 {
++        warnings.push(format!(
++            "경고: PDF {}페이지의 기울임 text {}개는 혼합 글꼴/복잡한 배치로 합성하지 못했습니다.",
++            page_index + 1,
++            italic_report.unsupported_texts,
++        ));
++    }
++    Ok(tree)
++}
++
+ /// 변환된 쪽들을 쪽 순서대로 재번호해 한 PDF 로 묶는다.
+ #[cfg(not(target_arch = "wasm32"))]
+ fn assemble_pdf(
+     page_datas: Vec<PdfPageData>,
+     links: &[Vec<super::hyperlinks::PdfLink>],
++    shared_fonts: Option<pdf_writer::Chunk>,
+ ) -> Result<Vec<u8>, String> {
+     use pdf_writer::{Finish, Pdf, Ref};
+     use std::collections::HashMap;
+@@ -1502,6 +1657,8 @@ fn assemble_pdf(
+     let mut page_refs: Vec<Ref> = Vec::new();
+     let mut renumbered_chunks: Vec<pdf_writer::Chunk> = Vec::new();
+     let mut svg_refs_remapped: Vec<Ref> = Vec::new();
++    // Shared font objects keep one number across every chunk that refers to them.
++    let mut shared = HashMap::new();
+ 
+     for pd in &page_datas {
+         let page_ref = alloc.bump();
+@@ -1510,9 +1667,14 @@ fn assemble_pdf(
+ 
+         // chunk 재번호화
+         let mut map = HashMap::new();
+-        let renumbered = pd
+-            .chunk
+-            .renumber(|old| *map.entry(old).or_insert_with(|| alloc.bump()));
++        let renumbered = pd.chunk.renumber(|old| {
++            let refs = if old.get() >= svg2pdf::SHARED_FONT_REF_START {
++                &mut shared
++            } else {
++                &mut map
++            };
++            *refs.entry(old).or_insert_with(|| alloc.bump())
++        });
+ 
+         let remapped_svg_ref = map.get(&pd.svg_ref).copied().unwrap_or(pd.svg_ref);
+         svg_refs_remapped.push(remapped_svg_ref);
+@@ -1584,6 +1746,9 @@ fn assemble_pdf(
+     for chunk in &renumbered_chunks {
+         pdf.extend(chunk);
+     }
++    if let Some(fonts) = &shared_fonts {
++        pdf.extend(&fonts.renumber(|old| *shared.entry(old).or_insert_with(|| alloc.bump())));
++    }
+ 
+     // 문서 정보
+     let info_ref = alloc.bump();

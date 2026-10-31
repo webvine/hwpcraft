@@ -24,6 +24,8 @@ mod icons;
 #[cfg(test)]
 mod input_format_tests;
 mod margin_guides;
+mod mcp_bridge;
+mod nested_edit;
 mod object_dialogs;
 mod page_setup;
 mod pdf_export;
@@ -33,6 +35,7 @@ mod review_dialogs;
 mod ribbon;
 mod ribbon_layout;
 mod rulers;
+mod split_view;
 mod symbol_dialog;
 mod table_drawing;
 mod wheel_zoom;
@@ -117,6 +120,11 @@ pub struct HwpApp {
     /// Page the scroll view last showed; a different `page` means "scroll there".
     shown_page: u32,
     scroll_to_caret: bool,
+    /// 편집 화면 나누기 (None: one view).
+    split: Option<split_view::Split>,
+    /// Pane being drawn (0 when not split) and whether it takes input.
+    pane: usize,
+    pane_active: bool,
     /// Screen rectangle of the top visible page, for rulers and overlays.
     view_page_rect: Option<Rect>,
 }
@@ -340,6 +348,9 @@ impl HwpApp {
             page_sizes: (u64::MAX, Vec::new()),
             shown_page: 0,
             scroll_to_caret: false,
+            split: None,
+            pane: 0,
+            pane_active: true,
             view_page_rect: None,
         })
     }
@@ -353,12 +364,18 @@ impl HwpApp {
         }
     }
     fn command(&mut self, command: Command) {
+        if self.nested_command(&command).is_some() {
+            return;
+        }
         let r = self.session.execute(command);
         self.result(r);
         self.sync_formatting();
         self.follow_cursor();
     }
     fn run(&mut self, id: &str, params: serde_json::Value) -> bool {
+        if let Some(success) = self.nested_run(id, &params) {
+            return success;
+        }
         let result = self.session.run(id, params);
         let success = self.result(result).is_some();
         self.sync_formatting();
@@ -467,6 +484,7 @@ impl HwpApp {
                 dialog
                     .add_filter("한글 표준 문서 (HWPX)", &["hwpx"])
                     .add_filter("한글 문서 (HWP)", &["hwp"])
+                    .add_filter("Word 문서 (DOCX)", &["docx"])
             };
             dialog.save_file()
         });
@@ -482,6 +500,17 @@ impl HwpApp {
         {
             // Conversion takes minutes on long documents; keep the window live.
             return self.start_pdf_export(path);
+        }
+        // A document with Hangul track changes asks first (the records cannot be kept).
+        if self.confirm_tracked_save(&path) {
+            return false;
+        }
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("docx"))
+        {
+            // An export, like PDF: the document keeps its own file and saved state.
+            return self.export_docx(&path, false);
         }
         let r = self.session.save(&path);
         if self.result(r).is_some() {
@@ -615,21 +644,22 @@ impl HwpApp {
                     return Vec::new();
                 }
             };
-            let sizes = (0..count)
+            // Each page's size, and its body band for 쪽 윤곽 off.
+            let (sizes, bodies) = (0..count)
                 .map(|i| {
-                    self.session
-                        .page_info(i)
-                        .ok()
-                        .and_then(|v| {
-                            Some(Vec2::new(
-                                v["width"].as_f64()? as f32,
-                                v["height"].as_f64()? as f32,
-                            ))
-                        })
-                        .unwrap_or(Vec2::new(794.0, 1123.0))
+                    let info = self.session.page_info(i).ok();
+                    let num = |k: &str| info.as_ref().and_then(|v| v[k].as_f64()).map(|x| x as f32);
+                    let size = num("width")
+                        .zip(num("height"))
+                        .map_or(Vec2::new(794.0, 1123.0), |(w, h)| Vec2::new(w, h));
+                    let edge = |a: &str, b: &str| num(a).unwrap_or(0.0) + num(b).unwrap_or(0.0);
+                    let top = edge("marginTop", "marginHeader").min(size.y);
+                    let bottom = (size.y - edge("marginBottom", "marginFooter")).max(top);
+                    (size, (top, bottom))
                 })
-                .collect();
+                .unzip();
             self.page_sizes = (self.session.generation, sizes);
+            self.ext.shell.page_bodies = bodies;
         }
         self.page_sizes.1.clone()
     }
@@ -670,12 +700,15 @@ impl HwpApp {
                 }
                 let output = scroll.show(ui, |ui| {
                     // Focus target shared by all pages; keeps Tab/arrows for editing.
+                    // Only the active pane of a split view registers it.
                     let canvas = egui::Id::new("document-canvas");
-                    ui.interact(
-                        ui.clip_rect(),
-                        canvas,
-                        egui::Sense::focusable_noninteractive(),
-                    );
+                    if self.pane_active {
+                        ui.interact(
+                            ui.clip_rect(),
+                            canvas,
+                            egui::Sense::focusable_noninteractive(),
+                        );
+                    }
                     ctx.memory_mut(|m| {
                         m.set_focus_lock_filter(
                             canvas,
@@ -689,7 +722,13 @@ impl HwpApp {
                     });
                     // About 15 px between the ruler and the first page.
                     ui.add_space(15.0);
-                    let caret = self.session.caret().ok();
+                    // A caret in a nested table cell or text box draws from its own rectangle.
+                    self.session.revalidate_nested();
+                    let caret = if self.session.nested_caret().is_some() {
+                        self.session.nested_caret_rect().ok()
+                    } else {
+                        self.session.caret().ok()
+                    };
                     let mut top_page = None;
                     // 맞쪽 보기 (Hangul's facing pages): page 1 alone on the right, then
                     // even/odd pairs side by side; otherwise one page per row.
@@ -706,9 +745,26 @@ impl HwpApp {
                         }
                         rows.push(vec![index]);
                     }
+                    // 쪽 윤곽 off: each page shows only its body band, pages touching.
+                    let outline = self.ext.shell.page_outline;
+                    if !outline {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                    }
+                    let band = |app: &Self, index: u32| {
+                        let size = sizes[index as usize];
+                        match app.ext.shell.page_bodies.get(index as usize) {
+                            Some(&(top, bottom)) if !outline => (top, bottom),
+                            _ => (0.0, size.y),
+                        }
+                    };
                     for row in rows {
-                        let page_sizes: Vec<egui::Vec2> =
-                            row.iter().map(|i| sizes[*i as usize] * self.zoom).collect();
+                        let page_sizes: Vec<egui::Vec2> = row
+                            .iter()
+                            .map(|i| {
+                                let (top, bottom) = band(self, *i);
+                                Vec2::new(sizes[*i as usize].x, bottom - top) * self.zoom
+                            })
+                            .collect();
                         let total_width = page_sizes.iter().map(|s| s.x).sum::<f32>()
                             + PAGE_GAP * (row.len() as f32 - 1.0);
                         // A lone first page in facing view sits where the right page goes.
@@ -724,11 +780,18 @@ impl HwpApp {
                                     ui.add_space(PAGE_GAP);
                                 }
                                 let size = page_sizes[n];
-                                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                                let (shown, _) = ui.allocate_exact_size(size, egui::Sense::hover());
                                 if jump == Some(index) {
-                                    ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                                    ui.scroll_to_rect(shown, Some(egui::Align::TOP));
                                 }
-                                let visible = ui.is_rect_visible(rect);
+                                // The whole page, placed so its body band lands on `shown`;
+                                // with 쪽 윤곽 on the two are the same.
+                                let top = band(self, index).0 * self.zoom;
+                                let rect = Rect::from_min_size(
+                                    shown.min - Vec2::new(0.0, top),
+                                    sizes[index as usize] * self.zoom,
+                                );
+                                let visible = ui.is_rect_visible(shown);
                                 if visible {
                                     self.wheel_zoom.pages.push((index, rect));
                                 }
@@ -736,11 +799,42 @@ impl HwpApp {
                                     top_page = Some((index, rect));
                                 }
                                 if visible || jump == Some(index) {
-                                    self.page_canvas(ui, &ctx, index, rect, caret.as_ref(), follow);
+                                    if outline {
+                                        self.page_canvas(
+                                            ui,
+                                            &ctx,
+                                            index,
+                                            rect,
+                                            caret.as_ref(),
+                                            follow,
+                                        );
+                                    } else {
+                                        let clip = shown.intersect(ui.clip_rect());
+                                        let mut band_ui =
+                                            ui.new_child(egui::UiBuilder::new().max_rect(shown));
+                                        band_ui.set_clip_rect(clip);
+                                        self.page_canvas(
+                                            &mut band_ui,
+                                            &ctx,
+                                            index,
+                                            rect,
+                                            caret.as_ref(),
+                                            follow,
+                                        );
+                                        if index + 1 < count {
+                                            dotted_line(
+                                                ui,
+                                                shown.left_bottom(),
+                                                shown.right_bottom(),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         });
-                        ui.add_space(PAGE_GAP);
+                        if outline {
+                            ui.add_space(PAGE_GAP);
+                        }
                     }
                     if let Some((index, rect)) = top_page {
                         // Fixed rulers outside the scroll view read this rectangle.
@@ -765,13 +859,15 @@ impl HwpApp {
         follow: bool,
     ) {
         ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
-        ui.painter().rect_stroke(
-            rect.expand(1.0),
-            0.0,
-            // Page frame: #ababab 1 px border, no shadow.
-            Stroke::new(1.0, Color32::from_gray(0xab)),
-            egui::StrokeKind::Outside,
-        );
+        if self.ext.shell.page_outline {
+            ui.painter().rect_stroke(
+                rect.expand(1.0),
+                0.0,
+                // Page frame: #ababab 1 px border, no shadow.
+                Stroke::new(1.0, Color32::from_gray(0xab)),
+                egui::StrokeKind::Outside,
+            );
+        }
         match self.page_texture(ctx, page) {
             Ok(texture) => {
                 ui.painter().image(
@@ -794,7 +890,7 @@ impl HwpApp {
         self.paint_margin_corners(ui, page, rect);
         let response = ui.interact(
             rect,
-            egui::Id::new(("document-page", page)),
+            egui::Id::new(("document-page", self.pane, page)),
             egui::Sense::click_and_drag(),
         );
         // One shared focus target keeps keyboard and IME routing independent of the page.
@@ -811,6 +907,22 @@ impl HwpApp {
                 Color32::from_rgba_unmultiplied(66, 133, 244, 65),
             );
         }
+        if self.session.nested_caret().is_some() {
+            for r in self.session.nested_selection_rects().unwrap_or_default() {
+                if r["pageIndex"].as_u64() != Some(u64::from(page)) {
+                    continue;
+                }
+                let n = |k: &str| r[k].as_f64().unwrap_or(0.0) as f32 * self.zoom;
+                ui.painter().rect_filled(
+                    Rect::from_min_size(
+                        rect.min + Vec2::new(n("x"), n("y")),
+                        Vec2::new(n("width"), n("height")),
+                    ),
+                    0.0,
+                    Color32::from_rgba_unmultiplied(66, 133, 244, 65),
+                );
+            }
+        }
         // Module canvas modes (e.g. table cell blocks) may take over pointer input.
         if !self.ext_canvas(page, &response, rect) {
             let hit = |s: &Self, p: Pos2| {
@@ -820,17 +932,35 @@ impl HwpApp {
             if (response.clicked() || response.dragged())
                 && let Some(p) = response.interact_pointer_pos()
             {
-                let r = hit(self, p);
-                if let Some(c) = self.result(r) {
-                    let r = self
-                        .session
-                        .select(c, response.dragged() || ctx.input(|i| i.modifiers.shift));
-                    self.result(r);
-                    self.page = page;
-                    self.shown_page = page;
+                let extend = response.dragged() || ctx.input(|i| i.modifiers.shift);
+                let pos = (p - rect.min) / self.zoom;
+                match hit(self, p) {
+                    Ok(c) if !(response.dragged() && self.session.nested_caret().is_some()) => {
+                        self.session.clear_nested();
+                        let r = self.session.select(c, extend);
+                        self.result(r);
+                        self.page = page;
+                        self.shown_page = page;
+                    }
+                    Ok(_) => {}
+                    // The body caret cannot stand in a nested cell or a text box.
+                    Err(e) => {
+                        let from_body = response.dragged() && self.session.nested_caret().is_none();
+                        if !from_body && self.nested_click(page, pos.x as f64, pos.y as f64, extend)
+                        {
+                            self.page = page;
+                            self.shown_page = page;
+                        } else if !response.dragged() {
+                            self.result(Err::<(), _>(e));
+                        }
+                    }
                 }
             }
-            if response.triple_clicked() {
+            if self.session.nested_caret().is_some() {
+                if response.triple_clicked() || response.double_clicked() {
+                    self.nested_multi_click(response.triple_clicked());
+                }
+            } else if response.triple_clicked() {
                 self.session.select_paragraph();
             } else if response.double_clicked() {
                 let r = self.session.select_word();
@@ -904,7 +1034,7 @@ impl HwpApp {
         }
     }
     fn keyboard(&mut self, ctx: &egui::Context) {
-        if self.pending.is_some()
+        let modal = self.pending.is_some()
             || self.error.is_some()
             || self.show_help
             || self.page_setup.is_some()
@@ -914,13 +1044,45 @@ impl HwpApp {
             || self.feature_dialog.is_some()
             || self.password_prompt.is_some()
             || self.symbol_dialog_open()
-            || self.ext_modal_open()
-        {
+            || self.ext_modal_open();
+        // A modal dialog takes the keyboard from the page (so Tab walks its own controls)
+        // and gives it back when it closes, so typing goes on without a click.
+        let canvas = egui::Id::new("document-canvas");
+        let was_open = std::mem::replace(&mut self.ext.shell.modal_was_open, modal);
+        if modal {
+            ctx.memory_mut(|m| {
+                if m.has_focus(canvas) {
+                    m.surrender_focus(canvas);
+                }
+            });
             return;
+        }
+        if was_open {
+            ctx.memory_mut(|m| m.request_focus(canvas));
         }
         let events = ctx.input(|i| i.events.clone());
         let canvas = ctx.memory(|m| m.focused() == Some(egui::Id::new("document-canvas")));
         for event in events {
+            // egui drops the canvas focus on Esc before this runs; Esc still leaves the
+            // nested caret, and the body caret takes the keyboard again.
+            if self.session.nested_caret().is_some()
+                && matches!(
+                    event,
+                    Event::Key {
+                        key: Key::Escape,
+                        pressed: true,
+                        ..
+                    }
+                )
+            {
+                self.session.clear_nested();
+                self.message = "본문 편집으로 돌아왔습니다.".into();
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new("document-canvas")));
+                continue;
+            }
+            if canvas && self.session.nested_caret().is_some() && self.nested_event(ctx, &event) {
+                continue;
+            }
             match event {
                 Event::Key {
                     key,
@@ -1025,13 +1187,11 @@ impl HwpApp {
                     self.sync_formatting();
                     self.follow_cursor();
                 }
-                Event::Text(t) if canvas && self.preedit.is_empty() => {
-                    self.command(Command::Insert(t))
-                }
+                Event::Text(t) if canvas && self.preedit.is_empty() => self.typed_text(t),
                 Event::Ime(ImeEvent::Preedit { text, .. }) if canvas => self.preedit = text,
                 Event::Ime(ImeEvent::Commit(text)) if canvas => {
                     self.preedit.clear();
-                    self.command(Command::Insert(text));
+                    self.typed_text(text);
                 }
                 Event::Ime(ImeEvent::DeleteSurrounding {
                     before_chars,
@@ -1237,9 +1397,7 @@ impl HwpApp {
                         .password(true)
                         .desired_width(220.0),
                 );
-                if ui.memory(|m| m.focused().is_none()) {
-                    edit.request_focus();
-                }
+                chrome::first_focus(&edit);
                 if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     submit = true;
                 }
@@ -1249,7 +1407,14 @@ impl HwpApp {
             }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                let (ok, cancel) = chrome::actions(ui, !prompt.password.is_empty(), "확인");
+                let (ok, cancel) = chrome::actions(
+                    ui,
+                    prompt
+                        .password
+                        .is_empty()
+                        .then_some("문서 암호를 넣으세요."),
+                    "확인(D)",
+                );
                 submit |= ok;
                 done |= cancel;
             });
@@ -1290,41 +1455,46 @@ impl HwpApp {
             self.ext_dialogs(ctx);
         }
         if self.pending.is_some() {
-            egui::Window::new("변경 내용을 저장할까요?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label("문서에 저장하지 않은 변경 내용이 있습니다.");
-                    ui.horizontal(|ui| {
-                        if ui.button("저장하고 계속").clicked()
-                            && self.save(false, None)
-                            && let Some(action) = self.pending.take()
-                        {
-                            self.perform(action, ctx);
-                        }
-                        if ui.button("저장하지 않고 계속").clicked()
-                            && let Some(action) = self.pending.take()
-                        {
-                            self.perform(action, ctx);
-                        }
-                        if ui.button("취소").clicked() {
-                            self.pending = None;
-                        }
-                    });
-                });
-        }
-        if let Some(message) = self.error.clone() {
-            egui::Window::new("작업을 완료하지 못했습니다")
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.set_max_width(500.0);
-                    ui.label(message);
-                    if ui.button("확인").clicked() {
-                        self.error = None;
+            // The shared dialog frame: buttons on the right, Enter/Alt+D save, Esc cancels.
+            let button = ext_shell::dialog(
+                ctx,
+                "변경 내용 저장",
+                440.0,
+                &["저장(D)", "저장 안 함(N)", "취소"],
+                |ui| {
+                    ui.label("문서에 저장하지 않은 변경 내용이 있습니다. 저장한 뒤 계속할까요?");
+                },
+            );
+            match button {
+                Some(0) => {
+                    if self.save(false, None)
+                        && let Some(action) = self.pending.take()
+                    {
+                        self.perform(action, ctx);
                     }
-                });
+                }
+                Some(1) => {
+                    if let Some(action) = self.pending.take() {
+                        self.perform(action, ctx);
+                    }
+                }
+                Some(_) => self.pending = None,
+                None => {}
+            }
+        }
+        if let Some(message) = self.error.clone()
+            && ext_shell::dialog(
+                ctx,
+                "작업을 완료하지 못했습니다",
+                480.0,
+                &["확인(D)"],
+                |ui| {
+                    ui.label(message);
+                },
+            )
+            .is_some()
+        {
+            self.error = None;
         }
         if self.show_help {
             egui::Window::new("HwpCraft · 사용 안내").open(&mut self.show_help).default_width(580.0).show(ctx,|ui| {
@@ -1338,8 +1508,13 @@ impl HwpApp {
     }
 }
 impl eframe::App for HwpApp {
+    /// `--view bench-ime` types through the same input events as the keyboard and IME.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        raw_input.events.append(&mut self.ext.shell.bench_events);
+    }
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_pdf_export(ctx);
+        self.serve_mcp_bridge(ctx);
         if self.hold_close_for_pdf(ctx) {
             // Closing waits for the running PDF export; the dirty check runs then.
         } else if ctx.input(|i| i.viewport().close_requested())
@@ -1374,25 +1549,38 @@ impl eframe::App for HwpApp {
             }
         }
     }
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Timed only while a bench runs (`--view bench-edit`), with eframe's time for the
+        // last frame (ui and painting, not the wait for the screen).
+        let mut laps = ext_shell::Laps::new(self.ext.shell.bench_running());
+        self.ext.shell.frame_cpu_ms = frame.info().cpu_usage.map(|s| f64::from(s) * 1000.0);
         self.sync_formatting();
+        laps.mark();
         self.shortcuts(&ctx);
+        laps.mark();
         self.toolbar(ui);
+        laps.mark();
         self.status_bar(ui);
+        laps.mark();
         if self.show_navigation {
             self.navigator(ui);
         }
         if self.show_editor {
             self.paragraph_editor(ui);
         }
+        laps.mark();
         if self.tab == 0 {
             self.file_backstage(ui);
         } else {
-            self.page_view(ui);
+            self.document_views(ui);
         }
+        laps.mark();
         self.keyboard(&ctx);
+        laps.mark();
         self.dialogs(&ctx);
+        laps.mark();
+        self.ext.shell.laps = laps.done();
         self.frames += 1;
         if self.screenshot.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -1407,11 +1595,28 @@ impl eframe::App for HwpApp {
             .and_then(|p| p.file_name())
             .map(|v| v.to_string_lossy().into_owned())
             .unwrap_or_else(|| "새 문서".into());
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+        let title = format!(
             "{}{} — HwpCraft {}",
             if self.session.dirty() { "● " } else { "" },
             name,
             hwpcraft_doc::VERSION.trim()
-        )));
+        );
+        // Only a changed title goes to the window: setting it is a system call each time.
+        if self.ext.shell.window_title != title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.ext.shell.window_title = title;
+        }
+    }
+}
+
+/// 쪽 윤곽 off: the dotted line Hangul draws where one page's body ends and the next begins.
+fn dotted_line(ui: &egui::Ui, from: Pos2, to: Pos2) {
+    let stroke = Stroke::new(1.0, Color32::from_gray(150));
+    let mut x = from.x;
+    while x < to.x {
+        let end = (x + 3.0).min(to.x);
+        ui.painter()
+            .line_segment([Pos2::new(x, from.y), Pos2::new(end, from.y)], stroke);
+        x += 6.0;
     }
 }

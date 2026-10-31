@@ -636,7 +636,37 @@ impl HwpApp {
             response.ctx.set_cursor_icon(egui::CursorIcon::Move);
             if page_release(response) {
                 self.ext.pen.moving = None;
-                if delta.length() > 1.0 {
+                let inline = self
+                    .session
+                    .table_properties(a)
+                    .is_ok_and(|props| props["treatAsChar"] == true);
+                if delta.length() > 1.0 && inline {
+                    // Hangul moves a table treated as a character to the text position
+                    // it is dropped on, as other inline objects.
+                    let at = (p - page_rect.min.to_vec2()) / self.zoom;
+                    match self
+                        .session
+                        .hit_test(page, f64::from(at.x), f64::from(at.y))
+                    {
+                        Ok(to) if to.cell.is_none() => {
+                            let moved = self
+                                .session
+                                .run("object.move_inline", json!({"address":a,"to":to}));
+                            // The table keeps its selection under its new address; the
+                            // caret is in the body text where it was dropped.
+                            if let Some(v) = self.result(moved) {
+                                self.ext.pen.selected =
+                                    serde_json::from_value(v["address"].clone()).ok();
+                            }
+                            self.sync_formatting();
+                            self.follow_cursor();
+                        }
+                        _ => {
+                            self.message =
+                                "글자처럼 취급한 표는 본문 글자 자리에 놓아야 옮겨집니다.".into();
+                        }
+                    }
+                } else if delta.length() > 1.0 {
                     self.run("table.move",json!({"table":a,"page":page,"dx_mm":delta.x/self.zoom*25.4/96.0,"dy_mm":delta.y/self.zoom*25.4/96.0}));
                 }
             }
@@ -922,6 +952,67 @@ mod tests {
             bounds(&app),
             app.ext.pen.selected
         );
+    }
+    #[test]
+    fn dragging_an_inline_table_drops_it_at_a_text_position() {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        app.session
+            .execute(Command::Insert("앞 문장 뒤 문장\n".into()))
+            .unwrap();
+        app.session
+            .run("table.create", json!({"rows": 2, "columns": 2}))
+            .unwrap();
+        let a = app.session.run("table.info", json!({})).unwrap()["table"].clone();
+        app.session
+            .run(
+                "table.properties",
+                json!({"table": a, "props": {"treatAsChar": true}}),
+            )
+            .unwrap();
+        let grip = table_move_grip(bounds(&app)).center();
+        let target = hwpcraft_doc::Cursor {
+            section: 0,
+            paragraph: 0,
+            offset: 3,
+            cell: None,
+        };
+        let c = app.session.caret_at(target).unwrap();
+        let drop = Pos2::new(50.0, 50.0)
+            + Vec2::new(
+                c["x"].as_f64().unwrap() as f32 + 1.0,
+                (c["y"].as_f64().unwrap() + c["height"].as_f64().unwrap() / 2.0) as f32,
+            ) * app.zoom;
+        drag(&mut app, grip, drop);
+        let paragraphs = &app.session.core.document().sections[0].paragraphs;
+        let held: Vec<(usize, bool)> = paragraphs
+            .iter()
+            .enumerate()
+            .flat_map(|(i, p)| {
+                p.controls.iter().filter_map(move |c| match c {
+                    hwpcraft_doc::model::control::Control::Table(t) => {
+                        Some((i, t.common.treat_as_char))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        // Still treated as a character, now in the first paragraph.
+        assert_eq!(held, [(0, true)], "{:?}", app.message);
+        // Selected under its new address, no cell block left, caret in the body text.
+        let a = app
+            .ext
+            .pen
+            .selected
+            .expect("the moved table stays selected");
+        let at = app.session.core.document().sections[a.section].paragraphs[a.paragraph]
+            .controls
+            .get(a.control);
+        assert!(
+            matches!(at, Some(hwpcraft_doc::model::control::Control::Table(_))),
+            "{a:?}"
+        );
+        assert!(app.session.cursor.cell.is_none());
+        assert!(!app.session.has_selection());
     }
     #[test]
     fn pointer_grip_selects_moves_and_resizes_in_single_undo_steps() {

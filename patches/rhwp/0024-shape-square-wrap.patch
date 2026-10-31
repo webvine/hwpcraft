@@ -1,0 +1,443 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index fcf70dc..590d321 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -1634,7 +1634,7 @@ impl DocumentCore {
+             let mut pi = 0usize;
+             while pi < section.paragraphs.len() {
+                 if section.paragraphs[pi].controls.iter().any(|control| {
+-                    matches!(control, Control::Picture(picture) if !picture.common.treat_as_char)
++                    crate::renderer::float_placement::side_flow_object(control).is_some()
+                 }) {
+                     latest_non_tac_picture_host = Some(pi);
+                 }
+@@ -1708,7 +1708,7 @@ impl DocumentCore {
+                     // do not publish a scalar host row and leave the source
+                     // geometry intact for the caller's existing path.
+                     if section.paragraphs[pi].controls.iter().any(|control| {
+-                        matches!(control, Control::Picture(picture) if !picture.common.treat_as_char)
++                        crate::renderer::float_placement::side_flow_object(control).is_some()
+                     }) {
+                         break;
+                     }
+diff --git a/src/document_core/commands/object_ops/picture.rs b/src/document_core/commands/object_ops/picture.rs
+index 6f2cf59..6330b85 100644
+--- a/src/document_core/commands/object_ops/picture.rs
++++ b/src/document_core/commands/object_ops/picture.rs
+@@ -16,7 +16,7 @@ use crate::model::shape::{common_obj_offsets, ShapeObject};
+ /// 글자처럼 취급(`treat_as_char`)은 밴드를 만들지 않지만, 그 토글 자체가 밴드의
+ /// 유무를 바꾸므로 포함한다.
+ #[derive(PartialEq, Eq)]
+-struct PictureBandGeometry {
++pub(super) struct PictureBandGeometry {
+     horizontal_offset: i32,
+     vertical_offset: i32,
+     width: u32,
+@@ -30,7 +30,9 @@ struct PictureBandGeometry {
+     margin: (i16, i16, i16, i16),
+ }
+ 
+-fn picture_band_geometry(common: &crate::model::shape::CommonObjAttr) -> PictureBandGeometry {
++pub(super) fn picture_band_geometry(
++    common: &crate::model::shape::CommonObjAttr,
++) -> PictureBandGeometry {
+     PictureBandGeometry {
+         horizontal_offset: common.horizontal_offset as i32,
+         vertical_offset: common.vertical_offset as i32,
+diff --git a/src/document_core/commands/object_ops/shape.rs b/src/document_core/commands/object_ops/shape.rs
+index 9d327c4..32e5922 100644
+--- a/src/document_core/commands/object_ops/shape.rs
++++ b/src/document_core/commands/object_ops/shape.rs
+@@ -388,6 +388,8 @@ impl DocumentCore {
+         use crate::document_core::helpers::{json_bool, json_i32, json_str};
+ 
+         let shape = self.resolve_shape_control_mut(section_idx, parent_para_idx, control_idx)?;
++        // [0010] 그림처럼(#6204) 어울림 배제 띠의 기하를 변경 전에 찍어 둔다.
++        let band_geometry_before = super::picture::picture_band_geometry(shape.common());
+ 
+         // [#6740] 변환 파생 상태 무효화 판정용 — 어떤 대입보다 먼저 잰다.
+         let transform_before =
+@@ -633,6 +635,17 @@ impl DocumentCore {
+             crate::parser::assign_auto_numbers(&mut self.document);
+         }
+ 
++        // [0010] 배제 띠 기하가 바뀌었으면 그림 속성 변경(#6204)과 같은 재투영 경로로 띠
++        // 문단의 줄을 새 기하로 다시 새긴다. 띠를 못 만드는 형상이면 `Ok(false)` 로 지나가
++        // 종전 recompose 가 그대로 남는다.
++        let band_geometry_after = self
++            .resolve_shape_control_mut(section_idx, parent_para_idx, control_idx)
++            .ok()
++            .map(|shape| super::picture::picture_band_geometry(shape.common()));
++        if band_geometry_after != Some(band_geometry_before) {
++            let _ = self.apply_body_edit_through_picture_band(section_idx, parent_para_idx, |_| {});
++        }
++
+         // 리플로우 + 렌더 트리 캐시 무효화
+         let section = &mut self.document.sections[section_idx];
+         section.raw_stream = None;
+diff --git a/src/document_core/commands/text_editing.rs b/src/document_core/commands/text_editing.rs
+index e392c89..9344413 100644
+--- a/src/document_core/commands/text_editing.rs
++++ b/src/document_core/commands/text_editing.rs
+@@ -562,7 +562,7 @@ impl DocumentCore {
+         let section = self.document.sections.get(section_idx)?;
+         let host_index = (0..=para_idx).rev().find(|&index| {
+             section.paragraphs[index].controls.iter().any(|control| {
+-                matches!(control, Control::Picture(picture) if !picture.common.treat_as_char)
++                crate::renderer::float_placement::side_flow_object(control).is_some()
+             })
+         })?;
+         let column_def = Self::find_column_def_for_paragraph(&section.paragraphs, host_index);
+diff --git a/src/renderer/composer/line_breaking.rs b/src/renderer/composer/line_breaking.rs
+index 1c2b7cd..59231bb 100644
+--- a/src/renderer/composer/line_breaking.rs
++++ b/src/renderer/composer/line_breaking.rs
+@@ -2919,6 +2919,25 @@ pub(super) fn supports_tac_table_band_frame_controls(para: &Paragraph) -> bool {
+     tac_tables == 1
+ }
+ 
++/// 어울림 띠 host 의 통제: 그림 띠와 같되 비-TAC 그리기 개체(글상자 포함)도 한 개까지 받는다.
++/// 일반 채움 경로는 [`supports_picture_band_frame_controls`] 그대로다 — 도형 문단의 저장 줄
++/// 소유권은 띠가 증명할 때만 바뀐다.
++pub(super) fn supports_side_flow_band_controls(para: &Paragraph) -> bool {
++    let mut side_flow = 0usize;
++    for control in &para.controls {
++        match control {
++            Control::Picture(picture) if picture.common.treat_as_char => {}
++            Control::Equation(equation) if equation.common.treat_as_char => {}
++            other if crate::renderer::float_placement::side_flow_object(other).is_some() => {
++                side_flow += 1;
++            }
++            other if control_is_width_neutral_marker(other) => {}
++            _ => return false,
++        }
++    }
++    side_flow <= 1
++}
++
+ pub(super) fn supports_picture_band_frame_controls(para: &Paragraph) -> bool {
+     let mut non_tac_pictures = 0usize;
+     for control in &para.controls {
+@@ -3190,6 +3209,7 @@ fn layout_paragraph_in_frame_impl(
+     if !supports_picture_band_frame_controls(para)
+         && !supports_cached_body_frame_controls(para)
+         && !(para.line_segs.is_empty() && supports_tac_table_band_frame_controls(para))
++        && !(frame.side_flow_band && supports_side_flow_band_controls(para))
+     {
+         return None;
+     }
+@@ -4070,17 +4090,12 @@ pub(crate) fn layout_picture_band(
+     let host_paragraph_horizontal =
+         picture_band_paragraph_reference(&column_horizontal, host_margin_left)?;
+ 
+-    let mut host_pictures = host
+-        .controls
+-        .iter()
+-        .enumerate()
+-        .filter_map(|(index, control)| match control {
+-            Control::Picture(picture) if !picture.common.treat_as_char => {
+-                Some((index, picture.as_ref()))
+-            }
+-            _ => None,
+-        });
+-    let (picture_control_index, picture) = host_pictures.next()?;
++    // [0010] 그림뿐 아니라 그리기 개체(글상자 등)도 본문을 옆으로 비켜 흐르게 한다.
++    let mut host_pictures = host.controls.iter().enumerate().filter_map(|(index, control)| {
++        crate::renderer::float_placement::side_flow_object(control)
++            .map(|(common, size)| (index, common, size))
++    });
++    let (picture_control_index, picture_common, picture_size) = host_pictures.next()?;
+     if host_pictures.next().is_some() {
+         return None;
+     }
+@@ -4096,14 +4111,16 @@ pub(crate) fn layout_picture_band(
+     let mut anchor_input = host.clone();
+     anchor_input.line_segs.clear();
+     let mut anchor_frame = host_box.frame(0);
++    anchor_frame.side_flow_band = true;
+     let anchor_rows = layout_paragraph_in_frame(&anchor_input, &mut anchor_frame, styles, dpi)?;
+     let anchor_top = anchor_rows
+         .iter()
+         .rfind(|row| row.text_start <= picture_raw_start)
+         .map(|row| row.vertical_pos)?;
+ 
+-    let exclusion = crate::renderer::float_placement::resolve_picture_exclusion(
+-        picture,
++    let exclusion = crate::renderer::float_placement::resolve_float_exclusion(
++        picture_common,
++        picture_size,
+         column_horizontal.clone(),
+         host_paragraph_horizontal,
+         anchor_top,
+@@ -4121,6 +4138,7 @@ pub(crate) fn layout_picture_band(
+     )?;
+     let exclusion_end = exclusion.vertical.end;
+     let mut frame = host_box.frame_with(0, vec![exclusion]);
++    frame.side_flow_band = true;
+     let mut line_segs = Vec::new();
+     let mut space_metrics = Vec::new();
+ 
+@@ -4130,7 +4148,9 @@ pub(crate) fn layout_picture_band(
+         }
+ 
+         let paragraph_style = styles.para_styles.get(paragraph.para_shape_id as usize);
+-        if paragraph.column_type != ColumnBreakType::None
++        // [0010] host 앞의 나누기(구역 첫 문단의 `Section`, 쪽·단 나누기)는 띠보다 앞에서
++        // 일어난다 — 띠는 host 의 위쪽에서 시작하므로 host 에는 막지 않는다.
++        if (paragraph_index != host_index && paragraph.column_type != ColumnBreakType::None)
+             || paragraph_style.is_some_and(|style| {
+                 style.spacing_before.abs() > f64::EPSILON
+                     || style.spacing_after.abs() > f64::EPSILON
+@@ -4139,7 +4159,7 @@ pub(crate) fn layout_picture_band(
+             || box_for(paragraph)?.effective() != host_horizontal
+             || (paragraph_index != host_index
+                 && paragraph.controls.iter().any(|control| {
+-                    matches!(control, Control::Picture(picture) if !picture.common.treat_as_char)
++                    crate::renderer::float_placement::side_flow_object(control).is_some()
+                 }))
+         {
+             return None;
+@@ -6150,6 +6170,64 @@ mod frame_reflow_tests {
+         );
+     }
+ 
++    /// [0010] 본문이 옆으로 비켜 흐르는(Square) 그리기 개체(글상자)도 그림처럼 띠를 만든다.
++    /// 구역 첫 문단(`Section` 나누기)인 host 도 받는다. 다른 배치의 도형은 띠가 아니다.
++    #[test]
++    fn square_drawing_object_makes_a_band_like_a_picture() {
++        use crate::model::paragraph::ColumnBreakType;
++        use crate::model::shape::{
++            CommonObjAttr, HorzAlign, HorzRelTo, RectangleShape, ShapeObject, TextFlow, TextWrap,
++            VertAlign, VertRelTo,
++        };
++
++        const DPI: f64 = 96.0;
++        const COLUMN_WIDTH: i32 = 15_000;
++        let styles = styles(&[12.0]);
++        let host_with = |text_wrap: TextWrap| {
++            let rect = RectangleShape {
++                common: CommonObjAttr {
++                width: 3_000,
++                height: 600,
++                text_wrap,
++                text_flow: TextFlow::BothSides,
++                vert_rel_to: VertRelTo::Para,
++                vert_align: VertAlign::Top,
++                horz_rel_to: HorzRelTo::Para,
++                horz_align: HorzAlign::Left,
++                ..Default::default()
++                },
++                ..Default::default()
++            };
++            let mut host = paragraph(
++                "x",
++                vec![CharShapeRef {
++                    start_pos: 0,
++                    char_shape_id: 0,
++                }],
++            );
++            host.column_type = ColumnBreakType::Section;
++            host.controls
++                .push(Control::Shape(Box::new(ShapeObject::Rectangle(rect))));
++            host
++        };
++        let band = |host: Paragraph| {
++            layout_picture_band(
++                &[host],
++                0,
++                crate::renderer::hwpunit_to_px(COLUMN_WIDTH, DPI),
++                &styles,
++                DPI,
++                (0.0, 0.0),
++            )
++        };
++
++        let square = band(host_with(TextWrap::Square)).expect("Square text box band");
++        assert_eq!(square.paragraph_range, 0..1);
++        assert_eq!(square.line_segs[0][0].column_start, 3_000);
++        assert_eq!(square.line_segs[0][0].segment_width, COLUMN_WIDTH - 3_000);
++        assert!(band(host_with(TextWrap::TopAndBottom)).is_none());
++    }
++
+     #[test]
+     fn real_p325_picture_band_matches_the_stored_seven_paragraph_geometry() {
+         use crate::model::page::ColumnDef;
+diff --git a/src/renderer/float_placement.rs b/src/renderer/float_placement.rs
+index 700815a..7569504 100644
+--- a/src/renderer/float_placement.rs
++++ b/src/renderer/float_placement.rs
+@@ -3061,7 +3061,71 @@ pub(crate) fn resolve_picture_exclusion(
+     paragraph_top: i32,
+     paper: PaperOrigin,
+ ) -> Option<FrameExclusion> {
+-    let common = &picture.common;
++    resolve_float_exclusion(
++        &picture.common,
++        picture_flow_frame_size_hu(picture),
++        column_horizontal,
++        paragraph_horizontal,
++        paragraph_top,
++        paper,
++    )
++}
++
++/// 어울림 띠의 host 개체: 비-TAC 그림(종전 그대로), 그리고 [0010] 본문이 옆으로 비켜 흐르는
++/// (`Square`) 비-TAC 그리기 개체(글상자 포함). 공통 속성과 흐름 틀 크기(HU)를 돌려준다.
++/// 그리기 개체는 개체 틀(`common`) 크기가 곧 흐름 틀이다. 다른 배치의 그리기 개체는 종전처럼
++/// 띠와 무관하다.
++pub(crate) fn side_flow_object(control: &Control) -> Option<(&CommonObjAttr, (i32, i32))> {
++    match control {
++        Control::Picture(picture) if !picture.common.treat_as_char => {
++            Some((&picture.common, picture_flow_frame_size_hu(picture)))
++        }
++        Control::Shape(shape)
++            if !shape.common().treat_as_char && shape.common().text_wrap == TextWrap::Square =>
++        {
++            let common = shape.common();
++            Some((common, (common.width as i32, common.height as i32)))
++        }
++        _ => None,
++    }
++}
++
++/// [0010] 그리기 개체 host 의 줄을 어울림 띠가 새로 계산했는가(첫 줄의 구현 표시).
++/// 한글이 저장한 배치의 도형 문단은 종전 경로 그대로 두고, RHWP 가 띠로 다시 나눈 문단만
++/// 그림처럼 다룬다.
++pub(crate) fn has_computed_band_rows(para: &Paragraph) -> bool {
++    para.line_segs.first().is_some_and(|seg| {
++        seg.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
++    })
++}
++
++/// 띠를 새로 계산한 문단의 Square 비-TAC 그리기 개체(그림 개체는 제외 — 종전 경로가 맡는다).
++pub(crate) fn computed_band_drawing_common<'a>(
++    para: &Paragraph,
++    control: &'a Control,
++) -> Option<&'a CommonObjAttr> {
++    match control {
++        Control::Shape(shape)
++            if !matches!(shape.as_ref(), crate::model::shape::ShapeObject::Picture(_))
++                && !shape.common().treat_as_char
++                && shape.common().text_wrap == TextWrap::Square
++                && has_computed_band_rows(para) =>
++        {
++            Some(shape.common())
++        }
++        _ => None,
++    }
++}
++
++/// [`resolve_picture_exclusion`] for any object: its common attributes and flow size (HU).
++pub(crate) fn resolve_float_exclusion(
++    common: &CommonObjAttr,
++    flow_size: (i32, i32),
++    column_horizontal: Range<i32>,
++    paragraph_horizontal: Range<i32>,
++    paragraph_top: i32,
++    paper: PaperOrigin,
++) -> Option<FrameExclusion> {
+     // [#6202] 용지 기준 개체도 잰다. 코퍼스 1,997건 표본에서 Square float 개체를
+     // 막는 관문은 사실상 `horz_rel`/`vert_rel` 의 `Paper|Page` 뿐이었다(각 57건).
+     //
+@@ -3098,7 +3162,7 @@ pub(crate) fn resolve_picture_exclusion(
+         TextFlow::LeftOnly | TextFlow::RightOnly => return None,
+     };
+ 
+-    let (width, height) = picture_flow_frame_size_hu(picture);
++    let (width, height) = flow_size;
+     if column_horizontal.is_empty() || paragraph_horizontal.is_empty() || width <= 0 || height <= 0
+     {
+         return None;
+diff --git a/src/renderer/layout/paragraph_layout.rs b/src/renderer/layout/paragraph_layout.rs
+index 39f9a5d..b0ea9a4 100644
+--- a/src/renderer/layout/paragraph_layout.rs
++++ b/src/renderer/layout/paragraph_layout.rs
+@@ -5971,7 +5971,12 @@ impl LayoutEngine {
+                         }
+                     }
+                 };
+-                let mr = anchor.anchor_image_margin_right;
++                // [0010] 어울림 띠가 새로 계산한 줄(구현 표시)의 cs/sw 는 개체 바깥 여백을 이미
++                // 배제에 넣었다 — 한글 저장 줄과 달리 여백을 다시 더하지 않는다.
++                let computed_row = seg.is_some_and(|s| {
++                    s.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
++                });
++                let mr = if computed_row { 0 } else { anchor.anchor_image_margin_right };
+                 let cs_px = crate::renderer::hwpunit_to_px(cs + mr, self.dpi);
+                 if synthetic_zone {
+                     // 합성 배제 존: 한글의 문단 왼 여백은 **열 기준** 들여쓰기라,
+diff --git a/src/renderer/layout_frame.rs b/src/renderer/layout_frame.rs
+index 2e746bf..d92956f 100644
+--- a/src/renderer/layout_frame.rs
++++ b/src/renderer/layout_frame.rs
+@@ -462,6 +462,9 @@ pub(crate) struct LayoutFrame {
+     /// 한컴 저장 줄 대신 새 줄바꿈을 사용하게 된다.
+     /// 원점을 보류한 프레임은 폭과 슬롯 간격으로 비교하고 실제 원점을 새로 공표하지 않는다.
+     origin_is_authoritative: bool,
++    /// 어울림(Square) 띠 계산 중인 프레임. 띠 host 의 비-TAC 그리기 개체는 그림처럼 줄 폭을
++    /// 차지하지 않으므로([`super::composer`] 채움 허용) 이 프레임에서만 받는다.
++    pub(crate) side_flow_band: bool,
+     /// 이 프레임에 확정된 물리 줄. 가로 범위는 생성자가 이미 격자를 적용한 값이다 —
+     /// 본문은 [`ParagraphBox::body`]가 단 폭을, 셀 등 내용 흐름은
+     /// [`ParagraphBox::content_width_px`]가 내용 폭을 4 HWPUNIT 격자로 내린다(#7412).
+@@ -480,6 +483,7 @@ impl LayoutFrame {
+             minimum_width: MINIMUM_USABLE_INTERVAL_HWP,
+             kopub_justified_space: false,
+             origin_is_authoritative: true,
++            side_flow_band: false,
+             rows: Vec::new(),
+         }
+     }
+@@ -1024,6 +1028,7 @@ mod tests {
+             minimum_width: 1,
+             kopub_justified_space: false,
+             origin_is_authoritative: true,
++            side_flow_band: false,
+             rows: Vec::new(),
+         }
+     }
+diff --git a/src/renderer/typeset/controls/host_wrap.rs b/src/renderer/typeset/controls/host_wrap.rs
+index f6464af..7e62647 100644
+--- a/src/renderer/typeset/controls/host_wrap.rs
++++ b/src/renderer/typeset/controls/host_wrap.rs
+@@ -20,7 +20,8 @@ pub(super) fn stored_candidate(para: &Paragraph) -> Option<StoredHostBand> {
+                 if let crate::model::shape::ShapeObject::Picture(p) = s.as_ref() {
+                     Some(&p.common)
+                 } else {
+-                    None
++                    // [0010] 띠가 줄을 새로 계산한 그리기 개체 host(글상자 등).
++                    crate::renderer::float_placement::computed_band_drawing_common(para, c)
+                 }
+             }
+             _ => None,
+diff --git a/src/renderer/typeset.rs b/src/renderer/typeset.rs
+index cd56863..15c8580 100644
+--- a/src/renderer/typeset.rs
++++ b/src/renderer/typeset.rs
+@@ -1125,7 +1125,7 @@ fn synth_square_wrap_rects(
+ ) -> Vec<(f64, f64, f64, f64)> {
+     para.controls
+         .iter()
+-        .filter_map(non_tac_square_picture_common)
++        .filter_map(|ctrl| square_flow_common(para, ctrl))
+         .filter_map(|cm| {
+             let w = crate::renderer::hwpunit_to_px(cm.width as i32, dpi);
+             let h = crate::renderer::hwpunit_to_px(cm.height as i32, dpi);
+@@ -1267,6 +1267,17 @@ fn square_picture_wrap_anchor_for_para(
+     })
+ }
+ 
++/// [`non_tac_square_picture_common`] plus, [0010], a Square drawing object whose host rows the
++/// side-flow band computed. Those rows carry the implementation tag, so the paragraph counts as
++/// NO_LS here; Hangul-stored hosts keep their existing path.
++fn square_flow_common<'a>(
++    para: &Paragraph,
++    ctrl: &'a Control,
++) -> Option<&'a crate::model::shape::CommonObjAttr> {
++    non_tac_square_picture_common(ctrl)
++        .or_else(|| crate::renderer::float_placement::computed_band_drawing_common(para, ctrl))
++}
++
+ fn maybe_register_square_picture_wrap_anchor(
+     st: &mut TypesetState,
+     body_paragraphs: &[Paragraph],

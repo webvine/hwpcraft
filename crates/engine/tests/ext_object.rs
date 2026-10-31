@@ -165,9 +165,12 @@ fn picture_rejects_bad_files_and_props_without_changes() -> anyhow::Result<()> {
         assert!(s.run(id, params.clone()).is_err(), "{id} {params}");
         assert_eq!(s.generation, generation, "{id} {params}");
     }
-    // A picture can also go into a table cell (RHWP floats it beside the table).
+    // A floating picture can also go into a table cell (RHWP floats it beside the table).
     s.run("table.create", json!({"rows":1,"columns":1}))?;
-    s.run("picture.insert", json!({"path":images[1]}))?;
+    s.run(
+        "picture.insert",
+        json!({"path":images[1],"treat_as_char":false}),
+    )?;
     assert_eq!(kinds(&s).iter().filter(|k| *k == "picture").count(), 2);
     Ok(())
 }

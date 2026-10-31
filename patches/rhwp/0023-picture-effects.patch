@@ -1,0 +1,727 @@
+diff --git a/src/model/image.rs b/src/model/image.rs
+index 7ea89f0..facdfbe 100644
+--- a/src/model/image.rs
++++ b/src/model/image.rs
+@@ -108,10 +108,73 @@ pub struct ImageAttr {
+     pub external_path: Option<String>,
+ }
+ 
+-/// HWPX 그림 효과 (`hp:effects`).
++/// HWPX 그림 효과 (`hp:effects`). OWPML `EffectsType` 순서: 그림자, 네온, 부드러운
++/// 가장자리, 반사. 값은 원문 문자열 그대로 보존한다(왕복 시 표기를 바꾸지 않는다).
+ #[derive(Debug, Clone, Default, serde::Serialize)]
+ pub struct PictureEffects {
+     pub shadow: Option<PictureShadow>,
++    pub glow: Option<PictureGlow>,
++    pub soft_edge: Option<PictureSoftEdge>,
++    pub reflection: Option<PictureReflection>,
++}
++
++impl PictureEffects {
++    /// 효과가 하나라도 있는가.
++    pub fn is_empty(&self) -> bool {
++        self.shadow.is_none()
++            && self.glow.is_none()
++            && self.soft_edge.is_none()
++            && self.reflection.is_none()
++    }
++}
++
++/// HWPX 네온 효과 (`hp:glow`): 투명도(0~1), 크기(HWPUNIT), 색.
++#[derive(Debug, Clone, Default, serde::Serialize)]
++pub struct PictureGlow {
++    pub alpha: Option<String>,
++    pub radius: Option<String>,
++    pub color: Option<EffectColor>,
++}
++
++/// HWPX 부드러운 가장자리 효과 (`hp:softEdge`): 크기(HWPUNIT).
++#[derive(Debug, Clone, Default, serde::Serialize)]
++pub struct PictureSoftEdge {
++    pub radius: Option<String>,
++}
++
++/// HWPX 반사 효과 (`hp:reflection`).
++#[derive(Debug, Clone, Default, serde::Serialize)]
++pub struct PictureReflection {
++    pub align_style: Option<String>,
++    /// 흐릿한 정도(HWPUNIT)
++    pub radius: Option<String>,
++    /// 방향 각도(0~360)
++    pub direction: Option<String>,
++    /// 거리(HWPUNIT)
++    pub distance: Option<String>,
++    pub rotation_style: Option<String>,
++    /// 오프셋 방향(0~360)
++    pub fade_direction: Option<String>,
++    pub skew: Option<EffectPoint>,
++    pub scale: Option<EffectPoint>,
++    /// 시작·끝 위치 투명도(0~1)
++    pub alpha: Option<EffectRange>,
++    /// 시작·끝 위치
++    pub pos: Option<EffectRange>,
++}
++
++/// 반사 효과의 시작·끝 값 (`hp:alpha`, `hp:pos`).
++#[derive(Debug, Clone, Default, serde::Serialize)]
++pub struct EffectRange {
++    pub start: Option<String>,
++    pub end: Option<String>,
++}
++
++/// 효과 색 변환 (`hp:effectsColor/hp:effect`): ALPHA, GRAY, COMP, GAMMA, INV_GAMMA, INV.
++#[derive(Debug, Clone, Default, serde::Serialize)]
++pub struct EffectColorTransform {
++    pub kind: String,
++    pub value: String,
+ }
+ 
+ /// HWPX 그림 그림자 효과 (`hp:shadow`).
+@@ -144,6 +207,8 @@ pub struct EffectColor {
+     pub system_idx: Option<String>,
+     pub preset_idx: Option<String>,
+     pub rgb: Option<EffectRgb>,
++    /// 네온 색의 색 변환(`hp:effect`). 다른 효과에서는 비어 있다.
++    pub transforms: Vec<EffectColorTransform>,
+ }
+ 
+ /// HWPX 효과 RGB 색상 (`hp:rgb`).
+diff --git a/src/parser/hwpx/section.rs b/src/parser/hwpx/section.rs
+index 58c1c48..ac21978 100644
+--- a/src/parser/hwpx/section.rs
++++ b/src/parser/hwpx/section.rs
+@@ -15,7 +15,8 @@ use crate::model::document::{Section, SectionDef};
+ use crate::model::footnote::{Endnote, Footnote};
+ use crate::model::header_footer::{Footer, Header, HeaderFooterApply, MasterPage};
+ use crate::model::image::{
+-    CropInfo, EffectColor, EffectPoint, EffectRgb, ImageAttr, ImageEffect, PictureEffects,
++    CropInfo, EffectColor, EffectColorTransform, EffectPoint, EffectRange, EffectRgb, ImageAttr,
++    ImageEffect, PictureEffects, PictureGlow, PictureReflection, PictureSoftEdge,
+     PictureShadow,
+ };
+ use crate::model::page::{
+@@ -3416,6 +3417,29 @@ fn parse_picture_effects(reader: &mut Reader<&[u8]>) -> Result<PictureEffects, H
+             Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"shadow" => {
+                 effects.shadow = Some(parse_picture_shadow_attrs(e));
+             }
++            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"glow" => {
++                effects.glow = Some(parse_picture_glow(e, reader)?);
++            }
++            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"glow" => {
++                effects.glow = Some(parse_picture_glow_attrs(e));
++            }
++            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
++                if local_name(e.name().as_ref()) == b"softEdge" =>
++            {
++                let mut soft_edge = PictureSoftEdge::default();
++                for attr in e.attributes().flatten() {
++                    if attr.key.as_ref().as_bytes() == b"radius" {
++                        soft_edge.radius = Some(attr_str(&attr));
++                    }
++                }
++                effects.soft_edge = Some(soft_edge);
++            }
++            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"reflection" => {
++                effects.reflection = Some(parse_picture_reflection(e, reader)?);
++            }
++            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"reflection" => {
++                effects.reflection = Some(parse_picture_reflection_attrs(e));
++            }
+             Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"effects" => break,
+             Ok(Event::Eof) => break,
+             Err(e) => return Err(HwpxError::XmlError(format!("effects: {}", e))),
+@@ -3427,6 +3451,97 @@ fn parse_picture_effects(reader: &mut Reader<&[u8]>) -> Result<PictureEffects, H
+     Ok(effects)
+ }
+ 
++fn parse_picture_glow_attrs(e: &quick_xml::events::BytesStart<'_>) -> PictureGlow {
++    let mut glow = PictureGlow::default();
++    for attr in e.attributes().flatten() {
++        match attr.key.as_ref().as_bytes() {
++            b"alpha" => glow.alpha = Some(attr_str(&attr)),
++            b"radius" => glow.radius = Some(attr_str(&attr)),
++            _ => {}
++        }
++    }
++    glow
++}
++
++fn parse_picture_glow(
++    e: &quick_xml::events::BytesStart<'_>,
++    reader: &mut Reader<&[u8]>,
++) -> Result<PictureGlow, HwpxError> {
++    let mut glow = parse_picture_glow_attrs(e);
++    let mut buf = Vec::new();
++    loop {
++        match reader.read_event_into(&mut buf) {
++            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"effectsColor" => {
++                glow.color = Some(parse_effect_color_attrs(e));
++            }
++            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"effectsColor" => {
++                glow.color = Some(parse_effect_color(e, reader)?);
++            }
++            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"glow" => break,
++            Ok(Event::Eof) => break,
++            Err(e) => return Err(HwpxError::XmlError(format!("glow: {}", e))),
++            _ => {}
++        }
++        buf.clear();
++    }
++    Ok(glow)
++}
++
++fn parse_picture_reflection_attrs(e: &quick_xml::events::BytesStart<'_>) -> PictureReflection {
++    let mut reflection = PictureReflection::default();
++    for attr in e.attributes().flatten() {
++        match attr.key.as_ref().as_bytes() {
++            b"alignStyle" => reflection.align_style = Some(attr_str(&attr)),
++            b"radius" => reflection.radius = Some(attr_str(&attr)),
++            b"direction" => reflection.direction = Some(attr_str(&attr)),
++            b"distance" => reflection.distance = Some(attr_str(&attr)),
++            b"rotationStyle" => reflection.rotation_style = Some(attr_str(&attr)),
++            b"fadeDirection" => reflection.fade_direction = Some(attr_str(&attr)),
++            _ => {}
++        }
++    }
++    reflection
++}
++
++fn parse_effect_range(e: &quick_xml::events::BytesStart<'_>) -> EffectRange {
++    let mut range = EffectRange::default();
++    for attr in e.attributes().flatten() {
++        match attr.key.as_ref().as_bytes() {
++            b"start" => range.start = Some(attr_str(&attr)),
++            b"end" => range.end = Some(attr_str(&attr)),
++            _ => {}
++        }
++    }
++    range
++}
++
++fn parse_picture_reflection(
++    e: &quick_xml::events::BytesStart<'_>,
++    reader: &mut Reader<&[u8]>,
++) -> Result<PictureReflection, HwpxError> {
++    let mut reflection = parse_picture_reflection_attrs(e);
++    let mut buf = Vec::new();
++    loop {
++        match reader.read_event_into(&mut buf) {
++            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) => {
++                match local_name(e.name().as_ref()) {
++                    b"skew" => reflection.skew = Some(parse_effect_point(e)),
++                    b"scale" => reflection.scale = Some(parse_effect_point(e)),
++                    b"alpha" => reflection.alpha = Some(parse_effect_range(e)),
++                    b"pos" => reflection.pos = Some(parse_effect_range(e)),
++                    _ => {}
++                }
++            }
++            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"reflection" => break,
++            Ok(Event::Eof) => break,
++            Err(e) => return Err(HwpxError::XmlError(format!("reflection: {}", e))),
++            _ => {}
++        }
++        buf.clear();
++    }
++    Ok(reflection)
++}
++
+ fn parse_picture_shadow(
+     e: &quick_xml::events::BytesStart<'_>,
+     reader: &mut Reader<&[u8]>,
+@@ -3514,6 +3629,17 @@ fn parse_effect_color(
+             Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"rgb" => {
+                 color.rgb = Some(parse_effect_rgb(e));
+             }
++            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"effect" => {
++                let mut transform = EffectColorTransform::default();
++                for attr in e.attributes().flatten() {
++                    match attr.key.as_ref().as_bytes() {
++                        b"type" => transform.kind = attr_str(&attr),
++                        b"value" => transform.value = attr_str(&attr),
++                        _ => {}
++                    }
++                }
++                color.transforms.push(transform);
++            }
+             Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"effectsColor" => break,
+             Ok(Event::Eof) => break,
+             Err(e) => return Err(HwpxError::XmlError(format!("effectsColor: {}", e))),
+diff --git a/src/renderer/layout.rs b/src/renderer/layout.rs
+index ccc8c66..3af89e9 100644
+--- a/src/renderer/layout.rs
++++ b/src/renderer/layout.rs
+@@ -15163,6 +15163,7 @@ impl LayoutEngine {
+                                     original_size_hu,
+                                     effect: pic.image_attr.effect,
+                                     brightness: pic.image_attr.brightness,
++                                    effects: (!pic.effects.is_empty()).then(|| Box::new(pic.effects.clone())),
+                                     contrast: pic.image_attr.contrast,
+                                     opacity: pic.image_attr.opacity(),
+                                     transform: utils::extract_shape_transform(&pic.shape_attr),
+diff --git a/src/renderer/layout/paragraph_layout.rs b/src/renderer/layout/paragraph_layout.rs
+index 39f9a5d..f9310f1 100644
+--- a/src/renderer/layout/paragraph_layout.rs
++++ b/src/renderer/layout/paragraph_layout.rs
+@@ -10453,6 +10453,7 @@ fn make_picture_image_node(
+             original_size_hu,
+             effect: pic.image_attr.effect,
+             brightness: pic.image_attr.brightness,
++            effects: (!pic.effects.is_empty()).then(|| Box::new(pic.effects.clone())),
+             contrast: pic.image_attr.contrast,
+             opacity: pic.image_attr.opacity(),
+             // Inline glyphs stay in flow even if the saved object retains a
+diff --git a/src/renderer/layout/picture_footnote.rs b/src/renderer/layout/picture_footnote.rs
+index c521b87..a24b089 100644
+--- a/src/renderer/layout/picture_footnote.rs
++++ b/src/renderer/layout/picture_footnote.rs
+@@ -540,6 +540,7 @@ impl LayoutEngine {
+                 original_size_hu,
+                 effect: picture.image_attr.effect,
+                 brightness: picture.image_attr.brightness,
++                effects: (!picture.effects.is_empty()).then(|| Box::new(picture.effects.clone())),
+                 contrast: picture.image_attr.contrast,
+                 opacity: picture.image_attr.opacity(),
+                 text_wrap: Some(picture.common.text_wrap),
+@@ -876,6 +877,7 @@ impl LayoutEngine {
+                 original_size_hu,
+                 effect: picture.image_attr.effect,
+                 brightness: picture.image_attr.brightness,
++                effects: (!picture.effects.is_empty()).then(|| Box::new(picture.effects.clone())),
+                 contrast: picture.image_attr.contrast,
+                 opacity: picture.image_attr.opacity(),
+                 text_wrap: Some(picture.common.text_wrap),
+diff --git a/src/renderer/layout/shape_layout.rs b/src/renderer/layout/shape_layout.rs
+index 06ac2fa..5cf20b8 100644
+--- a/src/renderer/layout/shape_layout.rs
++++ b/src/renderer/layout/shape_layout.rs
+@@ -2194,6 +2194,7 @@ impl LayoutEngine {
+                         original_size_hu,
+                         effect: pic.image_attr.effect,
+                         brightness: pic.image_attr.brightness,
++                        effects: (!pic.effects.is_empty()).then(|| Box::new(pic.effects.clone())),
+                         contrast: pic.image_attr.contrast,
+                         opacity: pic.image_attr.opacity(),
+                         text_wrap: Some(pic.common.text_wrap),
+@@ -2746,6 +2747,7 @@ impl LayoutEngine {
+                         fill_mode: Some(img_fill.fill_mode),
+                         original_size,
+                         brightness: img_bright,
++                        effects: None,
+                         contrast: img_contrast,
+                         effect: match img_fill.effect {
+                             1 => crate::model::image::ImageEffect::GrayScale,
+diff --git a/src/renderer/layout/table_cell_content.rs b/src/renderer/layout/table_cell_content.rs
+index b638739..2d20941 100644
+--- a/src/renderer/layout/table_cell_content.rs
++++ b/src/renderer/layout/table_cell_content.rs
+@@ -1282,6 +1282,7 @@ impl LayoutEngine {
+                                     original_size_hu,
+                                     effect: pic.image_attr.effect,
+                                     brightness: pic.image_attr.brightness,
++                                    effects: (!pic.effects.is_empty()).then(|| Box::new(pic.effects.clone())),
+                                     contrast: pic.image_attr.contrast,
+                                     opacity: pic.image_attr.opacity(),
+                                     text_wrap: None,
+diff --git a/src/renderer/layout/table_layout.rs b/src/renderer/layout/table_layout.rs
+index 5360444..9921e15 100644
+--- a/src/renderer/layout/table_layout.rs
++++ b/src/renderer/layout/table_layout.rs
+@@ -5183,6 +5183,7 @@ impl LayoutEngine {
+                     RenderNodeType::Image(ImageNode {
+                         fill_mode: Some(img_fill.fill_mode),
+                         brightness: img_bright,
++                        effects: None,
+                         contrast: img_contrast,
+                         effect: img_fill.effect,
+                         ..ImageNode::new(img_fill.bin_data_id, Some(img_bytes))
+diff --git a/src/renderer/render_tree.rs b/src/renderer/render_tree.rs
+index a2f5dcf..eefc0b5 100644
+--- a/src/renderer/render_tree.rs
++++ b/src/renderer/render_tree.rs
+@@ -1454,6 +1454,10 @@ pub struct ImageNode {
+     /// (점선 사각형 + 깨진 image 아이콘) — 한컴 한글 2024 viewer 정합.
+     #[serde(default)]
+     pub external_path: Option<String>,
++    /// 그림 개체의 그림자·네온·부드러운 가장자리·반사 효과. 효과가 없으면 `None`
++    /// (레이어 트리 JSON 에도 나타나지 않는다).
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub effects: Option<Box<crate::model::image::PictureEffects>>,
+     /// [Task #825] 머리말/꼬리말 그림 식별 marker.
+     /// `Some(ref)` 일 때 본 ImageNode 는 머리말 또는 꼬리말 안에 위치하며,
+     /// `para_index` / `control_index` 는 `Header.paragraphs[]` / `Footer.paragraphs[]`
+@@ -1535,6 +1539,7 @@ impl ImageNode {
+             opacity: 1.0,
+             text_wrap: None,
+             external_path: None,
++            effects: None,
+             header_footer_ref: None,
+             cell_index: None,
+             cell_para_index: None,
+diff --git a/src/renderer/svg.rs b/src/renderer/svg.rs
+index a737a03..838bb00 100644
+--- a/src/renderer/svg.rs
++++ b/src/renderer/svg.rs
+@@ -119,6 +119,8 @@ pub struct SvgRenderer {
+     overlay_page_section: i32,
+     /// defs 내 중복 방지용 ID 집합 (화살표 마커, 이미지 효과 필터 등)
+     defs_ids: std::collections::HashSet<String>,
++    /// 그림 효과 필터·마스크 id 일련번호 (쪽 안에서 결정적).
++    picture_effect_seq: usize,
+     /// 폰트 임베딩 모드
+     pub font_embed_mode: FontEmbedMode,
+     /// 추가 폰트 탐색 경로
+@@ -237,6 +239,7 @@ impl SvgRenderer {
+             overlay_skip_depth: 0,
+             overlay_page_section: -1,
+             defs_ids: std::collections::HashSet::new(),
++            picture_effect_seq: 0,
+             font_embed_mode: FontEmbedMode::None,
+             font_paths: Vec::new(),
+             font_codepoints: std::collections::HashMap::new(),
+@@ -2021,7 +2024,42 @@ impl SvgRenderer {
+         ));
+     }
+ 
++    /// 그림 효과(그림자·네온·부드러운 가장자리·반사)가 있으면 그림 출력을 감싼다.
++    /// 효과가 없으면 종전 출력 그대로다.
+     fn render_image_node(&mut self, img: &ImageNode, bbox: &super::render_tree::BoundingBox) {
++        let Some(effects) = img.effects.as_deref().filter(|effects| !effects.is_empty()) else {
++            return self.render_image_node_plain(img, bbox);
++        };
++        let start = self.output.len();
++        self.render_image_node_plain(img, bbox);
++        let picture = self.output.split_off(start);
++        if picture.is_empty() {
++            return;
++        }
++        let frame = img.paint_bbox(bbox);
++        let sequence = self.picture_effect_seq;
++        self.picture_effect_seq += 1;
++        if let Some(reflection) = &effects.reflection {
++            let reflected =
++                picture_reflection_svg(&mut self.defs, sequence, &frame, reflection, &picture);
++            self.output.push_str(&reflected);
++        }
++        match picture_effects_filter(sequence, &frame, effects) {
++            Some((id, def)) => {
++                self.defs.push(def);
++                self.output.push_str(&format!("<g filter=\"url(#{id})\">\n"));
++                self.output.push_str(&picture);
++                self.output.push_str("</g>\n");
++            }
++            None => self.output.push_str(&picture),
++        }
++    }
++
++    fn render_image_node_plain(
++        &mut self,
++        img: &ImageNode,
++        bbox: &super::render_tree::BoundingBox,
++    ) {
+         // 저장 자르기 선택이 비었으면 프레임만 점유하며 원본을 그리지 않는다.
+         if img.crop.is_some_and(|(l, t, r, b)| r <= l || b <= t) {
+             return;
+@@ -5131,3 +5169,199 @@ pub fn generate_font_style(
+ 
+ #[cfg(test)]
+ mod tests;
++
++/// HWPUNIT 문자열 값을 SVG px 로. 읽지 못하면 0.
++fn effect_hu_px(value: Option<&str>) -> f64 {
++    let hu = value.and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(0.0);
++    if hu.is_finite() {
++        (hu * super::DEFAULT_DPI / 7200.0).max(0.0)
++    } else {
++        0.0
++    }
++}
++
++fn effect_number(value: Option<&str>, default: f64) -> f64 {
++    value
++        .and_then(|v| v.trim().parse::<f64>().ok())
++        .filter(|v| v.is_finite())
++        .unwrap_or(default)
++}
++
++/// OWPML 효과의 `alpha` 는 투명도(0=불투명, 1=투명)다. SVG 불투명도로 바꾼다.
++fn effect_opacity(alpha: Option<&str>) -> f64 {
++    1.0 - effect_number(alpha, 0.0).clamp(0.0, 1.0)
++}
++
++fn effect_color_hex(color: Option<&crate::model::image::EffectColor>) -> String {
++    let channel = |v: Option<&String>| {
++        v.and_then(|v| v.trim().parse::<u32>().ok())
++            .map(|v| v.min(255))
++            .unwrap_or(0)
++    };
++    match color.and_then(|c| c.rgb.as_ref()) {
++        Some(rgb) => format!(
++            "#{:02x}{:02x}{:02x}",
++            channel(rgb.r.as_ref()),
++            channel(rgb.g.as_ref()),
++            channel(rgb.b.as_ref())
++        ),
++        None => "#000000".to_string(),
++    }
++}
++
++/// 그림자·네온·부드러운 가장자리를 한 SVG 필터로. 셋 다 없으면 `None`.
++fn picture_effects_filter(
++    sequence: usize,
++    frame: &super::render_tree::BoundingBox,
++    effects: &crate::model::image::PictureEffects,
++) -> Option<(String, String)> {
++    if effects.shadow.is_none() && effects.glow.is_none() && effects.soft_edge.is_none() {
++        return None;
++    }
++    let id = format!("rhwp-picfx-{sequence}");
++    let mut body = String::new();
++    let mut margin = 0.0f64;
++    // 개체 자체: 부드러운 가장자리면 안쪽으로 흐려진 알파로 자른다.
++    let object = match effects.soft_edge.as_ref().map(|s| effect_hu_px(s.radius.as_deref())) {
++        Some(radius) if radius > 0.0 => {
++            body.push_str(&format!(
++                "<feMorphology in=\"SourceAlpha\" operator=\"erode\" radius=\"{:.3}\" result=\"fx-se0\"/>\
++                 <feGaussianBlur in=\"fx-se0\" stdDeviation=\"{:.3}\" result=\"fx-se1\"/>\
++                 <feComposite in=\"SourceGraphic\" in2=\"fx-se1\" operator=\"in\" result=\"fx-obj\"/>",
++                radius / 2.0,
++                radius / 4.0
++            ));
++            "fx-obj"
++        }
++        _ => "SourceGraphic",
++    };
++    let mut under = Vec::new();
++    let mut over = Vec::new();
++    if let Some(glow) = &effects.glow {
++        let radius = effect_hu_px(glow.radius.as_deref());
++        if radius > 0.0 {
++            margin = margin.max(radius * 1.5);
++            body.push_str(&format!(
++                "<feMorphology in=\"SourceAlpha\" operator=\"dilate\" radius=\"{:.3}\" result=\"fx-g0\"/>\
++                 <feGaussianBlur in=\"fx-g0\" stdDeviation=\"{:.3}\" result=\"fx-g1\"/>\
++                 <feFlood flood-color=\"{}\" flood-opacity=\"{:.3}\"/>\
++                 <feComposite in2=\"fx-g1\" operator=\"in\" result=\"fx-glow\"/>",
++                radius / 2.0,
++                radius / 4.0,
++                effect_color_hex(glow.color.as_ref()),
++                effect_opacity(glow.alpha.as_deref())
++            ));
++            under.push("fx-glow");
++        }
++    }
++    if let Some(shadow) = &effects.shadow {
++        let blur = effect_hu_px(shadow.radius.as_deref());
++        let distance = effect_hu_px(shadow.distance.as_deref());
++        let angle = effect_number(shadow.direction.as_deref(), 0.0).to_radians();
++        let (dx, dy) = (distance * angle.cos(), distance * angle.sin());
++        let color = effect_color_hex(shadow.color.as_ref());
++        let opacity = effect_opacity(shadow.alpha.as_deref());
++        if shadow.style.as_deref() == Some("INSIDE") {
++            body.push_str(&format!(
++                "<feComponentTransfer in=\"SourceAlpha\" result=\"fx-inv\"><feFuncA type=\"table\" tableValues=\"1 0\"/></feComponentTransfer>\
++                 <feGaussianBlur in=\"fx-inv\" stdDeviation=\"{:.3}\"/>\
++                 <feOffset dx=\"{dx:.3}\" dy=\"{dy:.3}\" result=\"fx-is0\"/>\
++                 <feFlood flood-color=\"{color}\" flood-opacity=\"{opacity:.3}\"/>\
++                 <feComposite in2=\"fx-is0\" operator=\"in\"/>\
++                 <feComposite in2=\"SourceAlpha\" operator=\"in\" result=\"fx-ishadow\"/>",
++                blur / 2.0
++            ));
++            over.push("fx-ishadow");
++        } else {
++            margin = margin.max(blur * 1.5 + distance);
++            body.push_str(&format!(
++                "<feGaussianBlur in=\"SourceAlpha\" stdDeviation=\"{:.3}\"/>\
++                 <feOffset dx=\"{dx:.3}\" dy=\"{dy:.3}\" result=\"fx-s0\"/>\
++                 <feFlood flood-color=\"{color}\" flood-opacity=\"{opacity:.3}\"/>\
++                 <feComposite in2=\"fx-s0\" operator=\"in\" result=\"fx-shadow\"/>",
++                blur / 2.0
++            ));
++            under.insert(0, "fx-shadow");
++        }
++    }
++    body.push_str("<feMerge>");
++    for node in under.iter().chain(std::iter::once(&object)).chain(over.iter()) {
++        body.push_str(&format!("<feMergeNode in=\"{node}\"/>"));
++    }
++    body.push_str("</feMerge>");
++    let margin = margin + 1.0;
++    let def = format!(
++        "<filter id=\"{id}\" filterUnits=\"userSpaceOnUse\" x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" color-interpolation-filters=\"sRGB\">{body}</filter>\n",
++        frame.x - margin,
++        frame.y - margin,
++        frame.width + margin * 2.0,
++        frame.height + margin * 2.0
++    );
++    Some((id, def))
++}
++
++/// 반사: 그림 아래쪽 끝을 축으로 뒤집은 사본을 거리만큼 띄우고, 위에서 아래로
++/// 시작·끝 투명도 사이를 그라디언트 마스크로 옅게 한다. `pos` 의 끝 값은 비율(0~1) 또는
++/// 백분율(1 초과)로 읽는다.
++fn picture_reflection_svg(
++    defs: &mut Vec<String>,
++    sequence: usize,
++    frame: &super::render_tree::BoundingBox,
++    reflection: &crate::model::image::PictureReflection,
++    picture: &str,
++) -> String {
++    let distance = effect_hu_px(reflection.distance.as_deref());
++    let blur = effect_hu_px(reflection.radius.as_deref());
++    let fraction = |value: Option<&String>, default: f64| {
++        let v = effect_number(value.map(String::as_str), default);
++        if v > 1.0 { v / 100.0 } else { v }.clamp(0.0, 1.0)
++    };
++    let (start_alpha, end_alpha) = reflection.alpha.as_ref().map_or((0.5, 1.0), |a| {
++        (fraction(a.start.as_ref(), 0.5), fraction(a.end.as_ref(), 1.0))
++    });
++    let (start_pos, end_pos) = reflection.pos.as_ref().map_or((0.0, 1.0), |p| {
++        (fraction(p.start.as_ref(), 0.0), fraction(p.end.as_ref(), 1.0))
++    });
++    let axis = frame.y + frame.height + distance / 2.0;
++    let top = frame.y + frame.height + distance;
++    let mask_id = format!("rhwp-picrefl-{sequence}");
++    defs.push(format!(
++        "<linearGradient id=\"{mask_id}-g\" gradientUnits=\"userSpaceOnUse\" x1=\"0\" y1=\"{:.3}\" x2=\"0\" y2=\"{:.3}\">\
++         <stop offset=\"0\" stop-color=\"#fff\" stop-opacity=\"{:.3}\"/>\
++         <stop offset=\"1\" stop-color=\"#fff\" stop-opacity=\"{:.3}\"/></linearGradient>\
++         <mask id=\"{mask_id}\" maskUnits=\"userSpaceOnUse\" x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\">\
++         <rect x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" fill=\"url(#{mask_id}-g)\"/></mask>\n",
++        top + frame.height * start_pos,
++        top + frame.height * end_pos.max(start_pos + 0.001),
++        1.0 - start_alpha,
++        1.0 - end_alpha,
++        frame.x - 1.0,
++        top,
++        frame.width + 2.0,
++        frame.height * end_pos,
++        frame.x - 1.0,
++        top,
++        frame.width + 2.0,
++        frame.height * end_pos
++    ));
++    let mut out = format!("<g mask=\"url(#{mask_id})\">\n");
++    if blur > 0.0 {
++        defs.push(format!(
++            "<filter id=\"{mask_id}-b\"><feGaussianBlur stdDeviation=\"{:.3}\"/></filter>\n",
++            blur / 2.0
++        ));
++        out.push_str(&format!("<g filter=\"url(#{mask_id}-b)\">\n"));
++    }
++    out.push_str(&format!(
++        "<g transform=\"translate(0 {:.3}) scale(1 -1)\">\n",
++        axis * 2.0
++    ));
++    out.push_str(picture);
++    out.push_str("</g>\n");
++    if blur > 0.0 {
++        out.push_str("</g>\n");
++    }
++    out.push_str("</g>\n");
++    out
++}
++
+diff --git a/src/serializer/hwpx/picture.rs b/src/serializer/hwpx/picture.rs
+index 564e62e..7f5f881 100644
+--- a/src/serializer/hwpx/picture.rs
++++ b/src/serializer/hwpx/picture.rs
+@@ -28,7 +28,7 @@ use std::io::Write;
+ use quick_xml::Writer;
+ 
+ use crate::model::image::{
+-    EffectColor, EffectPoint, EffectRgb, ImageEffect, Picture, PictureShadow,
++    EffectColor, EffectPoint, EffectRgb, ImageEffect, Picture, PictureReflection, PictureShadow,
+ };
+ use crate::model::shape::{
+     CommonObjAttr, HorzAlign, HorzRelTo, ShapeComponentAttr, SizeCriterion, TextFlow, TextWrap,
+@@ -312,10 +312,58 @@ fn write_effects<W: Write>(w: &mut Writer<W>, pic: &Picture) -> Result<(), Seria
+     if let Some(shadow) = &pic.effects.shadow {
+         write_shadow(w, shadow)?;
+     }
++    if let Some(glow) = &pic.effects.glow {
++        let mut attrs = Vec::new();
++        push_opt_attr(&mut attrs, "alpha", glow.alpha.as_deref());
++        push_opt_attr(&mut attrs, "radius", glow.radius.as_deref());
++        start_tag_attrs(w, "hp:glow", &attrs)?;
++        if let Some(color) = &glow.color {
++            write_effect_color(w, color)?;
++        }
++        end_tag(w, "hp:glow")?;
++    }
++    if let Some(soft_edge) = &pic.effects.soft_edge {
++        let mut attrs = Vec::new();
++        push_opt_attr(&mut attrs, "radius", soft_edge.radius.as_deref());
++        empty_tag(w, "hp:softEdge", &attrs)?;
++    }
++    if let Some(reflection) = &pic.effects.reflection {
++        write_reflection(w, reflection)?;
++    }
+     end_tag(w, "hp:effects")?;
+     Ok(())
+ }
+ 
++fn write_reflection<W: Write>(
++    w: &mut Writer<W>,
++    reflection: &PictureReflection,
++) -> Result<(), SerializeError> {
++    let mut attrs = Vec::new();
++    push_opt_attr(&mut attrs, "alignStyle", reflection.align_style.as_deref());
++    push_opt_attr(&mut attrs, "radius", reflection.radius.as_deref());
++    push_opt_attr(&mut attrs, "direction", reflection.direction.as_deref());
++    push_opt_attr(&mut attrs, "distance", reflection.distance.as_deref());
++    push_opt_attr(&mut attrs, "rotationStyle", reflection.rotation_style.as_deref());
++    push_opt_attr(&mut attrs, "fadeDirection", reflection.fade_direction.as_deref());
++    start_tag_attrs(w, "hp:reflection", &attrs)?;
++    if let Some(skew) = &reflection.skew {
++        write_effect_point(w, "hp:skew", skew)?;
++    }
++    if let Some(scale) = &reflection.scale {
++        write_effect_point(w, "hp:scale", scale)?;
++    }
++    for (name, range) in [("hp:alpha", &reflection.alpha), ("hp:pos", &reflection.pos)] {
++        if let Some(range) = range {
++            let mut attrs = Vec::new();
++            push_opt_attr(&mut attrs, "start", range.start.as_deref());
++            push_opt_attr(&mut attrs, "end", range.end.as_deref());
++            empty_tag(w, name, &attrs)?;
++        }
++    }
++    end_tag(w, "hp:reflection")?;
++    Ok(())
++}
++
+ fn write_shadow<W: Write>(w: &mut Writer<W>, shadow: &PictureShadow) -> Result<(), SerializeError> {
+     let mut attrs = Vec::new();
+     push_opt_attr(&mut attrs, "style", shadow.style.as_deref());
+@@ -365,9 +413,18 @@ fn write_effect_color<W: Write>(
+     push_opt_attr(&mut attrs, "systemIdx", color.system_idx.as_deref());
+     push_opt_attr(&mut attrs, "presetIdx", color.preset_idx.as_deref());
+ 
+-    if let Some(rgb) = &color.rgb {
++    if color.rgb.is_some() || !color.transforms.is_empty() {
+         start_tag_attrs(w, "hp:effectsColor", &attrs)?;
+-        write_effect_rgb(w, rgb)?;
++        if let Some(rgb) = &color.rgb {
++            write_effect_rgb(w, rgb)?;
++        }
++        for transform in &color.transforms {
++            empty_tag(
++                w,
++                "hp:effect",
++                &[("type", transform.kind.as_str()), ("value", transform.value.as_str())],
++            )?;
++        }
+         end_tag(w, "hp:effectsColor")?;
+     } else {
+         empty_tag(w, "hp:effectsColor", &attrs)?;
+@@ -892,8 +949,10 @@ mod tests {
+                         g: Some("0".to_string()),
+                         b: Some("0".to_string()),
+                     }),
++                    transforms: Vec::new(),
+                 }),
+             }),
++            ..Default::default()
+         };
+ 
+         let xml = serialize(&pic, &mut ctx);

@@ -1680,7 +1680,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hwpcraft"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1689,7 +1689,7 @@ dependencies = [
 
 [[package]]
 name = "hwpcraft-cli"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "hwpcraft-engine",
@@ -1704,7 +1704,7 @@ dependencies = [
 
 [[package]]
 name = "hwpcraft-doc"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "rhwp",
  "serde",
@@ -1712,7 +1712,7 @@ dependencies = [
 
 [[package]]
 name = "hwpcraft-engine"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1731,20 +1731,23 @@ dependencies = [
 
 [[package]]
 name = "hwpcraft-formats"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "cfb",
  "flate2",
  "hwpcraft-doc",
+ "hwpcraft-render",
+ "image",
  "quick-xml 0.42.0",
+ "serde_json",
  "tempfile",
  "zip",
 ]
 
 [[package]]
 name = "hwpcraft-mcp"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1766,7 +1769,7 @@ dependencies = [
 
 [[package]]
 name = "hwpcraft-render"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "hwpcraft-doc",
@@ -1776,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "hwpcraft-ui-egui"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1785,6 +1788,7 @@ dependencies = [
  "hwpcraft-doc",
  "hwpcraft-engine",
  "hwpcraft-formats",
+ "hwpcraft-mcp",
  "hwpcraft-render",
  "image",
  "rfd",

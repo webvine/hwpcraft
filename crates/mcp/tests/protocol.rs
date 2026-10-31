@@ -488,7 +488,8 @@ fn with_meta(mut params: Value) -> Value {
 }
 
 fn scoped_arguments(current: Option<&str>, name: &str, mut args: Value) -> Value {
-    let pure = name == "list_commands" || (name == "hwp_action" && args.get("id").is_none());
+    let pure = matches!(name, "list_commands" | "list_documents")
+        || (name == "hwp_action" && args.get("id").is_none());
     if !pure && args.get("document_id").is_none() {
         if let Some(id) = current {
             args.as_object_mut()
@@ -1350,7 +1351,7 @@ fn roots_apply_to_tools_aliases_batch_pictures_and_printing() {
 #[test]
 fn unsupported_save_never_truncates_and_exports_keep_dirty_state() {
     let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("keep.docx");
+    let target = dir.path().join("keep.odt");
     std::fs::write(&target, b"preserve").unwrap();
     let mut s = server();
     tool(&mut s, "type_text", json!({"text":"보존"}));
@@ -1589,7 +1590,11 @@ fn korean_report_authored_end_to_end_through_mcp() {
     // A table with a caption at the end, a footnote, a footer page number and today's date.
     tool(&mut s, "hwp_action", json!({"id":"MoveDocumentEnd"}));
     execute(&mut s, "paragraph.split", json!({}));
-    execute(&mut s, "insert.table", json!({"rows":2,"columns":3}));
+    let table = execute(&mut s, "insert.table", json!({"rows":2,"columns":3}))["table"].clone();
+    assert!(
+        table.is_object(),
+        "insert.table returns the new table's address"
+    );
     let doc = tool(&mut s, "inspect_document", json!({}));
     let cell = doc["blocks"]
         .as_array()
@@ -1603,12 +1608,12 @@ fn korean_report_authored_end_to_end_through_mcp() {
     execute(
         &mut s,
         "table.properties",
-        json!({"props":{"hasCaption":true}}),
+        json!({"table":table,"props":{"hasCaption":true}}),
     );
     execute(
         &mut s,
         "table.caption_text",
-        json!({"text":"표 1 주간 실적"}),
+        json!({"table":table,"text":"표 1 주간 실적"}),
     );
     tool(&mut s, "hwp_action", json!({"id":"MoveDocumentBegin"}));
     tool(&mut s, "hwp_action", json!({"id":"MoveLineEnd"}));
@@ -1659,4 +1664,512 @@ fn korean_report_authored_end_to_end_through_mcp() {
         execute(&mut s, "format.character.get", json!({}))["bold"],
         true
     );
+}
+
+#[test]
+fn change_tracked_save_is_refused_unless_accepted() {
+    let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../rhwp/samples/issue5169_viewtext_changetracking.hwp");
+    if !sample.exists() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("tracked.hwp");
+    std::fs::copy(&sample, &input).unwrap();
+    let mut s = server();
+    tool(&mut s, "open_document", json!({"path":input}));
+    let state = execute(&mut s, "document.track_changes", json!({}));
+    assert_eq!(state["tracked"], true, "{state}");
+    let plain = dir.path().join("plain.hwpx");
+    fails(&mut s, "save_document", json!({"path":plain}));
+    assert!(!plain.exists());
+    // Saving over the source is refused too, and leaves it intact.
+    let before = std::fs::read(&input).unwrap();
+    fails(&mut s, "save_document", json!({}));
+    assert_eq!(std::fs::read(&input).unwrap(), before);
+    let accepted = dir.path().join("accepted.hwp");
+    tool(
+        &mut s,
+        "save_document",
+        json!({"path":accepted,"acceptTrackChanges":true}),
+    );
+    assert!(accepted.exists());
+    let state = execute(&mut s, "document.track_changes", json!({}));
+    assert_eq!(state["tracked"], false, "{state}");
+}
+
+#[test]
+fn distribution_documents_never_hand_out_text_or_save_through_any_tool() {
+    let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../rhwp/samples/20250130-hongbo-no.hwp");
+    if !sample.exists() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("dist.hwp");
+    std::fs::copy(&sample, &input).unwrap();
+    let mut s = server();
+    let opened = tool(&mut s, "open_document", json!({"path":input}));
+    // Words from the sample's first page.
+    let leaks = |v: &Value| {
+        let text = v.to_string();
+        ["봉화댐", "보도자료", "수자원공사"]
+            .iter()
+            .any(|w| text.contains(w))
+    };
+    assert!(!leaks(&opened), "{opened}");
+    for (name, args, refused) in [
+        ("list_commands", json!({}), Some(false)),
+        ("get_text", json!({}), Some(true)),
+        ("inspect_document", json!({}), None),
+        ("get_selection", json!({}), None),
+        ("select_text", json!({"text":"봉화댐"}), Some(true)),
+        ("type_text", json!({"text":"x"}), Some(true)),
+        (
+            "execute",
+            json!({"command":"document.text","params":{}}),
+            Some(true),
+        ),
+        ("execute", json!({"command":"select.all","params":{}}), None),
+        ("get_selection", json!({}), None),
+        (
+            "execute",
+            json!({"command":"edit.find","params":{"query":"봉화댐"}}),
+            Some(false),
+        ),
+        (
+            "execute",
+            json!({"command":"clipboard.copy","params":{}}),
+            Some(true),
+        ),
+        ("hwp_action", json!({"id":"SelectAll"}), None),
+        ("hwp_action", json!({"id":"Copy"}), Some(true)),
+        ("hwp_action", json!({"id":"Delete"}), Some(true)),
+        ("hwp_action", json!({"query":"Copy"}), Some(false)),
+        (
+            "batch",
+            json!({"commands":[{"command":"document.text"}]}),
+            Some(true),
+        ),
+        (
+            "batch",
+            json!({"commands":[{"command":"text.insert","params":{"text":"x"}}]}),
+            Some(true),
+        ),
+        ("save_document", json!({}), Some(true)),
+        (
+            "save_document",
+            json!({"path":dir.path().join("o.hwp")}),
+            Some(true),
+        ),
+        (
+            "save_document",
+            json!({"path":dir.path().join("o.hwpx")}),
+            Some(true),
+        ),
+        (
+            "save_document",
+            json!({"path":dir.path().join("o.txt")}),
+            Some(true),
+        ),
+        (
+            "save_document",
+            json!({"path":dir.path().join("o.pdf")}),
+            Some(true),
+        ),
+        ("render_page", json!({"page":1}), Some(false)),
+        ("list_documents", json!({}), Some(false)),
+    ] {
+        let r = raw_tool(&mut s, name, args.clone());
+        let failed = r["isError"] == true;
+        assert!(!leaks(&r), "{name} {args} leaks text: {r}");
+        if let Some(refused) = refused {
+            assert_eq!(failed, refused, "{name} {args}: {r}");
+        }
+        if failed && refused == Some(true) && name != "batch" {
+            let text = r["content"][0]["text"].as_str().unwrap_or_default();
+            assert!(
+                text.contains(hwpcraft_engine::DISTRIBUTION_READ_ONLY),
+                "{name} {args}: {r}"
+            );
+        }
+    }
+    for ext in ["hwp", "hwpx", "txt", "pdf"] {
+        assert!(!dir.path().join(format!("o.{ext}")).exists(), "o.{ext}");
+    }
+    assert_eq!(
+        std::fs::read(&input).unwrap(),
+        std::fs::read(&sample).unwrap()
+    );
+    tool(&mut s, "close_document", json!({}));
+}
+
+#[test]
+fn picture_effects_save_as_hwp_is_refused_unless_dropped() {
+    let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../rhwp/samples/hwpx/aift.hwpx");
+    if !sample.exists() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("aift.hwpx");
+    std::fs::copy(&sample, &input).unwrap();
+    let mut s = server();
+    tool(&mut s, "open_document", json!({"path":input}));
+    // Hangul saved one picture shadow; HWPX keeps it.
+    let kept = dir.path().join("kept.hwpx");
+    let saved = tool(&mut s, "save_document", json!({"path":kept}));
+    assert!(saved.get("droppedPictureEffects").is_none(), "{saved}");
+    let hwp = dir.path().join("out.hwp");
+    std::fs::write(&hwp, b"preserve").unwrap();
+    fails(&mut s, "save_document", json!({"path":hwp}));
+    assert_eq!(std::fs::read(&hwp).unwrap(), b"preserve");
+    let dropped = tool(
+        &mut s,
+        "save_document",
+        json!({"path":hwp,"dropPictureEffects":true}),
+    );
+    assert_eq!(dropped["droppedPictureEffects"], 1, "{dropped}");
+    assert_ne!(std::fs::read(&hwp).unwrap(), b"preserve");
+    // Saving again needs no drop: the effects left the document.
+    tool(&mut s, "save_document", json!({"path":hwp}));
+}
+
+#[test]
+fn docx_export_reports_what_it_could_not_carry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = server();
+    tool(
+        &mut s,
+        "type_text",
+        json!({"text":"보고서 제목
+본문 문단"}),
+    );
+    let path = dir.path().join("report.docx");
+    let saved = tool(&mut s, "save_document", json!({"path":path}));
+    assert_eq!(saved["omitted"], json!([]), "{saved}");
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[..2], b"PK");
+    // DOCX is an export: the document stays unsaved.
+    assert_eq!(
+        tool(&mut s, "inspect_document", json!({}))["document"]["dirty"],
+        true
+    );
+}
+
+/// The final goal end to end: an AI writes a whole report through MCP alone (the
+/// 보고서 style set, a cover with its date field, outline headings, table of contents
+/// and 표 차례, body, captioned tables and picture, chart, a cross reference, footnote,
+/// a memo, page numbers in header and footer, a two-column part), saves it as HWPX,
+/// HWP, PDF and DOCX, and every reopened file still has the same pages, renders every
+/// page, the table of contents still points at the right pages and nothing failed
+/// silently. docs/mcp-commands.md "보고서 작성 순서" follows these steps.
+#[test]
+fn ai_report_authored_saved_and_reopened_in_every_format() {
+    report_round_trip(false, false);
+}
+
+/// The same report with HWPX pages compared too: a chart next to a footnote, a
+/// captioned table and a picture once came back a page lower from HWPX.
+#[test]
+fn ai_report_hwpx_reopen_keeps_every_page() {
+    report_round_trip(true, false);
+}
+
+/// The same report under the 보고서 style set (larger, spaced headings) and with a
+/// reviewer's memo. Its HWP reopen once laid out a heading a page lower than the
+/// live document, so the saved table of contents was off by a page (stale line
+/// positions from incremental layout; RHWP 0038 and fresh rows for a new document's
+/// HWP save).
+#[test]
+fn ai_report_with_style_set_keeps_hwp_toc_pages() {
+    report_round_trip(true, true);
+}
+
+fn report_round_trip(strict_hwpx: bool, style_set: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let png = dir.path().join("figure.png");
+    image::RgbaImage::from_pixel(48, 30, image::Rgba([68, 114, 196, 255]))
+        .save(&png)
+        .unwrap();
+    let mut s = server();
+    let heading = |s: &mut TestClient, style: u32, text: &str| {
+        tool(s, "type_text", json!({ "text": text }));
+        execute(s, "style.apply", json!({ "id": style }));
+        tool(s, "type_text", json!({"text":"\n"}));
+        execute(s, "style.apply", json!({"id":0}));
+    };
+    // The style set first: headings and body take its sizes and spacing as typed.
+    if style_set {
+        let set = execute(&mut s, "format.style.set.apply", json!({"name":"보고서"}));
+        assert_eq!(set["name"], "보고서", "{set}");
+    }
+    tool(
+        &mut s,
+        "type_text",
+        json!({"text":"2026년 3분기 사업 실적 보고서\n작성: 경영기획팀\n작성일: "}),
+    );
+    let date = execute(&mut s, "insert.date_field", json!({"kind":"created"}));
+    assert!(
+        date["text"].as_str().is_some_and(|t| t.contains('년')),
+        "{date}"
+    );
+    tool(&mut s, "type_text", json!({"text":"\n"}));
+    execute(&mut s, "insert.page_break", json!({}));
+    tool(&mut s, "type_text", json!({"text":"[[차례]]\n"}));
+    execute(&mut s, "insert.page_break", json!({}));
+    for c in 1..=2 {
+        heading(&mut s, 2, &format!("제{c}장 사업 추진 현황"));
+        for sec in 1..=2 {
+            heading(&mut s, 3, &format!("{c}.{sec} 세부 과제"));
+            let body = (1..=3)
+                .map(|k| format!("{c}.{sec}-{k} 이번 분기에는 계획한 과제를 차질 없이 진행했으며 세부 일정과 예산 집행률을 함께 점검했습니다."))
+                .collect::<Vec<_>>()
+                .join("\n");
+            tool(&mut s, "type_text", json!({ "text": body + "\n" }));
+            if sec == 1 {
+                execute(&mut s, "insert.table", json!({"rows":2,"columns":2}));
+                let doc = tool(&mut s, "inspect_document", json!({"limit":1000}));
+                let cell = doc["blocks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|b| b["cursor"]["cell"].is_object())
+                    .unwrap()["cursor"]
+                    .clone();
+                execute(&mut s, "selection.set", json!({ "cursor": cell }));
+                tool(&mut s, "type_text", json!({"text":"과제"}));
+                execute(
+                    &mut s,
+                    "table.properties",
+                    json!({"props":{"hasCaption":true}}),
+                );
+                execute(
+                    &mut s,
+                    "table.caption_text",
+                    json!({ "text": format!("{c}장 예산 집행") }),
+                );
+            } else {
+                let made = execute(
+                    &mut s,
+                    "picture.insert",
+                    json!({"path":png,"width_mm":60.0,"treat_as_char":true}),
+                );
+                execute(
+                    &mut s,
+                    "object.properties",
+                    json!({"address":made["address"],"props":{"hasCaption":true}}),
+                );
+            }
+            tool(&mut s, "hwp_action", json!({"id":"MoveDocumentEnd"}));
+            tool(&mut s, "type_text", json!({"text":"\n"}));
+        }
+        if c == 1 {
+            execute(
+                &mut s,
+                "note.insert",
+                json!({"endnote":false,"paragraphs":["9월 말 결산 기준입니다."]}),
+            );
+            execute(
+                &mut s,
+                "chart.create",
+                json!({"chart":{"kind":"column","title":"분기별 매출",
+                "categories":["1분기","2분기","3분기"],"series":[{"name":"매출","values":[12,19,23]}]}}),
+            );
+            tool(&mut s, "hwp_action", json!({"id":"MoveDocumentEnd"}));
+            tool(&mut s, "type_text", json!({"text":"\n"}));
+        } else {
+            execute(
+                &mut s,
+                "page.column_def_break",
+                json!({"count":2,"spacing_mm":8.0}),
+            );
+            for k in 1..=4 {
+                tool(
+                    &mut s,
+                    "type_text",
+                    json!({ "text": format!("다단 구간 {k}: 현장 점검 결과를 두 단으로 정리합니다.\n") }),
+                );
+            }
+            execute(
+                &mut s,
+                "page.column_def_break",
+                json!({"count":1,"spacing_mm":0.0}),
+            );
+        }
+    }
+    // Header with a page number field, plus a page number at the bottom: both are
+    // auto numbers next to the footnote's and the captions' (HWPX once refused this).
+    execute(
+        &mut s,
+        "page.header_footer.text",
+        json!({"header":true,"apply_to":"both","text":"사업 실적 보고서 ","fields":[{"offset":10,"kind":"page_number"}]}),
+    );
+    execute(
+        &mut s,
+        "page.number",
+        json!({"position":"bottom_center","format":0,"dash":true,"start":1}),
+    );
+    // A reviewer's memo on a body sentence.
+    if style_set {
+        tool(&mut s, "select_text", json!({"text":"1.1-1 이번 분기에는"}));
+        execute(
+            &mut s,
+            "memo.create",
+            json!({"text":"집행률 수치를 재무팀과 맞춰 주세요.","author":"검토자"}),
+        );
+    }
+    tool(&mut s, "select_text", json!({"text":"[[차례]]"}));
+    tool(&mut s, "hwp_action", json!({"id":"Delete"}));
+    let toc = execute(
+        &mut s,
+        "tools.toc",
+        json!({"levels":2,"title":"차례","leader":"dot"}),
+    );
+    assert_eq!(toc["entries"], 6, "{toc}");
+    // A 표 차례 right after the contents: captions as shown, with their pages.
+    let tables = execute(&mut s, "tools.toc", json!({"kind":"tables"}));
+    assert_eq!(tables["entries"], 2, "{tables}");
+    // "표 1을 참조하세요." with the number as a cross reference that stays current.
+    tool(&mut s, "hwp_action", json!({"id":"MoveDocumentEnd"}));
+    tool(&mut s, "type_text", json!({"text":"\n자세한 내용은 표 "}));
+    let reference = execute(
+        &mut s,
+        "insert.cross_reference",
+        json!({"target":{"table":1},"show":"number"}),
+    );
+    assert_eq!(reference["text"], "1", "{reference}");
+    tool(&mut s, "type_text", json!({"text":"을 참조하세요."}));
+
+    let summary = tool(&mut s, "inspect_document", json!({"limit":1}));
+    let pages = summary["document"]["pages"].as_u64().unwrap();
+    assert!(pages >= 4, "{summary}");
+    for page in 1..=pages {
+        let png = raw_tool(&mut s, "render_page", json!({"page":page,"scale":0.25}));
+        assert_eq!(png["isError"], false, "page {page}");
+    }
+    let outline = |s: &mut TestClient| -> Vec<(String, u64)> {
+        execute(s, "document.outline", json!({}))["outline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o.get("cellIndex").is_none())
+            .map(|o| {
+                (
+                    o["title"].as_str().unwrap().to_owned(),
+                    o["page"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    };
+    let live = outline(&mut s);
+    assert_eq!(live.len(), 6, "{live:?}");
+    let table_lines = |s: &mut TestClient| -> Vec<String> {
+        tool(s, "get_text", json!({"limit":1000}))["text"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("표 ") && l.contains('\t'))
+            .map(str::to_owned)
+            .collect()
+    };
+    let live_tables = table_lines(&mut s);
+    assert_eq!(live_tables.len(), 2, "{live_tables:?}");
+    assert!(
+        live_tables[0].starts_with("표 1 1장 예산 집행\t"),
+        "{live_tables:?}"
+    );
+
+    for ext in ["hwpx", "hwp", "pdf"] {
+        tool(
+            &mut s,
+            "save_document",
+            json!({"path": dir.path().join(format!("report.{ext}"))}),
+        );
+    }
+    let pdf = std::fs::read(dir.path().join("report.pdf")).unwrap();
+    assert!(pdf.starts_with(b"%PDF"));
+    // 차례, 표 차례 and the cross reference are links to their pages in the PDF too.
+    let gotos = String::from_utf8_lossy(&pdf).matches("/S /GoTo").count();
+    assert!(gotos >= 9, "{gotos} GoTo links");
+    let docx = tool(
+        &mut s,
+        "save_document",
+        json!({"path": dir.path().join("report.docx")}),
+    );
+    // The chart is pictured from its page; nothing else is left out.
+    assert_eq!(
+        docx["omitted"],
+        json!(["그리기 개체·글상자·차트(그림으로 씀) 1개"]),
+        "{docx}"
+    );
+
+    for ext in ["hwpx", "hwp"] {
+        let opened = tool(
+            &mut s,
+            "open_document",
+            json!({"path": dir.path().join(format!("report.{ext}")), "force": true}),
+        );
+        let reopened = outline(&mut s);
+        if ext == "hwp" || strict_hwpx {
+            assert_eq!(opened["pages"].as_u64(), Some(pages), "{ext}: {opened}");
+            assert_eq!(reopened, live, "{ext}");
+        } else {
+            let titles = |o: &[(String, u64)]| o.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>();
+            assert_eq!(titles(&reopened), titles(&live), "{ext}");
+        }
+        // Each table of contents line ends with the page of its heading.
+        let text = tool(&mut s, "get_text", json!({"limit":1000}))["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for (title, page) in &live {
+            let line = text
+                .lines()
+                .find(|l| l.contains(title.as_str()) && l.contains('\t'))
+                .unwrap_or_else(|| panic!("{ext}: no TOC line for {title}"));
+            assert!(
+                line.ends_with(&format!("\t{page}")),
+                "{ext}: {line} vs page {page}"
+            );
+        }
+        assert!(text.contains("자세한 내용은 표 1을 참조하세요."), "{ext}");
+        if ext == "hwp" || strict_hwpx {
+            assert_eq!(table_lines(&mut s), live_tables, "{ext}");
+        }
+        // Every page still renders; the memo, the date field and the style set stay.
+        let reopened_pages = opened["pages"].as_u64().unwrap();
+        for page in 1..=reopened_pages {
+            let png = raw_tool(&mut s, "render_page", json!({"page":page,"scale":0.25}));
+            assert_eq!(png["isError"], false, "{ext}: page {page}");
+        }
+        let memos = execute(&mut s, "memo.list", json!({}));
+        let expected = usize::from(style_set);
+        assert_eq!(
+            memos.as_array().map(Vec::len),
+            Some(expected),
+            "{ext}: {memos}"
+        );
+        if style_set {
+            assert_eq!(memos[0]["author"], "검토자", "{ext}: {memos}");
+        }
+        let dates = execute(&mut s, "tools.date_field.update", json!({}));
+        assert_eq!(dates["fields"], 1, "{ext}: {dates}");
+        assert!(text.contains("작성일: "), "{ext}");
+        let styles = execute(&mut s, "format.style.export", json!({}));
+        let h1 = styles["styles"]
+            .as_array()
+            .and_then(|a| a.iter().find(|st| st["name"] == "개요 1"))
+            .cloned()
+            .unwrap_or_default();
+        if style_set {
+            assert_eq!(h1["character"]["fontSize"], 1600, "{ext}: {h1}");
+        }
+        let references = execute(&mut s, "tools.cross_reference.list", json!({}));
+        // `execute` hands back the list itself.
+        let number = &references[0];
+        assert_eq!(number["show"], "number", "{ext}: {references}");
+        assert_eq!(number["expected"], number["text"], "{ext}: {references}");
+    }
 }

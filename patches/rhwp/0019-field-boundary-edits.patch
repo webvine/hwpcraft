@@ -1,0 +1,244 @@
+diff --git a/src/document_core/commands/clipboard.rs b/src/document_core/commands/clipboard.rs
+index 4a0ede6..6fb8f38 100644
+--- a/src/document_core/commands/clipboard.rs
++++ b/src/document_core/commands/clipboard.rs
+@@ -759,9 +759,26 @@ impl DocumentCore {
+             let clip_char_offsets = clip_paras[0].char_offsets.clone();
+             let new_chars = clip_text.chars().count();
+ 
++            // 메모·누름틀 끝에 붙인 글은 입력과 같은 규칙으로 범위 밖에 둔다 — 끝 칸이 새 글
++            // 앞에 남으므로 범위만 늘리면 저장본을 다시 열 때 글이 필드 안으로 들어간다.
++            let active_field = self.active_field.clone();
++            let outside_field_ends = super::text_editing::inactive_field_end_insertions(
++                &self.document.sections[section_idx].paragraphs[para_idx],
++                active_field.as_ref(),
++                section_idx,
++                para_idx,
++                None,
++                char_offset,
++            );
++
+             // 텍스트 삽입
+             self.document.sections[section_idx].paragraphs[para_idx]
+                 .insert_text_at(char_offset, &clip_text);
++            super::text_editing::keep_inactive_field_end_outside(
++                &mut self.document.sections[section_idx].paragraphs[para_idx],
++                &outside_field_ends,
++                new_chars,
++            );
+ 
+             // 클립보드의 글자 모양 적용
+             self.apply_clipboard_char_shapes(
+diff --git a/src/document_core/commands/text_editing.rs b/src/document_core/commands/text_editing.rs
+index e392c89..352faf1 100644
+--- a/src/document_core/commands/text_editing.rs
++++ b/src/document_core/commands/text_editing.rs
+@@ -888,7 +888,7 @@ fn body_paragraph_flow_signature(paragraph: &Paragraph) -> (usize, Option<i64>)
+ }
+ 
+ #[derive(Clone, Copy)]
+-struct FieldEndInsertion {
++pub(super) struct FieldEndInsertion {
+     control_idx: usize,
+     start_char_idx: usize,
+     end_char_idx: usize,
+@@ -927,7 +927,7 @@ fn active_field_matches(
+     })
+ }
+ 
+-fn inactive_field_end_insertions(
++pub(super) fn inactive_field_end_insertions(
+     para: &Paragraph,
+     active_field: Option<&ActiveFieldInfo>,
+     section_idx: usize,
+@@ -938,8 +938,11 @@ fn inactive_field_end_insertions(
+     para.field_ranges
+         .iter()
+         .filter_map(|fr| {
++            // 메모도 끝 칸이 새 글자 앞에 남는다(스트림이 그렇다). 범위만 늘리면 저장본을
++            // 다시 열 때 글자가 메모 안으로 들어가 모델이 달라진다.
+             match para.controls.get(fr.control_idx) {
+-                Some(Control::Field(field)) if field.field_type == FieldType::ClickHere => {}
++                Some(Control::Field(field))
++                    if matches!(field.field_type, FieldType::ClickHere | FieldType::Memo) => {}
+                 _ => return None,
+             }
+             // 빈 누름틀은 active 상태가 아직 반영되기 전 첫 입력도 값으로 받아야 한다.
+@@ -1150,7 +1153,7 @@ fn inactive_field_start_insertions(
+         .collect()
+ }
+ 
+-fn keep_inactive_field_end_outside(
++pub(super) fn keep_inactive_field_end_outside(
+     para: &mut Paragraph,
+     insertions: &[FieldEndInsertion],
+     inserted_len: usize,
+@@ -3738,14 +3741,8 @@ impl DocumentCore {
+         self.document.sections[section_idx]
+             .paragraphs
+             .insert(new_para_idx, new_para);
+-        for i in para_idx..=new_para_idx {
+-            if !self.document.sections[section_idx].paragraphs[i]
+-                .field_ranges
+-                .is_empty()
+-            {
+-                rebuild_char_offsets(&mut self.document.sections[section_idx].paragraphs[i]);
+-            }
+-        }
++        // `split_at` 이 누름틀·메모의 시작·끝 칸을 맞춰 나눈다. 범위만으로 글자 위치를 다시
++        // 만들면(`rebuild_char_offsets`) 번호·수식 같은 인라인 개체 칸이 사라진다.
+ 
+         // 양쪽 문단 리플로우 → vpos 재계산 → 재구성 → 재페이지네이션 + 다단 수렴 루프
+         let old_col1 = self
+@@ -3848,14 +3845,8 @@ impl DocumentCore {
+         self.document.sections[section_idx]
+             .paragraphs
+             .insert(new_para_idx, new_para);
+-        for i in para_idx..=new_para_idx {
+-            if !self.document.sections[section_idx].paragraphs[i]
+-                .field_ranges
+-                .is_empty()
+-            {
+-                rebuild_char_offsets(&mut self.document.sections[section_idx].paragraphs[i]);
+-            }
+-        }
++        // `split_at` 이 누름틀·메모의 시작·끝 칸을 맞춰 나눈다. 범위만으로 글자 위치를 다시
++        // 만들면(`rebuild_char_offsets`) 번호·수식 같은 인라인 개체 칸이 사라진다.
+ 
+         // 새 문단에 쪽 나누기 설정
+         self.document.sections[section_idx].paragraphs[new_para_idx].column_type =
+diff --git a/src/model/paragraph.rs b/src/model/paragraph.rs
+index 669a7d8..3e306b0 100644
+--- a/src/model/paragraph.rs
++++ b/src/model/paragraph.rs
+@@ -1142,7 +1142,26 @@ impl Paragraph {
+             let trailing_ctrl_count = (char_offset - text_len) as u32;
+             last_char_end + trailing_ctrl_count * 8
+         } else if inserts_before_inline_control {
+-            if effective_char_offset == 0 {
++            // 캐럿 글자가 자동 번호 placeholder 면 그 칸 바로 앞(그 글자 위치)에 넣는다. 그
++            // 앞 갭의 누름틀·메모 시작 칸은 앞 글자 쪽에 남아, 캐럿에서 시작하는 범위가 새
++            // 글자를 감싼다. 갭이 없으면 아래 경로와 같은 위치다.
++            let caret_is_number_placeholder = text_chars.get(effective_char_offset) == Some(&' ')
++                && self
++                    .char_offsets
++                    .get(effective_char_offset + 1)
++                    .zip(self.char_offsets.get(effective_char_offset))
++                    .is_some_and(|(&next, &here)| next == here + 8)
++                && self
++                    .controls
++                    .iter()
++                    .zip(control_positions.iter())
++                    .any(|(ctrl, &pos)| {
++                        pos == effective_char_offset
++                            && matches!(ctrl, Control::AutoNumber(_) | Control::NewNumber(_))
++                    });
++            if caret_is_number_placeholder {
++                self.char_offsets[effective_char_offset]
++            } else if effective_char_offset == 0 {
+                 0
+             } else if !self.char_offsets.is_empty() {
+                 let prev_idx = effective_char_offset - 1;
+@@ -1503,9 +1522,25 @@ impl Paragraph {
+         let split_pos = self.split_text_pos_for_logical_offset(char_offset, &control_positions);
+         let text_chars: Vec<char> = self.text.chars().collect();
+ 
++        // 분할 지점에서 시작하는 누름틀·메모는 시작 칸(8 유닛씩)이 분할 글자 앞 갭에 있다.
++        // 그 갭이 시작 칸뿐이면 칸까지 새 문단으로 보내 범위와 함께 옮긴다. 남기면 새
++        // 문단 필드에 시작 칸이 없어 저장본을 다시 열 때 글자 위치가 달라진다.
++        let starting_fields = self
++            .field_ranges
++            .iter()
++            .filter(|fr| split_pos > 0 && fr.start_char_idx == split_pos)
++            .count() as u32;
++        let begin_slots_before_split = (starting_fields > 0 && split_pos < self.char_offsets.len())
++            .then(|| {
++                let prev_end = self.char_offsets[split_pos - 1]
++                    + Self::char_stream_len(text_chars[split_pos - 1]);
++                self.char_offsets[split_pos].saturating_sub(prev_end)
++            })
++            .filter(|gap| *gap == starting_fields * 8)
++            .unwrap_or(0);
+         // 분할 지점의 UTF-16 위치
+         let utf16_split: u32 = if split_pos < self.char_offsets.len() {
+-            self.char_offsets[split_pos]
++            self.char_offsets[split_pos] - begin_slots_before_split
+         } else if !self.char_offsets.is_empty() {
+             let last = self.char_offsets.len() - 1;
+             self.char_offsets[last] + Self::char_stream_len(text_chars[last])
+@@ -1676,6 +1711,49 @@ impl Paragraph {
+                 }
+             }
+         }
++        // 5-0. 분할 지점에 걸친 필드는 원래 문단에서 끝난다(아래 5-1). 그 끝 칸(8 유닛)은
++        // 새 문단의 끝 글자 앞 갭에 남아 있으므로 함께 걷어 낸다. 남기면 컨트롤 없는 칸이
++        // 생겨 저장본을 다시 열 때 글자 위치가 달라진다.
++        let mut dangling_ends: Vec<usize> = self
++            .field_ranges
++            .iter()
++            .filter(|fr| fr.start_char_idx < split_pos && split_pos < fr.end_char_idx)
++            .map(|fr| fr.end_char_idx - split_pos)
++            .collect();
++        dangling_ends.sort_unstable();
++        let mut new_char_offsets = new_char_offsets;
++        let mut removed_units: Vec<u32> = Vec::new();
++        for &end in dangling_ends.iter().rev() {
++            if end == 0 || end >= new_char_offsets.len() {
++                continue;
++            }
++            let prev_end = new_char_offsets[end - 1]
++                + Self::char_stream_len(new_text.chars().nth(end - 1).unwrap_or(' '));
++            if new_char_offsets[end] < prev_end + 8 {
++                continue;
++            }
++            // 끝 칸은 갭의 맨 앞(앞 글자 바로 뒤)에 있다.
++            removed_units.push(prev_end);
++            for off in &mut new_char_offsets[end..] {
++                *off -= 8;
++            }
++        }
++        for &slot in &removed_units {
++            let after = |pos: u32| pos >= slot + 8;
++            for cs in &mut new_char_shapes {
++                if after(cs.start_pos) {
++                    cs.start_pos -= 8;
++                }
++            }
++            for rt in &mut new_range_tags {
++                if after(rt.start) {
++                    rt.start -= 8;
++                }
++                if after(rt.end) {
++                    rt.end -= 8;
++                }
++            }
++        }
+         // 5-1. field_ranges 분할
+         let mut new_field_ranges: Vec<FieldRange> = Vec::new();
+         let mut kept_field_ranges: Vec<FieldRange> = Vec::new();
+@@ -1759,8 +1837,23 @@ impl Paragraph {
+         let kept_text_code_units: u32 = self.text.chars().map(Self::char_stream_len).sum();
+         let new_text_code_units: u32 = new_text.chars().map(Self::char_stream_len).sum();
+         let ctrl_code_units: u32 = self.controls.len() as u32 * 8;
+-        self.char_count = kept_text_code_units + ctrl_code_units + 1; // +1 for paragraph end marker
+-        let new_char_count = new_text_code_units + new_controls.len() as u32 * 8 + 1;
++        // 필드 끝·제목 차례 표시는 컨트롤 없이 8 유닛씩 차지한다(`control_text_positions`의
++        // hidden slot). 빼면 표를 넣으려고 나눈 앞 문단이 메모 끝 칸을 잃는다.
++        let hidden_slot_units = |ranges: &[FieldRange], orphans: usize, titles: usize| {
++            (ranges.len() + orphans + titles) as u32 * 8
++        };
++        self.char_count = kept_text_code_units
++            + ctrl_code_units
++            + hidden_slot_units(
++                &self.field_ranges,
++                self.orphan_field_ends.len(),
++                self.title_marks.len(),
++            )
++            + 1; // +1 for paragraph end marker
++        let new_char_count = new_text_code_units
++            + new_controls.len() as u32 * 8
++            + hidden_slot_units(&new_field_ranges, 0, new_title_marks.len())
++            + 1;
+ 
+         // 7. has_para_text: 빈 문단(텍스트 없고 컨트롤 없음)이면 PARA_TEXT 불필요
+         //    HWP 프로그램은 cc=1(빈 문단)에 PARA_TEXT가 있으면 파일 손상으로 판단

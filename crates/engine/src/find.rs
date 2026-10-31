@@ -180,6 +180,13 @@ impl Session {
         let Ok(para) = self.paragraph(c) else {
             return false;
         };
+        self.shape_ok_in(para, range, o)
+    }
+    /// [`Self::shape_ok`] for a paragraph in any context.
+    fn shape_ok_in(&self, para: &Paragraph, range: &Range<usize>, o: FindOptions) -> bool {
+        if !o.has_format() {
+            return true;
+        }
         let shapes = &self.core.document().doc_info.char_shapes;
         range.clone().all(|k| {
             let pos = para.char_offsets.get(k).copied().unwrap_or(k as u32);
@@ -396,6 +403,234 @@ impl Session {
         })?;
         Ok(count)
     }
+    /// 모두 찾기 over the contexts `include` names (the kinds of `context.v2.list`;
+    /// empty means every kind): body, table cells at any depth, headers, footers,
+    /// text boxes, footnotes and endnotes. Each match carries its version 2 address,
+    /// and the body / first-level cell ones also an editing `cursor`.
+    pub(crate) fn find_all_in_contexts(
+        &self,
+        query: &str,
+        o: FindOptions,
+        include: &[String],
+        limit: usize,
+    ) -> Result<Value> {
+        let m = Matcher::new(query, o)?;
+        let (addresses, truncated) = self.context_v2_addresses(include)?;
+        let mut total = 0;
+        let mut matches = Vec::new();
+        for (address, writable) in addresses {
+            let para = self.context_v2_paragraph(&address)?;
+            for r in m.ranges(&para.text) {
+                if !self.shape_ok_in(para, &r, o) {
+                    continue;
+                }
+                total += 1;
+                if matches.len() >= limit {
+                    continue;
+                }
+                let mut hit = json!({"address": address, "kind": context_kind(&address),
+                    "offset": r.start, "length": r.len(), "readonly": !writable});
+                if let Some(c) = legacy_cursor(&address) {
+                    hit["cursor"] = json!(Cursor {
+                        offset: r.start,
+                        ..c
+                    });
+                }
+                matches.push(hit);
+            }
+        }
+        Ok(
+            json!({"total": total, "returned": matches.len(), "matches": matches,
+            "truncated": truncated, "generation": self.generation, "addressVersion": 2,
+            "offsetUnit": "unicode_scalar"}),
+        )
+    }
+    /// 모두 바꾸기 over the contexts `include` names, as one undo step. Matches in
+    /// protected or read-only contexts are left alone and counted in the second value;
+    /// the third says whether the document was too large to walk completely.
+    pub(crate) fn replace_all_in_contexts(
+        &mut self,
+        query: &str,
+        replacement: &str,
+        o: FindOptions,
+        include: &[String],
+    ) -> Result<(usize, usize, bool)> {
+        if query.is_empty() {
+            bail!("찾을 내용을 입력하세요.");
+        }
+        if query.contains(['\r', '\n']) || replacement.contains(['\r', '\n']) {
+            bail!("모두 바꾸기는 문단 안의 한 줄 텍스트만 지원합니다.");
+        }
+        if query.len() > 1_000_000 || replacement.len() > 1_000_000 {
+            bail!("찾기와 바꾸기 텍스트는 각각 1 MB 이하입니다.");
+        }
+        let m = Matcher::new(query, o)?;
+        let (addresses, truncated) = self.context_v2_addresses(include)?;
+        let (mut count, mut skipped) = (0, 0);
+        let mut body = Vec::new();
+        let mut other = Vec::new();
+        for (address, writable) in addresses {
+            let para = self.context_v2_paragraph(&address)?;
+            let cursor = legacy_cursor(&address);
+            let writable = writable && cursor.is_none_or(|c| !self.cell_protected(c));
+            for r in m.ranges(&para.text) {
+                if !self.shape_ok_in(para, &r, o) {
+                    continue;
+                }
+                if !writable {
+                    skipped += 1;
+                    continue;
+                }
+                count += 1;
+                if count > 10_000 {
+                    bail!("한 번의 모두 바꾸기는 10,000건 이하입니다.");
+                }
+                if para
+                    .text
+                    .chars()
+                    .skip(r.start)
+                    .take(r.len())
+                    .eq(replacement.chars())
+                {
+                    continue;
+                }
+                match cursor {
+                    Some(c) => body.push((c, r)),
+                    None => other.push((address.clone(), r)),
+                }
+            }
+        }
+        if body.is_empty() && other.is_empty() {
+            return Ok((count, skipped, truncated));
+        }
+        let caret = self.cursor;
+        self.transaction(|s| {
+            // Headers, notes, text boxes and nested cells first: editing them leaves
+            // the body text and its control indices, so the body ranges stay valid.
+            s.context_v2_replace_ranges(&other, replacement)?;
+            s.deferred_layout(|s| {
+                for (cursor, r) in body.into_iter().rev() {
+                    s.clear_selection();
+                    s.cursor = Cursor {
+                        offset: r.end,
+                        ..cursor
+                    };
+                    s.anchor = Some(r.start);
+                    s.insert(replacement)?;
+                }
+                Ok(())
+            })?;
+            s.cursor = caret;
+            s.clear_selection();
+            Ok(())
+        })?;
+        Ok((count, skipped, truncated))
+    }
+    /// The version 2 address of a hit RHWP's search reports by its parent paragraph
+    /// and (control, cell, paragraph) steps: a table cell, or a text box (RHWP puts
+    /// cell 0 there). `None` when a step does not resolve.
+    pub(crate) fn search_hit_address(
+        &self,
+        section: usize,
+        paragraph: usize,
+        steps: &[(usize, usize, usize)],
+    ) -> Option<ContextAddress> {
+        let mut para = self
+            .core
+            .document()
+            .sections
+            .get(section)?
+            .paragraphs
+            .get(paragraph)?;
+        let mut path = Vec::new();
+        for &(control, cell, index) in steps {
+            match para.controls.get(control)? {
+                Control::Table(t) => {
+                    para = t.cells.get(cell)?.paragraphs.get(index)?;
+                    path.push(ContextStep::TableCell {
+                        control,
+                        cell,
+                        paragraph: index,
+                    });
+                }
+                Control::Shape(shape) => {
+                    let text = shape.drawing().and_then(|d| d.text_box.as_ref())?;
+                    para = text.paragraphs.get(index)?;
+                    path.push(ContextStep::TextBox {
+                        control,
+                        shape_path: vec![],
+                        paragraph: index,
+                    });
+                }
+                _ => return None,
+            }
+        }
+        Some(ContextAddress {
+            version: 2,
+            section,
+            paragraph,
+            path,
+        })
+    }
+}
+
+/// The context kind of an address, as `context.v2.list` names it.
+pub(crate) fn context_kind(address: &ContextAddress) -> &'static str {
+    match address.path.last() {
+        None => "body",
+        Some(ContextStep::TableCell { .. }) => "table_cell",
+        Some(ContextStep::Header { .. }) => "header",
+        Some(ContextStep::Footer { .. }) => "footer",
+        Some(ContextStep::Footnote { .. }) => "footnote",
+        Some(ContextStep::Endnote { .. }) => "endnote",
+        Some(ContextStep::TextBox { .. }) => "textbox",
+    }
+}
+
+/// A body paragraph or first-level table cell as an editing cursor at offset 0;
+/// other contexts have none.
+pub(crate) fn legacy_cursor(address: &ContextAddress) -> Option<Cursor> {
+    let cell = match address.path.as_slice() {
+        [] => None,
+        [
+            ContextStep::TableCell {
+                control,
+                cell,
+                paragraph,
+            },
+        ] => Some(Cell {
+            control: *control,
+            index: *cell,
+            paragraph: *paragraph,
+        }),
+        _ => return None,
+    };
+    Some(Cursor {
+        section: address.section,
+        paragraph: address.paragraph,
+        offset: 0,
+        cell,
+    })
+}
+
+/// Context kinds `include` accepts; an empty list means all of them.
+pub(crate) fn check_context_kinds(include: &[String]) -> Result<()> {
+    for kind in include {
+        if ![
+            "body",
+            "table_cell",
+            "header",
+            "footer",
+            "textbox",
+            "footnote",
+            "endnote",
+        ]
+        .contains(&kind.as_str())
+        {
+            bail!("알 수 없는 문맥 종류: {kind}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

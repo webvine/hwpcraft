@@ -1,0 +1,120 @@
+diff --git a/src/renderer/composer.rs b/src/renderer/composer.rs
+--- a/src/renderer/composer.rs
++++ b/src/renderer/composer.rs
+@@ -446,6 +446,10 @@
+                     Some((pos, crate::renderer::equation::flow_width_hwp(eq) as i32, i))
+                 }
+                 Control::Form(f) if f.common.treat_as_char => Some((pos, f.width as i32, i)),
++                // 덧말: 기준 글자는 문단 텍스트가 아니라 컨트롤에 있다(HWP5 'tdut',
++                // HWPX `hp:dutmal`). 인라인 개체처럼 자리를 차지하며, 폭은 글자 모양이
++                // 필요해 배치(`layout_composed_paragraph_in_frame`)에서 잰다.
++                Control::Ruby(r) if !r.main_text.is_empty() => Some((pos, 0, i)),
+                 Control::Table(t)
+                     if t.common.treat_as_char
+                         && super::height_measurer::is_tac_table_inline_in_para(
+diff --git a/src/renderer/layout/paragraph_layout.rs b/src/renderer/layout/paragraph_layout.rs
+--- a/src/renderer/layout/paragraph_layout.rs
++++ b/src/renderer/layout/paragraph_layout.rs
+@@ -572,6 +572,33 @@
+         return None;
+     }
+     (delta > 0).then(|| hwpunit_to_px(delta, dpi))
++}
++
++/// 덧말의 기준 글자와 덧말 글자 모양: 컨트롤 자리의 글자 모양, 덧말은 크기 비율
++/// (`szRatio`, 기본 50 %)만큼 줄인다.
++fn ruby_text_styles(
++    para: &Paragraph,
++    control_index: usize,
++    ruby: &crate::model::control::Ruby,
++    styles: &ResolvedStyleSet,
++) -> (TextStyle, TextStyle) {
++    let position = para
++        .control_utf16_positions()
++        .get(control_index)
++        .copied()
++        .unwrap_or(0);
++    let char_shape = crate::renderer::composer::find_active_char_shape(&para.char_shapes, position);
++    let lang = ruby
++        .main_text
++        .chars()
++        .next()
++        .map(crate::renderer::style_resolver::detect_lang_category)
++        .unwrap_or(0);
++    let main = resolved_to_text_style(styles, char_shape, lang);
++    let mut annotation = main.clone();
++    let ratio = if ruby.sz_ratio == 0 { 50 } else { ruby.sz_ratio.min(100) };
++    annotation.font_size = main.font_size * f64::from(ratio) / 100.0;
++    (main, annotation)
+ }
+ 
+ /// 글머리표 문단의 마커 문자열. 없거나 그릴 수 없으면 `None`.
+@@ -4793,6 +4820,10 @@
+                                         + margin_right,
+                                 )
+                             }
++                            Control::Ruby(ruby) => para.map(|p| {
++                                let (main, _) = ruby_text_styles(p, *ci, ruby, styles);
++                                estimate_text_width(&ruby.main_text, &main)
++                            }),
+                             Control::Shape(shape) => {
+                                 // [#6606] 도형·묶음도 줄 안에서 상자(폭 + 좌우 여백)를 차지한다.
+                                 let (margin_left, margin_right, _, _) =
+@@ -8800,6 +8831,57 @@
+                             }
+                         }
+                     }
++                    // 덧말: 기준 글자를 줄에, 작은 덧말을 그 위(또는 아래)에 그린다.
++                    if let Some(p) = para {
++                        if let Some(Control::Ruby(ruby)) = p.controls.get(tac_ci) {
++                            let (main_style, ruby_style) =
++                                ruby_text_styles(p, tac_ci, ruby, styles);
++                            let ruby_w = estimate_text_width(&ruby.ruby_text, &ruby_style);
++                            let ruby_x = match ruby.align {
++                                0 => x,
++                                1 => x + tac_w - ruby_w,
++                                _ => x + (tac_w - ruby_w) / 2.0,
++                            };
++                            let ruby_baseline = if ruby.pos_type == 1 {
++                                baseline + ruby_style.font_size
++                            } else {
++                                baseline - main_style.font_size * 0.92
++                            };
++                            for (text, style, run_x, run_w, run_baseline) in [
++                                (&ruby.main_text, main_style.clone(), x, tac_w, baseline),
++                                (&ruby.ruby_text, ruby_style, ruby_x, ruby_w, ruby_baseline),
++                            ] {
++                                if text.is_empty() {
++                                    continue;
++                                }
++                                let node = RenderNode::new(
++                                    tree.next_id(),
++                                    RenderNodeType::TextRun(TextRunNode {
++                                        text: text.clone(),
++                                        style,
++                                        char_shape_id: None,
++                                        para_shape_id: Some(composed.para_style_id),
++                                        section_index: Some(section_index),
++                                        para_index: Some(para_index),
++                                        char_start: None, // 문서 좌표에 포함되지 않음
++                                        cell_context: cell_ctx.clone(),
++                                        is_para_end: false,
++                                        is_line_break_end: false,
++                                        rotation: 0.0,
++                                        is_vertical: false,
++                                        char_overlap: None,
++                                        border_fill_id: 0,
++                                        baseline: run_baseline,
++                                        field_marker: FieldMarkerType::None,
++                                        layout_positions: None,
++                                        display_text: None,
++                                    }),
++                                    BoundingBox::new(run_x, y, run_w, line_height),
++                                );
++                                line_node.children.push(node);
++                            }
++                        }
++                    }
+                     // 인라인 양식 개체 렌더링
+                     if let Some(p) = para {
+                         if let Some(Control::Form(f)) = p.controls.get(tac_ci) {

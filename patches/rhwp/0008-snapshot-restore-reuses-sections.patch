@@ -1,0 +1,491 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index ef75ff2..09a01b0 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -339,6 +339,10 @@ impl DocumentCore {
+             event_log: Vec::new(),
+             overflow_links_cache: RefCell::new(HashMap::new()),
+             snapshot_store: Vec::new(),
++            model_stamps: crate::document_core::ModelStamps::default(),
++            model_stamp_clock: 0,
++            untracked_model_edit: false,
++            derived_layout_contract: None,
+             next_snapshot_id: 0,
+             fragment_store: Vec::new(),
+             next_fragment_id: 0,
+@@ -2524,6 +2528,8 @@ impl DocumentCore {
+     /// WASM 영역 영역 외부 image inject 영역 의 영역 영역 영역.
+     pub fn document_mut(&mut self) -> &mut Document {
+         self.flush_cell_format_vpos();
++        // 무엇이 바뀌는지 모르므로 스냅샷 복원은 다음 전체 재구성까지 구역을 재사용하지 않는다.
++        self.untracked_model_edit = true;
+         &mut self.document
+     }
+ 
+@@ -2802,10 +2808,12 @@ impl DocumentCore {
+         self.flush_cell_format_vpos();
+         let id = self.next_snapshot_id;
+         self.next_snapshot_id += 1;
++        let stamps = self.model_stamps_for_snapshot();
+         self.snapshot_store.push((
+             id,
+             self.document.clone(),
+             self.text_reflowed_table_paths_for_snapshot(),
++            stamps,
+         ));
+         // 초과 시 가장 오래된 스냅샷 제거. 상한은 `Self::MAX_SNAPSHOTS` 하나뿐이고
+         // studio 는 `snapshotCapacity()` 로 그 값을 받아 예산을 계산한다(#7002 후속).
+@@ -2836,24 +2844,36 @@ impl DocumentCore {
+ 
+     /// 지정 ID의 스냅샷으로 Document를 복원한다.
+     /// 스타일 재해소 + 문단 구성 + 페이지네이션까지 수행.
++    ///
++    /// 내용 표식이 현재와 같은 구역은 파생 상태를 그대로 두고, 바뀐 구역만 다시 구성·측정·
++    /// 조판한다(`rebuild_changed_sections`). 판단할 수 없으면 전부 다시 만든다.
+     pub fn restore_snapshot_native(&mut self, id: u32) -> Result<String, HwpError> {
+         let idx = self
+             .snapshot_store
+             .iter()
+-            .position(|(sid, _, _)| *sid == id)
++            .position(|(sid, ..)| *sid == id)
+             .ok_or_else(|| HwpError::RenderError(format!("스냅샷 {} 없음", id)))?;
+-        let (_, doc, text_reflowed_table_paths) = self.snapshot_store[idx].clone();
+-        self.document = doc;
++        let (_, doc, text_reflowed_table_paths, stamps) = self.snapshot_store[idx].clone();
++        let changed = self.snapshot_changed_sections(&doc, &stamps);
++        let previous = std::mem::replace(&mut self.document, doc);
+         self.restore_text_reflowed_tables_from_snapshot(&text_reflowed_table_paths);
+         self.bump_bin_data_epoch();
+-        // 문서를 통째로 갈아끼웠으므로 파생 상태는 전부 새 원본에서 다시 만든다.
+-        self.rebuild_derived_state();
++        let reused =
++            changed.is_some_and(|changed| self.rebuild_changed_sections(&changed, &previous));
++        drop(previous);
++        if !reused {
++            // 문서를 통째로 갈아끼웠으므로 파생 상태는 전부 새 원본에서 다시 만든다.
++            self.rebuild_derived_state();
++        }
++        // 파생 상태가 이제 스냅샷 내용과 맞으므로 그 표식을 잇는다.
++        self.model_stamps = stamps;
++        self.untracked_model_edit = false;
+         Ok(super::super::helpers::json_ok())
+     }
+ 
+     /// 지정 ID의 스냅샷을 저장소에서 제거하여 메모리를 해제한다.
+     pub fn discard_snapshot_native(&mut self, id: u32) {
+-        self.snapshot_store.retain(|(sid, _, _)| *sid != id);
++        self.snapshot_store.retain(|(sid, ..)| *sid != id);
+     }
+ 
+     pub fn measure_width_diagnostic_native(
+diff --git a/src/document_core/commands/formatting.rs b/src/document_core/commands/formatting.rs
+index 77a14b9..8774486 100644
+--- a/src/document_core/commands/formatting.rs
++++ b/src/document_core/commands/formatting.rs
+@@ -1228,6 +1228,11 @@ impl DocumentCore {
+             }
+             None => self.rebuild_paragraph_deferred_in_batch(sec_idx, para_idx),
+         }
++        // 호출자는 이 문단(과 DocInfo 의 모양 등록)만 고쳤다 — 구역 표식은 위에서 새로 받았고,
++        // DocInfo 는 공통 앞부분 비교에 맡긴다.
++        self.stamp_section_changed(sec_idx);
++        self.model_stamps.doc_info = self.next_model_stamp();
++        self.untracked_model_edit = false;
+         Ok("{\"ok\":true}".to_string())
+     }
+ 
+diff --git a/src/document_core/commands/text_editing.rs b/src/document_core/commands/text_editing.rs
+index 9f6f809..e392c89 100644
+--- a/src/document_core/commands/text_editing.rs
++++ b/src/document_core/commands/text_editing.rs
+@@ -697,6 +697,8 @@ impl DocumentCore {
+         let text_reflowed_paths = staged.text_reflowed_table_paths_for_snapshot();
+         self.document.sections[section_idx] = staged.document.sections.remove(section_idx);
+         self.restore_text_reflowed_tables_from_snapshot(&text_reflowed_paths);
++        // 아래 비배치 경로는 dirty 표시 없이 파생 상태를 통째로 넘겨받는다.
++        self.stamp_section_changed(section_idx);
+ 
+         if self.batch_mode {
+             self.invalidate_page_tree_cache();
+diff --git a/src/document_core/mod.rs b/src/document_core/mod.rs
+index c7f2d2c..6358b48 100644
+--- a/src/document_core/mod.rs
++++ b/src/document_core/mod.rs
+@@ -159,6 +159,17 @@ impl TableTextReflowKey {
+     }
+ }
+ 
++/// 구역·DocInfo 내용의 판(版) 표식.
++///
++/// 편집이 구역을 dirty 로 표시할 때마다 그 구역에 새 값을 준다 — 값이 같으면 내용도 같다.
++/// 스냅샷은 저장 시점의 표식을 함께 들고, 복원은 값이 같은 구역의 파생 상태(문단 구성·
++/// 측정·쪽 나눔)를 다시 만들지 않는다.
++#[derive(Clone, Debug, Default)]
++pub(crate) struct ModelStamps {
++    pub(crate) sections: Vec<u64>,
++    pub(crate) doc_info: u64,
++}
++
+ #[derive(Default)]
+ pub(crate) struct RenderNormalizationState {
+     pub(crate) document_epoch: u64,
+@@ -273,8 +284,22 @@ pub struct DocumentCore {
+     /// 글상자 오버플로우 연결 캐시 (섹션별, 지연 계산)
+     pub(crate) overflow_links_cache:
+         RefCell<HashMap<usize, Vec<queries::doc_tree_nav::OverflowLink>>>,
+-    /// Undo/Redo용 Document 스냅샷 저장소 (ID → Document 클론)
+-    pub(crate) snapshot_store: Vec<(u32, Document, std::collections::HashSet<RenderPath>)>,
++    /// Undo/Redo용 Document 스냅샷 저장소 (ID → Document 클론, 저장 시점의 내용 표식)
++    pub(crate) snapshot_store: Vec<(
++        u32,
++        Document,
++        std::collections::HashSet<RenderPath>,
++        ModelStamps,
++    )>,
++    /// 현재 구역·DocInfo 내용의 판 표식 (스냅샷 복원의 구역 재사용 판단).
++    pub(crate) model_stamps: ModelStamps,
++    /// 판 표식 발급 카운터.
++    pub(crate) model_stamp_clock: u64,
++    /// `document_mut` 로 표식 없이 모델이 바뀌었다. 다음 전체 재구성까지 구역을 재사용하지 않는다.
++    pub(crate) untracked_model_edit: bool,
++    /// 모든 구역의 파생 상태를 만든 문서 전체 조판 계약. 증분 조판 중 계약이 바뀌어
++    /// 구역마다 다른 계약으로 만든 상태가 섞이면 `None`.
++    pub(crate) derived_layout_contract: Option<queries::rendering::LayoutContract>,
+     /// 다음 스냅샷 ID
+     pub(crate) next_snapshot_id: u32,
+     /// [#5769] Undo/Redo용 삭제 조각 저장소 (ID → DeleteFragment).
+@@ -474,6 +499,7 @@ impl DocumentCore {
+     }
+ 
+     pub(crate) fn rebuild_resolved_styles(&mut self) {
++        self.model_stamps.doc_info = self.next_model_stamp();
+         self.styles = self.resolve_render_styles();
+         self.styles.supplemental_metrics = self
+             .canvas_metrics
+@@ -549,6 +575,10 @@ impl DocumentCore {
+             event_log: Vec::new(),
+             overflow_links_cache: RefCell::new(HashMap::new()),
+             snapshot_store: Vec::new(),
++            model_stamps: ModelStamps::default(),
++            model_stamp_clock: 0,
++            untracked_model_edit: false,
++            derived_layout_contract: None,
+             next_snapshot_id: 0,
+             fragment_store: Vec::new(),
+             next_fragment_id: 0,
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 1c2d54f..353701e 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -4240,6 +4240,7 @@ impl DocumentCore {
+         if section_idx < self.dirty_sections.len() {
+             self.dirty_sections[section_idx] = true;
+         }
++        self.stamp_section_changed(section_idx);
+         // 문단 dirty는 건드리지 않음 (셀 편집 시 문단 재측정 불필요)
+     }
+ 
+@@ -4505,6 +4506,7 @@ impl DocumentCore {
+         for d in &mut self.dirty_sections {
+             *d = true;
+         }
++        self.stamp_all_sections_changed();
+         self.render_normalization
+             .section_revisions
+             .resize(self.document.sections.len(), 0);
+@@ -4516,6 +4518,201 @@ impl DocumentCore {
+         self.render_normalization.path_revisions.clear();
+     }
+ 
++    pub(crate) fn next_model_stamp(&mut self) -> u64 {
++        self.model_stamp_clock = self.model_stamp_clock.wrapping_add(1);
++        self.model_stamp_clock
++    }
++
++    /// 구역 수에 맞춰 판 표식을 늘리거나 줄인다. 새 자리는 새 값이다.
++    fn sync_model_stamp_len(&mut self) {
++        let count = self.document.sections.len();
++        while self.model_stamps.sections.len() < count {
++            let stamp = self.next_model_stamp();
++            self.model_stamps.sections.push(stamp);
++        }
++        self.model_stamps.sections.truncate(count);
++    }
++
++    /// 구역 내용이 바뀌었다 — 이전 스냅샷과 이 구역의 파생 상태를 나누어 쓰지 않는다.
++    pub(crate) fn stamp_section_changed(&mut self, section_idx: usize) {
++        self.sync_model_stamp_len();
++        if section_idx < self.model_stamps.sections.len() {
++            let stamp = self.next_model_stamp();
++            self.model_stamps.sections[section_idx] = stamp;
++        }
++    }
++
++    pub(crate) fn stamp_all_sections_changed(&mut self) {
++        self.sync_model_stamp_len();
++        for idx in 0..self.model_stamps.sections.len() {
++            let stamp = self.next_model_stamp();
++            self.model_stamps.sections[idx] = stamp;
++        }
++    }
++
++    /// 스냅샷에 함께 넣을 표식. `document_mut` 뒤라면 모든 구역·DocInfo 가 새 내용이다.
++    pub(crate) fn model_stamps_for_snapshot(&mut self) -> crate::document_core::ModelStamps {
++        self.sync_model_stamp_len();
++        if self.untracked_model_edit {
++            self.stamp_all_sections_changed();
++            self.model_stamps.doc_info = self.next_model_stamp();
++        }
++        self.model_stamps.clone()
++    }
++
++    /// 스냅샷 복원에서 다시 만들어야 할 구역(`true`). 구역을 나누어 판단할 수 없으면 `None`.
++    ///
++    /// 표식이 같은 구역은 내용이 같고 파생 상태도 그 내용에서 만든 것이다. DocInfo 표식이
++    /// 다르면 두 쪽의 모양 표가 공통 앞부분에서 같을 때만 나눈다 — 모양 등록은 뒤에 덧붙이기만
++    /// 하므로, 바뀌지 않은 구역은 양쪽에 다 있는 id 만 쓴다.
++    pub(crate) fn snapshot_changed_sections(
++        &self,
++        snapshot: &Document,
++        stamps: &crate::document_core::ModelStamps,
++    ) -> Option<Vec<bool>> {
++        let count = self.document.sections.len();
++        let derived_complete = self.composed.len() == count
++            && self.pagination.len() == count
++            && self.dirty_sections.len() == count
++            && self.measured_sections.len() == count
++            && self.measured_tables.len() == count
++            && self.dirty_paragraphs.len() == count
++            && self.para_column_map.len() == count;
++        if self.untracked_model_edit
++            || self.pending_cell_format_vpos
++            || snapshot.sections.len() != count
++            || stamps.sections.len() != count
++            || self.model_stamps.sections.len() != count
++            || !derived_complete
++            || has_embedded_font_source(&self.document.doc_info)
++            || has_embedded_font_source(&snapshot.doc_info)
++        {
++            return None;
++        }
++        // 문서 전체에서 정하는 조판 계약(편집 여부·HWP3 계보 보정)이 다르면 모든 구역이 달라진다.
++        let contract = self.derived_layout_contract?;
++        if layout_contract(&self.document) != contract || layout_contract(snapshot) != contract {
++            return None;
++        }
++        if stamps.doc_info != self.model_stamps.doc_info
++            && !doc_info_shapes_share_prefix(&self.document.doc_info, &snapshot.doc_info)
++        {
++            return None;
++        }
++        let changed: Vec<bool> = stamps
++            .sections
++            .iter()
++            .zip(&self.model_stamps.sections)
++            .map(|(snapshot_stamp, current)| snapshot_stamp != current)
++            .collect();
++        // 모든 구역이 바뀌었으면 전체 재구성이 더 싸다.
++        (!changed.iter().all(|changed| *changed)).then_some(changed)
++    }
++
++    /// 스냅샷으로 갈아끼운 문서에서 `changed` 구역의 파생 상태만 다시 만든다.
++    ///
++    /// 바뀐 구역은 전체 재구성과 같은 경로(문단 구성 → 전체 측정 → 조판)를 밟는다. 그 구역의
++    /// 쪽 수·쪽 번호·머리말/꼬리말·바탕쪽이 달라지면 뒤 구역도 다시 조판한다(측정은 재사용).
++    /// 결과를 믿을 수 없는 경우에는 `false` 를 돌려주고, 호출자가 전부 다시 만든다.
++    pub(crate) fn rebuild_changed_sections(
++        &mut self,
++        changed: &[bool],
++        previous: &Document,
++    ) -> bool {
++        let style_flags = |styles: &crate::renderer::style_resolver::ResolvedStyleSet| {
++            (
++                styles.page_number_char_style_id,
++                styles.hwp3_variant,
++                styles.hft_ascii_halfwidth,
++            )
++        };
++        let before = style_flags(&self.styles);
++        self.pending_cell_format_vpos = false;
++        self.rebuild_resolved_styles();
++        if style_flags(&self.styles) != before {
++            return false;
++        }
++        self.rebuild_embedded_exact_font_sources();
++
++        let count = changed.len();
++        let section_has_endnote = |section: &Section| {
++            section.paragraphs.iter().any(|para| {
++                para.controls
++                    .iter()
++                    .any(|ctrl| matches!(ctrl, Control::Endnote(_)))
++            })
++        };
++        let mut endnotes_changed = false;
++        for idx in (0..count).filter(|&idx| changed[idx]) {
++            endnotes_changed |= section_has_endnote(&self.document.sections[idx])
++                || previous
++                    .sections
++                    .get(idx)
++                    .is_some_and(|section| section_has_endnote(section));
++            self.composed[idx] =
++                compose_section_with_horizontal_shaping(&self.document.sections[idx], &self.styles);
++            self.dirty_sections[idx] = true;
++            self.invalidate_render_normalization_section(idx);
++            self.measured_tables[idx].clear();
++            self.measured_sections[idx] = MeasuredSection {
++                fallback_paragraphs: Vec::new(),
++                tables: Vec::new(),
++            };
++            self.dirty_paragraphs[idx] = None;
++            self.para_column_map[idx].clear();
++        }
++        // 문서 끝 미주는 마지막 구역이 모아 조판한다.
++        if endnotes_changed && count > 1 && !changed[count - 1] {
++            self.dirty_sections[count - 1] = true;
++        }
++        self.render_normalization.document_epoch =
++            self.render_normalization.document_epoch.wrapping_add(1);
++        self.render_normalization
++            .path_revisions
++            .retain(|path, _| !changed.get(path.section_index).copied().unwrap_or(true));
++        self.invalidate_page_tree_cache();
++        self.overflow_links_cache.borrow_mut().clear();
++
++        let carry = |pagination: &PaginationResult| {
++            format!(
++                "{:?}",
++                pagination
++                    .pages
++                    .iter()
++                    .map(|page| (
++                        page.page_number,
++                        page.page_number_restarted,
++                        &page.page_number_pos,
++                        &page.active_header,
++                        &page.active_footer,
++                        &page.active_master_page,
++                        &page.extra_master_pages,
++                    ))
++                    .collect::<Vec<_>>()
++            )
++        };
++        let carry_before: Vec<Option<String>> = (0..count)
++            .map(|idx| changed[idx].then(|| carry(&self.pagination[idx])))
++            .collect();
++        self.paginate();
++        if self.pagination.len() != count {
++            return false;
++        }
++        let first_shifted = (0..count).find(|&idx| {
++            carry_before[idx]
++                .as_ref()
++                .is_some_and(|before| *before != carry(&self.pagination[idx]))
++        });
++        if let Some(first) = first_shifted {
++            // 뒤 구역의 쪽 번호·상속 머리말이 앞 구역 결과에 기대므로 다시 조판한다.
++            for idx in first..count {
++                self.dirty_sections[idx] = true;
++            }
++            self.paginate();
++        }
++        true
++    }
++
+     /// 원본 IR 은 그대로 두고, 거기서 파생된 렌더 상태를 전부 원본에서 다시 만든다.
+     ///
+     /// `document` 는 읽기만 한다 — 편집이 아니라 **메모된 파생본이 더는 원본과 대응하지
+@@ -4533,6 +4730,7 @@ impl DocumentCore {
+     /// 만들면 같은 패스 안에서 옛 값이 섞인다.
+     pub(crate) fn rebuild_derived_state(&mut self) {
+         self.pending_cell_format_vpos = false;
++        self.untracked_model_edit = false;
+         self.rebuild_resolved_styles();
+         self.rebuild_embedded_exact_font_sources();
+         self.recompose_all_with_horizontal_shaping();
+@@ -4917,6 +5115,25 @@ impl DocumentCore {
+     }
+ 
+     fn paginate_pass(&mut self, force_breaks: &[std::collections::HashSet<usize>]) {
++        // 모든 구역을 처음부터 측정하는 pass 는 지금 계약으로 파생 상태를 통일한다. 일부만
++        // 다시 만드는 pass 에서 계약이 바뀌었으면 옛 계약의 구역이 남는다.
++        let contract = layout_contract(&self.document);
++        let fresh = (0..self.document.sections.len()).all(|idx| {
++            self.dirty_sections.get(idx).copied().unwrap_or(true)
++                && (self
++                    .measured_sections
++                    .get(idx)
++                    .is_none_or(|measured| measured.fallback_paragraphs.is_empty())
++                    || self
++                        .dirty_paragraphs
++                        .get(idx)
++                        .is_none_or(|bits| bits.is_none()))
++        });
++        if fresh {
++            self.derived_layout_contract = Some(contract);
++        } else if self.derived_layout_contract != Some(contract) {
++            self.derived_layout_contract = None;
++        }
+         // [#4968 R4C-3] 이번 pass의 모든 fresh-layout 경로가 동일한 exact-source
+         // generation을 읽는다. 등록 source가 없으면 None으로 K0 fast path를 고정한다.
+         self.ensure_exact_font_measurement_contexts();
+@@ -9786,3 +10003,59 @@ mod tests {
+         }
+     }
+ }
++
++/// 문서 전체에서 정해 모든 구역의 조판에 들어가는 계약: 레이아웃 프로필(세션 편집 여부
++/// 포함)과 HWP3 계보 보정 두 가지.
++pub(crate) type LayoutContract = (
++    crate::model::provenance::LayoutCompatibilityProfile,
++    bool,
++    bool,
++);
++
++pub(crate) fn layout_contract(document: &Document) -> LayoutContract {
++    (
++        document.layout_profile(),
++        uses_hwp3_origin_page_tolerance(document),
++        uses_hwp3_origin_flow_spacing_before(document),
++    )
++}
++
++/// 문서에 실린 글꼴(embedded face)을 쓰는가. exact source 등록은 문서 전체에서 다시 정하므로
++/// 스냅샷 복원의 구역 재사용 대상에서 뺀다.
++fn has_embedded_font_source(doc_info: &crate::model::document::DocInfo) -> bool {
++    doc_info.font_faces.iter().flatten().any(|font| {
++        (font.is_embedded && font.resolved_bin_data_id.is_some())
++            || font.subst_font.as_ref().is_some_and(|substitute| {
++                substitute.is_embedded && substitute.resolved_bin_data_id.is_some()
++            })
++    })
++}
++
++/// 두 DocInfo 의 모양 표가 공통 앞부분에서 같고 그 밖의 조판 관련 레코드도 같은가.
++fn doc_info_shapes_share_prefix(
++    a: &crate::model::document::DocInfo,
++    b: &crate::model::document::DocInfo,
++) -> bool {
++    fn same_prefix<T: serde::Serialize>(a: &[T], b: &[T]) -> bool {
++        let n = a.len().min(b.len());
++        match (serde_json::to_vec(&a[..n]), serde_json::to_vec(&b[..n])) {
++            (Ok(a), Ok(b)) => a == b,
++            _ => false,
++        }
++    }
++    a.font_faces.len() == b.font_faces.len()
++        && a.font_faces
++            .iter()
++            .zip(&b.font_faces)
++            .all(|(a, b)| same_prefix(a, b))
++        && same_prefix(&a.border_fills, &b.border_fills)
++        && same_prefix(&a.char_shapes, &b.char_shapes)
++        && same_prefix(&a.tab_defs, &b.tab_defs)
++        && same_prefix(&a.numberings, &b.numberings)
++        && same_prefix(&a.bullets, &b.bullets)
++        && same_prefix(&a.para_shapes, &b.para_shapes)
++        && same_prefix(&a.styles, &b.styles)
++        && a.extra_records.len() == b.extra_records.len()
++        && same_prefix(&a.extra_records, &b.extra_records)
++        && a.hwpx_head_tail == b.hwpx_head_tail
++}

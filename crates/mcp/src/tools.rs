@@ -57,8 +57,11 @@ pub fn tool_definitions() -> Value {
         ),
         tool(
             "save_document",
-            "Save HWP/HWPX or export PDF/TXT, by path extension. Omit path to save to the current HWP/HWPX path. Exports do not clear dirty state.",
-            object(json!({"path":text}), &[]),
+            "Save HWP/HWPX or export PDF/TXT/DOCX, by path extension. DOCX results list what DOCX could not carry (drawing objects, equations, numbering text, …) in omitted. Omit path to save to the current HWP/HWPX path. Exports do not clear dirty state. A document with Hangul change tracking is refused as HWP/HWPX (HwpCraft cannot keep the tracking) unless acceptTrackChanges is true, which merges the changes into the shown text and drops the tracking records; see execute document.track_changes. Picture effects (shadow, glow, soft edge, reflection) cannot be written to .hwp yet: such a save is refused unless dropPictureEffects is true, which removes them first (one undo step) and returns droppedPictureEffects; HWPX keeps them.",
+            object(
+                json!({"path":text,"acceptTrackChanges":boolean,"dropPictureEffects":boolean}),
+                &[]
+            ),
             false
         ),
         tool(
@@ -123,8 +126,13 @@ pub fn tool_definitions() -> Value {
         )
     ])
 }
+/// Internal key carrying a result's value next to its text, so the MCP response
+/// does not parse back the JSON it was just written from. Never sent to clients.
+pub(crate) const PARSED: &str = "hwpcraft/parsed";
+
 pub(crate) fn result(value: Value, is_error: bool) -> Value {
-    json!({"content":[{"type":"text","text":value.to_string()}],"isError":is_error})
+    let text = value.to_string();
+    json!({"content":[{"type":"text","text":text}],"isError":is_error,PARSED:value})
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -204,8 +212,21 @@ fn answer(b: &mut Headless, name: &str, args: Value) -> Result<Value> {
                             | "tools.autotext.delete"
                             | "tools.autotext.body.add"
                             | "tools.autotext.body.delete"
-                    ) || (c.command == "format.style.export"
-                        && c.params.get("path").is_some_and(|path| !path.is_null()))
+                            | "macro.save"
+                            | "macro.delete"
+                            | "equation.macro.save"
+                            | "equation.macro.delete"
+                            | "file.template.new"
+                            | "file.template.save"
+                            | "file.template.delete"
+                            | "table.user_style.save"
+                            | "table.user_style.delete"
+                            | "format.style.set.save"
+                            | "format.style.set.delete"
+                    ) || (c.command == "macro.record.stop"
+                        && c.params.get("name").is_some_and(|name| !name.is_null()))
+                        || (c.command == "format.style.export"
+                            && c.params.get("path").is_some_and(|path| !path.is_null()))
                 })
             {
                 bail!("atomic batch에는 파일 또는 설정 쓰기 명령을 넣을 수 없습니다.");

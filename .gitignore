@@ -27,3 +27,5 @@
 /docs/CODEX-ACTIVE-WORK.md
 /tools/test_gen_hwp_actions.py
 /.build/
+# Browser automation captures (may hold Hangul screenshots — internal only)
+/.playwright-mcp/

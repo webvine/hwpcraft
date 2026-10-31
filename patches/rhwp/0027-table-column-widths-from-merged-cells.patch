@@ -1,0 +1,62 @@
+diff --git a/src/model/table.rs b/src/model/table.rs
+index 406dd1b..077e05d 100644
+--- a/src/model/table.rs
++++ b/src/model/table.rs
+@@ -1219,6 +1219,7 @@ impl Table {
+                 }
+             }
+         }
++        self.solve_spanned_column_widths(&mut widths);
+         // 폭이 0인 열은 기본값 1800 HWPUNIT (약 6.35mm)
+         for w in &mut widths {
+             if *w == 0 {
+@@ -1228,6 +1229,49 @@ impl Table {
+         widths
+     }
+ 
++    /// 단일 열 셀이 없는 격자 열의 폭을 병합 셀 폭에서 풀어 채운다.
++    ///
++    /// 셀 경계가 줄마다 어긋난 표(한글에서 블록의 경계선만 끈 표)는 어떤 격자 열에도
++    /// `col_span == 1` 셀이 없을 수 있다. 그 열을 기본값 1800 으로 두면 이 폭으로 표
++    /// 상자 폭(`update_ctrl_dimensions`)과 줄·칸 넣기의 새 셀 폭이 정해져, 표가 실제
++    /// 줄보다 좁다고 선언되고(레이아웃이 모든 줄을 무효로 버림) 새 줄이 어긋난다.
++    /// 레이아웃의 `resolve_column_widths` 2단계와 같이, 걸친 열 가운데 모르는 열이
++    /// 하나뿐인 병합 셀(짧은 span 먼저)에서 나머지 폭을 그 열에 준다. 끝까지 모르는
++    /// 열은 호출자가 종전처럼 기본값으로 채운다.
++    fn solve_spanned_column_widths(&self, widths: &mut [u32]) {
++        if !widths.contains(&0) {
++            return;
++        }
++        let mut constraints: Vec<(usize, usize, u32)> = Vec::new();
++        for cell in &self.cells {
++            let (c, span) = (cell.col as usize, cell.col_span as usize);
++            if span > 1 && c + span <= widths.len() {
++                match constraints.iter_mut().find(|x| x.0 == c && x.1 == span) {
++                    Some(existing) => existing.2 = existing.2.max(cell.width),
++                    None => constraints.push((c, span, cell.width)),
++                }
++            }
++        }
++        constraints.sort_by_key(|&(_, span, _)| span);
++        for _ in 0..widths.len() + constraints.len() {
++            let mut progress = false;
++            for &(c, span, total) in &constraints {
++                let unknown: Vec<usize> = (c..c + span).filter(|&i| widths[i] == 0).collect();
++                if let [only] = unknown[..] {
++                    let known: u32 = (c..c + span).map(|i| widths[i]).sum();
++                    let rest = total.saturating_sub(known);
++                    if rest > 0 {
++                        widths[only] = rest;
++                        progress = true;
++                    }
++                }
++            }
++            if !progress {
++                break;
++            }
++        }
++    }
++
+     /// Base grid column widths.
+     ///
+     /// Independent persisted row boundaries are consumed by layout directly;

@@ -247,3 +247,113 @@ fn move_inline_and_floating_table_preserves_size_content_and_undo() -> anyhow::R
     }
     Ok(())
 }
+/// Cell spacing (셀 간격) leaves a gap between neighbouring cells. The pen works on such
+/// a table on the cell grid of `table.info` (the desktop maps a gap onto its edge).
+#[test]
+fn the_pen_draws_and_erases_on_a_table_with_cell_spacing() -> anyhow::Result<()> {
+    let mut s = create()?;
+    let a = table(&mut s)?;
+    // 2 mm between cells.
+    s.run(
+        "table.properties",
+        json!({"table":a,"props":{"cellSpacing":567}}),
+    )?;
+    let columns = |s: &mut Session| -> anyhow::Result<Vec<i64>> {
+        let i = s.run("table.info", json!({}))?;
+        Ok(i["columnWidths"]
+            .as_array()
+            .map(|w| {
+                w.iter()
+                    .map(|v| (v.as_f64().unwrap_or(0.0) * 25.4 / 7200.0).round() as i64)
+                    .collect()
+            })
+            .unwrap_or_default())
+    };
+    let cells = |s: &mut Session| -> anyhow::Result<usize> {
+        Ok(s.run("table.info", json!({}))?["cells"]
+            .as_array()
+            .map_or(0, Vec::len))
+    };
+    pen(&mut s, [30.0, 0.0], [30.0, 60.0], false)?;
+    assert_eq!(columns(&mut s)?, [30, 70]);
+    pen(&mut s, [0.0, 20.0], [100.0, 20.0], false)?;
+    assert_eq!(cells(&mut s)?, 4);
+    pen(&mut s, [70.0, 0.0], [70.0, 60.0], false)?;
+    assert_eq!(columns(&mut s)?, [30, 40, 30]);
+    pen(&mut s, [30.0, 0.0], [30.0, 60.0], true)?;
+    assert_eq!(cells(&mut s)?, 4);
+    assert_eq!(columns(&mut s)?.last(), Some(&30));
+    let props = s.run("table.properties.get", json!({}))?;
+    assert_eq!(props["cellSpacing"], 567, "the spacing stays");
+    s.execute(Command::Undo)?;
+    assert_eq!(cells(&mut s)?, 6);
+    Ok(())
+}
+/// Where each table sits: (paragraph, text position) of every body table.
+fn tables(s: &Session) -> Vec<(usize, usize)> {
+    s.core.document().sections[0]
+        .paragraphs
+        .iter()
+        .enumerate()
+        .flat_map(|(i, p)| {
+            p.controls
+                .iter()
+                .zip(p.control_text_positions())
+                .filter(|(c, _)| matches!(c, hwpcraft_doc::model::control::Control::Table(_)))
+                .map(move |(_, pos)| (i, pos))
+        })
+        .collect()
+}
+/// A table treated as a character moves to another text position like other inline
+/// objects (Hangul's drag); its cells and text stay, in one undo step.
+#[test]
+fn an_inline_table_moves_to_another_text_position() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("앞 문장 뒤 문장\n".into()))?;
+    s.run("table.create", json!({"rows": 2, "columns": 2}))?;
+    s.execute(Command::Insert("셀 내용".into()))?;
+    let a = table(&mut s)?;
+    s.run(
+        "table.properties",
+        json!({"table": a, "props": {"treatAsChar": true}}),
+    )?;
+    let before = tables(&s);
+    let cells = s.run("table.info", json!({"table": a}))?["cells"].clone();
+    let to = json!({"section": 0, "paragraph": 0, "offset": 3});
+    let moved = s.run("object.move_inline", json!({"address": a, "to": to}))?["address"].clone();
+    assert_eq!(moved["paragraph"], 0);
+    assert_eq!(tables(&s), [(0, 3)]);
+    assert_eq!(
+        s.run("table.info", json!({"table": moved}))?["cells"],
+        cells
+    );
+    let text = s.run("document.text", json!({}))?.to_string();
+    assert!(text.contains("앞 문장 뒤 문장"), "{text}");
+    let dir = tempfile::tempdir()?;
+    for ext in ["hwp", "hwpx"] {
+        let path = dir.path().join(format!("inline-table.{ext}"));
+        s.save(&path)?;
+        let mut r = Session::new()?;
+        r.open(&path)?;
+        assert_eq!(tables(&r), [(0, 3)], "{ext}");
+        assert_eq!(
+            r.run("table.info", json!({"table": moved}))?["cells"],
+            cells
+        );
+    }
+    s.execute(Command::Undo)?;
+    assert_eq!(tables(&s), before);
+    // A floating table keeps moving by position (table.move), not by text position.
+    let a = table(&mut s)?;
+    s.run(
+        "table.properties",
+        json!({"table": a, "props": {"treatAsChar": false}}),
+    )?;
+    let generation = s.generation;
+    assert!(
+        s.run("object.move_inline", json!({"address": a, "to": to}))
+            .is_err()
+    );
+    assert_eq!(s.generation, generation);
+    Ok(())
+}

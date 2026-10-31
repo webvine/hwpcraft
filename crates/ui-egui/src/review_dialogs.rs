@@ -19,6 +19,10 @@ pub(crate) struct CompareWindow {
     pub ignore_whitespace: bool,
     pub result: Value,
     pub selected: Option<usize>,
+    /// `review.merge.plan`: each difference with both texts, for 나란히 보기·병합.
+    pub plan: Value,
+    /// Ids of the differences ticked for 병합.
+    pub picked: std::collections::BTreeSet<usize>,
 }
 
 impl HwpApp {
@@ -133,12 +137,44 @@ impl HwpApp {
         } else {
             format!("문서 비교: 차이 {total}건")
         };
+        let plan = self
+            .session
+            .run(
+                "review.merge.plan",
+                json!({"path": path, "ignore_whitespace": ignore_whitespace}),
+            )
+            .unwrap_or_default();
         self.ext.tools.compare = Some(CompareWindow {
             path,
             ignore_whitespace,
             result,
             selected: None,
+            plan,
+            picked: Default::default(),
         });
+    }
+
+    /// Take the ticked differences (all of them with `None`) over from the file.
+    fn merge_compare(&mut self, ids: Option<Vec<usize>>) {
+        let Some(window) = self.ext.tools.compare.as_ref() else {
+            return;
+        };
+        let (path, ignore_whitespace) = (window.path.clone(), window.ignore_whitespace);
+        let mut params = json!({"path": path, "ignore_whitespace": ignore_whitespace});
+        if let Some(ids) = ids {
+            params["ids"] = json!(ids);
+        }
+        let r = self.session.run("review.merge", params);
+        if let Some(done) = self.result(r) {
+            self.sync_formatting();
+            self.follow_cursor();
+            self.run_compare(path, ignore_whitespace);
+            self.message = format!(
+                "병합: {}건 가져옴, 남은 차이 {}건",
+                done["applied"].as_u64().unwrap_or(0),
+                done["changes"].as_u64().unwrap_or(0)
+            );
+        }
     }
     /// Move to the next/previous finding that points into the current document.
     fn compare_step(&mut self, delta: i32) {
@@ -186,6 +222,8 @@ impl HwpApp {
         let mut ignore_whitespace = window.ignore_whitespace;
         let result = &window.result;
         let mut selected = window.selected;
+        let mut picked = window.picked.clone();
+        let mut merge: Option<Option<Vec<usize>>> = None;
         let mut close = false;
         let mut rerun = false;
         let mut step = 0;
@@ -296,7 +334,7 @@ impl HwpApp {
                                 );
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(f["detail"].as_str().unwrap_or("")).size(12.0),
+                                        RichText::new(f["text"].as_str().or(f["detail"].as_str()).unwrap_or("")).size(12.0),
                                     )
                                     .truncate(),
                                 );
@@ -308,6 +346,85 @@ impl HwpApp {
                                 }
                             });
                         }
+                    });
+                let changes: &[Value] = window.plan["changes"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                egui::CollapsingHeader::new(format!("나란히 보기·병합 ({}건)", changes.len()))
+                    .id_salt("compare-merge")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        const TICK: f32 = 24.0;
+                        const WHAT: f32 = 56.0;
+                        let text = (ui.available_width() - TICK - WHAT - 16.0).max(120.0) / 2.0;
+                        ui.horizontal(|ui| {
+                            column(ui, TICK, egui::Label::new(""));
+                            column(ui, WHAT, egui::Label::new(RichText::new("종류").strong()));
+                            column(ui, text, egui::Label::new(RichText::new("현재 문서").strong()));
+                            ui.label(RichText::new("비교 파일").strong());
+                        });
+                        egui::ScrollArea::vertical()
+                            .id_salt("compare-merge-rows")
+                            .max_height(180.0)
+                            .auto_shrink([false, true])
+                            .show_rows(ui, row_height, changes.len(), |ui, rows| {
+                                for c in changes.iter().skip(rows.start).take(rows.len()) {
+                                    let Some(id) = c["id"].as_u64().map(|v| v as usize) else {
+                                        continue;
+                                    };
+                                    let what = match c["kind"].as_str() {
+                                        Some("changed") => "바뀜",
+                                        Some("added") => "파일에만",
+                                        _ => "현재에만",
+                                    };
+                                    let shown = |v: &Value| match v.as_str() {
+                                        None => "—".to_owned(),
+                                        Some("") => "(표·개체 문단)".to_owned(),
+                                        Some(t) => t.to_owned(),
+                                    };
+                                    ui.horizontal(|ui| {
+                                        let mut on = picked.contains(&id);
+                                        if ui.checkbox(&mut on, "").changed() {
+                                            if on {
+                                                picked.insert(id);
+                                            } else {
+                                                picked.remove(&id);
+                                            }
+                                        }
+                                        column(ui, WHAT, egui::Label::new(what));
+                                        column(
+                                            ui,
+                                            text,
+                                            egui::Label::new(shown(&c["current_text"])).truncate(),
+                                        );
+                                        ui.add(egui::Label::new(shown(&c["other_text"])).truncate());
+                                    });
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!picked.is_empty(), egui::Button::new("고른 변경 병합"))
+                                .on_disabled_hover_text("병합할 차이를 고르세요.")
+                                .clicked()
+                            {
+                                merge = Some(Some(picked.iter().copied().collect()));
+                            }
+                            if ui
+                                .add_enabled(!changes.is_empty(), egui::Button::new("모두 병합"))
+                                .on_disabled_hover_text("가져올 차이가 없습니다.")
+                                .clicked()
+                            {
+                                merge = Some(None);
+                            }
+                        });
+                        ui.label(
+                            RichText::new(
+                                "병합은 고른 차이를 비교 파일 쪽으로 맞춥니다(바뀐 문단은 파일 문단으로, 파일에만 있는 문단은 넣고, 현재에만 있는 문단은 지움). 서식·표·그림도 함께 가져오며 한 번에 되돌립니다.",
+                            )
+                            .size(12.0)
+                            .color(Color32::GRAY),
+                        );
                     });
                 ui.add_space(4.0);
                 ui.label(
@@ -346,8 +463,12 @@ impl HwpApp {
         self.ext.tools.compare = Some(CompareWindow {
             selected,
             ignore_whitespace,
+            picked,
             ..window
         });
+        if let Some(ids) = merge {
+            self.merge_compare(ids);
+        }
         if let Some(f) = goto {
             self.goto_finding(&f);
         }

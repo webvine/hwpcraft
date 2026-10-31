@@ -1,0 +1,72 @@
+diff --git a/src/serializer/control/tests.rs b/src/serializer/control/tests.rs
+index 83359fa..d6ca637 100644
+--- a/src/serializer/control/tests.rs
++++ b/src/serializer/control/tests.rs
+@@ -1371,3 +1371,37 @@ fn field_serialization_no_longer_writes_unverified_ctrl_data_extension() {
+         "이름 아이템 item_id 가 바뀜(기존 계약 위반)"
+     );
+ }
++
++/// 글상자 세로 정렬을 바꾸면 LIST_HEADER list_attr 비트 5~6 에 새 값이 실린다(값이 같으면
++/// 원본 비트 그대로).
++#[test]
++fn text_box_vertical_align_edit_reaches_list_header() {
++    let list_attr_of = |list_attr: u32, vertical_align: VerticalAlign| {
++        let rect = RectangleShape {
++            drawing: DrawingObjAttr {
++                text_box: Some(crate::model::shape::TextBox {
++                    list_attr,
++                    vertical_align,
++                    paragraphs: vec![Paragraph::default()],
++                    ..Default::default()
++                }),
++                ..Default::default()
++            },
++            ..Default::default()
++        };
++        let ctrl = Control::Shape(Box::new(ShapeObject::Rectangle(rect)));
++        let mut records: Vec<Record> = Vec::new();
++        serialize_control(&ctrl, 1, None, &mut records);
++        let header = records
++            .iter()
++            .find(|r| r.tag_id == tags::HWPTAG_LIST_HEADER)
++            .expect("글상자 LIST_HEADER");
++        u32::from_le_bytes(header.data[4..8].try_into().unwrap())
++    };
++    // 가운데(비트 5 = 1)로 만들어진 글상자를 위로 바꾸면 비트가 지워지고 다른 비트는 남는다.
++    assert_eq!(list_attr_of(0x0002_0020, VerticalAlign::Top), 0x0002_0000);
++    assert_eq!(list_attr_of(0x0002_0020, VerticalAlign::Bottom), 0x0002_0040);
++    // 값이 같으면 원본 그대로(파싱 때 Top 으로 읽는 값 3 포함).
++    assert_eq!(list_attr_of(0x0002_0020, VerticalAlign::Center), 0x0002_0020);
++    assert_eq!(list_attr_of(0x0000_0060, VerticalAlign::Top), 0x0000_0060);
++}
+diff --git a/src/serializer/control.rs b/src/serializer/control.rs
+index 4bef1ca..56992b3 100644
+--- a/src/serializer/control.rs
++++ b/src/serializer/control.rs
+@@ -2152,7 +2152,24 @@ fn serialize_text_box_if_present(drawing: &DrawingObjAttr, level: u16, records:
+         let mut w = ByteWriter::new();
+         // para_count: 스펙은 INT16이지만 실제 HWP 파일에서는 UINT32로 저장됨
+         w.write_u32(text_box.paragraphs.len() as u32).unwrap();
+-        w.write_u32(text_box.list_attr).unwrap();
++        // list_attr bit 5~6 = 세로 정렬(표 67). 속성 편집은 `vertical_align` 만 바꾸므로 그 값과
++        // 원본 비트가 다르면 비트를 다시 세운다 — 같으면 원본 비트(값 3 포함)를 그대로 둔다.
++        let stored_v_align = match (text_box.list_attr >> 5) & 0x03 {
++            1 => VerticalAlign::Center,
++            2 => VerticalAlign::Bottom,
++            _ => VerticalAlign::Top,
++        };
++        let list_attr = if stored_v_align == text_box.vertical_align {
++            text_box.list_attr
++        } else {
++            let code: u32 = match text_box.vertical_align {
++                VerticalAlign::Top => 0,
++                VerticalAlign::Center => 1,
++                VerticalAlign::Bottom => 2,
++            };
++            (text_box.list_attr & !(0x03 << 5)) | (code << 5)
++        };
++        w.write_u32(list_attr).unwrap();
+         // 여백 + 최대 폭 (글상자 고유 데이터)
+         w.write_i16(text_box.margin_left).unwrap();
+         w.write_i16(text_box.margin_right).unwrap();

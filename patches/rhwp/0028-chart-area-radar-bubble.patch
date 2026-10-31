@@ -1,0 +1,703 @@
+diff --git a/crates/rhwp-ooxml-chart/src/lib.rs b/crates/rhwp-ooxml-chart/src/lib.rs
+index 6bc00ea..fb2d897 100644
+--- a/crates/rhwp-ooxml-chart/src/lib.rs
++++ b/crates/rhwp-ooxml-chart/src/lib.rs
+@@ -110,6 +110,25 @@ pub struct OoxmlChart {
+     /// ofPie(원형대원형/원형대가로막대형) 보조플롯 정보. chart_type은 Pie를 유지하고
+     /// (#1453 라우팅 앵커) 이 필드 유무로 render_of_pie를 분기. (C2b #2278)
+     pub of_pie: Option<OfPieInfo>,
++    /// 영역형(areaChart) plot의 `c:grouping` (standard/stacked/percentStacked).
++    /// 막대·라인 grouping과 같은 이유로 별도 필드.
++    pub area_grouping: BarGrouping,
++    /// 방사형(radarChart) `c:radarStyle` (standard/marker/filled).
++    pub radar_style: RadarStyle,
++    /// 거품형(bubbleChart) `c:bubbleScale` (%, 스키마 기본 100).
++    pub bubble_scale: Option<f64>,
++}
++
++/// 방사형 표현 방식 (`c:radarStyle`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub enum RadarStyle {
++    /// 선만 (`standard`, 스키마 기본).
++    #[default]
++    Standard,
++    /// 선 + 표식.
++    Marker,
++    /// 채운 다각형.
++    Filled,
+ }
+ 
+ /// `c:ofPieChart` 보조플롯 파라미터 (C2b #2278)
+@@ -349,6 +368,12 @@ pub enum OoxmlChartType {
+     Scatter,
+     /// 주식형 (hiLowLines 고저선 / upDownBars 캔들) (C2a #2277)
+     Stock,
++    /// 영역형 (areaChart)
++    Area,
++    /// 방사형 (radarChart)
++    Radar,
++    /// 거품형 (bubbleChart: xVal, yVal, bubbleSize)
++    Bubble,
+     #[default]
+     Unknown,
+ }
+@@ -362,6 +387,9 @@ impl OoxmlChartType {
+             Self::Pie => "원형",
+             Self::Scatter => "분산형",
+             Self::Stock => "주식형",
++            Self::Area => "영역형",
++            Self::Radar => "방사형",
++            Self::Bubble => "거품형",
+             Self::Unknown => "미지원",
+         }
+     }
+@@ -410,6 +438,8 @@ pub struct OoxmlSeries {
+     /// (`c:marker`) 의 spPr 은 제외. 없으면 렌더러가 Office 기본 2.25pt 를 쓴다
+     /// (한컴 꺽은선형 실측 3px = 2.25pt).
+     pub line_width_emu: Option<u32>,
++    /// 거품형 거품 크기 (`c:bubbleSize`). 거품형 전용이며 그 외 차트에서는 빈 Vec.
++    pub bubble_sizes: Vec<f64>,
+ }
+ 
+ impl OoxmlChart {
+diff --git a/crates/rhwp-ooxml-chart/src/parser.rs b/crates/rhwp-ooxml-chart/src/parser.rs
+index 45acf53..94d9c26 100644
+--- a/crates/rhwp-ooxml-chart/src/parser.rs
++++ b/crates/rhwp-ooxml-chart/src/parser.rs
+@@ -11,7 +11,7 @@
+ 
+ use super::{
+     BarGrouping, LegendPos, OfPieInfo, OfPieSplitType, OfPieType, OoxmlChart, OoxmlChartType,
+-    OoxmlSeries, ScatterStyle, SeriesMarker, View3D,
++    OoxmlSeries, RadarStyle, ScatterStyle, SeriesMarker, View3D,
+ };
+ use quick_xml::events::Event;
+ use quick_xml::Reader;
+@@ -73,8 +73,9 @@ struct ParseState {
+     in_cat: bool,
+     collect_categories: bool,
+     in_val: bool,
+-    in_x_val: bool, // c:xVal (분산형 X 값)
+-    in_y_val: bool, // c:yVal (분산형 Y 값)
++    in_x_val: bool,       // c:xVal (분산형 X 값)
++    in_y_val: bool,       // c:yVal (분산형 Y 값)
++    in_bubble_size: bool, // c:bubbleSize (거품형 크기)
+     in_chart_title: bool,
+     in_v: bool,
+     in_a_t: bool,
+@@ -218,7 +219,10 @@ pub fn parse_chart_xml(xml: &[u8]) -> Option<OoxmlChart> {
+     // 분산형(scatter)은 X·Y 모두 valAx(axPos b/l)라 위 primary/secondary 매핑이 두 축을
+     // 오분류해 has_secondary_axis=true → 콤보 라우팅으로 새는 것을 차단한다. scatter는
+     // axis_group=0, has_secondary_axis=false 기본값을 유지한다. (C1b #1660)
+-    if chart.chart_type != OoxmlChartType::Scatter {
++    if !matches!(
++        chart.chart_type,
++        OoxmlChartType::Scatter | OoxmlChartType::Bubble
++    ) {
+         for s in chart.series.iter_mut() {
+             let is_secondary = match (&secondary_axid, &primary_axid) {
+                 (Some(sec), _) if s.axis_ids.iter().any(|a| a == sec) => true,
+@@ -321,6 +325,47 @@ fn handle_start(e: &quick_xml::events::BytesStart, chart: &mut OoxmlChart, st: &
+             st.cur_plot_ax_ids.clear();
+             st.cur_plot_series_start = chart.series.len();
+         }
++        b"areaChart" | b"area3DChart" => {
++            // 영역형. 콤보의 주 타입은 덮지 않는다(lineChart와 같은 규칙). area3D는
++            // 입체 표현 없이 2D 영역 근사 + is_3d(line3DChart 선례).
++            if chart.chart_type == OoxmlChartType::Unknown {
++                chart.chart_type = OoxmlChartType::Area;
++            }
++            if name_bytes == b"area3DChart" {
++                chart.is_3d = true;
++                chart.view3d.get_or_insert_with(View3D::default);
++            }
++            st.cur_plot_type = Some(OoxmlChartType::Area);
++            st.cur_plot_ax_ids.clear();
++            st.cur_plot_series_start = chart.series.len();
++        }
++        b"radarChart" => {
++            chart.chart_type = OoxmlChartType::Radar;
++            st.cur_plot_type = Some(OoxmlChartType::Radar);
++            st.cur_plot_ax_ids.clear();
++            st.cur_plot_series_start = chart.series.len();
++        }
++        b"bubbleChart" => {
++            // 거품형 — (x, y, 크기) 셋, 2개 수치축(분산형과 같은 축 규칙).
++            chart.chart_type = OoxmlChartType::Bubble;
++            st.cur_plot_type = Some(OoxmlChartType::Bubble);
++            st.cur_plot_ax_ids.clear();
++            st.cur_plot_series_start = chart.series.len();
++        }
++        b"radarStyle" => {
++            if let Some(val) = attr_val(e, "val") {
++                chart.radar_style = match val.as_str() {
++                    "marker" => RadarStyle::Marker,
++                    "filled" => RadarStyle::Filled,
++                    _ => RadarStyle::Standard,
++                };
++            }
++        }
++        b"bubbleScale" => {
++            if st.cur_plot_type == Some(OoxmlChartType::Bubble) {
++                chart.bubble_scale = attr_f64(e);
++            }
++        }
+         b"view3D" => {
+             // c:plotArea보다 먼저 온다(ECMA CT_Chart 시퀀스, 코퍼스 바이트 실측
+             // 908 < 1059) — 여기서 초기화해야 자식 rotX/rotY/…가 유실되지 않음.
+@@ -467,6 +512,7 @@ fn handle_start(e: &quick_xml::events::BytesStart, chart: &mut OoxmlChart, st: &
+                 match st.cur_plot_type {
+                     Some(OoxmlChartType::Column | OoxmlChartType::Bar) => chart.grouping = g,
+                     Some(OoxmlChartType::Line) => chart.line_grouping = g,
++                    Some(OoxmlChartType::Area) => chart.area_grouping = g,
+                     _ => {}
+                 }
+             }
+@@ -541,6 +587,7 @@ fn handle_start(e: &quick_xml::events::BytesStart, chart: &mut OoxmlChart, st: &
+         b"val" => st.in_val = true,
+         b"xVal" => st.in_x_val = true,
+         b"yVal" => st.in_y_val = true,
++        b"bubbleSize" => st.in_bubble_size = true,
+         b"title" => {
+             st.in_chart_title = true;
+             // C1c #1882 갭①: 요소 존재만 기록 (텍스트 유무는 chart.title이 담당 —
+@@ -772,6 +819,8 @@ fn handle_end(name: &[u8], chart: &mut OoxmlChart, st: &mut ParseState) {
+                     }
+                 } else if st.in_x_val {
+                     ser.x_values.push(text.parse::<f64>().unwrap_or(0.0));
++                } else if st.in_bubble_size {
++                    ser.bubble_sizes.push(text.parse::<f64>().unwrap_or(0.0));
+                 }
+             }
+         }
+@@ -810,6 +859,7 @@ fn handle_end(name: &[u8], chart: &mut OoxmlChart, st: &mut ParseState) {
+         b"marker" => st.in_marker = false,
+         b"xVal" => st.in_x_val = false,
+         b"yVal" => st.in_y_val = false,
++        b"bubbleSize" => st.in_bubble_size = false,
+         b"title" => st.in_chart_title = false,
+         b"ser" => {
+             if let Some(ser) = st.cur_series.take() {
+@@ -858,7 +908,8 @@ fn handle_end(name: &[u8], chart: &mut OoxmlChart, st: &mut ParseState) {
+             }
+         }
+         b"barChart" | b"lineChart" | b"pieChart" | b"bar3DChart" | b"pie3DChart"
+-        | b"ofPieChart" | b"scatterChart" | b"stockChart" | b"line3DChart" => {
++        | b"ofPieChart" | b"scatterChart" | b"stockChart" | b"line3DChart" | b"areaChart"
++        | b"area3DChart" | b"radarChart" | b"bubbleChart" => {
+             // plot 종료 — 이 plot에 속한 시리즈에 axIds 복사
+             let start = st.cur_plot_series_start;
+             for ser in chart.series.iter_mut().skip(start) {
+diff --git a/crates/rhwp-ooxml-chart/src/renderer.rs b/crates/rhwp-ooxml-chart/src/renderer.rs
+index adf6319..ddb63df 100644
+--- a/crates/rhwp-ooxml-chart/src/renderer.rs
++++ b/crates/rhwp-ooxml-chart/src/renderer.rs
+@@ -6,7 +6,7 @@
+ 
+ use super::{
+     AxisPos, BarGrouping, LegendPos, OfPieInfo, OfPieType, OoxmlAxis, OoxmlChart, OoxmlChartType,
+-    OoxmlSeries, SeriesMarker, TickMark, View3D,
++    OoxmlSeries, RadarStyle, SeriesMarker, TickMark, View3D,
+ };
+ 
+ use super::LineSpec;
+@@ -430,7 +430,11 @@ pub fn render_chart_svg(chart: &OoxmlChart, x: f64, y: f64, w: f64, h: f64) -> S
+     // [#6624] 가로 값축(가로 막대·분산형)은 마지막 값 라벨이 플롯 오른끝에 가운데 정렬되어
+     // 절반이 플롯 밖으로 나온다 — 그 절반 + 라벨 간격 1.3L 을 비운다 (한/글 실측: 묶은가로
+     // 21.5px, 분산형 22.5px ≈ 3.7 + 17.3). 세로 값축은 0.6L (라인 실측 9.5px).
+-    let value_axis_horizontal = horizontal_bars || chart.chart_type == OoxmlChartType::Scatter;
++    let value_axis_horizontal = horizontal_bars
++        || matches!(
++            chart.chart_type,
++            OoxmlChartType::Scatter | OoxmlChartType::Bubble
++        );
+     let right_pad = if chart.has_secondary_axis {
+         estimate_axis_label_width(chart, 1)
+     } else if value_axis_horizontal {
+@@ -503,6 +507,11 @@ pub fn render_chart_svg(chart: &OoxmlChart, x: f64, y: f64, w: f64, h: f64) -> S
+                 render_scatter(&mut svg, chart, plot_x, plot_y, plot_w, plot_h)
+             }
+             OoxmlChartType::Stock => render_stock(&mut svg, chart, plot_x, plot_y, plot_w, plot_h),
++            OoxmlChartType::Area => render_area(&mut svg, chart, plot_x, plot_y, plot_w, plot_h),
++            OoxmlChartType::Radar => render_radar(&mut svg, chart, plot_x, plot_y, plot_w, plot_h),
++            OoxmlChartType::Bubble => {
++                render_bubble(&mut svg, chart, plot_x, plot_y, plot_w, plot_h)
++            }
+             _ => {}
+         }
+     }
+@@ -1138,6 +1147,336 @@ fn render_line(svg: &mut String, chart: &OoxmlChart, px: f64, py: f64, pw: f64,
+     render_category_labels(svg, chart, px, py, pw, ph, max_len, false);
+ }
+ 
++// ---------------- Area / Radar / Bubble ----------------
++
++/// 영역형 (areaChart). 점은 꺾은선과 같은 카테고리 슬롯 중앙에 두고(범주 라벨과 같은
++/// 공식), 표준은 값과 0(값축 범위로 자름) 사이, 누적은 앞 계열 위를 채운다. 음수는 누적에서
++/// 0으로 자른다(막대·라인 누적과 같은 정책). 뒤 계열이 앞 계열 위에 그려진다.
++fn render_area(svg: &mut String, chart: &OoxmlChart, px: f64, py: f64, pw: f64, ph: f64) {
++    let stacked = matches!(
++        chart.area_grouping,
++        BarGrouping::Stacked | BarGrouping::PercentStacked
++    );
++    let percent = chart.area_grouping == BarGrouping::PercentStacked;
++    let max_len = chart
++        .series
++        .iter()
++        .map(|s| s.values.len())
++        .max()
++        .unwrap_or(0);
++    if max_len == 0 {
++        return;
++    }
++    let (vmin, vmax, vstep) = if percent {
++        (0.0, 100.0, 20.0)
++    } else if stacked {
++        let max_sum = (0..max_len)
++            .map(|ci| category_positive_sum(chart, ci))
++            .fold(0.0_f64, f64::max);
++        nice_axis(0.0, max_sum.max(1.0), VERTICAL_AXIS_TICKS)
++    } else {
++        value_range(chart, VERTICAL_AXIS_TICKS)
++    };
++    svg.push_str(&plot_rect(chart, px, py, pw, ph));
++    render_value_grid(
++        svg,
++        chart,
++        px,
++        py,
++        pw,
++        ph,
++        vmin,
++        vmax,
++        vstep,
++        chart.series.first().and_then(|s| s.format_code.as_deref()),
++        false,
++        false,
++        percent,
++        false,
++    );
++    let y_of = |v: f64| -> f64 {
++        let t = if vmax > vmin {
++            ((v - vmin) / (vmax - vmin)).clamp(0.0, 1.0)
++        } else {
++            0.0
++        };
++        py + ph - ph * t
++    };
++    let cat_span = pw / max_len as f64;
++    let base = 0.0_f64.clamp(vmin, vmax);
++    let mut cum = vec![0.0_f64; max_len];
++    let mut lower = vec![base; max_len];
++    for (si, ser) in chart.series.iter().enumerate() {
++        let n = ser.values.len();
++        if n == 0 {
++            continue;
++        }
++        let upper: Vec<f64> = (0..n)
++            .map(|i| {
++                let v = ser.values[i];
++                if !stacked {
++                    return v;
++                }
++                cum[i] += v.max(0.0);
++                if !percent {
++                    cum[i]
++                } else {
++                    let sum = category_positive_sum(chart, i);
++                    if sum > 0.0 {
++                        cum[i] / sum * 100.0
++                    } else {
++                        0.0
++                    }
++                }
++            })
++            .collect();
++        // 점 하나뿐이면 슬롯 절반 폭의 띠로 보인다.
++        let xs: Vec<f64> = if n == 1 {
++            vec![px + cat_span * 0.25, px + cat_span * 0.75]
++        } else {
++            (0..n).map(|i| px + cat_span * (i as f64 + 0.5)).collect()
++        };
++        let at = |k: usize| k.min(n - 1);
++        let mut points: Vec<(f64, f64)> = xs
++            .iter()
++            .enumerate()
++            .map(|(k, &x)| (x, y_of(upper[at(k)])))
++            .collect();
++        points.extend(
++            xs.iter()
++                .enumerate()
++                .rev()
++                .map(|(k, &x)| (x, y_of(if stacked { lower[at(k)] } else { base }))),
++        );
++        svg.push_str(&format!(
++            "<path class=\"hwp-chart-area\" d=\"{} Z\" fill=\"{}\" stroke=\"none\"/>\n",
++            polyline_path(&points),
++            series_color(ser, si)
++        ));
++        if stacked {
++            lower[..n].copy_from_slice(&upper);
++        }
++    }
++    render_category_labels(svg, chart, px, py, pw, ph, max_len, false);
++}
++
++/// 축 눈금 라벨: 정수 간격이면 정수, 아니면 소수 한 자리까지.
++fn radar_tick_label(v: f64, step: f64) -> String {
++    if (step - step.round()).abs() < 1e-9 {
++        format!("{}", v.round() as i64)
++    } else {
++        let s = format!("{v:.2}");
++        s.trim_end_matches('0').trim_end_matches('.').to_string()
++    }
++}
++
++/// 방사형 (radarChart). 범주마다 바퀴살, 값 눈금마다 다각형 격자, 값 라벨은 위쪽
++/// 바퀴살 왼쪽. 첫 범주는 12시, 시계 방향. standard=선, marker=선+표식, filled=채움.
++fn render_radar(svg: &mut String, chart: &OoxmlChart, px: f64, py: f64, pw: f64, ph: f64) {
++    let n = chart.categories.len().max(
++        chart
++            .series
++            .iter()
++            .map(|s| s.values.len())
++            .max()
++            .unwrap_or(0),
++    );
++    if n == 0 {
++        return;
++    }
++    let font = label_font_px(chart);
++    let label_w = (0..n)
++        .map(|i| {
++            label_text_width(
++                chart.categories.get(i).map(String::as_str).unwrap_or(""),
++                font,
++            )
++        })
++        .fold(0.0_f64, f64::max);
++    // 방사형은 아래 범주 축 띠를 쓰지 않으므로 그 일부까지 그림 높이로 쓴다.
++    let avail_h = ph + font * hancom_default::BOTTOM_PAD_EM * 0.8;
++    let r = (avail_h / 2.0 - font * 1.8)
++        .min(pw / 2.0 - label_w - font * 0.6)
++        .max(10.0);
++    let (cx, cy) = (px + pw / 2.0, py + avail_h / 2.0);
++    let (dmin, dmax) = raw_value_bounds(chart.series.iter());
++    let (vmin, vmax, vstep) = nice_axis(
++        dmin.min(0.0),
++        dmax.max(dmin.min(0.0) + 1.0),
++        VERTICAL_AXIS_TICKS,
++    );
++    let angle =
++        |i: usize| -std::f64::consts::FRAC_PI_2 + std::f64::consts::TAU * i as f64 / n as f64;
++    let at = |i: usize, t: f64| (cx + r * t * angle(i).cos(), cy + r * t * angle(i).sin());
++    let t_of = |v: f64| {
++        if vmax > vmin {
++            ((v - vmin) / (vmax - vmin)).clamp(0.0, 1.0)
++        } else {
++            0.0
++        }
++    };
++    // 격자 다각형과 값 라벨
++    let ticks = if vstep > 0.0 {
++        (((vmax - vmin) / vstep).round() as usize).min(50)
++    } else {
++        0
++    };
++    for k in 0..=ticks {
++        let v = vmin + vstep * k as f64;
++        let t = t_of(v);
++        if k > 0 {
++            let ring: Vec<(f64, f64)> = (0..n).map(|i| at(i, t)).collect();
++            svg.push_str(&format!(
++                "<path class=\"hwp-chart-radar-grid\" d=\"{} Z\" fill=\"none\" {}/>\n",
++                polyline_path(&ring),
++                hancom_default::GRID_STYLE
++            ));
++        }
++        svg.push_str(&format!(
++            "<text x=\"{:.2}\" y=\"{:.2}\" font-family=\"sans-serif\" font-size=\"{:.2}\" fill=\"{}\" text-anchor=\"end\" dominant-baseline=\"central\">{}</text>\n",
++            cx - font * 0.4,
++            cy - r * t,
++            font,
++            hancom_default::TEXT_COLOR,
++            xml_escape(&radar_tick_label(v, vstep))
++        ));
++    }
++    // 바퀴살과 범주 라벨
++    for i in 0..n {
++        let (ex, ey) = at(i, 1.0);
++        svg.push_str(&format!(
++            "<line class=\"hwp-chart-radar-spoke\" x1=\"{cx:.2}\" y1=\"{cy:.2}\" x2=\"{ex:.2}\" y2=\"{ey:.2}\" {}/>\n",
++            hancom_default::GRID_STYLE
++        ));
++        // 위·아래 범주 라벨은 값 라벨과 겹치지 않게 조금 더 띄운다.
++        let gap = if angle(i).sin().abs() > 0.7 {
++            font * 1.1
++        } else {
++            font * 0.6
++        };
++        let (lx, ly) = (
++            cx + (r + gap) * angle(i).cos(),
++            cy + (r + gap) * angle(i).sin(),
++        );
++        let c = angle(i).cos();
++        let anchor = if c > 0.2 {
++            "start"
++        } else if c < -0.2 {
++            "end"
++        } else {
++            "middle"
++        };
++        let label = chart
++            .categories
++            .get(i)
++            .cloned()
++            .unwrap_or_else(|| format!("{}", i + 1));
++        svg.push_str(&format!(
++            "<text x=\"{lx:.2}\" y=\"{ly:.2}\" font-family=\"sans-serif\" font-size=\"{font:.2}\" fill=\"{}\" text-anchor=\"{anchor}\" dominant-baseline=\"central\">{}</text>\n",
++            hancom_default::TEXT_COLOR,
++            xml_escape(&label)
++        ));
++    }
++    // 계열
++    for (si, ser) in chart.series.iter().enumerate() {
++        if ser.values.is_empty() {
++            continue;
++        }
++        let color = series_color(ser, si);
++        let points: Vec<(f64, f64)> = ser
++            .values
++            .iter()
++            .enumerate()
++            .take(n)
++            .map(|(i, &v)| at(i, t_of(v)))
++            .collect();
++        let closed = points.len() == n && n > 2;
++        let d = format!(
++            "{}{}",
++            polyline_path(&points),
++            if closed { " Z" } else { "" }
++        );
++        if chart.radar_style == RadarStyle::Filled {
++            svg.push_str(&format!(
++                "<path class=\"hwp-chart-radar\" d=\"{d}\" fill=\"{color}\" stroke=\"{color}\" stroke-width=\"1\"/>\n"
++            ));
++        } else {
++            svg.push_str(&format!(
++                "<path class=\"hwp-chart-radar\" d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{:.2}\"/>\n",
++                series_line_px(ser)
++            ));
++        }
++        if chart.radar_style == RadarStyle::Marker {
++            for &(mx, my) in &points {
++                push_line_marker(svg, si, mx, my, &color);
++            }
++        }
++    }
++}
++
++/// 거품형 (bubbleChart). 축은 분산형과 같다(X값이 없으면 1, 2, …). 거품 넓이가 크기에
++/// 비례하고 가장 큰 거품의 지름은 플롯 짧은 변의 25 % × bubbleScale. 크기가 0 이하인
++/// 거품은 그리지 않는다(showNegBubbles 기본). 큰 거품을 먼저 그려 작은 거품이 보인다.
++fn render_bubble(svg: &mut String, chart: &OoxmlChart, px: f64, py: f64, pw: f64, ph: f64) {
++    let xs = |s: &OoxmlSeries| -> Vec<f64> {
++        if s.x_values.is_empty() {
++            (1..=s.values.len()).map(|i| i as f64).collect()
++        } else {
++            s.x_values.clone()
++        }
++    };
++    if chart.series.iter().all(|s| s.values.is_empty()) {
++        return;
++    }
++    let (xmin, xmax, xstep) = scatter_range(chart.series.iter().flat_map(|s| xs(s)));
++    let (ymin, ymax, ystep) =
++        scatter_range(chart.series.iter().flat_map(|s| s.values.iter().copied()));
++    let xspan = (xmax - xmin).max(1e-9);
++    let yspan = (ymax - ymin).max(1e-9);
++    svg.push_str(&plot_rect(chart, px, py, pw, ph));
++    render_value_grid(
++        svg, chart, px, py, pw, ph, xmin, xmax, xstep, None, true, false, false, true,
++    );
++    render_value_grid(
++        svg, chart, px, py, pw, ph, ymin, ymax, ystep, None, false, false, false, true,
++    );
++    let max_size = chart
++        .series
++        .iter()
++        .flat_map(|s| s.bubble_sizes.iter().copied())
++        .filter(|v| v.is_finite())
++        .fold(0.0_f64, f64::max);
++    let scale = chart.bubble_scale.unwrap_or(100.0).clamp(0.0, 300.0) / 100.0;
++    let r_max = pw.min(ph) * 0.125 * scale;
++    let mut bubbles: Vec<(f64, f64, f64, String)> = Vec::new();
++    for (si, ser) in chart.series.iter().enumerate() {
++        let color = series_color(ser, si);
++        for (i, (&x, &y)) in xs(ser).iter().zip(ser.values.iter()).enumerate() {
++            let size = ser.bubble_sizes.get(i).copied().unwrap_or(1.0);
++            if !size.is_finite() || size <= 0.0 {
++                continue;
++            }
++            let r = if max_size > 0.0 {
++                r_max * (size / max_size).sqrt()
++            } else {
++                r_max
++            };
++            bubbles.push((
++                px + pw * (x - xmin) / xspan,
++                py + ph - ph * (y - ymin) / yspan,
++                r,
++                color.clone(),
++            ));
++        }
++    }
++    bubbles.sort_by(|a, b| b.2.total_cmp(&a.2));
++    for (x, y, r, color) in bubbles {
++        svg.push_str(&format!(
++            "<circle class=\"hwp-chart-bubble\" cx=\"{x:.2}\" cy=\"{y:.2}\" r=\"{r:.2}\" fill=\"{color}\" fill-opacity=\"0.75\" stroke=\"#ffffff\" stroke-width=\"0.75\"/>\n"
++        ));
++    }
++}
++
+ // ---------------- Stock (주식형, hiLowLines/upDownBars) ----------------
+ 
+ /// stock (주식형). 계열 역할은 **위치가 아니라 그리기 장치가 정한다** — OOXML 본래 의미:
+@@ -2585,6 +2924,10 @@ fn legend_order_reversed(chart: &OoxmlChart) -> bool {
+             chart.line_grouping,
+             BarGrouping::Stacked | BarGrouping::PercentStacked
+         ),
++        OoxmlChartType::Area => matches!(
++            chart.area_grouping,
++            BarGrouping::Stacked | BarGrouping::PercentStacked
++        ),
+         _ => false,
+     }
+ }
+@@ -2630,6 +2973,11 @@ fn swatch_kind(chart: &OoxmlChart, s: &OoxmlSeries, i: usize) -> SwatchKind {
+                 SwatchKind::Blank
+             }
+         }
++        OoxmlChartType::Radar => match chart.radar_style {
++            RadarStyle::Standard => SwatchKind::LineOnly,
++            RadarStyle::Marker => SwatchKind::LineGlyph(i),
++            RadarStyle::Filled => SwatchKind::Square,
++        },
+         _ => SwatchKind::Square,
+     }
+ }
+@@ -5253,3 +5601,114 @@ mod tests {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod area_radar_bubble_tests {
++    use super::*;
++    use crate::RadarStyle;
++
++    fn chart(plot: &str) -> String {
++        format!(
++            r#"<?xml version="1.0"?><c:chartSpace xmlns:c="x" xmlns:a="y"><c:chart><c:plotArea>{plot}<c:catAx><c:axId val="100"/><c:axPos val="b"/></c:catAx><c:valAx><c:axId val="200"/><c:axPos val="l"/></c:valAx></c:plotArea><c:legend><c:legendPos val="r"/></c:legend></c:chart></c:chartSpace>"#
++        )
++    }
++
++    fn series(name: &str, values: &[f64]) -> String {
++        let pts: String = values
++            .iter()
++            .enumerate()
++            .map(|(i, v)| format!(r#"<c:pt idx="{i}"><c:v>{v}</c:v></c:pt>"#))
++            .collect();
++        format!(
++            r#"<c:ser><c:tx><c:v>{name}</c:v></c:tx><c:cat><c:strLit><c:pt idx="0"><c:v>가</c:v></c:pt><c:pt idx="1"><c:v>나</c:v></c:pt><c:pt idx="2"><c:v>다</c:v></c:pt></c:strLit></c:cat><c:val><c:numLit>{pts}</c:numLit></c:val></c:ser>"#
++        )
++    }
++
++    fn area(grouping: &str) -> OoxmlChart {
++        let xml = chart(&format!(
++            r#"<c:areaChart><c:grouping val="{grouping}"/>{}{}<c:axId val="100"/><c:axId val="200"/></c:areaChart>"#,
++            series("A", &[1.0, 3.0, 2.0]),
++            series("B", &[2.0, 1.0, 4.0])
++        ));
++        OoxmlChart::parse(xml.as_bytes()).expect("area parses")
++    }
++
++    #[test]
++    fn area_parses_grouping_and_fills_one_band_per_series() {
++        for (g, want) in [
++            ("standard", BarGrouping::Clustered),
++            ("stacked", BarGrouping::Stacked),
++            ("percentStacked", BarGrouping::PercentStacked),
++        ] {
++            let c = area(g);
++            assert_eq!(c.chart_type, OoxmlChartType::Area);
++            assert_eq!(c.area_grouping, want);
++            assert_eq!(c.grouping, BarGrouping::Clustered, "bar grouping untouched");
++            let svg = render_chart_svg(&c, 0.0, 0.0, 400.0, 300.0);
++            assert_eq!(svg.matches("hwp-chart-area").count(), 2, "{g}");
++            assert_eq!(svg, render_chart_svg(&c, 0.0, 0.0, 400.0, 300.0));
++        }
++        assert!(
++            render_chart_svg(&area("percentStacked"), 0.0, 0.0, 400.0, 300.0).contains(">100%<")
++        );
++        assert_ne!(
++            render_chart_svg(&area("standard"), 0.0, 0.0, 400.0, 300.0),
++            render_chart_svg(&area("stacked"), 0.0, 0.0, 400.0, 300.0)
++        );
++    }
++
++    #[test]
++    fn radar_styles_draw_grid_spokes_and_series() {
++        for (style, want) in [
++            ("standard", RadarStyle::Standard),
++            ("marker", RadarStyle::Marker),
++            ("filled", RadarStyle::Filled),
++        ] {
++            let xml = chart(&format!(
++                r#"<c:radarChart><c:radarStyle val="{style}"/>{}{}<c:axId val="100"/><c:axId val="200"/></c:radarChart>"#,
++                series("A", &[1.0, 3.0, 2.0]),
++                series("B", &[2.0, 1.0, 4.0])
++            ));
++            let c = OoxmlChart::parse(xml.as_bytes()).expect("radar parses");
++            assert_eq!(c.chart_type, OoxmlChartType::Radar);
++            assert_eq!(c.radar_style, want);
++            let svg = render_chart_svg(&c, 0.0, 0.0, 400.0, 300.0);
++            assert_eq!(svg.matches("hwp-chart-radar-spoke").count(), 3);
++            assert!(svg.contains("hwp-chart-radar-grid"));
++            assert_eq!(svg.matches("class=\"hwp-chart-radar\"").count(), 2);
++            assert!(svg.contains(">가<") && svg.contains(">다<"));
++            let unfilled = svg.split("class=\"hwp-chart-radar\" ").skip(1).all(|rest| {
++                rest.contains("fill=\"none\"") && rest.find("fill=\"none\"") < rest.find("/>")
++            });
++            assert_eq!(unfilled, want != RadarStyle::Filled, "{style}");
++            assert_eq!(svg.contains("hwp-chart-marker"), want == RadarStyle::Marker);
++        }
++    }
++
++    #[test]
++    fn bubble_sizes_scale_areas_and_keep_one_axis_group() {
++        let xml = r#"<?xml version="1.0"?><c:chartSpace xmlns:c="x" xmlns:a="y"><c:chart><c:plotArea><c:bubbleChart><c:varyColors val="0"/><c:ser><c:tx><c:v>A</c:v></c:tx><c:xVal><c:numLit><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>2</c:v></c:pt><c:pt idx="2"><c:v>3</c:v></c:pt></c:numLit></c:xVal><c:yVal><c:numLit><c:pt idx="0"><c:v>5</c:v></c:pt><c:pt idx="1"><c:v>7</c:v></c:pt><c:pt idx="2"><c:v>6</c:v></c:pt></c:numLit></c:yVal><c:bubbleSize><c:numLit><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>4</c:v></c:pt><c:pt idx="2"><c:v>-2</c:v></c:pt></c:numLit></c:bubbleSize></c:ser><c:bubbleScale val="50"/><c:axId val="100"/><c:axId val="200"/></c:bubbleChart><c:valAx><c:axId val="100"/><c:axPos val="b"/></c:valAx><c:valAx><c:axId val="200"/><c:axPos val="l"/></c:valAx></c:plotArea></c:chart></c:chartSpace>"#;
++        let c = OoxmlChart::parse(xml.as_bytes()).expect("bubble parses");
++        assert_eq!(c.chart_type, OoxmlChartType::Bubble);
++        assert_eq!(c.series[0].bubble_sizes, vec![1.0, 4.0, -2.0]);
++        assert_eq!(c.series[0].x_values, vec![1.0, 2.0, 3.0]);
++        assert_eq!(c.bubble_scale, Some(50.0));
++        assert!(
++            !c.has_secondary_axis,
++            "two value axes are X and Y, not a secondary axis"
++        );
++        let svg = render_chart_svg(&c, 0.0, 0.0, 400.0, 300.0);
++        // The negative size is not drawn; the larger bubble comes first, twice the radius.
++        let radii: Vec<f64> = svg
++            .split("class=\"hwp-chart-bubble\"")
++            .skip(1)
++            .filter_map(|rest| {
++                let r = rest.split(" r=\"").nth(1)?;
++                r.split('"').next()?.parse().ok()
++            })
++            .collect();
++        assert_eq!(radii.len(), 2, "{svg}");
++        assert!((radii[0] / radii[1] - 2.0).abs() < 0.01, "{radii:?}");
++        assert_eq!(svg, render_chart_svg(&c, 0.0, 0.0, 400.0, 300.0));
++    }
++}

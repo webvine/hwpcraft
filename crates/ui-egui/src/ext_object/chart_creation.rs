@@ -23,6 +23,15 @@ const SCATTER_STYLES: &[(&str, &str)] = &[
     ("line_marker", "직선과 표식"),
     ("smooth_marker", "곡선과 표식"),
 ];
+const GROUPINGS: &[(&str, &str)] = &[
+    ("clustered", "묶은"),
+    ("stacked", "누적"),
+    ("percent_stacked", "100% 누적"),
+];
+/// Kinds whose plot takes a grouping.
+fn groups(kind: &str) -> bool {
+    matches!(kind, "column" | "bar" | "line")
+}
 fn stock_roles(kind: &str) -> &'static [&'static str] {
     match kind {
         "stock_hlc" => &["고가", "저가", "종가"],
@@ -56,6 +65,7 @@ struct Draft {
     legend: bool,
     x_values: Vec<String>,
     scatter_style: String,
+    grouping: String,
     // UI-only backups preserve all draft input when switching data families.
     saved_data: std::collections::BTreeMap<String, DataDraft>,
 }
@@ -83,6 +93,7 @@ impl Default for Draft {
             legend: true,
             x_values: vec!["1".into(), "2".into(), "3".into()],
             scatter_style: "marker".into(),
+            grouping: "clustered".into(),
             saved_data: Default::default(),
         }
     }
@@ -110,6 +121,7 @@ impl Draft {
             "height_mm",
             "legend",
             "scatter_style",
+            "grouping",
         ];
         if spec
             .as_object()
@@ -202,6 +214,13 @@ impl Draft {
             }
             "marker".into()
         };
+        let grouping = spec
+            .get("grouping")
+            .filter(|v| !v.is_null())
+            .map(|v| v.as_str().context("묶음 방식 오류"))
+            .transpose()?
+            .unwrap_or("clustered")
+            .to_owned();
         let draft = Self {
             kind,
             title: text("title")?,
@@ -216,6 +235,7 @@ impl Draft {
                 .map(ToString::to_string)
                 .collect(),
             scatter_style,
+            grouping,
             saved_data: Default::default(),
         };
         draft.spec()?;
@@ -343,6 +363,12 @@ impl Draft {
             "series":series,"width_mm":self.width_mm,"height_mm":self.height_mm,"legend":self.legend});
         if scatter {
             spec["scatter_style"] = json!(self.scatter_style);
+        }
+        if !GROUPINGS.iter().any(|(id, _)| *id == self.grouping) {
+            bail!("지원하지 않는 묶음 방식입니다.");
+        }
+        if groups(&self.kind) && self.grouping != "clustered" {
+            spec["grouping"] = json!(self.grouping);
         }
         Ok(spec)
     }
@@ -734,6 +760,19 @@ impl Editor {
                 ui.label(RichText::new("모든 계열이 같은 X열을 사용합니다.").weak());
             });
         }
+        if groups(&self.draft.kind) {
+            ui.horizontal(|ui| {
+                ui.label("묶음");
+                let before = self.draft.grouping.clone();
+                for (id, label) in GROUPINGS {
+                    ui.selectable_value(&mut self.draft.grouping, (*id).into(), *label);
+                }
+                if self.draft.grouping != before {
+                    self.preview_stale = true;
+                    self.changed = true;
+                }
+            });
+        }
         ui.horizontal(|ui| {
             ui.label("너비");
             ui.add(
@@ -757,12 +796,14 @@ impl Editor {
                         && (self.draft.points() + 1) * self.draft.series.len() <= 16_000,
                     egui::Button::new("행 추가"),
                 )
+                .on_disabled_hover_text("항목은 1000개, 값은 모두 16000개까지 넣을 수 있습니다.")
                 .clicked()
             {
                 self.draft.add_row();
             }
             if ui
                 .add_enabled(self.draft.points() > 1, egui::Button::new("마지막 행 제거"))
+                .on_disabled_hover_text("항목이 하나뿐이라 지울 수 없습니다.")
                 .clicked()
             {
                 self.draft.categories.pop();
@@ -778,6 +819,11 @@ impl Editor {
                         && (self.draft.series.len() + 1) * self.draft.points() <= 16_000,
                     egui::Button::new("계열 추가"),
                 )
+                .on_disabled_hover_text(if stock_roles(&self.draft.kind).is_empty() {
+                    "계열은 64개, 값은 모두 16000개까지 넣을 수 있습니다."
+                } else {
+                    "주식형 차트는 시가·고가·저가·종가 계열이 정해져 있습니다."
+                })
                 .clicked()
             {
                 self.draft.add_series();
@@ -787,6 +833,11 @@ impl Editor {
                     stock_roles(&self.draft.kind).is_empty() && self.draft.series.len() > 1,
                     egui::Button::new("마지막 계열 제거"),
                 )
+                .on_disabled_hover_text(if stock_roles(&self.draft.kind).is_empty() {
+                    "계열이 하나뿐이라 지울 수 없습니다."
+                } else {
+                    "주식형 차트는 시가·고가·저가·종가 계열이 정해져 있습니다."
+                })
                 .clicked()
             {
                 self.draft.series.pop();
@@ -810,7 +861,8 @@ impl Editor {
                                 }
                                 ui.add_sized(
                                     [VALUE_WIDTH, 22.0],
-                                    egui::TextEdit::singleline(&mut series.name),
+                                    egui::TextEdit::singleline(&mut series.name)
+                                        .background_color(HEADER_FILL),
                                 );
                             });
                         }
@@ -822,7 +874,8 @@ impl Editor {
                                     &mut self.draft.x_values[row]
                                 } else {
                                     &mut self.draft.categories[row]
-                                }),
+                                })
+                                .background_color(HEADER_FILL),
                             );
                             #[cfg(test)]
                             if scatter && row == 0 {
@@ -861,9 +914,11 @@ impl Editor {
                     });
             });
         ui.label(
-            RichText::new(
-                "11종 작성·구성. 주가형은 고가 ≥ 저가, 시가·종가가 그 사이여야 합니다. 입체 표현의 한컴 호환성은 미검증입니다.",
-            )
+            RichText::new(if stock_roles(&self.draft.kind).is_empty() {
+                "값을 고치면 잠시 뒤 오른쪽 미리 보기가 바뀝니다."
+            } else {
+                "주식형: 고가는 저가보다 크거나 같고, 시가·종가는 그 사이여야 합니다."
+            })
             .weak(),
         );
         // Compare with the last spec seen, so changes made outside the form
@@ -880,6 +935,8 @@ impl Editor {
 /// Category / X column and value columns of the data grid (fixed, so a first
 /// frame does not shrink cells to the grid's unknown column width).
 const LABEL_WIDTH: f32 = 120.0;
+/// Background of the header row (series names) and column (categories, X).
+const HEADER_FILL: Color32 = Color32::from_rgb(238, 243, 250);
 const VALUE_WIDTH: f32 = 84.0;
 /// Pause after the last edit before the live preview is regenerated (seconds).
 const PREVIEW_PAUSE: f64 = 0.35;
@@ -971,24 +1028,41 @@ impl HwpApp {
             });
             ui.separator();
             ui.horizontal(|ui| {
-                let r = ui.button("현재 문서 기준으로 갱신");
+                let r = ui
+                    .button("현재 문서 기준으로 갱신")
+                    .on_hover_text("창을 연 뒤 문서가 바뀌었으면 입력을 지금 문서에 맞춥니다.");
                 refresh = r.clicked();
                 #[cfg(test)]
                 editor.record("refresh", ui, &r);
-                let r = ui.button(if editor.capture.target.is_some() {
-                    "구성 적용"
-                } else {
-                    "차트 넣기"
+                // Same order as the other dialogs: main action first, cancel last,
+                // at the right edge; Enter applies, Esc cancels.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let r = ui.add(egui::Button::new("취소").min_size(Vec2::new(80.0, 28.0)));
+                    close |= r.clicked();
+                    #[cfg(test)]
+                    editor.record("cancel", ui, &r);
+                    let r = ui.add(
+                        egui::Button::new(if editor.capture.target.is_some() {
+                            "구성 적용"
+                        } else {
+                            "차트 넣기"
+                        })
+                        .fill(Color32::WHITE)
+                        .stroke(Stroke::new(1.5, chrome::Tokens::ACCENT))
+                        .min_size(Vec2::new(80.0, 28.0)),
+                    );
+                    apply = r.clicked();
+                    #[cfg(test)]
+                    editor.record("apply", ui, &r);
                 });
-                apply = r.clicked();
-                #[cfg(test)]
-                editor.record("apply", ui, &r);
-                let r = ui.button("취소");
-                close |= r.clicked();
-                #[cfg(test)]
-                editor.record("cancel", ui, &r);
             });
         });
+        if !apply
+            && !ctx.egui_wants_keyboard_input()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+        {
+            apply = true;
+        }
         // Live preview: regenerate once the user has paused typing.
         if editor.changed {
             editor.changed = false;
@@ -1650,6 +1724,17 @@ mod tests {
                 "{name} clipped: {rect:?} {clip:?}"
             );
         }
+        // Common dialog order: refresh on the left, main action then cancel at the right.
+        let (refresh, apply, cancel) = (
+            editor.regions["refresh"].0,
+            editor.regions["apply"].0,
+            editor.regions["cancel"].0,
+        );
+        assert!(refresh.right() < apply.left() && apply.right() <= cancel.left());
+        assert!(
+            cancel.left() - refresh.right() > 200.0,
+            "{refresh:?} {cancel:?}"
+        );
         let (title_rect, _, title_id) = editor.regions["title"];
         click(&mut app, &context, title_rect.center());
         assert!(
@@ -1703,6 +1788,30 @@ mod tests {
         );
         app.session.execute(Command::Undo)?;
         assert_eq!(format!("{:?}", app.session.core.document()), original);
+        Ok(())
+    }
+
+    #[test]
+    fn grouping_round_trips_for_bars_and_lines_only() -> Result<()> {
+        for kind in ["column", "bar", "line"] {
+            let mut draft = draft_for_kind(kind);
+            draft.add_series();
+            draft.grouping = "percent_stacked".into();
+            let spec = draft.spec()?;
+            assert_eq!(spec["grouping"], "percent_stacked", "{kind}");
+            assert_eq!(Draft::from_spec(&spec)?.spec()?, spec);
+            draft.grouping = "clustered".into();
+            assert!(
+                draft.spec()?.get("grouping").is_none(),
+                "{kind}: default is not written"
+            );
+        }
+        let mut pie = draft_for_kind("pie");
+        pie.grouping = "stacked".into();
+        assert!(pie.spec()?.get("grouping").is_none(), "pie has no grouping");
+        let mut bad = draft_for_kind("column");
+        bad.grouping = "sideways".into();
+        assert!(bad.spec().is_err());
         Ok(())
     }
 }

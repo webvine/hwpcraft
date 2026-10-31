@@ -1,0 +1,55 @@
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 64e2279..47c7038 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -5663,8 +5663,21 @@ impl DocumentCore {
+                 }
+             }
+ 
++            // 구역 시작 쪽 번호(secd page_num / hwpx startNum page): 0이 아니면 그 구역의
++            // 첫 쪽 번호다. 한컴은 65530처럼 큰 값도 그대로 인쇄 쪽번호로 쓴다. 절대값이라
++            // 앞 구역 carry를 더하지 않고, `새 번호로 시작`이 발화한 쪽부터는 그 값을 따른다.
++            let section_start = u32::from(section.section_def.page_num);
++            if section_start > 0 {
++                for page in &mut result.pages {
++                    if page.page_number_restarted {
++                        break;
++                    }
++                    page.page_number = page.page_number.saturating_sub(1) + section_start;
++                }
++            }
++
+             // 구역 간 쪽번호 연속: NewNumber(Page) 컨트롤이 없으면 이전 구역에서 이어짐
+-            if idx > 0 && carry_last_page_number > 0 {
++            if idx > 0 && carry_last_page_number > 0 && section_start == 0 {
+                 use crate::model::control::{AutoNumberType, Control};
+                 let has_new_number = section.paragraphs.iter().any(|p|
+                     p.controls.iter().any(|c| matches!(c, Control::NewNumber(nn) if nn.number_type == AutoNumberType::Page))
+@@ -10070,3 +10083,27 @@ fn doc_info_shapes_share_prefix(
+         && same_prefix(&a.extra_records, &b.extra_records)
+         && a.hwpx_head_tail == b.hwpx_head_tail
+ }
++
++#[cfg(test)]
++mod section_start_page_number_tests {
++    use crate::document_core::DocumentCore;
++
++    /// 구역 시작 쪽 번호는 그 구역 첫 쪽의 절대 번호다. 0인 구역은 앞 구역에서 잇는다.
++    #[test]
++    fn section_start_number_sets_the_first_page_and_later_sections_continue() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        let mut doc = core.document().clone();
++        let base = doc.sections[0].clone();
++        doc.sections = vec![base.clone(), base.clone(), base];
++        doc.sections[0].section_def.page_num = 65530;
++        doc.sections[2].section_def.page_num = 7;
++        core.set_document(doc);
++        let numbers: Vec<u32> = core
++            .pagination
++            .iter()
++            .flat_map(|r| r.pages.iter().map(|p| p.page_number))
++            .collect();
++        assert_eq!(numbers, [65530, 65531, 7]);
++    }
++}

@@ -23,8 +23,71 @@ impl CellGeometry {
         self.rect.right() - self.padding[1] * self.scale
     }
 }
+/// 보기 → 격자: screen-only lines every [`GRID_MM`] over the paper, every second one
+/// a little darker, like Hangul's line grid. Nothing is saved or printed.
+pub(crate) const GRID_MM: f32 = 5.0;
+
+/// Grid line offsets from the paper edge (screen px) for a side of `length` px.
+pub(crate) fn grid_offsets(length: f32, zoom: f32) -> Vec<(f32, bool)> {
+    let step = GRID_MM / 25.4 * 96.0 * zoom;
+    if !(step.is_finite() && step >= 3.0) {
+        return Vec::new();
+    }
+    (1..)
+        .map(|n| (n as f32 * step, n % 2 == 0))
+        .take_while(|(offset, _)| *offset < length)
+        .collect()
+}
+
+/// 안내선 on the page `rect`: dashed lines across the paper.
+fn paint_guides(ui: &egui::Ui, rect: Rect, zoom: f32, guides: &[(bool, f32)]) {
+    let painter = ui.painter_at(rect.intersect(ui.clip_rect()));
+    let stroke = Stroke::new(1.0, Color32::from_rgb(0, 160, 200));
+    for &(vertical, mm) in guides {
+        let at = mm / 25.4 * 96.0 * zoom;
+        let line = if vertical {
+            let x = rect.left() + at;
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())]
+        } else {
+            let y = rect.top() + at;
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)]
+        };
+        painter.add(egui::Shape::dashed_line(&line, stroke, 6.0, 4.0));
+    }
+}
+
+fn paint_grid(ui: &egui::Ui, rect: Rect, zoom: f32) {
+    let painter = ui.painter_at(rect.intersect(ui.clip_rect()));
+    let stroke = |major: bool| {
+        Stroke::new(
+            1.0,
+            Color32::from_rgba_unmultiplied(70, 120, 200, if major { 70 } else { 34 }),
+        )
+    };
+    for (x, major) in grid_offsets(rect.width(), zoom) {
+        let x = rect.left() + x;
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            stroke(major),
+        );
+    }
+    for (y, major) in grid_offsets(rect.height(), zoom) {
+        let y = rect.top() + y;
+        painter.line_segment(
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+            stroke(major),
+        );
+    }
+}
+
 impl HwpApp {
     pub(crate) fn paint_margin_corners(&self, ui: &egui::Ui, page: u32, rect: Rect) {
+        if self.ext.shell.show_grid {
+            paint_grid(ui, rect, self.zoom);
+        }
+        if self.ext.shell.show_guides {
+            paint_guides(ui, rect, self.zoom, &self.ext.shell.guides);
+        }
         let Ok(info) = self.session.page_info(page) else {
             return;
         };
@@ -309,5 +372,53 @@ mod tests {
         }
         assert!((boxes[0].left() - 32.0 * 96.0 / 25.4).abs() < 0.2);
         assert_ne!(boxes[0].left(), boxes[1].left());
+    }
+}
+
+#[cfg(test)]
+mod grid_tests {
+    use super::*;
+
+    #[test]
+    fn the_grid_is_five_millimetres_with_every_second_line_darker() {
+        // A4 width at 100 %: 794 px, 5 mm = 18.9 px.
+        let lines = grid_offsets(794.0, 1.0);
+        assert_eq!(lines.len(), 42);
+        assert!((lines[0].0 - 18.9).abs() < 0.05 && !lines[0].1);
+        assert!(lines[1].1, "10 mm lines are darker");
+        // Too dense to read at tiny zoom: no grid rather than a grey wash.
+        assert!(grid_offsets(794.0, 0.1).is_empty());
+    }
+
+    #[test]
+    fn guides_are_added_shown_and_cleared() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        assert_eq!(a.shell_ext_enabled("view.guides.clear"), Some(false));
+        a.shell_ext_dispatch("view.guides.add", &ctx);
+        assert!(a.ext.shell.dialog.is_some(), "asks direction and position");
+        a.ext.shell.dialog = None;
+        a.ext.shell.guides.push((false, 25.0));
+        assert!(a.shell_ext_checked("view.guides"));
+        assert_eq!(a.shell_ext_enabled("view.guides.clear"), Some(true));
+        a.shell_ext_dispatch("view.guides", &ctx);
+        assert!(!a.shell_ext_checked("view.guides"), "hidden but kept");
+        assert_eq!(a.ext.shell.guides.len(), 1);
+        a.shell_ext_dispatch("view.guides.clear", &ctx);
+        assert!(a.ext.shell.guides.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn the_grid_toggle_is_a_checked_view_command() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        assert_eq!(a.shell_ext_enabled("view.grid"), Some(true));
+        assert!(!a.shell_ext_checked("view.grid"));
+        assert!(a.shell_ext_dispatch("view.grid", &ctx));
+        assert!(a.shell_ext_checked("view.grid") && a.message.contains("5 mm"));
+        a.shell_ext_dispatch("view.grid", &ctx);
+        assert!(!a.ext.shell.show_grid);
+        Ok(())
     }
 }

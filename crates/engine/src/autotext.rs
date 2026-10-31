@@ -29,7 +29,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "tools.autotext.list",
-        "No parameters; entries[] with name, abbreviation, text and the store path.",
+        "매개 변수 없음. entries[]: name, abbreviation, text와 저장 위치(path).",
         "{}",
     ),
     (

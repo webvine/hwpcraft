@@ -1,9 +1,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 pub mod auto_number_formats;
+pub mod doc_history;
+pub mod docx_export;
 pub mod file_access;
 mod memo_formats;
 mod page_counter_formats;
 mod page_number_formats;
+pub mod pdf_compact;
 mod table_repair;
 mod textbox_formats;
 use anyhow::{Context, Result, bail};
@@ -55,6 +58,23 @@ fn open_inner(path: &Path, password: Option<&[u8]>) -> Result<DocumentCore> {
     // only layouts identified by its validation report before the first render.
     core.reflow_linesegs_on_demand();
     Ok(core)
+}
+
+/// A throwaway core holding `doc` only for serialization. RHWP's HWP/HWPX writers
+/// read the model and the core's source format (and file name, here the default of
+/// `new_empty`), not layout, so `set_document`'s full layout (about 0.25 s on 380
+/// pages, once per number kind) is skipped. The source format decides the writers'
+/// adapters: an HWPX copy of an `Hwp` source is marked HWP5-origin, and its tables
+/// treated as characters then flow differently when the copy is read back. Never
+/// render from this core.
+pub(crate) fn export_core(
+    doc: hwpcraft_doc::model::document::Document,
+    source_format: hwpcraft_doc::FileFormat,
+) -> DocumentCore {
+    let mut core = DocumentCore::new_empty();
+    *core.document_mut() = doc;
+    core.set_source_format(source_format);
+    core
 }
 
 /// Did `open` fail because the document is encrypted and no password was given?
@@ -126,8 +146,11 @@ fn save_inner(core: &DocumentCore, path: &Path, password: Option<&[u8]>) -> Resu
             let pdf = core.render_document_pdf_native_with_options(&options);
             // Every page's render tree stays cached otherwise (hundreds of MB).
             core.release_page_render_caches();
-            pdf.map_err(|e| anyhow::anyhow!("{e}"))?
+            pdf_compact::compact(pdf.map_err(|e| anyhow::anyhow!("{e}"))?)
         }
+        // What DOCX cannot carry is reported by `docx_export::export`; callers that
+        // need the list call it directly.
+        ("docx", _) => docx_export::export(core)?.bytes,
         ("txt", _) => {
             let mut lines = Vec::new();
             for section in &core.document().sections {
@@ -135,7 +158,7 @@ fn save_inner(core: &DocumentCore, path: &Path, password: Option<&[u8]>) -> Resu
             }
             lines.join("\r\n").into_bytes()
         }
-        _ => bail!("지원하는 저장 형식: HWP, HWPX, PDF, TXT"),
+        _ => bail!("지원하는 저장 형식: HWP, HWPX, PDF, TXT, DOCX"),
     };
     atomic_write(path, &bytes)
 }

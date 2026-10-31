@@ -94,6 +94,11 @@ use Action as A;
 use Item::{Big, Checks, Sep, Stack};
 use Mini::{Icon as I, Text as T, Widget as W};
 
+/// 도형 gallery: cell size and columns (two rows hold all sixteen shapes).
+const SHAPE_CELL: f32 = 22.0;
+const SHAPE_COLUMNS: usize = 8;
+const SHAPE_GALLERY_WIDTH: f32 = SHAPE_CELL * SHAPE_COLUMNS as f32 + 6.0;
+
 const SHAPES: &[(Icon, &str, Action)] = &[
     (
         Icon::Textbox,
@@ -142,27 +147,27 @@ const SHAPES: &[(Icon, &str, Action)] = &[
         A::Ext("insert.shape.connector.straight"),
     ),
     (
-        Icon::Connector,
+        Icon::ConnectorArrow,
         "직선 화살표 연결선",
         A::Ext("insert.shape.connector.straight_arrow"),
     ),
     (
-        Icon::Connector,
+        Icon::ConnectorBoth,
         "직선 양쪽 화살표 연결선",
         A::Ext("insert.shape.connector.straight_both"),
     ),
     (
-        Icon::Connector,
+        Icon::Elbow,
         "꺾인 연결선",
         A::Ext("insert.shape.connector.stroke"),
     ),
     (
-        Icon::Connector,
+        Icon::ElbowArrow,
         "꺾인 화살표 연결선",
         A::Ext("insert.shape.connector.stroke_arrow"),
     ),
     (
-        Icon::Connector,
+        Icon::ElbowBoth,
         "꺾인 양쪽 화살표 연결선",
         A::Ext("insert.shape.connector.stroke_both"),
     ),
@@ -277,15 +282,10 @@ const WHY_TRACK: &str = "변경 내용 추적은 지원하지 않습니다. HWP 
 const WHY_SPELLING: &str = "맞춤법 검사는 지원하지 않습니다. 내장 맞춤법 사전이 없습니다.";
 const WHY_DICTIONARY: &str = "사전 찾기는 지원하지 않습니다. 내장 국어·한자 사전이 없습니다. 한자의 음과 뜻 후보는 [한자로 바꾸기](F9)에서 볼 수 있습니다.";
 const WHY_PROOF: &str = "교정 부호 넣기와 보기는 지원하지 않습니다.";
-const WHY_LINE_NUMBERS: &str = "줄 번호는 지원하지 않습니다. 조판 엔진(RHWP)에 줄 번호가 없습니다.";
-const WHY_GRID: &str = "격자 보기는 지원하지 않습니다. 화면 렌더에 격자 층이 없습니다.";
-const WHY_OUTLINE: &str =
-    "쪽 윤곽 끄기(본문만 이어 보기)는 지원하지 않습니다. 문서는 항상 쪽 모양으로 보입니다.";
 const WHY_DISTRIBUTION: &str = "배포용 문서 저장·편집은 지원하지 않습니다.";
-const WHY_WINDOWS: &str = "한 창에 문서 하나만 엽니다. 창 나누기·배열·전환은 지원하지 않습니다.";
 const WHY_NOT_YET: &str = "아직 지원하지 않는 기능입니다.";
+const WHY_PRIVATE_INFO: &str = "개인 정보 보호(암호화)는 지원하지 않습니다. 한글의 암호화 형식이 공개되지 않았습니다. 대신 [개인 정보 찾아서 보호]로 찾아서 가릴 수 있습니다.";
 const UNSUPPORTED: &[(&str, &str)] = &[
-    ("review.history", WHY_TRACK),
     ("review.track_changes", WHY_TRACK),
     ("review.balloons", WHY_TRACK),
     ("review.show_changes", WHY_TRACK),
@@ -301,49 +301,37 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("tools.dictionary", WHY_DICTIONARY),
     ("view.proof_marks", WHY_PROOF),
     ("review.proof_marks", WHY_PROOF),
-    ("page.line_numbers", WHY_LINE_NUMBERS),
-    ("view.grid", WHY_GRID),
-    ("view.page_outline", WHY_OUTLINE),
     ("security.distribution", WHY_DISTRIBUTION),
     ("security.distribution_edit", WHY_DISTRIBUTION),
     ("security.distribution_change", WHY_DISTRIBUTION),
-    ("view.split", WHY_WINDOWS),
-    ("view.arrange", WHY_WINDOWS),
-    ("view.switch_window", WHY_WINDOWS),
-    ("view.guides", WHY_NOT_YET),
-    ("format.style.gallery", WHY_NOT_YET),
-    ("format.drop_cap", WHY_NOT_YET),
-    ("format.picture_bullet", WHY_NOT_YET),
-    ("view.hanja_pronounce", WHY_NOT_YET),
-    ("insert.shape.freeline", WHY_NOT_YET),
     ("insert.textart", WHY_NOT_YET),
     ("insert.ole", WHY_NOT_YET),
-    ("insert.cross_reference", WHY_NOT_YET),
     ("insert.helper", WHY_NOT_YET),
-    ("page.text_direction", WHY_NOT_YET),
-    ("page.column_def_break", WHY_NOT_YET),
-    ("page.section_break", WHY_NOT_YET),
-    ("page.label", WHY_NOT_YET),
-    ("page.manuscript", WHY_NOT_YET),
-    ("security.protect_text", WHY_NOT_YET),
-    ("security.privacy_clear", WHY_NOT_YET),
-    ("security.privacy_password", WHY_NOT_YET),
-    ("security.settings", WHY_NOT_YET),
-    ("tools.index", WHY_NOT_YET),
-    ("tools.toc", WHY_NOT_YET),
+    (
+        "page.text_direction",
+        "본문 세로쓰기는 아직 지원하지 않습니다. 조판 엔진(RHWP)이 구역 세로쓰기를 그리지 못합니다. 표 셀과 글상자의 세로쓰기는 됩니다.",
+    ),
+    (
+        "page.manuscript",
+        "원고지는 아직 지원하지 않습니다. 글자를 칸에 맞추는 조판이 조판 엔진(RHWP)에 없습니다.",
+    ),
+    ("security.protect_text", WHY_PRIVATE_INFO),
+    ("security.privacy_clear", WHY_PRIVATE_INFO),
+    ("security.privacy_password", WHY_PRIVATE_INFO),
+    (
+        "security.settings",
+        "문서 보안 설정은 지원하지 않습니다. 한글의 설정 형식이 공개되지 않았습니다.",
+    ),
     ("tools.citation", WHY_NOT_YET),
     ("tools.bibliography", WHY_NOT_YET),
     ("tools.bibliography_style", WHY_NOT_YET),
     ("tools.bibliography_refresh", WHY_NOT_YET),
-    ("tools.macro", WHY_NOT_YET),
-    ("tools.autocorrect", WHY_NOT_YET),
     ("tools.translate", WHY_NOT_YET),
     ("tools.presentation", WHY_NOT_YET),
-    ("tools.keyboard", WHY_NOT_YET),
-    ("tools.customize", WHY_NOT_YET),
-    ("tools.options", WHY_NOT_YET),
-    ("tools.user_info", WHY_NOT_YET),
-    ("file.template", WHY_NOT_YET),
+    (
+        "tools.keyboard",
+        "글자판은 Windows 입력기(한글 IME) 설정을 따릅니다. Windows 설정 → 언어에서 바꾸세요.",
+    ),
 ];
 
 fn unsupported_reason(action: Action) -> Option<&'static str> {
@@ -448,7 +436,45 @@ fn unsupported_in(items: &[Item]) -> Vec<(String, &'static str)> {
         .collect()
 }
 
+/// A short note beside the 지원 안 함 chip for a tab that hides at least as many
+/// commands as it shows, so a nearly empty tab says why it looks empty.
+fn sparse_note(items: &[Item]) -> Option<String> {
+    let hidden = unsupported_in(items);
+    let shown = HwpApp::tools(items)
+        .into_iter()
+        .filter(|(_, _, action)| unsupported_reason(*action).is_none())
+        .count();
+    if hidden.is_empty() || hidden.len() < shown {
+        return None;
+    }
+    let names: Vec<String> = hidden
+        .iter()
+        .take(2)
+        .map(|(label, _)| label.replace('\n', " "))
+        .collect();
+    Some(format!(
+        "{} 등 {}개는 아직 지원하지 않아 숨겼습니다.\n칩을 누르면 목록과 이유를 봅니다.",
+        names.join(", "),
+        hidden.len()
+    ))
+}
+
 /// Hangul 쪽 여백 gallery (measured values live in the engine's `page.margins.preset`).
+/// 쪽 → 줄 번호: show / hide, the settings dialog, and skipping the caret paragraph.
+const LINE_NUMBER_MENU: &[(&str, Action)] = &[
+    ("줄 번호 표시", A::Ext("page.line_numbers.toggle")),
+    ("줄 번호 설정...", A::Ext("page.line_numbers.dialog")),
+    (
+        "현재 문단 건너뜀",
+        A::Ext("page.line_numbers.skip_paragraph"),
+    ),
+];
+/// 보기 → 창 배열: every HwpCraft window on the main monitor.
+const ARRANGE_MENU: &[(&str, Action)] = &[
+    ("계단식", A::Ext("view.arrange")),
+    ("왼쪽·오른쪽으로 나란히", A::Ext("view.arrange.side")),
+    ("위·아래로 나란히", A::Ext("view.arrange.stacked")),
+];
 const MARGIN_MENU: &[(&str, Action)] = &[
     ("기본", A::Ext("page.margins.default")),
     (
@@ -501,8 +527,8 @@ const VIEW: &[Item] = &[
         ("눈금자", A::Rulers),
     ]),
     Checks(&[("지원하지 않는 명령", A::ShowUnsupported)]),
-    Big(Icon::Grid, "격자", A::Ext("view.grid"), true),
-    Big(Icon::Eye, "안내선", A::Ext("view.guides"), true),
+    Big(Icon::Grid, "격자", A::Ext("view.grid"), false),
+    Item::Menu(Icon::Eye, "안내선", GUIDE_MENU),
     Sep,
     Big(
         Icon::Pronounce,
@@ -513,18 +539,14 @@ const VIEW: &[Item] = &[
     Sep,
     Big(Icon::Windows, "작업\n창", A::Navigation, true),
     Sep,
-    Big(
-        Icon::SplitView,
-        "편집 화면\n나누기",
-        A::Ext("view.split"),
-        true,
-    ),
-    Big(Icon::Windows, "창\n배열", A::Ext("view.arrange"), true),
+    Item::Menu(Icon::SplitView, "편집 화면\n나누기", SPLIT_MENU),
+    Item::Menu(Icon::Windows, "새\n창", WINDOW_MENU),
+    Item::Menu(Icon::Windows, "창\n배열", ARRANGE_MENU),
     Big(
         Icon::Windows,
         "창\n전환",
         A::Ext("view.switch_window"),
-        true,
+        false,
     ),
     Sep,
     Big(Icon::ZoomOut, "축소", A::ZoomOut, false),
@@ -578,12 +600,7 @@ const INSERT: &[Item] = &[
     ),
     Big(Icon::Ole, "OLE\n개체", A::Ext("insert.ole"), false),
     Sep,
-    Big(
-        Icon::FormObject,
-        "양식\n개체",
-        A::Ext("insert.form_object"),
-        true,
-    ),
+    Item::Menu(Icon::FormObject, "양식\n개체", FORM_OBJECT),
     Big(Icon::Field, "누름틀", A::Ext("insert.field"), false),
     Sep,
     Item::Menu(Icon::NewNumber, "번호\n넣기", AUTO_NUMBER),
@@ -638,18 +655,8 @@ const INSERT: &[Item] = &[
     Sep,
     Big(Icon::Link, "하이퍼링크", A::Link, false),
     Stack(&[
-        &[I(
-            Icon::Prev,
-            "하이퍼링크 이전",
-            A::Ext("view.link_prev"),
-            false,
-        )],
-        &[I(
-            Icon::Next,
-            "하이퍼링크 다음",
-            A::Ext("view.link_next"),
-            false,
-        )],
+        &[T(Icon::Prev, "이전 링크", A::Ext("view.link_prev"), false)],
+        &[T(Icon::Next, "다음 링크", A::Ext("view.link_next"), false)],
     ]),
     Sep,
     Big(
@@ -671,6 +678,12 @@ const INSERT: &[Item] = &[
         Icon::Character,
         "글자\n겹치기",
         A::Ext("format.char_overlap.dialog"),
+        false,
+    ),
+    Big(
+        Icon::Character,
+        "덧말\n넣기",
+        A::Ext("format.ruby.dialog"),
         false,
     ),
     Item::Menu(
@@ -734,7 +747,7 @@ const FORMAT: &[Item] = &[
     ),
     Stack(&[
         &[
-            W("format.font_lang", 91.0),
+            W("format.font_lang", 76.0),
             W("format.font_face", 150.0),
             W("format.font_size", 106.0),
             I(Icon::Prev, "이전 글꼴", A::Ext("format.font.prev"), false),
@@ -936,12 +949,7 @@ const PAGE: &[Item] = &[
         A::Ext("page.hide"),
         false,
     ),
-    Big(
-        Icon::LineNumber,
-        "줄\n번호",
-        A::Ext("page.line_numbers"),
-        true,
-    ),
+    Item::Menu(Icon::LineNumber, "줄\n번호", LINE_NUMBER_MENU),
     Sep,
     Big(Icon::PageBreak, "쪽\n나누기", A::Break, false),
     Big(Icon::ColumnBreak, "단\n나누기", A::ColumnBreak, false),
@@ -1140,7 +1148,8 @@ const TOOLS: &[Item] = &[
     Sep,
     Item::Menu(Icon::BlockCalc, "블록\n계산", BLOCK_CALC),
     Sep,
-    Big(Icon::Macro, "스크립트\n매크로", A::Ext("tools.macro"), true),
+    Item::Menu(Icon::Macro, "스크립트\n매크로", MACRO_MENU),
+    Item::Menu(Icon::Link, "MCP\n연결", MCP_MENU),
     Sep,
     Big(Icon::ProofMark, "맞춤법", A::Ext("review.spelling"), true),
     Big(
@@ -1190,6 +1199,72 @@ const TOOLS: &[Item] = &[
     Big(Icon::Find, "명령\n찾기", A::Search, false),
     Big(Icon::Help, "사용\n안내", A::Help, false),
 ];
+/// 안내선: screen-only guide lines at set distances from the paper edge.
+const GUIDE_MENU: &[(&str, Action)] = &[
+    ("안내선 보이기", A::Ext("view.guides")),
+    ("안내선 넣기…", A::Ext("view.guides.add")),
+    ("안내선 모두 지우기", A::Ext("view.guides.clear")),
+];
+/// 편집 화면 나누기: one document in two panes.
+const SPLIT_MENU: &[(&str, Action)] = &[
+    ("위아래로 나누기", A::Ext("view.split")),
+    ("좌우로 나누기", A::Ext("view.split.side")),
+    ("나누기 해제", A::Ext("view.split.none")),
+];
+/// 새 창: another HwpCraft window (a separate process).
+const WINDOW_MENU: &[(&str, Action)] = &[
+    ("새 창", A::Ext("view.new_window")),
+    ("새 창에서 열기…", A::Ext("view.open_in_new_window")),
+];
+/// Every supported ribbon command once, as (tab · label, id), for user shortcuts.
+pub(crate) fn ribbon_commands() -> Vec<(String, String)> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for (tab, _, items) in TABS {
+        for (_, label, action) in HwpApp::tools(items) {
+            let Some(id) = HwpApp::action_id(action) else {
+                continue;
+            };
+            if unsupported_reason(action).is_some() || !seen.insert(id) {
+                continue;
+            }
+            out.push((
+                format!("{tab} · {}", label.replace('\n', " ")),
+                id.to_owned(),
+            ));
+        }
+    }
+    out
+}
+
+/// 스크립트 매크로 menu; the saved macros follow these entries.
+const MACRO_MENU: &[(&str, Action)] = &[
+    ("매크로 정의 (기록 시작)", A::Ext("macro.record.start")),
+    ("매크로 정의 끝…", A::Ext("macro.record.stop")),
+    ("매크로 실행…", A::Ext("macro.run")),
+];
+const MCP_MENU: &[(&str, Action)] = &[
+    ("연결 켜기/끄기", A::Ext("tools.mcp_connect")),
+    ("연결 정보…", A::Ext("tools.mcp_info")),
+];
+/// Tooltips of menu buttons that need more than their name.
+fn menu_note(list: &[(&str, Action)]) -> Option<String> {
+    if std::ptr::eq(list, MACRO_MENU) {
+        Some(format!(
+            "키보드로 한 편집을 기록해 두었다가 다시 실행합니다.\n{}",
+            super::ext_shell::MOUSE_NOTE
+        ))
+    } else if std::ptr::eq(list, MCP_MENU) {
+        Some(
+            "AI 도우미(MCP 클라이언트)가 이 창의 문서를 직접 편집하게 합니다.\n\
+             이 컴퓨터에서 토큰이 있는 클라이언트만 연결됩니다."
+                .into(),
+        )
+    } else {
+        None
+    }
+}
+
 const TABLE_DESIGN: &[Item] = &[
     // Hangul's order: selection, then the 모양 group (표마당·테두리·음영), drawing, caption.
     Big(
@@ -1618,6 +1693,14 @@ const AUTO_NUMBER: &[(&str, Action)] = &[
     ("그림 번호", A::Ext("insert.auto_number.picture")),
     ("표 번호", A::Ext("insert.auto_number.table")),
     ("수식 번호", A::Ext("insert.auto_number.equation")),
+];
+const FORM_OBJECT: &[(&str, Action)] = &[
+    ("선택 상자", A::Ext("insert.form.check_box")),
+    ("입력 상자", A::Ext("insert.form.edit")),
+    ("콤보 상자", A::Ext("insert.form.combo_box")),
+    ("라디오 단추", A::Ext("insert.form.radio_button")),
+    ("명령 단추", A::Ext("insert.form.push_button")),
+    ("양식 개체 값 고치기", A::Ext("insert.form_object")),
 ];
 const NOTE_SHAPE: &[(&str, Action)] = &[
     ("각주/미주 모양", A::Ext("note.shape")),
@@ -2191,10 +2274,16 @@ impl HwpApp {
             _ => {}
         }
         let id = Self::action_id(action).unwrap_or("");
+        if let Some(why) = self.macro_disabled_reason(id) {
+            return why;
+        }
         match id {
             "edit.sort" if !in_table => "정렬할 문단들을 먼저 블록으로 선택하세요.",
             "note.convert" | "note.delete" => "각주나 미주 안에 커서를 두세요.",
             "page.delete" => "쪽이 하나뿐이라 지울 쪽이 없습니다.",
+            "view.guides.clear" => "지울 안내선이 없습니다. [안내선 넣기]로 먼저 넣으세요.",
+            "format.ruby.dialog" => "덧말을 달 글자를 본문 한 문단 안에서 먼저 선택하세요.",
+            "view.split.none" => "화면을 나누지 않았습니다.",
             "security.password_change" => {
                 "암호가 걸린 문서가 아닙니다. [문서 암호 설정]으로 먼저 거세요."
             }
@@ -2229,7 +2318,7 @@ impl HwpApp {
         // A label that already names one of the keys (진하게 (Ctrl+B)) keeps its text.
         let mut tip = match shortcut(action) {
             Some(keys) if !keys.split(" / ").any(|k| label.contains(k.trim())) => {
-                format!("{label} ({keys})")
+                format!("{label} ({})", shown_keys(keys))
             }
             _ => label,
         };
@@ -2344,7 +2433,7 @@ impl HwpApp {
                         let entry = ui.add_enabled(
                             enabled,
                             egui::Button::new(format!("{tab}  /  {label}"))
-                                .shortcut_text(shortcut(action).unwrap_or(""))
+                                .shortcut_text(shown_keys(shortcut(action).unwrap_or("")))
                                 .frame(false),
                         );
                         if self.explain(entry, action, enabled).clicked() {
@@ -2395,6 +2484,8 @@ impl HwpApp {
             )
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    // Full width of the column, so the shortcut column is never clipped.
+                    let width = ui.available_width();
                     for entry in backstage_entries() {
                         let Some((label, key, action)) = entry else {
                             ui.add_space(4.0);
@@ -2406,9 +2497,9 @@ impl HwpApp {
                         let response = ui.add_enabled(
                             enabled,
                             egui::Button::new(label)
-                                .shortcut_text(key)
+                                .shortcut_text(shown_keys(key))
                                 .frame(false)
-                                .min_size(Vec2::new(262.0, 28.0)),
+                                .min_size(Vec2::new(width, 28.0)),
                         );
                         if self.explain(response, action, enabled).clicked() {
                             self.dispatch(action, &ctx);
@@ -2421,13 +2512,21 @@ impl HwpApp {
             ui.add_space(22.0);
             ui.heading("문서 정보");
             ui.add_space(12.0);
-            ui.label(
-                self.session
-                    .path
-                    .as_ref()
-                    .map(|p| super::ext_shell::recent_path(p).display().to_string())
-                    .unwrap_or_else(|| "아직 저장하지 않은 문서".into()),
-            );
+            match self.session.path.as_ref() {
+                Some(path) => {
+                    let path = super::ext_shell::recent_path(path);
+                    ui.label(RichText::new(super::ext_shell::recent_name(&path, 60)).size(15.0))
+                        .on_hover_text(path.display().to_string());
+                    ui.label(
+                        RichText::new(super::ext_shell::recent_folder(&path, 80))
+                            .color(Color32::from_gray(110)),
+                    )
+                    .on_hover_text(path.display().to_string());
+                }
+                None => {
+                    ui.label("아직 저장하지 않은 문서");
+                }
+            }
             ui.label(format!(
                 "{}쪽 · {}개 구역",
                 self.layout_page_count(),
@@ -2450,36 +2549,12 @@ impl HwpApp {
                     RichText::new("최근에 연 문서가 없습니다.").color(Color32::from_gray(110)),
                 );
             }
-            egui::Grid::new("hwp-file-recent")
-                .num_columns(2)
-                .spacing([24.0, 6.0])
+            egui::ScrollArea::vertical()
+                .id_salt("hwp-file-recent")
                 .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
                     for (i, path) in self.ext.shell.recent.iter().enumerate() {
-                        let exists = path.is_file();
-                        let name = super::ext_shell::recent_name(path, 32);
-                        let folder = super::ext_shell::recent_folder(path, 64);
-                        let (label, color) = if exists {
-                            (format!("{}  {name}", i + 1), ui.visuals().text_color())
-                        } else {
-                            (
-                                format!("{}  {name}  (찾을 수 없음)", i + 1),
-                                Color32::from_gray(150),
-                            )
-                        };
-                        let response = ui
-                            .add(egui::Button::new(RichText::new(label).color(color)).frame(false));
-                        ui.label(RichText::new(folder).color(Color32::from_gray(120)));
-                        ui.end_row();
-                        let tip = if exists {
-                            path.display().to_string()
-                        } else {
-                            format!(
-                                "파일을 찾을 수 없습니다. 누르면 목록에서 지웁니다.
-{}",
-                                path.display()
-                            )
-                        };
-                        if response.on_hover_text(tip).clicked() {
+                        if recent_row(ui, i, path).clicked() {
                             open_recent = Some(i);
                         }
                     }
@@ -2506,7 +2581,7 @@ impl HwpApp {
             let response = ui.add_enabled(
                 enabled,
                 egui::Button::new(*label)
-                    .shortcut_text(*key)
+                    .shortcut_text(shown_keys(key))
                     .frame(false)
                     .min_size(Vec2::new(290.0, 26.0)),
             );
@@ -2553,6 +2628,18 @@ impl HwpApp {
         let Some((_, _, items)) = TABS.get(self.tab) else {
             return;
         };
+        if let Some(label) = keytip_menu(self.tab, id) {
+            let menu = egui::Id::new(("hwp-menu", label, self.tab));
+            match ctx.data(|d| d.get_temp::<egui::Id>(menu.with("group"))) {
+                // Narrow window: the group is folded. Open it, and the menu inside it.
+                Some(group) => {
+                    egui::Popup::open_id(ctx, group);
+                    ctx.data_mut(|d| d.insert_temp(menu.with("unfold"), true));
+                }
+                None => egui::Popup::toggle_id(ctx, self.menu_popup(ctx, label)),
+            }
+            return;
+        }
         let found = Self::tools(items)
             .into_iter()
             .map(|(_, _, action)| action)
@@ -2623,19 +2710,25 @@ impl HwpApp {
     }
     /// Draw the Alt key tip for an action over its widget when tips are showing.
     fn keytip_badge(&self, ui: &egui::Ui, rect: Rect, action: Action) {
+        if let Some(id) = Self::action_id(action) {
+            self.keytip_badge_for(ui, rect, id);
+        }
+    }
+    /// The key tip of command id (or "menu:<label>") `id` over `rect`.
+    fn keytip_badge_for(&self, ui: &egui::Ui, rect: Rect, id: &str) {
         if self.ext.shell.keytips != super::ext_shell::KeyTips::Items {
             return;
         }
-        let Some(letter) =
-            Self::action_id(action).and_then(|id| super::ext_shell::alt_letter(self.tab, id))
-        else {
+        let Some(letter) = super::ext_shell::alt_letter(self.tab, id) else {
             return;
         };
-        keytip(
-            ui,
-            Pos2::new(rect.left() + 2.0, rect.bottom() - 16.0),
-            letter,
-        );
+        let at = if rect.height() < 40.0 {
+            // Small tools: on the lower right corner, so the icon stays readable.
+            Pos2::new(rect.right() - 8.0, rect.bottom() - 8.0)
+        } else {
+            Pos2::new(rect.left() + 2.0, rect.bottom() - 16.0)
+        };
+        keytip(ui, at, letter);
     }
     fn tab_menu(&mut self, ui: &mut egui::Ui, index: usize) {
         let ctx = ui.ctx().clone();
@@ -2654,7 +2747,7 @@ impl HwpApp {
                 let entry = ui.add_enabled(
                     enabled,
                     egui::Button::new(label)
-                        .shortcut_text(shortcut(action).unwrap_or(""))
+                        .shortcut_text(shown_keys(shortcut(action).unwrap_or("")))
                         .frame(false),
                 );
                 if self.explain(entry, action, enabled).clicked() {
@@ -2663,6 +2756,20 @@ impl HwpApp {
                 }
             });
         }
+    }
+    /// The popup a drop-down menu of the current tab opens: its own, or that of the format
+    /// widget drawn in its place (문단 정렬).
+    fn menu_popup(&self, ctx: &egui::Context, label: &str) -> egui::Id {
+        let id = egui::Id::new(("hwp-menu", label, self.tab));
+        ctx.data(|d| d.get_temp(id.with("widget"))).unwrap_or(id)
+    }
+    /// Contextual tab (표 디자인 Y, 표 레이아웃 L, 그림 P, 도형 X) the Alt tab tip `letter`
+    /// selects, when that tab is showing.
+    pub(crate) fn keytip_context_tab(&self, letter: char) -> Option<usize> {
+        let in_table = self.session.cursor.cell.is_some();
+        CONTEXT_TABS
+            .into_iter()
+            .find(|&i| TABS[i].1 == letter && self.tab_visible(i, in_table))
     }
     fn tab_visible(&self, index: usize, in_table: bool) -> bool {
         match index {
@@ -2674,144 +2781,273 @@ impl HwpApp {
     }
     fn menu_tabs(&mut self, ui: &mut egui::Ui) {
         let in_table = self.session.cursor.cell.is_some();
-        ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            for (index, (name, key, _)) in TABS.iter().enumerate() {
-                if !self.tab_visible(index, in_table) {
-                    continue;
-                }
-                let selected = self.tab == index;
-                let color = if selected {
-                    ACCENT
-                } else if CONTEXT_TABS.contains(&index) {
-                    CONTEXT
+        let visible: Vec<usize> = (0..TABS.len())
+            .filter(|&i| self.tab_visible(i, in_table))
+            .collect();
+        // A narrowing window first shrinks the search box to a button, then drops the tabs'
+        // ∨ part, then moves the tabs that still do not fit behind » (the open tab stays).
+        let font = egui::FontId::proportional(13.0);
+        let names: Vec<f32> = visible
+            .iter()
+            .map(|&i| {
+                ui.painter()
+                    .layout_no_wrap(TABS[i].0.to_owned(), font.clone(), Color32::BLACK)
+                    .size()
+                    .x
+            })
+            .collect();
+        let tab_width = |k: usize, narrow: bool| match visible[k] {
+            0 => 65.0 + 8.0,
+            _ if narrow => (names[k] + 16.0).max(36.0),
+            _ => (names[k] + 22.0 + 18.0).max(50.0),
+        };
+        let total = |narrow: bool| {
+            (0..visible.len())
+                .map(|k| tab_width(k, narrow))
+                .sum::<f32>()
+        };
+        let avail = ui.available_width();
+        let (narrow, search_box) = if total(false) + TABS_RIGHT + SEARCH_BOX <= avail {
+            (false, true)
+        } else if total(false) + TABS_RIGHT + SEARCH_BUTTON <= avail {
+            (false, false)
+        } else {
+            (true, false)
+        };
+        let room = avail
+            - TABS_RIGHT
+            - if search_box {
+                SEARCH_BOX
+            } else {
+                SEARCH_BUTTON
+            };
+        let mut shown: Vec<usize> = (0..visible.len()).collect();
+        let mut hidden = Vec::new();
+        if total(narrow) > room {
+            let open = visible.iter().position(|&i| i == self.tab);
+            let mut used = MORE_TABS + open.map_or(0.0, |k| tab_width(k, narrow));
+            shown.clear();
+            for (k, &index) in visible.iter().enumerate() {
+                if Some(k) == open {
+                    shown.push(k);
+                } else if hidden.is_empty() && used + tab_width(k, narrow) <= room {
+                    used += tab_width(k, narrow);
+                    shown.push(k);
                 } else {
-                    Color32::from_gray(34)
-                };
-                let font = egui::FontId::proportional(13.0);
-                let text = ui
-                    .painter()
-                    .layout_no_wrap((*name).to_owned(), font.clone(), color);
-                let menu_part = if index == 0 { 0.0 } else { 18.0 };
-                let width = if index == 0 {
-                    65.0
-                } else {
-                    (text.size().x + 22.0 + menu_part).max(50.0)
-                };
-                let (rect, response) =
-                    ui.allocate_exact_size(Vec2::new(width, 29.0), egui::Sense::click());
-                let label_rect = Rect::from_min_max(
-                    rect.min,
-                    Pos2::new(rect.right() - menu_part, rect.bottom()),
-                );
-                if response.hovered() {
-                    ui.painter().rect_filled(rect, 2.0, Color32::from_gray(242));
-                }
-                ui.painter().galley(
-                    Pos2::new(
-                        label_rect.center().x - text.size().x / 2.0,
-                        rect.center().y - text.size().y / 2.0,
-                    ),
-                    text,
-                    color,
-                );
-                if index > 0 {
-                    icons::chevron(
-                        ui,
-                        Pos2::new(rect.right() - 12.0, rect.center().y + 1.0),
-                        Color32::from_gray(90),
-                    );
-                }
-                if selected {
-                    ui.painter().line_segment(
-                        [
-                            rect.left_bottom() + Vec2::new(2.0, -1.0),
-                            rect.right_bottom() + Vec2::new(-2.0, -1.0),
-                        ],
-                        Stroke::new(2.0, ACCENT),
-                    );
-                }
-                let response = response.on_hover_text(format!("{name} (Alt+{key})"));
-                if self.ext.shell.keytips != super::ext_shell::KeyTips::Off && index <= 8 {
-                    keytip(
-                        ui,
-                        Pos2::new(label_rect.center().x - 7.0, rect.bottom() - 15.0),
-                        *key,
-                    );
-                }
-                let pointer = response.interact_pointer_pos();
-                let on_menu_part = pointer.is_some_and(|p| p.x > label_rect.right());
-                let popup = egui::Id::new(("hwp-tab-menu", index));
-                if response.clicked() {
-                    if index == 0 || on_menu_part {
-                        egui::Popup::toggle_id(ui.ctx(), popup);
-                    } else {
-                        self.tab = index;
-                        self.show_ribbon = true;
-                    }
-                }
-                egui::Popup::from_response(&response)
-                    .id(popup)
-                    .open_memory(None)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| {
-                        if index == 0 {
-                            self.file_menu(ui);
-                        } else {
-                            self.tab_menu(ui, index);
-                        }
-                    });
-                if index == 0 {
-                    ui.add_space(4.0);
-                    let x = ui.cursor().min.x;
-                    ui.painter().line_segment(
-                        [
-                            Pos2::new(x, rect.top() + 7.0),
-                            Pos2::new(x, rect.bottom() - 7.0),
-                        ],
-                        Stroke::new(1.0, Color32::from_gray(200)),
-                    );
-                    ui.add_space(4.0);
+                    hidden.push(index);
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.add_space(8.0);
-                let collapse = if self.show_ribbon { "︿" } else { "﹀" };
-                if ui
-                    .add(egui::Button::new(collapse).frame(false))
-                    .on_hover_text("기본 도구 상자 접기/펴기 (Ctrl+F1)")
-                    .clicked()
-                {
-                    self.show_ribbon = !self.show_ribbon;
+        }
+        let tabs_right = ui
+            .horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for k in shown {
+                    let index = visible[k];
+                    let (name, key, _) = &TABS[index];
+                    let selected = self.tab == index;
+                    let color = if selected {
+                        ACCENT
+                    } else if CONTEXT_TABS.contains(&index) {
+                        CONTEXT
+                    } else {
+                        Color32::from_gray(34)
+                    };
+                    let font = egui::FontId::proportional(13.0);
+                    let text = ui
+                        .painter()
+                        .layout_no_wrap((*name).to_owned(), font.clone(), color);
+                    let menu_part = if index == 0 || narrow { 0.0 } else { 18.0 };
+                    let width = if index == 0 {
+                        65.0
+                    } else {
+                        tab_width(k, narrow)
+                    };
+                    let (rect, response) =
+                        ui.allocate_exact_size(Vec2::new(width, 29.0), egui::Sense::click());
+                    let label_rect = Rect::from_min_max(
+                        rect.min,
+                        Pos2::new(rect.right() - menu_part, rect.bottom()),
+                    );
+                    if response.hovered() {
+                        ui.painter().rect_filled(rect, 2.0, Color32::from_gray(242));
+                    }
+                    ui.painter().galley(
+                        Pos2::new(
+                            label_rect.center().x - text.size().x / 2.0,
+                            rect.center().y - text.size().y / 2.0,
+                        ),
+                        text,
+                        color,
+                    );
+                    if menu_part > 0.0 {
+                        icons::chevron(
+                            ui,
+                            Pos2::new(rect.right() - 12.0, rect.center().y + 1.0),
+                            Color32::from_gray(90),
+                        );
+                    }
+                    if selected {
+                        ui.painter().line_segment(
+                            [
+                                rect.left_bottom() + Vec2::new(2.0, -1.0),
+                                rect.right_bottom() + Vec2::new(-2.0, -1.0),
+                            ],
+                            Stroke::new(2.0, ACCENT),
+                        );
+                    }
+                    let response = response.on_hover_text(format!("{name} (Alt+{key})"));
+                    if self.ext.shell.keytips != super::ext_shell::KeyTips::Off {
+                        keytip(
+                            ui,
+                            Pos2::new(label_rect.center().x - 7.0, rect.bottom() - 15.0),
+                            *key,
+                        );
+                    }
+                    let pointer = response.interact_pointer_pos();
+                    let on_menu_part = pointer.is_some_and(|p| p.x > label_rect.right());
+                    let popup = egui::Id::new(("hwp-tab-menu", index));
+                    if response.clicked() {
+                        if index == 0 || on_menu_part {
+                            egui::Popup::toggle_id(ui.ctx(), popup);
+                        } else {
+                            self.tab = index;
+                            self.show_ribbon = true;
+                        }
+                    }
+                    egui::Popup::from_response(&response)
+                        .id(popup)
+                        .open_memory(None)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(|ui| {
+                            if index == 0 {
+                                self.file_menu(ui);
+                            } else {
+                                self.tab_menu(ui, index);
+                            }
+                        });
+                    if index == 0 {
+                        ui.add_space(4.0);
+                        let x = ui.cursor().min.x;
+                        ui.painter().line_segment(
+                            [
+                                Pos2::new(x, rect.top() + 7.0),
+                                Pos2::new(x, rect.bottom() - 7.0),
+                            ],
+                            Stroke::new(1.0, Color32::from_gray(200)),
+                        );
+                        ui.add_space(4.0);
+                    }
                 }
-                // Hangul's quick search box: white, grey outline, ∨ at the right.
-                let (rect, response) =
-                    ui.allocate_exact_size(Vec2::new(160.0, 24.0), egui::Sense::click());
-                ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
-                ui.painter().rect_stroke(
-                    rect,
-                    0.0,
-                    Stroke::new(1.0, Color32::from_gray(200)),
-                    egui::StrokeKind::Inside,
-                );
-                ui.painter().text(
-                    rect.left_center() + Vec2::new(8.0, 0.0),
-                    egui::Align2::LEFT_CENTER,
-                    "찾을 내용",
-                    egui::FontId::proportional(12.0),
-                    Color32::from_gray(170),
-                );
-                icons::chevron(
-                    ui,
-                    rect.right_center() - Vec2::new(10.0, 0.0),
-                    Color32::from_gray(110),
-                );
-                if response.on_hover_text("명령 찾기").clicked() {
-                    self.dispatch(A::Search, &ui.ctx().clone());
+                if !hidden.is_empty() {
+                    self.more_tabs(ui, &hidden);
+                }
+                ui.cursor().min.x
+            })
+            .inner;
+        // The right end of the strip, drawn over the same row.
+        let rect = ui.max_rect();
+        let search_left = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.add_space(8.0);
+                    let collapse = if self.show_ribbon { "︿" } else { "﹀" };
+                    if ui
+                        .add(egui::Button::new(collapse).frame(false))
+                        .on_hover_text("기본 도구 상자 접기/펴기 (Ctrl+F1)")
+                        .clicked()
+                    {
+                        self.show_ribbon = !self.show_ribbon;
+                    }
+                    if !search_box {
+                        let (rect, response) =
+                            ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::click());
+                        if response.hovered() {
+                            ui.painter().rect_filled(rect, 2.0, Color32::from_gray(235));
+                        }
+                        self.icons.paint(ui, rect.shrink(3.0), Icon::Find, true);
+                        if response.on_hover_text("명령 찾기").clicked() {
+                            self.dispatch(A::Search, &ui.ctx().clone());
+                        }
+                        return ui.min_rect().left();
+                    }
+                    // Hangul's quick search box: white, grey outline, ∨ at the right.
+                    let (rect, response) =
+                        ui.allocate_exact_size(Vec2::new(160.0, 24.0), egui::Sense::click());
+                    ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
+                    ui.painter().rect_stroke(
+                        rect,
+                        0.0,
+                        Stroke::new(1.0, Color32::from_gray(200)),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        rect.left_center() + Vec2::new(8.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        "찾을 내용",
+                        egui::FontId::proportional(12.0),
+                        Color32::from_gray(170),
+                    );
+                    icons::chevron(
+                        ui,
+                        rect.right_center() - Vec2::new(10.0, 0.0),
+                        Color32::from_gray(110),
+                    );
+                    if response.on_hover_text("명령 찾기").clicked() {
+                        self.dispatch(A::Search, &ui.ctx().clone());
+                    }
+                    ui.min_rect().left()
+                })
+                .inner
+            })
+            .inner;
+        self.ext.shell.tabs_fit = (tabs_right, search_left);
+    }
+    /// »: the menu tabs a narrow window has no room for.
+    fn more_tabs(&mut self, ui: &mut egui::Ui, hidden: &[usize]) {
+        let response = ui
+            .add_sized(
+                Vec2::new(MORE_TABS, 29.0),
+                egui::Button::new(RichText::new("»").size(16.0)).frame(false),
+            )
+            .on_hover_text("창이 좁아 보이지 않는 탭");
+        let popup = egui::Id::new("hwp-more-tabs");
+        if response.clicked() {
+            egui::Popup::toggle_id(ui.ctx(), popup);
+        }
+        egui::Popup::from_response(&response)
+            .id(popup)
+            .open_memory(None)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                // Each tab unfolds its ∨ list (파일: the file menu), led by 탭 열기.
+                for &index in hidden {
+                    let (name, key, _) = TABS[index];
+                    let id = egui::Id::new(("hwp-more-tab", index));
+                    let unfold = ui
+                        .ctx()
+                        .data_mut(|d| d.remove_temp::<bool>(id.with("unfold")));
+                    egui::CollapsingHeader::new(format!("{name}    Alt+{key}"))
+                        .id_salt(id)
+                        .open(unfold)
+                        .show(ui, |ui| {
+                            if index == 0 {
+                                self.file_menu(ui);
+                                return;
+                            }
+                            if ui
+                                .selectable_label(false, format!("{name} 탭 열기"))
+                                .clicked()
+                            {
+                                ui.close();
+                                self.tab = index;
+                                self.show_ribbon = true;
+                            }
+                            ui.separator();
+                            self.tab_menu(ui, index);
+                        });
                 }
             });
-        });
     }
     /// Layout width of an item at a ribbon level (full, compact, collapsed).
     fn item_width(ui: &egui::Ui, item: &Item, hide: bool) -> [f32; 3] {
@@ -2823,22 +3059,7 @@ impl HwpApp {
                 .size()
                 .x
         };
-        let big = |label: &str, menu: bool| {
-            let lines: Vec<&str> = label.split('\n').collect();
-            let w = lines
-                .iter()
-                .enumerate()
-                .map(|(i, l)| {
-                    text(l)
-                        + if menu && i + 1 == lines.len() && lines.len() > 1 {
-                            10.0
-                        } else {
-                            0.0
-                        }
-                })
-                .fold(0.0_f32, f32::max);
-            (w + 12.0).max(38.0).round()
-        };
+        let big = |label: &str, menu: bool| big_width(ui, label, menu);
         let mini = |m: &Mini| match *m {
             I(_, _, a, _) | T(_, _, a, _) if !shown(&a) => 0.0,
             I(_, _, _, menu) => 23.0 + if menu { 16.0 } else { 0.0 },
@@ -2867,7 +3088,7 @@ impl HwpApp {
                     + CHECK_GAP;
                 [w, w, w]
             }
-            Item::Shapes => [139.0, 139.0, 139.0],
+            Item::Shapes => [SHAPE_GALLERY_WIDTH; 3],
             Item::StyleGallery => [407.0, 200.0, 200.0],
             Item::Custom(_, width, _) => [*width, 34.0, 34.0],
             Sep => [13.0, 13.0, 13.0],
@@ -2878,56 +3099,98 @@ impl HwpApp {
             return;
         };
         // Groups are the runs between separators; WordCraft's planner shrinks from the right.
-        let hide = !self.ext.shell.show_unsupported;
+        // Widths start as estimates and become what each group really took when drawn, so
+        // from the next frame on the plan matches the screen.
+        let (tab, hide) = (self.tab, !self.ext.shell.show_unsupported);
         let groups = ribbon_groups(items, hide);
         let widths: Vec<[f32; 3]> = groups
             .iter()
-            .map(|g| {
-                let mut w = [13.0_f32; 3];
+            .enumerate()
+            .map(|(gi, g)| {
+                let mut w = [GROUP_GAP; 3];
                 for item in g.iter() {
                     let iw = Self::item_width(ui, item, hide);
                     for level in 0..3 {
                         w[level] += iw[level];
                     }
                 }
-                w[2] = 54.0;
+                w[2] = GROUP_GAP + folded_width(ui, g);
+                for (level, width) in w.iter_mut().enumerate() {
+                    let key = (tab, hide, gi, level as u8);
+                    if let Some(drawn) = self.ext.shell.ribbon_widths.get(&key) {
+                        *width = *drawn;
+                    }
+                }
                 w
             })
             .collect();
-        let levels = super::ribbon_layout::plan(&widths, ui.available_width() - 16.0);
+        let chip = self.ext.shell.ribbon_chip.get(&(tab, hide)).copied();
+        let limit = ui.max_rect().right();
+        let avail = ui.available_width() - RIBBON_PAD - chip.unwrap_or(0.0);
+        let mut levels = super::ribbon_layout::plan(&widths, avail);
+        let used = |n: usize, levels: &[u8]| -> f32 {
+            widths[..n]
+                .iter()
+                .zip(levels)
+                .map(|(w, l)| w[usize::from(*l)])
+                .sum()
+        };
+        // Even folded the groups do not fit: the tail goes behind 더 보기.
+        let mut shown = groups.len();
+        if used(shown, &levels) > avail {
+            let room = avail - GROUP_GAP - MORE_WIDTH;
+            while shown > 0 && used(shown, &vec![super::ribbon_layout::COLLAPSED; shown]) > room {
+                shown -= 1;
+            }
+            levels = super::ribbon_layout::plan(&widths[..shown], room);
+        }
         ui.add_space(6.0);
-        ui.horizontal_top(|ui| {
-            // Hangul packs ribbon buttons edge to edge; groups are 13 px apart.
-            ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
-            ui.add_space(14.0);
-            for (gi, (group, level)) in groups.iter().zip(levels).enumerate() {
-                if gi > 0 {
-                    let (rect, _) = ui.allocate_exact_size(
-                        Vec2::new(13.0, icons::LARGE_HEIGHT),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().line_segment(
-                        [
-                            Pos2::new(rect.center().x, rect.top() + 2.0),
-                            Pos2::new(rect.center().x, rect.bottom() - 2.0),
-                        ],
-                        Stroke::new(1.0, LINE),
-                    );
-                }
-                ui.push_id((self.tab, gi), |ui| {
-                    if level == super::ribbon_layout::COLLAPSED {
-                        self.collapsed_group(ui, group);
-                    } else {
-                        for item in group.iter() {
-                            self.ribbon_item(ui, item, level == super::ribbon_layout::FULL);
-                        }
+        let right = ui
+            .horizontal_top(|ui| {
+                // Hangul packs ribbon buttons edge to edge; groups are 13 px apart.
+                ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
+                ui.add_space(14.0);
+                for (gi, (group, level)) in groups.iter().zip(levels).enumerate().take(shown) {
+                    let start = ui.cursor().min.x;
+                    if gi > 0 {
+                        group_separator(ui);
                     }
-                });
-            }
-            if hide {
-                self.unsupported_chip(ui, items);
-            }
-        });
+                    ui.push_id((self.tab, gi), |ui| {
+                        if level == super::ribbon_layout::COLLAPSED {
+                            self.collapsed_group(ui, group);
+                        } else {
+                            for item in group.iter() {
+                                self.ribbon_item(ui, item, level == super::ribbon_layout::FULL);
+                            }
+                        }
+                    });
+                    let drawn = ui.cursor().min.x - start;
+                    if (drawn - widths[gi][usize::from(level)]).abs() > 0.5 {
+                        ui.ctx().request_repaint();
+                    }
+                    self.ext
+                        .shell
+                        .ribbon_widths
+                        .insert((tab, hide, gi, level), drawn);
+                }
+                if shown < groups.len() {
+                    group_separator(ui);
+                    let rest: Vec<&[Item]> = groups[shown..].iter().map(Vec::as_slice).collect();
+                    self.more_groups(ui, &rest);
+                }
+                if hide {
+                    let start = ui.cursor().min.x;
+                    self.unsupported_chip(ui, items);
+                    let drawn = ui.cursor().min.x - start;
+                    if chip.is_none_or(|c| (c - drawn).abs() > 0.5) {
+                        ui.ctx().request_repaint();
+                    }
+                    self.ext.shell.ribbon_chip.insert((tab, hide), drawn);
+                }
+                ui.cursor().min.x
+            })
+            .inner;
+        self.ext.shell.ribbon_fit = (right, limit);
     }
     /// 지원 안 함 n: what this tab leaves out, with the reasons and the switch to show them.
     fn unsupported_chip(&mut self, ui: &mut egui::Ui, items: &[Item]) {
@@ -2951,6 +3214,19 @@ impl HwpApp {
             })
             .inner
             .on_hover_text("이 탭에서 숨긴, 아직 지원하지 않는 명령");
+        if !self.ext.shell.show_unsupported
+            && let Some(note) = sparse_note(items)
+        {
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                ui.add_space(5.0);
+                ui.label(
+                    RichText::new(note)
+                        .size(11.0)
+                        .color(Color32::from_gray(120)),
+                );
+            });
+        }
         let popup = egui::Id::new(("hwp-unsupported", self.tab));
         if response.clicked() {
             egui::Popup::toggle_id(ui.ctx(), popup);
@@ -2989,50 +3265,156 @@ impl HwpApp {
                 }
             });
     }
+    /// A group folded into one button (narrow window) that lists its commands.
     fn collapsed_group(&mut self, ui: &mut egui::Ui, group: &[Item]) {
-        let ctx = ui.ctx().clone();
-        let Some((icon, label)) = group.iter().find_map(|i| match *i {
-            Big(icon, label, _, _) | Item::Menu(icon, label, _) => Some((icon, label)),
-            _ => None,
-        }) else {
+        let Some((icon, label)) = folded_label(group) else {
             return;
         };
-        let label = label.split('\n').next().unwrap_or(label);
-        let response = self.icons.large(ui, icon, label, true, true, false);
-        let response = response.on_hover_text(label);
-        let popup = egui::Id::new(("hwp-group", label, self.tab));
+        let response = self.icons.large(ui, icon, &label, true, true, false);
+        let popup = egui::Id::new(("hwp-group", label.as_str(), self.tab));
+        self.folded_button(ui, response.on_hover_text(&label), popup, &[group]);
+    }
+    /// 더 보기: the groups that do not fit even folded, at the right end of the ribbon.
+    fn more_groups(&mut self, ui: &mut egui::Ui, groups: &[&[Item]]) {
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(MORE_WIDTH, icons::LARGE_HEIGHT),
+            egui::Sense::click(),
+        );
+        if response.hovered() {
+            ui.painter().rect_filled(rect, 2.0, Color32::from_gray(235));
+        }
+        ui.painter().text(
+            Pos2::new(rect.center().x, rect.top() + 22.0),
+            egui::Align2::CENTER_CENTER,
+            "»",
+            egui::FontId::proportional(24.0),
+            Color32::from_gray(60),
+        );
+        ui.painter().text(
+            Pos2::new(rect.center().x, rect.top() + 50.0),
+            egui::Align2::CENTER_CENTER,
+            "더 보기",
+            egui::FontId::proportional(12.0),
+            Color32::from_gray(34),
+        );
+        let tip = "창이 좁아 다 보이지 않는 리본 명령";
+        let popup = egui::Id::new(("hwp-more", self.tab));
+        self.folded_button(ui, response.on_hover_text(tip), popup, groups);
+    }
+    /// Popup list of folded groups under `response`, with the key tips of what is inside.
+    fn folded_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        response: egui::Response,
+        popup: egui::Id,
+        groups: &[&[Item]],
+    ) {
+        let ctx = ui.ctx().clone();
+        if self.ext.shell.keytips == super::ext_shell::KeyTips::Items {
+            let letters = self.folded_letters(groups);
+            if !letters.is_empty() {
+                keytip_text(
+                    ui,
+                    Pos2::new(response.rect.left() + 2.0, response.rect.bottom() - 16.0),
+                    &letters,
+                );
+            }
+        }
         if response.clicked() {
             egui::Popup::toggle_id(&ctx, popup);
+        }
+        // A menu key tip finds its folded group here (see ribbon_keytip).
+        for (label, _) in groups.iter().flat_map(|g| g.iter()).filter_map(item_menu) {
+            let menu = egui::Id::new(("hwp-menu", label, self.tab));
+            ctx.data_mut(|d| d.insert_temp(menu.with("group"), popup));
         }
         egui::Popup::from_response(&response)
             .id(popup)
             .open_memory(None)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                for (icon, label, action) in Self::tools(group) {
-                    if self.hides(action) {
-                        continue;
-                    }
-                    let enabled = self.enabled(action);
-                    let tip = self.tip(&label, action, enabled);
-                    if self
-                        .icons
-                        .small(
-                            ui,
-                            icon,
-                            Some(&label),
-                            &tip,
-                            enabled,
-                            false,
-                            self.checked(action),
-                        )
-                        .clicked()
-                    {
-                        ui.close();
-                        self.dispatch(action, &ctx);
-                    }
-                }
+                egui::ScrollArea::vertical()
+                    .max_height(460.0)
+                    .show(ui, |ui| {
+                        for (gi, group) in groups.iter().enumerate() {
+                            if gi > 0 {
+                                ui.separator();
+                            }
+                            self.folded_list(ui, group);
+                        }
+                    });
             });
+    }
+    /// The commands of one folded group; a drop-down menu stays one heading that unfolds.
+    fn folded_list(&mut self, ui: &mut egui::Ui, group: &[Item]) {
+        let ctx = ui.ctx().clone();
+        for item in group {
+            let Some((label, list)) = item_menu(item) else {
+                for (icon, label, action) in Self::tools(std::slice::from_ref(item)) {
+                    self.folded_entry(ui, icon, &label, action);
+                }
+                continue;
+            };
+            if list.iter().all(|(_, a)| self.hides(*a)) {
+                continue;
+            }
+            let menu = egui::Id::new(("hwp-menu", label, self.tab));
+            let unfold = ctx.data_mut(|d| d.remove_temp::<bool>(menu.with("unfold")));
+            egui::CollapsingHeader::new(label.replace('\n', " "))
+                .id_salt(menu)
+                .open(unfold)
+                .show(ui, |ui| {
+                    for (icon, label, action) in Self::tools(std::slice::from_ref(item)) {
+                        self.folded_entry(ui, icon, &label, action);
+                    }
+                    if std::ptr::eq(list, MACRO_MENU) {
+                        self.macro_menu_entries(ui);
+                    }
+                });
+        }
+    }
+    /// Key-tip letters of the commands and menus inside folded groups ("JM", "ABC…").
+    fn folded_letters(&self, groups: &[&[Item]]) -> String {
+        let mut letters = String::new();
+        for id in groups
+            .iter()
+            .flat_map(|g| g.iter())
+            .flat_map(|item| item_keytip_ids(item, !self.ext.shell.show_unsupported))
+        {
+            if let Some(c) = super::ext_shell::alt_letter(self.tab, &id)
+                && !letters.contains(c)
+            {
+                letters.push(c);
+            }
+        }
+        if letters.chars().count() > 4 {
+            letters = letters.chars().take(3).chain(['…']).collect();
+        }
+        letters
+    }
+    /// One command in the list of a folded ribbon group.
+    fn folded_entry(&mut self, ui: &mut egui::Ui, icon: Icon, label: &str, action: Action) {
+        if self.hides(action) {
+            return;
+        }
+        let enabled = self.enabled(action);
+        let tip = self.tip(label, action, enabled);
+        if self
+            .icons
+            .small(
+                ui,
+                icon,
+                Some(label),
+                &tip,
+                enabled,
+                false,
+                self.checked(action),
+            )
+            .clicked()
+        {
+            ui.close();
+            self.dispatch(action, &ui.ctx().clone());
+        }
     }
     fn ribbon_item(&mut self, ui: &mut egui::Ui, item: &Item, full: bool) {
         let ctx = ui.ctx().clone();
@@ -3062,6 +3444,9 @@ impl HwpApp {
                 // Grey out (and ignore clicks on) a menu whose every entry is unavailable.
                 let any = self.menu_enabled(list);
                 let mut tip = label.replace('\n', " ");
+                if let Some(note) = menu_note(list) {
+                    tip = format!("{tip}\n{note}");
+                }
                 if !any && let Some((_, first)) = list.iter().find(|(_, a)| !self.hides(*a)) {
                     tip = format!("{tip}\n{}", self.disabled_reason(*first));
                 }
@@ -3069,7 +3454,9 @@ impl HwpApp {
                     .icons
                     .large(ui, icon, label, any, true, false)
                     .on_hover_text(tip);
+                self.keytip_badge_for(ui, response.rect, &menu_keytip_id(label));
                 let popup = egui::Id::new(("hwp-menu", label, self.tab));
+                ctx.data_mut(|d| d.remove::<egui::Id>(popup.with("group")));
                 if response.clicked() {
                     egui::Popup::toggle_id(&ctx, popup);
                 }
@@ -3086,12 +3473,15 @@ impl HwpApp {
                             let entry = ui.add_enabled(
                                 enabled,
                                 egui::Button::selectable(self.checked(*action), *label)
-                                    .shortcut_text(shortcut(*action).unwrap_or("")),
+                                    .shortcut_text(shown_keys(shortcut(*action).unwrap_or(""))),
                             );
                             if self.explain(entry, *action, enabled).clicked() {
                                 ui.close();
                                 self.dispatch(*action, &ctx);
                             }
+                        }
+                        if std::ptr::eq(list, MACRO_MENU) {
+                            self.macro_menu_entries(ui);
                         }
                     });
             }
@@ -3164,8 +3554,20 @@ impl HwpApp {
                 } else {
                     Vec2::new(width, icons::SMALL)
                 };
-                if self.format_ext_widget(ui, id, size).is_none() {
-                    self.ribbon_item(ui, inner, full);
+                match self.format_ext_widget(ui, id, size) {
+                    // A format widget standing in for a menu keeps the menu's key tip.
+                    Some(response) => {
+                        if let Item::Menu(_, label, _) = inner {
+                            let menu = egui::Id::new(("hwp-menu", *label, self.tab));
+                            ui.ctx()
+                                .data_mut(|d| d.remove::<egui::Id>(menu.with("group")));
+                            let key = menu.with("widget");
+                            let popup = egui::Popup::default_response_id(&response);
+                            ui.ctx().data_mut(|d| d.insert_temp(key, popup));
+                            self.keytip_badge_for(ui, response.rect, &menu_keytip_id(label));
+                        }
+                    }
+                    None => self.ribbon_item(ui, inner, full),
                 }
             }
             Sep => {}
@@ -3196,21 +3598,41 @@ impl HwpApp {
             self.dispatch(action, &ctx);
         }
     }
+    /// 도형: the shapes in two rows of eight with the group name below, like the
+    /// labels of the big buttons beside it.
     fn shape_gallery(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(139.0, icons::LARGE_HEIGHT), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(
+            Vec2::new(SHAPE_GALLERY_WIDTH, icons::LARGE_HEIGHT),
+            egui::Sense::hover(),
+        );
+        let cells = SHAPE_COLUMNS as f32 * SHAPE_CELL;
         ui.painter().rect_stroke(
-            Rect::from_min_size(rect.min + Vec2::new(0.0, 2.0), Vec2::new(122.0, 72.0)),
+            Rect::from_min_size(
+                rect.min + Vec2::new(0.0, 1.0),
+                Vec2::new(cells + 2.0, 2.0 * SHAPE_CELL + 2.0),
+            ),
             0.0,
             Stroke::new(1.0, LINE),
             egui::StrokeKind::Inside,
         );
+        ui.painter().text(
+            Pos2::new(rect.left() + cells / 2.0 + 1.0, rect.top() + 47.0),
+            egui::Align2::CENTER_TOP,
+            "도형",
+            egui::FontId::proportional(12.0),
+            Color32::from_gray(51),
+        );
         let shapes: Vec<_> = SHAPES.iter().filter(|(_, _, a)| !self.hides(*a)).collect();
         for (i, (icon, label, action)) in shapes.into_iter().enumerate() {
+            let (column, row) = (i % SHAPE_COLUMNS, i / SHAPE_COLUMNS);
             let cell = Rect::from_min_size(
-                rect.min + Vec2::new(1.0 + (i % 5) as f32 * 24.0, 2.0 + (i / 5) as f32 * 24.0),
-                Vec2::splat(24.0),
+                rect.min
+                    + Vec2::new(
+                        1.0 + column as f32 * SHAPE_CELL,
+                        2.0 + row as f32 * SHAPE_CELL,
+                    ),
+                Vec2::splat(SHAPE_CELL),
             );
             let enabled = self.enabled(*action);
             let tip = self.tip(label, *action, enabled);
@@ -3233,21 +3655,6 @@ impl HwpApp {
             if response.clicked() {
                 self.dispatch(*action, &ctx);
             }
-        }
-        // Hangul's scroll arrows beside the gallery; this gallery has one page.
-        for (row, up) in [(0.0, true), (25.0, false)] {
-            let r = Rect::from_min_size(rect.min + Vec2::new(123.0, row), Vec2::new(16.0, 25.0));
-            let c = r.center();
-            let s = if up { -2.0 } else { 2.0 };
-            ui.painter().add(egui::Shape::convex_polygon(
-                vec![
-                    c + Vec2::new(-4.0, -s),
-                    c + Vec2::new(4.0, -s),
-                    c + Vec2::new(0.0, s),
-                ],
-                Color32::from_gray(150),
-                Stroke::NONE,
-            ));
         }
     }
     fn style_gallery(&mut self, ui: &mut egui::Ui, width: f32) {
@@ -3445,7 +3852,6 @@ impl HwpApp {
         }
     }
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
         let white = egui::Frame::NONE.fill(Color32::WHITE);
         let in_table = self.session.cursor.cell.is_some();
         let kind = self.object_ext_selected_kind();
@@ -3488,47 +3894,121 @@ impl HwpApp {
                     })
                     .stroke(Stroke::new(1.0, Color32::from_rgb(210, 210, 210))),
             )
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    for (icon, label, action, menu) in [
-                        (Icon::New, "새 문서 (Alt+N)", A::New, true),
-                        (Icon::Open, "불러오기 (Alt+O)", A::Open, true),
-                        (Icon::Save, "저장하기 (Alt+S)", A::Save, true),
-                        (Icon::Print, "인쇄 (Alt+P)", A::Ext("file.print"), false),
-                        (Icon::Preview, "미리 보기", A::Ext("file.preview"), false),
-                        (Icon::Undo, "되돌리기 (Ctrl+Z)", A::Undo, true),
-                        (Icon::Redo, "다시 실행 (Ctrl+Shift+Z)", A::Redo, true),
-                    ] {
-                        let enabled = self.enabled(action);
-                        if self
-                            .icons
-                            .small(ui, icon, None, label, enabled, menu, false)
-                            .clicked()
-                        {
-                            self.dispatch(action, &ctx);
+            .show(ui, |ui| self.format_bar(ui));
+    }
+    /// 서식 도구 줄. A narrowing window first narrows its boxes, then moves what still does
+    /// not fit behind »: the language box first, then from the right end. Widths are what
+    /// each piece really took when last drawn, as in the ribbon.
+    fn format_bar(&mut self, ui: &mut egui::Ui) {
+        let pieces = FORMAT_BAR.len() + 1;
+        let widths: Vec<[f32; 2]> = (0..pieces)
+            .map(|k| {
+                [false, true].map(|narrow| {
+                    let guess = match k {
+                        0 => 7.0 * 30.0,
+                        _ => {
+                            let (_, full, small) = FORMAT_BAR[k - 1];
+                            if narrow { small } else { full }
                         }
+                    } + FORMAT_GAP;
+                    let drawn = self.ext.shell.format_widths.get(&(k, narrow));
+                    drawn.copied().unwrap_or(guess)
+                })
+            })
+            .collect();
+        let width = |k: usize, narrow: bool| widths[k][usize::from(narrow)];
+        let total = |narrow: bool| (0..pieces).map(|k| width(k, narrow)).sum::<f32>();
+        let limit = ui.max_rect().right();
+        let avail = ui.available_width();
+        let narrow = total(false) > avail;
+        let mut hidden = Vec::new();
+        if total(narrow) > avail {
+            let room = avail - MORE_FORMAT - FORMAT_GAP;
+            let mut used = total(narrow);
+            let order = std::iter::once(FORMAT_LANG + 1)
+                .chain((1..pieces).rev().filter(|&k| k != FORMAT_LANG + 1))
+                .chain([0]);
+            for k in order {
+                if used <= room {
+                    break;
+                }
+                used -= width(k, narrow);
+                hidden.push(k);
+            }
+            hidden.sort_unstable();
+        }
+        let right = ui
+            .horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = FORMAT_GAP;
+                for k in (0..pieces).filter(|k| !hidden.contains(k)) {
+                    let start = ui.cursor().min.x;
+                    self.format_piece(ui, k, narrow);
+                    let drawn = ui.cursor().min.x - start;
+                    if (drawn - width(k, narrow)).abs() > 0.5 {
+                        ui.ctx().request_repaint();
                     }
-                    for (id, width) in [
-                        ("format.style", 106.0),
-                        ("format.font_lang", 91.0),
-                        ("format.font_face", 150.0),
-                        ("format.font_size", 106.0),
-                        ("format.bold", 24.0),
-                        ("format.italic", 24.0),
-                        ("format.underline", 40.0),
-                        ("format.strikethrough", 40.0),
-                        ("format.text_color", 40.0),
-                        ("format.shade_color", 40.0),
-                        ("format.align.justify", 24.0),
-                        ("format.align.left", 24.0),
-                        ("format.align.center", 24.0),
-                        ("format.align.right", 24.0),
-                        ("format.align.distribute", 24.0),
-                        ("format.align.split", 24.0),
-                        ("format.line_spacing", 123.0),
-                    ] {
-                        self.format_widget(ui, id, Vec2::new(width, icons::SMALL));
+                    self.ext.shell.format_widths.insert((k, narrow), drawn);
+                }
+                if !hidden.is_empty() {
+                    self.more_format(ui, &hidden);
+                }
+                ui.cursor().min.x - FORMAT_GAP
+            })
+            .inner;
+        self.ext.shell.format_fit = (right, limit, hidden.len());
+    }
+    /// One piece of the 서식 도구 줄: 0 is the file and undo buttons, then FORMAT_BAR.
+    fn format_piece(&mut self, ui: &mut egui::Ui, k: usize, narrow: bool) {
+        let Some(&(id, full, small)) = k.checked_sub(1).and_then(|i| FORMAT_BAR.get(i)) else {
+            let ctx = ui.ctx().clone();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = FORMAT_GAP;
+                for (icon, label, action, menu) in [
+                    (Icon::New, "새 문서 (Alt+N)", A::New, true),
+                    (Icon::Open, "불러오기 (Alt+O)", A::Open, true),
+                    (Icon::Save, "저장하기 (Alt+S)", A::Save, true),
+                    (Icon::Print, "인쇄 (Alt+P)", A::Ext("file.print"), false),
+                    (Icon::Preview, "미리 보기", A::Ext("file.preview"), false),
+                    (Icon::Undo, "되돌리기 (Ctrl+Z)", A::Undo, true),
+                    (Icon::Redo, "다시 실행 (Ctrl+Shift+Z)", A::Redo, true),
+                ] {
+                    let enabled = self.enabled(action);
+                    if self
+                        .icons
+                        .small(ui, icon, None, label, enabled, menu, false)
+                        .clicked()
+                    {
+                        self.dispatch(action, &ctx);
+                    }
+                }
+            });
+            return;
+        };
+        let width = if narrow { small } else { full };
+        self.format_widget(ui, id, Vec2::new(width, icons::SMALL));
+    }
+    /// »: the 서식 도구 줄 pieces a narrow window has no room for, at full width.
+    fn more_format(&mut self, ui: &mut egui::Ui, hidden: &[usize]) {
+        let response = ui
+            .add_sized(
+                Vec2::new(MORE_FORMAT, icons::SMALL),
+                egui::Button::new(RichText::new("»").size(16.0)).frame(false),
+            )
+            .on_hover_text("창이 좁아 보이지 않는 서식 도구");
+        let popup = egui::Id::new("hwp-more-format");
+        if response.clicked() {
+            egui::Popup::toggle_id(ui.ctx(), popup);
+        }
+        egui::Popup::from_response(&response)
+            .id(popup)
+            .open_memory(None)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_max_width(360.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(FORMAT_GAP, 6.0);
+                    for &k in hidden {
+                        self.format_piece(ui, k, false);
                     }
                 });
             });
@@ -3575,7 +4055,7 @@ impl HwpApp {
                     });
                     ui.add_space(8.0);
                     ui.vertical(|ui| {
-                        let (a, c) = chrome::actions(ui, true, "만들기");
+                        let (a, c) = chrome::actions(ui, None, "만들기(D)");
                         create = a;
                         close |= c;
                     });
@@ -3637,6 +4117,167 @@ fn widget_fallback(id: &str) -> Option<(Icon, &'static str, Action)> {
     })
 }
 
+/// Menu tab strip: the collapse button at the right end with its margins, the search box,
+/// the search button that replaces it when narrow, and the » holding tabs with no room.
+const TABS_RIGHT: f32 = 40.0;
+const SEARCH_BOX: f32 = 166.0;
+const SEARCH_BUTTON: f32 = 30.0;
+const MORE_TABS: f32 = 28.0;
+/// 서식 도구 줄: (widget id, width, narrowed width); the language box is FORMAT_LANG.
+const FORMAT_BAR: &[(&str, f32, f32)] = &[
+    ("format.style", 106.0, 84.0),
+    ("format.font_lang", 76.0, 76.0),
+    ("format.font_face", 150.0, 110.0),
+    ("format.font_size", 106.0, 80.0),
+    ("format.bold", 24.0, 24.0),
+    ("format.italic", 24.0, 24.0),
+    ("format.underline", 40.0, 40.0),
+    ("format.strikethrough", 40.0, 40.0),
+    ("format.text_color", 40.0, 40.0),
+    ("format.shade_color", 40.0, 40.0),
+    ("format.align.justify", 24.0, 24.0),
+    ("format.align.left", 24.0, 24.0),
+    ("format.align.center", 24.0, 24.0),
+    ("format.align.right", 24.0, 24.0),
+    ("format.align.distribute", 24.0, 24.0),
+    ("format.align.split", 24.0, 24.0),
+    ("format.line_spacing", 123.0, 96.0),
+];
+const FORMAT_LANG: usize = 1;
+const FORMAT_GAP: f32 = 4.0;
+const MORE_FORMAT: f32 = 24.0;
+/// Space between ribbon groups (the separator line sits in it).
+const GROUP_GAP: f32 = 13.0;
+/// The ribbon's left inset plus a little slack at the right end.
+const RIBBON_PAD: f32 = 16.0;
+/// The 더 보기 button holding the groups that do not fit even folded.
+const MORE_WIDTH: f32 = 44.0;
+
+fn group_separator(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(GROUP_GAP, icons::LARGE_HEIGHT),
+        egui::Sense::hover(),
+    );
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.center().x, rect.top() + 2.0),
+            Pos2::new(rect.center().x, rect.bottom() - 2.0),
+        ],
+        Stroke::new(1.0, LINE),
+    );
+}
+/// Width of a big ribbon button, as `icons.large` lays it out (the menu mark rides on the
+/// last line).
+fn big_width(ui: &egui::Ui, label: &str, menu: bool) -> f32 {
+    let font = egui::FontId::proportional(12.0);
+    let lines: Vec<&str> = label.split('\n').collect();
+    let widest = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let mark = if menu && i + 1 == lines.len() {
+                10.0
+            } else {
+                0.0
+            };
+            ui.painter()
+                .layout_no_wrap((*line).to_owned(), font.clone(), Color32::BLACK)
+                .size()
+                .x
+                + mark
+        })
+        .fold(0.0_f32, f32::max);
+    (widest + 12.0).max(38.0).round()
+}
+/// Icon and one-line label of a folded group's button: its first big button or menu, else
+/// its first command.
+fn folded_label(group: &[Item]) -> Option<(Icon, String)> {
+    group
+        .iter()
+        .find_map(|item| match *item {
+            Big(icon, label, _, _) | Item::Menu(icon, label, _) => {
+                Some((icon, label.split('\n').next().unwrap_or(label).to_owned()))
+            }
+            _ => None,
+        })
+        .or_else(|| {
+            HwpApp::tools(group)
+                .into_iter()
+                .next()
+                .map(|(icon, label, _)| (icon, label))
+        })
+}
+fn folded_width(ui: &egui::Ui, group: &[Item]) -> f32 {
+    folded_label(group).map_or(0.0, |(_, label)| big_width(ui, &label, true))
+}
+/// Key-tip ids of an item's commands and menus (the ones a tip can reach).
+fn item_keytip_ids(item: &Item, hide: bool) -> Vec<String> {
+    let shown = |a: &Action| !(hide && unsupported_reason(*a).is_some());
+    let id = |a: &Action| shown(a).then(|| HwpApp::action_id(*a)).flatten();
+    match item {
+        Big(_, _, action, _) => id(action).map(str::to_owned).into_iter().collect(),
+        Item::Menu(_, label, _) => vec![menu_keytip_id(label)],
+        Stack(rows) => rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .filter_map(|mini| match mini {
+                I(_, _, action, _) | T(_, _, action, _) => id(action).map(str::to_owned),
+                W(..) => None,
+            })
+            .collect(),
+        Checks(list) => list
+            .iter()
+            .filter_map(|(_, a)| id(a).map(str::to_owned))
+            .collect(),
+        Item::Custom(_, _, inner) => item_keytip_ids(inner, hide),
+        _ => Vec::new(),
+    }
+}
+/// Label and entries of a drop-down menu item (also one a format widget stands in for).
+fn item_menu(item: &Item) -> Option<(&'static str, &'static [(&'static str, Action)])> {
+    match item {
+        Item::Menu(_, label, list) | Item::Custom(_, _, Item::Menu(_, label, list)) => {
+            Some((*label, *list))
+        }
+        _ => None,
+    }
+}
+/// Key-tip id of a drop-down menu button: "menu:" and its label on one line.
+fn menu_keytip_id(label: &str) -> String {
+    format!("menu:{}", label.replace('\n', " "))
+}
+/// Label of the drop-down menu of `tab` that the key tip id `id` ("menu:<label>") opens.
+fn keytip_menu(tab: usize, id: &str) -> Option<&'static str> {
+    id.strip_prefix("menu:")?;
+    TABS.get(tab)?.2.iter().find_map(|item| match item {
+        Item::Menu(_, label, _) | Item::Custom(_, _, Item::Menu(_, label, _))
+            if menu_keytip_id(label) == id =>
+        {
+            Some(*label)
+        }
+        _ => None,
+    })
+}
+
+/// Key tip badge with the letters of a folded group's commands.
+fn keytip_text(ui: &egui::Ui, at: Pos2, letters: &str) {
+    let font = egui::FontId::proportional(10.0);
+    let width = ui
+        .painter()
+        .layout_no_wrap(letters.to_owned(), font.clone(), Color32::WHITE)
+        .size()
+        .x;
+    let rect = Rect::from_min_size(at, Vec2::new((width + 6.0).max(14.0), 14.0));
+    ui.painter()
+        .rect_filled(rect, 2.0, Color32::from_rgb(60, 60, 60));
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        letters,
+        font,
+        Color32::WHITE,
+    );
+}
 /// Alt key tip badge: 14 px dark square with one letter, like Hangul's key tips.
 fn keytip(ui: &egui::Ui, at: Pos2, letter: char) {
     let rect = Rect::from_min_size(at, Vec2::splat(14.0));
@@ -3651,9 +4292,217 @@ fn keytip(ui: &egui::Ui, at: Pos2, letter: char) {
     );
 }
 
+/// A shortcut as shown: "Ctrl+Q, I" — the comma alone reads like part of the key.
+pub(crate) fn shown_keys(keys: &str) -> String {
+    keys.replace(',', ", ")
+}
+
+/// What a 최근 문서 row shows: number, file name, folder, format badge and whether the
+/// file is still there.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RecentRow {
+    pub number: String,
+    pub name: String,
+    pub folder: String,
+    pub badge: &'static str,
+    pub exists: bool,
+}
+
+pub(crate) fn recent_row_text(i: usize, path: &std::path::Path) -> RecentRow {
+    let exists = path.is_file();
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut folder = super::ext_shell::recent_folder(path, 80);
+    if !exists {
+        folder = format!("찾을 수 없음 · {folder}");
+    }
+    RecentRow {
+        number: (i + 1).to_string(),
+        name: super::ext_shell::recent_name(path, 56),
+        folder,
+        badge: match ext.as_str() {
+            "hwpx" => "HWPX",
+            "hwp" => "HWP",
+            _ => "",
+        },
+        exists,
+    }
+}
+
+/// One 최근 문서 row drawn as a button: hover highlight, document icon with the format,
+/// name over its folder. A missing file is grey and says so.
+fn recent_row(ui: &mut egui::Ui, i: usize, path: &std::path::Path) -> egui::Response {
+    let row = recent_row_text(i, path);
+    let width = ui.available_width().min(760.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 46.0), egui::Sense::click());
+    let tip = if row.exists {
+        path.display().to_string()
+    } else {
+        format!(
+            "파일을 찾을 수 없습니다. 누르면 목록에서 지웁니다.\n{}",
+            path.display()
+        )
+    };
+    let response = response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tip);
+    let painter = ui.painter();
+    if response.hovered() || response.has_focus() {
+        painter.rect_filled(rect, 4.0, Color32::from_rgb(229, 241, 251));
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0, Color32::from_rgb(204, 228, 247)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let (ink, faint) = if row.exists {
+        (ui.visuals().text_color(), Color32::from_gray(110))
+    } else {
+        (Color32::from_gray(150), Color32::from_gray(160))
+    };
+    painter.text(
+        Pos2::new(rect.left() + 18.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        &row.number,
+        egui::FontId::proportional(12.0),
+        faint,
+    );
+    // Document icon: page with a folded corner and the format underneath.
+    let page = Rect::from_min_size(
+        Pos2::new(rect.left() + 34.0, rect.top() + 7.0),
+        Vec2::new(24.0, 32.0),
+    );
+    let fold = 7.0;
+    let outline = if row.exists {
+        Color32::from_rgb(120, 140, 165)
+    } else {
+        Color32::from_gray(175)
+    };
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            page.left_top(),
+            Pos2::new(page.right() - fold, page.top()),
+            Pos2::new(page.right(), page.top() + fold),
+            page.right_bottom(),
+            page.left_bottom(),
+        ],
+        Color32::WHITE,
+        Stroke::new(1.0, outline),
+    ));
+    painter.line_segment(
+        [
+            Pos2::new(page.right() - fold, page.top()),
+            Pos2::new(page.right() - fold, page.top() + fold),
+        ],
+        Stroke::new(1.0, outline),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(page.right() - fold, page.top() + fold),
+            Pos2::new(page.right(), page.top() + fold),
+        ],
+        Stroke::new(1.0, outline),
+    );
+    if !row.badge.is_empty() {
+        let band = Rect::from_min_max(
+            Pos2::new(page.left() - 3.0, page.bottom() - 13.0),
+            Pos2::new(page.right() + 3.0, page.bottom() - 3.0),
+        );
+        let fill = if !row.exists {
+            Color32::from_gray(175)
+        } else if row.badge == "HWPX" {
+            Color32::from_rgb(38, 110, 190)
+        } else {
+            Color32::from_rgb(30, 80, 150)
+        };
+        painter.rect_filled(band, 2.0, fill);
+        painter.text(
+            band.center(),
+            egui::Align2::CENTER_CENTER,
+            row.badge,
+            egui::FontId::proportional(8.5),
+            Color32::WHITE,
+        );
+    }
+    let text_left = page.right() + 14.0;
+    let clip = Rect::from_min_max(Pos2::new(text_left, rect.top()), rect.right_bottom());
+    let painter = painter.with_clip_rect(clip);
+    painter.text(
+        Pos2::new(text_left, rect.top() + 6.0),
+        egui::Align2::LEFT_TOP,
+        &row.name,
+        egui::FontId::proportional(14.0),
+        ink,
+    );
+    painter.text(
+        Pos2::new(text_left, rect.top() + 26.0),
+        egui::Align2::LEFT_TOP,
+        &row.folder,
+        egui::FontId::proportional(11.5),
+        faint,
+    );
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_rows_show_the_format_and_say_when_a_file_is_gone() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("hwpcraft-recent-row-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let here = dir.join("보고서.hwpx");
+        std::fs::write(&here, b"x")?;
+        let row = recent_row_text(0, &here);
+        assert_eq!(
+            (row.number.as_str(), row.name.as_str(), row.badge),
+            ("1", "보고서.hwpx", "HWPX")
+        );
+        assert!(
+            row.exists && !row.folder.contains("찾을 수 없음"),
+            "{row:?}"
+        );
+        let gone = recent_row_text(1, &dir.join("옛 문서.HWP"));
+        assert_eq!((gone.badge, gone.exists), ("HWP", false));
+        assert!(gone.folder.starts_with("찾을 수 없음"), "{gone:?}");
+        assert_eq!(recent_row_text(2, &dir.join("메모.txt")).badge, "");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn every_shape_has_its_own_icon_and_the_gallery_keeps_two_rows() {
+        let mut icons: Vec<usize> = SHAPES.iter().map(|(icon, _, _)| *icon as usize).collect();
+        icons.sort_unstable();
+        icons.dedup();
+        assert_eq!(icons.len(), SHAPES.len(), "two shapes share an icon");
+        const {
+            assert!(SHAPES.len() <= 2 * SHAPE_COLUMNS);
+            // Two rows of cells end above the group name at the label row.
+            assert!(2.0 + 2.0 * SHAPE_CELL <= 47.0);
+        }
+    }
+
+    #[test]
+    fn nearly_empty_tabs_say_what_they_hide() {
+        for tab in [REVIEW, SECURITY] {
+            let note = sparse_note(tab).expect("note");
+            let n = unsupported_in(tab).len();
+            assert!(note.contains(&format!("{n}개")), "{note}");
+        }
+        assert_eq!(sparse_note(EDIT), None);
+        assert_eq!(sparse_note(INSERT), None);
+    }
+
+    #[test]
+    fn two_key_shortcuts_are_shown_with_a_space_after_the_comma() {
+        assert_eq!(shown_keys("Ctrl+Q,I"), "Ctrl+Q, I");
+        assert_eq!(shown_keys("Ctrl+B"), "Ctrl+B");
+    }
 
     /// Same chain as `ext_enabled`, but distinguishing "no module owns this id".
     fn owned(app: &HwpApp, id: &str) -> bool {
@@ -3667,6 +4516,7 @@ mod tests {
             || app.object_ext_enabled(id).is_some()
             || app.shell_ext_enabled(id).is_some()
             || app.tools_ext_enabled(id).is_some()
+            || app.mcp_ext_enabled(id).is_some()
     }
 
     #[test]
@@ -3751,6 +4601,244 @@ mod tests {
     }
 
     #[test]
+    fn every_ribbon_button_and_menu_has_an_alt_key_tip() {
+        // A new ribbon button needs a letter in ext_shell::ALT_KEYS ("menu:<label>" for a
+        // drop-down menu); unsupported commands and gallery cells go without.
+        fn top(item: &Item, out: &mut Vec<(String, Option<Action>)>) {
+            match item {
+                Big(_, label, action, _) => out.push((label.replace('\n', " "), Some(*action))),
+                Item::Menu(_, label, _) => out.push((menu_keytip_id(label), None)),
+                Stack(rows) => {
+                    for mini in rows.iter().flat_map(|row| row.iter()) {
+                        if let I(_, label, action, _) | T(_, label, action, _) = mini {
+                            out.push((label.to_string(), Some(*action)));
+                        }
+                    }
+                }
+                Checks(list) => out.extend(list.iter().map(|(l, a)| (l.to_string(), Some(*a)))),
+                Item::Custom(_, _, inner) => top(inner, out),
+                _ => {}
+            }
+        }
+        use crate::ext_shell::{ALT_KEYS, alt_letter};
+        for (tab, (name, _, items)) in TABS.iter().enumerate().skip(1) {
+            let mut out = Vec::new();
+            for item in *items {
+                top(item, &mut out);
+            }
+            for (label, action) in out {
+                let id = match action {
+                    None => Some(label.clone()),
+                    Some(a) if unsupported_reason(a).is_some() => continue,
+                    Some(a) => HwpApp::action_id(a).map(str::to_owned),
+                };
+                if let Some(id) = id {
+                    assert!(
+                        alt_letter(tab, &id).is_some(),
+                        "{name}: {label} ({id}) has no Alt key tip"
+                    );
+                }
+            }
+        }
+        // And every tip opens a menu or runs a command its tab holds.
+        let mut stray = Vec::new();
+        for (tab, letter, id) in ALT_KEYS {
+            let items = TABS[*tab].2;
+            let found = keytip_menu(*tab, id).is_some()
+                || HwpApp::tools(items)
+                    .into_iter()
+                    .map(|(_, _, a)| a)
+                    .chain(SHAPES.iter().map(|(_, _, a)| *a))
+                    .any(|a| HwpApp::action_id(a) == Some(*id));
+            if !found {
+                stray.push(format!("{} {letter}: {id}", TABS[*tab].0));
+            }
+        }
+        assert!(
+            stray.is_empty(),
+            "key tips for commands not on their tab: {stray:?}"
+        );
+        assert_eq!(keytip_menu(8, "menu:MCP 연결"), Some("MCP\n연결"));
+        assert_eq!(keytip_menu(4, "menu:문단 정렬"), Some("문단\n정렬"));
+        assert_eq!(keytip_menu(1, "menu:MCP 연결"), None);
+    }
+
+    #[test]
+    fn a_menu_key_tip_unfolds_its_folded_group_first() {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        let ctx = app.ctx.clone();
+        let frame = |app: &mut HwpApp, width: f32| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 700.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| app.toolbar(ui));
+            out.textures_delta.clear();
+        };
+        app.tab = 8;
+        let menu = egui::Id::new(("hwp-menu", "MCP\n연결", 8usize));
+        let folded = |ctx: &egui::Context| ctx.data(|d| d.get_temp::<egui::Id>(menu.with("group")));
+        // Wide: the MCP 연결 button is drawn and its key tip opens its own list.
+        frame(&mut app, 1800.0);
+        assert_eq!(folded(&ctx), None);
+        app.ribbon_keytip("menu:MCP 연결", &ctx);
+        assert!(egui::Popup::is_id_open(&ctx, menu));
+        egui::Popup::close_all(&ctx);
+        // Narrow: the group is folded, so the tip opens the group and unfolds the menu in it.
+        frame(&mut app, 300.0);
+        let group = folded(&ctx).expect("the MCP group folds in a narrow window");
+        app.ribbon_keytip("menu:MCP 연결", &ctx);
+        assert!(egui::Popup::is_id_open(&ctx, group));
+        assert_eq!(
+            ctx.data(|d| d.get_temp::<bool>(menu.with("unfold"))),
+            Some(true)
+        );
+        frame(&mut app, 300.0);
+        frame(&mut app, 300.0);
+        assert!(egui::Popup::is_id_open(&ctx, group));
+        assert_eq!(
+            ctx.data(|d| d.get_temp::<bool>(menu.with("unfold"))),
+            None,
+            "the folded list took the request"
+        );
+        // Widening again forgets the fold.
+        egui::Popup::close_all(&ctx);
+        frame(&mut app, 1800.0);
+        assert_eq!(folded(&ctx), None);
+    }
+
+    #[test]
+    fn the_ribbon_never_runs_past_the_window() {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        let ctx = app.ctx.clone();
+        let frame = |app: &mut HwpApp, width: f32| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 700.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| app.toolbar(ui));
+            out.textures_delta.clear();
+        };
+        let mut folded = 0;
+        for show_unsupported in [false, true] {
+            app.ext.shell.show_unsupported = show_unsupported;
+            for (tab, (name, _, _)) in TABS.iter().enumerate().skip(1) {
+                for width in [400.0, 600.0, 900.0, 1280.0] {
+                    app.tab = tab;
+                    // The first frame plans on estimates; drawn widths settle it.
+                    for _ in 0..3 {
+                        frame(&mut app, width);
+                    }
+                    let (right, limit) = app.ext.shell.ribbon_fit;
+                    assert!(
+                        right <= limit + 0.5,
+                        "{name} at {width} px (unsupported shown: {show_unsupported}): \
+                         ribbon ends at {right}, window at {limit}"
+                    );
+                    let (tabs, search) = app.ext.shell.tabs_fit;
+                    assert!(
+                        tabs <= search + 0.5,
+                        "{name} at {width} px: tabs end at {tabs}, search starts at {search}"
+                    );
+                    // The 서식 도구 줄 too: nothing behind » when wide, something when narrow.
+                    let (right, limit, behind) = app.ext.shell.format_fit;
+                    assert!(
+                        right <= limit + 0.5,
+                        "서식 도구 줄 at {width} px: ends at {right}, window at {limit}"
+                    );
+                    assert_eq!(behind == 0, width >= 1280.0, "서식 도구 줄 at {width} px");
+                    folded += usize::from(width == 400.0);
+                }
+            }
+        }
+        assert_eq!(folded, 2 * (TABS.len() - 1));
+        // In a table the two table tabs join the strip; the open one is always shown.
+        app.session
+            .run("table.create", serde_json::json!({"rows": 2, "columns": 2}))
+            .unwrap();
+        assert!(
+            app.session.cursor.cell.is_some(),
+            "the caret is in the new table"
+        );
+        for width in [400.0, 600.0, 900.0] {
+            app.tab = 10;
+            for _ in 0..3 {
+                frame(&mut app, width);
+            }
+            let (tabs, search) = app.ext.shell.tabs_fit;
+            assert!(
+                tabs <= search + 0.5,
+                "in a table at {width} px: {tabs} > {search}"
+            );
+            assert_eq!(app.tab, 10);
+        }
+    }
+
+    #[test]
+    fn a_tab_behind_more_still_offers_its_command_list() {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        let ctx = app.ctx.clone();
+        let frame = |app: &mut HwpApp| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 700.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| app.toolbar(ui));
+            out.textures_delta.clear();
+        };
+        app.tab = 1;
+        for _ in 0..3 {
+            frame(&mut app);
+        }
+        // 검토 is behind » at 400 px; its heading unfolds the 검토 ∨ list.
+        let tab = egui::Id::new(("hwp-more-tab", 7usize));
+        egui::Popup::open_id(&ctx, egui::Id::new("hwp-more-tabs"));
+        ctx.data_mut(|d| d.insert_temp(tab.with("unfold"), true));
+        frame(&mut app);
+        frame(&mut app);
+        assert!(egui::Popup::is_id_open(
+            &ctx,
+            egui::Id::new("hwp-more-tabs")
+        ));
+        assert_eq!(
+            ctx.data(|d| d.get_temp::<bool>(tab.with("unfold"))),
+            None,
+            "the » list drew 검토 and took the request"
+        );
+        assert_eq!(app.tab, 1, "unfolding a tab's list does not switch tabs");
+    }
+
+    #[test]
+    fn what_does_not_fit_goes_behind_more_with_its_key_tips() {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        let ctx = app.ctx.clone();
+        app.tab = 3;
+        app.ext.shell.keytips = crate::ext_shell::KeyTips::Items;
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 700.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| app.toolbar(ui));
+            out.textures_delta.clear();
+        }
+        // 입력 at 400 px: 상용구 is behind 더 보기, and its tip opens that list and the menu.
+        let menu = egui::Id::new(("hwp-menu", "상용구", 3usize));
+        let more = egui::Id::new(("hwp-more", 3usize));
+        assert_eq!(
+            ctx.data(|d| d.get_temp::<egui::Id>(menu.with("group"))),
+            Some(more)
+        );
+        app.ribbon_keytip("menu:상용구", &ctx);
+        assert!(egui::Popup::is_id_open(&ctx, more));
+        // The folded buttons show the letters of what they hold.
+        let groups = ribbon_groups(INSERT, true);
+        let last: Vec<&[Item]> = vec![groups.last().unwrap().as_slice()];
+        // 문자표 S, 한자 입력 H, 글자 겹치기 2, … (more than four: cut with …).
+        assert_eq!(app.folded_letters(&last), "SH2…");
+    }
+
+    #[test]
     fn hidden_unsupported_commands_leave_no_empty_groups() {
         let shown = |items: &[Item]| -> Vec<&'static str> {
             ribbon_groups(items, true)
@@ -3772,7 +4860,10 @@ mod tests {
         let tools = shown(TOOLS);
         assert!(!tools.contains(&"tools.citation") && !tools.contains(&"tools.macro"));
         assert!(tools.contains(&"table.block_sum") && tools.contains(&"help"));
-        assert_eq!(ribbon_groups(TOOLS, true).len(), 2);
+        assert!(tools.contains(&"macro.record.start") && tools.contains(&"tools.mcp_connect"));
+        // 제목 차례, 블록 계산, 빠른 교정, 매크로·MCP, 사용자 설정·환경 설정, 개인 정보, then
+        // 개체 목록·명령 찾기·사용 안내.
+        assert_eq!(ribbon_groups(TOOLS, true).len(), 7);
         // The 지원 안 함 list names each hidden command once, with its reason.
         let list = unsupported_in(REVIEW);
         assert!(list.iter().all(|(_, why)| !why.is_empty()));
@@ -3784,8 +4875,7 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>()
                 .len()
         );
-        let format: Vec<_> = unsupported_in(FORMAT).into_iter().map(|(l, _)| l).collect();
-        assert_eq!(format, ["스타일마당", "문단 첫 글자 장식", "그림 글머리표"]);
+        assert!(unsupported_in(FORMAT).is_empty());
         assert!(unsupported_in(TABLE_LAYOUT).is_empty());
     }
 
@@ -3846,7 +4936,7 @@ mod tests {
         assert_eq!(blank.tip("오려\n두기", A::Cut, true), "오려 두기 (Ctrl+X)");
         assert_eq!(
             blank.tip("하이퍼링크", A::Link, true),
-            "하이퍼링크 (Ctrl+K,H)"
+            "하이퍼링크 (Ctrl+K, H)"
         );
         assert_eq!(
             blank.tip("진하게 (Ctrl+B)", A::Char("bold"), true),

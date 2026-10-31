@@ -43,52 +43,52 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "context.table.create",
-        "address of body/cell paragraph, rows/columns, position before|after (default after), width_mm?/height_mm?/column_widths_mm?, expected_generation?. Inserts a separate inline-table host paragraph; returns first cell address. Default width fits the containing cell.",
+        "본문·셀 문단 address, rows/columns, position before|after(기본 after), width_mm?/height_mm?/column_widths_mm?, expected_generation?. 따로 글자처럼 취급한 표를 담을 문단을 넣고 첫 셀 주소를 돌려줍니다. 기본 너비는 그 셀에 맞춥니다.",
         r#"{"address":{"section":0,"paragraph":0,"path":[{"control":2,"cell":0,"paragraph":0}]},"rows":2,"columns":2}"#,
     ),
     (
         "context.table.delete",
-        "address of table-host paragraph, control index, allow_nonempty (default false), expected_generation?. Refuses any protected/locked descendant; nonempty deletion must be explicit.",
+        "표를 담은 문단의 address, 컨트롤 번호, allow_nonempty(기본 false), expected_generation?. 보호·잠긴 하위 항목이 있으면 거절하며, 내용이 있는 표를 지우려면 명시해야 합니다.",
         r#"{"address":{"section":0,"paragraph":0,"path":[]},"control":2,"allow_nonempty":false}"#,
     ),
     (
         "context.hit_test",
-        "page (0-based), x/y in unscaled page pixels; returns the complete validated table-cell path, Unicode scalar offset and generation.",
+        "page(0부터), x/y(배율 없는 쪽 픽셀). 결과: 검증된 전체 표 셀 경로, 유니코드 스칼라 오프셋, generation.",
         r#"{"page":0,"x":120.0,"y":150.0}"#,
     ),
     (
         "context.list",
-        "start>=0, limit 1–1000; body and nested-cell addresses, generation and protection. Addresses use Unicode scalar offsets and must be rediscovered after structural edits.",
+        "start ≥ 0, limit 1–1000. 본문과 중첩 셀 주소, generation, 보호 여부. 주소는 유니코드 스칼라 오프셋이며 구조를 고친 뒤에는 다시 찾아야 합니다.",
         r#"{"start":0,"limit":100}"#,
     ),
     (
         "context.get",
-        "address:{section,paragraph,path:[{control,cell,paragraph},...]}; path is empty for body. Returns text (up to 1 MB), lengths, format and generation.",
+        "address:{section,paragraph,path:[{control,cell,paragraph},...]}(본문은 path가 빔). 결과: 글(1 MB까지), 길이, 서식, generation.",
         r#"{"address":{"section":0,"paragraph":0,"path":[]}}"#,
     ),
     (
         "context.replace",
-        "address, start/end Unicode scalar range, text (single paragraph, <=1 MB), expected_generation?; no selection change. Use split/merge for paragraph boundaries. Refuses deletion of inline control anchors.",
+        "address, start/end(유니코드 스칼라 범위), text(한 문단, 1 MB 이하), expected_generation?. 선택은 바뀌지 않습니다. 문단 경계는 split/merge를 쓰세요. 글자처럼 취급한 개체 자리를 지우는 것은 거절합니다.",
         r#"{"address":{"section":0,"paragraph":0,"path":[{"control":2,"cell":0,"paragraph":0}]},"start":0,"end":0,"text":"입력"}"#,
     ),
     (
         "context.split",
-        "address, offset in Unicode scalars, expected_generation?; returns the next paragraph address. Existing visible caret/selection follows its text/table after structural edits.",
+        "address, offset(유니코드 스칼라), expected_generation?. 다음 문단 주소를 돌려줍니다. 보이는 캐럿·선택은 구조를 고친 뒤 그 글·표를 따라갑니다.",
         r#"{"address":{"section":0,"paragraph":0,"path":[]},"offset":3}"#,
     ),
     (
         "context.merge",
-        "address of the later paragraph, expected_generation?; merges with previous paragraph in the same body/cell and returns its address/end of old prefix.",
+        "뒤 문단의 address, expected_generation?. 같은 본문·셀의 앞 문단과 합치고 그 주소와 옛 앞부분 끝 위치를 돌려줍니다.",
         r#"{"address":{"section":0,"paragraph":1,"path":[]}}"#,
     ),
     (
         "context.character",
-        "address, start/end (defaults whole paragraph), format matching format.character, expected_generation?; targets the deepest cell.",
+        "address, start/end(기본 문단 전체), format.character와 같은 format, expected_generation?. 가장 깊은 셀이 대상입니다.",
         r#"{"address":{"section":0,"paragraph":0,"path":[]},"format":{"bold":true}}"#,
     ),
     (
         "context.paragraph",
-        "address, format matching format.paragraph, expected_generation?; updates only the addressed paragraph.",
+        "address, format.paragraph와 같은 format, expected_generation?. 지정한 문단만 바꿉니다.",
         r#"{"address":{"section":0,"paragraph":0,"path":[]},"format":{"alignment":"center"}}"#,
     ),
 ];

@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 const MAX_DEPTH: usize = 64;
 const MAX_LIST: usize = 100_000;
 const MAX_TEXT: usize = 1_000_000;
+/// A paragraph index in a container and a scalar range in it.
+type ParagraphRange = (usize, std::ops::Range<usize>);
 fn version_two() -> u8 {
     2
 }
@@ -66,7 +68,7 @@ impl ContextStep {
             | Self::TextBox { control, .. } => *control,
         }
     }
-    fn paragraph(&self) -> usize {
+    pub(crate) fn paragraph(&self) -> usize {
         match self {
             Self::TableCell { paragraph, .. }
             | Self::Header { paragraph, .. }
@@ -132,7 +134,7 @@ impl ContextAddress {
             .last()
             .map_or(self.paragraph, ContextStep::paragraph)
     }
-    fn with_index(&self, index: usize) -> Self {
+    pub(crate) fn with_index(&self, index: usize) -> Self {
         let mut result = self.clone();
         if let Some(step) = result.path.last_mut() {
             step.set_paragraph(index);
@@ -186,37 +188,37 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "context.v2.list",
-        "start, limit 1..1000, include optional kinds: body/table_cell/header/footer/textbox/footnote/endnote. Returns typed version-2 addresses and generation.",
+        "start, limit 1..1000, include(선택 종류: body/table_cell/header/footer/textbox/footnote/endnote). 종류가 붙은 버전 2 주소와 generation을 돌려줍니다.",
         r#"{"limit":100}"#,
     ),
     (
         "context.v2.get",
-        "address:{version:2,section,paragraph,path:[{kind,control,paragraph,...}]}, offset optional Unicode scalar.",
+        "address:{version:2,section,paragraph,path:[{kind,control,paragraph,...}]}, offset(선택, 유니코드 스칼라).",
         r#"{"address":{"version":2,"section":0,"paragraph":0,"path":[]}}"#,
     ),
     (
         "context.v2.replace",
-        "address, start/end Unicode scalar range, single-paragraph text, required expected_generation. Refuses inline control loss and protected ancestors.",
+        "address, start/end(유니코드 스칼라 범위), 한 문단 text, expected_generation 필수. 글자처럼 취급한 개체를 잃거나 보호된 상위 항목이면 거절합니다.",
         r#"{"address":{"version":2,"section":0,"paragraph":0,"path":[{"kind":"header","control":2,"paragraph":0}]},"start":0,"end":0,"text":"머리말","expected_generation":0}"#,
     ),
     (
         "context.v2.split",
-        "address, offset Unicode scalar, required expected_generation. Returns next paragraph in the same container.",
+        "address, offset(유니코드 스칼라), expected_generation 필수. 같은 영역의 다음 문단을 돌려줍니다.",
         r#"{"address":{"version":2,"section":0,"paragraph":0,"path":[]},"offset":0,"expected_generation":0}"#,
     ),
     (
         "context.v2.merge",
-        "address of later paragraph, required expected_generation. Never merges across container boundaries.",
+        "뒤 문단 address, expected_generation 필수. 영역 경계를 넘어 합치지 않습니다.",
         r#"{"address":{"version":2,"section":0,"paragraph":1,"path":[]},"expected_generation":0}"#,
     ),
     (
         "context.v2.character",
-        "address, start/end optional whole paragraph, format as format.character, required expected_generation.",
+        "address, start/end(선택, 기본 문단 전체), format.character와 같은 format, expected_generation 필수.",
         r#"{"address":{"version":2,"section":0,"paragraph":0,"path":[]},"format":{"bold":true},"expected_generation":0}"#,
     ),
     (
         "context.v2.paragraph",
-        "address, format as format.paragraph, required expected_generation.",
+        "address, format.paragraph와 같은 format, expected_generation 필수.",
         r#"{"address":{"version":2,"section":0,"paragraph":0,"path":[]},"format":{"alignment":"center"},"expected_generation":0}"#,
     ),
 ];
@@ -428,9 +430,9 @@ fn resolve<'a>(doc: &'a Document, address: &ContextAddress) -> Result<Resolved<'
                 ) {
                     result.readonly.push("unsupported_textbox_shape");
                 }
-                if text.vertical_all || text.list_attr & 7 != 0 {
-                    result.readonly.push("vertical_textbox_not_validated");
-                }
+                // A vertical text box edits like a horizontal one: the projection only
+                // stores the paragraphs, and RHWP lays them out again in the vertical
+                // box on commit (tests/vertical_textbox.rs).
                 result.width = content_width(
                     ancestor.common().width,
                     i64::from(text.margin_left),
@@ -646,7 +648,131 @@ impl Session {
         if !(1..=1000).contains(&p.limit) {
             bail!("limit은 1–1000이어야 합니다.");
         }
-        for kind in &p.include {
+        let (mut rows, truncated) = self.context_v2_rows(&p.include)?;
+        let total = rows.len();
+        let end = p.start.saturating_add(p.limit).min(total);
+        let items = if p.start < total {
+            rows.drain(p.start..end).collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        Ok(
+            json!({"items":items,"start":p.start,"total":total,"nextStart":(end<total).then_some(end),"truncated":truncated,"generation":self.generation,"addressVersion":2,"offsetUnit":"unicode_scalar"}),
+        )
+    }
+    /// The address of every paragraph of `include`'s kinds (all kinds when empty) in
+    /// document order, with whether it can be edited, and whether the walk stopped at
+    /// its size limit. Used by find and replace across contexts.
+    pub(crate) fn context_v2_addresses(
+        &self,
+        include: &[String],
+    ) -> Result<(Vec<(ContextAddress, bool)>, bool)> {
+        let (rows, truncated) = self.context_v2_rows(include)?;
+        let addresses = rows
+            .into_iter()
+            .map(|row| {
+                let writable = row["readonly"] != true;
+                Ok((serde_json::from_value(row["address"].clone())?, writable))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((addresses, truncated))
+    }
+    /// The paragraph at a context address.
+    pub(crate) fn context_v2_paragraph(&self, address: &ContextAddress) -> Result<&Paragraph> {
+        let resolved = resolve(self.core.document(), address)?;
+        resolved
+            .paragraphs
+            .get(address.index())
+            .ok_or_else(|| anyhow!("문맥 문단 주소가 범위를 벗어났습니다."))
+    }
+    /// Replace each scalar range with `text` (모두 바꾸기 across contexts). Each
+    /// container is projected once, with only its own section, and edited from its
+    /// last range back; the document is laid out once at the end. A projection of the
+    /// whole document per edit took over a second each in a 381-page document. The
+    /// caller skips protected contexts and runs this inside a transaction.
+    pub(crate) fn context_v2_replace_ranges(
+        &mut self,
+        ranges: &[(ContextAddress, std::ops::Range<usize>)],
+        text: &str,
+    ) -> Result<()> {
+        let mut groups: Vec<(ContextAddress, Vec<ParagraphRange>)> = Vec::new();
+        for (address, range) in ranges {
+            let key = address.with_index(0);
+            let edit = (address.index(), range.clone());
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, edits)) => edits.push(edit),
+                None => groups.push((key, vec![edit])),
+            }
+        }
+        for (key, mut edits) in groups {
+            edits.sort_by_key(|(index, r)| std::cmp::Reverse((*index, r.start)));
+            let doc = self.core.document();
+            let resolved = resolve(doc, &key)?;
+            for (index, r) in &edits {
+                let para = resolved
+                    .paragraphs
+                    .get(*index)
+                    .ok_or_else(|| anyhow!("문맥 문단 주소가 범위를 벗어났습니다."))?;
+                checked_range(para, r.start, r.end)?;
+                guard_inline_deletion(para, r.start, r.end)?;
+            }
+            // As `context_v2_projection`, without the other sections.
+            let mut section_def = doc.sections[key.section].section_def.clone();
+            let page = &mut section_def.page_def;
+            page.width = resolved.width.max(1);
+            page.landscape = false;
+            page.margin_left = 0;
+            page.margin_right = 0;
+            page.margin_gutter = 0;
+            section_def.text_direction = 0;
+            let projected = Document {
+                header: doc.header.clone(),
+                doc_properties: doc.doc_properties.clone(),
+                doc_info: doc.doc_info.clone(),
+                sections: vec![hwpcraft_doc::model::document::Section {
+                    section_def,
+                    paragraphs: resolved.paragraphs.clone(),
+                    raw_stream: None,
+                    raw_provenance: None,
+                }],
+                bin_data_content: doc.bin_data_content.clone(),
+                is_hwp3_variant: doc.is_hwp3_variant,
+                is_hwpx_variant: doc.is_hwpx_variant,
+                provenance: doc.provenance,
+                ..Default::default()
+            };
+            let mut projection = DocumentCore::new_empty();
+            projection.set_document(projected);
+            for (index, r) in edits {
+                if r.start != r.end {
+                    projection
+                        .delete_text_native(0, index, r.start, r.end - r.start)
+                        .map_err(err)?;
+                }
+                if !text.is_empty() {
+                    projection
+                        .insert_text_native(0, index, r.start, text)
+                        .map_err(err)?;
+                }
+            }
+            let mut paragraphs = projection.document().sections[0].paragraphs.clone();
+            for para in &mut paragraphs {
+                para.invalidate_layout_inputs();
+            }
+            let doc_info = projection.document().doc_info.clone();
+            let document = self.core.document_mut();
+            *container_mut(document, &key)? = paragraphs;
+            document.doc_info = doc_info;
+            document.sections[key.section].raw_stream = None;
+        }
+        if !ranges.is_empty() {
+            self.core.set_document(self.core.document().clone());
+        }
+        Ok(())
+    }
+    /// The rows of `context.v2.list` before paging, and whether the walk was cut short.
+    fn context_v2_rows(&self, include: &[String]) -> Result<(Vec<Value>, bool)> {
+        for kind in include {
             if ![
                 "body",
                 "table_cell",
@@ -787,7 +913,7 @@ impl Session {
                     },
                     &mut rows,
                     &mut truncated,
-                    &p.include,
+                    include,
                     &mut visited,
                 )?;
                 if visited >= MAX_LIST {
@@ -798,16 +924,7 @@ impl Session {
                 break;
             }
         }
-        let total = rows.len();
-        let end = p.start.saturating_add(p.limit).min(total);
-        let items = if p.start < total {
-            rows.drain(p.start..end).collect::<Vec<_>>()
-        } else {
-            vec![]
-        };
-        Ok(
-            json!({"items":items,"start":p.start,"total":total,"nextStart":(end<total).then_some(end),"truncated":truncated,"generation":self.generation,"addressVersion":2,"offsetUnit":"unicode_scalar"}),
-        )
+        Ok((rows, truncated))
     }
     fn context_v2_replace(&mut self, p: Replace) -> Result<Value> {
         self.context_v2_writable(&p.address, p.expected_generation)?;

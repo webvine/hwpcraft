@@ -19,6 +19,20 @@ fn main() -> Result<()> {
         password = Some(args.remove(i + 1));
         args.remove(i);
     }
+    // `--accept-track-changes`: save a change-tracked document as HWP/HWPX,
+    // merging the changes into the shown text (refused otherwise).
+    let accept_track_changes = args
+        .iter()
+        .position(|a| a == "--accept-track-changes")
+        .map(|i| args.remove(i))
+        .is_some();
+    // `--drop-picture-effects`: save as .hwp without the picture effects HWP
+    // cannot hold yet (refused otherwise).
+    let drop_picture_effects = args
+        .iter()
+        .position(|a| a == "--drop-picture-effects")
+        .map(|i| args.remove(i))
+        .is_some();
     let command = args.first().map(String::as_str).unwrap_or("--help");
     if command == "mcp" {
         return hwpcraft_mcp::run_stdio(&args[1..]);
@@ -30,7 +44,7 @@ fn main() -> Result<()> {
     if command == "--help" {
         println!("  mcp [--automation-read-root DIR] [--automation-write-root DIR] (stdio server)");
         println!(
-            "HwpCraft CLI (옵션: --password <암호>  암호 문서 열기·암호 저장)\n  info <hwp|hwpx>\n  text <hwp|hwpx>\n  convert <input> <output.hwp|hwpx|pdf|txt>\n  render <input> <output.png> [page: 1-based]\n  new <output.hwp|hwpx> [text]\n  edit <input.hwp|hwpx|--new> <commands.json> <output.hwp|hwpx>\n  demo <output-directory>\n  commands\n  --version"
+            "HwpCraft CLI (옵션: --password <암호>  암호 문서 열기·암호 저장, --accept-track-changes  변경 추적 문서를 결과본으로 합쳐 저장, --drop-picture-effects  그림 효과를 빼고 .hwp로 저장)\n  info <hwp|hwpx>\n  text <hwp|hwpx>\n  convert <input> <output.hwp|hwpx|pdf|txt|docx>\n  render <input> <output.png> [page: 1-based]\n  new <output.hwp|hwpx> [text]\n  edit <input.hwp|hwpx|--new> <commands.json> <output.hwp|hwpx>\n  demo <output-directory>\n  commands\n  --version"
         );
         return Ok(());
     }
@@ -56,6 +70,29 @@ fn main() -> Result<()> {
     if let Some(p) = &password {
         session.set_password(Some(p.clone()))?;
     }
+    let save = |session: &mut Session, path: &Path| -> Result<()> {
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("docx"))
+        {
+            let omitted = session.export_docx(path, accept_track_changes)?;
+            if !omitted.is_empty() {
+                eprintln!("DOCX에 담지 못한 것: {}", omitted.join(", "));
+            }
+            return Ok(());
+        }
+        if drop_picture_effects {
+            let dropped = session.save_dropping_picture_effects(path, accept_track_changes)?;
+            if dropped > 0 {
+                eprintln!("그림 효과 {dropped}개를 빼고 저장했습니다.");
+            }
+            Ok(())
+        } else if accept_track_changes {
+            session.save_accepting_track_changes(path)
+        } else {
+            session.save(path)
+        }
+    };
     match command {
         "edit" => {
             use std::io::Read;
@@ -104,7 +141,7 @@ fn main() -> Result<()> {
                     )
                 })?);
             }
-            session.save(output)?;
+            save(&mut session, output)?;
             println!("{}", json!({"results":results,"document":session.info()}));
         }
         "new" => {
@@ -120,11 +157,14 @@ fn main() -> Result<()> {
             match command {
                 "info" => println!("{}", serde_json::to_string_pretty(&session.info())?),
                 "text" => {
+                    if session.is_distribution() {
+                        bail!("{}", hwpcraft_engine::DISTRIBUTION_READ_ONLY);
+                    }
                     for (c, _) in session.entries() {
                         println!("{}", session.paragraph(c)?.text);
                     }
                 }
-                "convert" => session.save(Path::new(argument(&args, 2)?))?,
+                "convert" => save(&mut session, Path::new(argument(&args, 2)?))?,
                 "render" => {
                     let page = args
                         .get(3)

@@ -1,0 +1,259 @@
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 47c7038..a878232 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -824,6 +824,30 @@ fn should_insert_hwp3_title_filler_page(
+         && has_early_explicit_page_break
+ }
+ 
++/// 쪽마다 `start`부터 각주 번호를 다시 매긴다. 앞 쪽에서 이어진 각주 조각(번호를 그리지
++/// 않는 조각)은 앞 쪽에서 받은 번호를 그대로 쓰고 새 번호를 쓰지 않는다.
++fn renumber_footnotes_per_page(result: &mut PaginationResult, start: u16) {
++    let mut previous: Vec<(crate::renderer::pagination::FootnoteSource, u16)> = Vec::new();
++    for page in &mut result.pages {
++        let mut current = Vec::with_capacity(page.footnotes.len());
++        let mut next = start.max(1);
++        for footnote in &mut page.footnotes {
++            let continued = footnote.fragment.is_some_and(|f| !f.draw_number);
++            let carried = continued
++                .then(|| previous.iter().find(|(s, _)| *s == footnote.source))
++                .flatten()
++                .map(|(_, n)| *n);
++            footnote.number = carried.unwrap_or_else(|| {
++                let n = next;
++                next = next.saturating_add(1);
++                n
++            });
++            current.push((footnote.source.clone(), footnote.number));
++        }
++        previous = current;
++    }
++}
++
+ fn insert_hwp3_title_filler_page(result: &mut PaginationResult, section_index: usize) {
+     let Some(first_page) = result.pages.first() else {
+         return;
+@@ -5676,6 +5700,13 @@ impl DocumentCore {
+                 }
+             }
+ 
++            // 각주 번호 매기기 `쪽마다 새로`(HWPX ON_PAGE): 한컴은 쪽마다 시작 번호부터 다시
++            // 매긴다(156584446 정답지 PDF: 각주가 있는 쪽마다 1)).
++            let footnote_shape = &section.section_def.footnote_shape;
++            if footnote_shape.numbering == crate::model::footnote::FootnoteNumbering::RestartPage {
++                renumber_footnotes_per_page(&mut result, footnote_shape.start_number);
++            }
++
+             // 구역 간 쪽번호 연속: NewNumber(Page) 컨트롤이 없으면 이전 구역에서 이어짐
+             if idx > 0 && carry_last_page_number > 0 && section_start == 0 {
+                 use crate::model::control::{AutoNumberType, Control};
+@@ -10107,3 +10138,49 @@ mod section_start_page_number_tests {
+         assert_eq!(numbers, [65530, 65531, 7]);
+     }
+ }
++
++#[cfg(test)]
++mod footnote_page_numbering_tests {
++    use super::renumber_footnotes_per_page;
++    use crate::document_core::DocumentCore;
++    use crate::renderer::pagination::{FootnoteFragment, FootnoteRef, FootnoteSource};
++
++    fn note(para_index: usize, fragment: Option<FootnoteFragment>) -> FootnoteRef {
++        FootnoteRef {
++            number: 99,
++            source: FootnoteSource::Body {
++                para_index,
++                control_index: 0,
++            },
++            fragment,
++        }
++    }
++
++    /// 쪽마다 시작 번호부터 다시 매기고, 앞 쪽에서 이어진 조각은 그 번호를 이어 쓴다.
++    #[test]
++    fn footnotes_restart_per_page_and_a_continued_fragment_keeps_its_number() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        let result = &mut core.pagination[0];
++        let page = result.pages[0].clone();
++        result.pages = vec![page.clone(), page.clone(), page];
++        let split = |draw_number| {
++            Some(FootnoteFragment {
++                start_line: 0,
++                end_line: 1,
++                draw_separator: true,
++                draw_number,
++            })
++        };
++        result.pages[0].footnotes = vec![note(0, None), note(1, None), note(2, split(true))];
++        result.pages[1].footnotes = vec![note(2, split(false)), note(3, None)];
++        result.pages[2].footnotes = vec![note(4, None)];
++        renumber_footnotes_per_page(result, 1);
++        let numbers: Vec<Vec<u16>> = result
++            .pages
++            .iter()
++            .map(|p| p.footnotes.iter().map(|f| f.number).collect())
++            .collect();
++        assert_eq!(numbers, [vec![1, 2, 3], vec![3, 1], vec![1]]);
++    }
++}
+diff --git a/src/renderer/layout.rs b/src/renderer/layout.rs
+index 3af89e9..453bb7f 100644
+--- a/src/renderer/layout.rs
++++ b/src/renderer/layout.rs
+@@ -4515,6 +4515,9 @@ impl LayoutEngine {
+         wrap_around_paras: &[super::pagination::WrapAroundPara],
+     ) -> PageRenderTree {
+         let layout = &page_content.layout;
++        // 쪽마다 새로 매기는 각주는 본문 각주 표시도 이 쪽의 번호를 쓴다.
++        let _footnote_numbers =
++            picture_footnote::PageFootnoteNumbers::install(&page_content.footnotes, paragraphs);
+         // [#6175] 본문 저장 행 admission의 외부-기하 증거 - 조판이 구역당 한 번
+         // 계산하는 것과 **같은 함수·같은 입력**이라 두 경로가 갈리지 않는다.
+         *self.body_float_carve_evidence.borrow_mut() =
+diff --git a/src/renderer/layout/paragraph_layout.rs b/src/renderer/layout/paragraph_layout.rs
+index 32195aa..ef45de8 100644
+--- a/src/renderer/layout/paragraph_layout.rs
++++ b/src/renderer/layout/paragraph_layout.rs
+@@ -1644,7 +1644,7 @@ fn format_note_marker_text(
+ fn note_marker_text_from_control(ctrl: Option<&Control>, fallback_number: u16) -> String {
+     match ctrl {
+         Some(Control::Footnote(footnote)) => format_note_marker_text(
+-            fallback_number,
++            super::picture_footnote::page_footnote_number(footnote).unwrap_or(fallback_number),
+             footnote.number_shape,
+             footnote.before_decoration_letter,
+             footnote.after_decoration_letter,
+diff --git a/src/renderer/layout/picture_footnote.rs b/src/renderer/layout/picture_footnote.rs
+index a24b089..b9cb51f 100644
+--- a/src/renderer/layout/picture_footnote.rs
++++ b/src/renderer/layout/picture_footnote.rs
+@@ -17,7 +17,7 @@ use super::utils::{
+ use super::{footnote_separator_length_px, LayoutEngine, ParagraphVerticalSpacing};
+ use crate::model::bin_data::BinDataContent;
+ use crate::model::control::Control;
+-use crate::model::footnote::{FootnoteShape, NumberFormat};
++use crate::model::footnote::{Footnote, FootnoteShape, NumberFormat};
+ use crate::model::paragraph::Paragraph;
+ use crate::model::shape::{
+     Caption, CaptionDirection, CommonObjAttr, HorzAlign, TextWrap, VertAlign, VertRelTo,
+@@ -1921,21 +1921,67 @@ impl LayoutEngine {
+     }
+ }
+ 
++thread_local! {
++    /// 지금 조판하는 쪽에서 저장 번호와 다르게 매긴 각주(쪽마다 새로): 컨트롤 주소 → 번호.
++    static PAGE_FOOTNOTE_NUMBERS: std::cell::RefCell<Vec<(usize, u16)>> =
++        const { std::cell::RefCell::new(Vec::new()) };
++}
++
++/// 한 쪽을 조판하는 동안 본문 각주 표시가 그 쪽의 각주 번호를 쓰게 한다. 놓으면 이전
++/// 상태로 돌아간다.
++pub(super) struct PageFootnoteNumbers(Vec<(usize, u16)>);
++
++impl PageFootnoteNumbers {
++    pub(super) fn install(footnotes: &[FootnoteRef], paragraphs: &[Paragraph]) -> Self {
++        let numbers: Vec<(usize, u16)> = footnotes
++            .iter()
++            .filter_map(|fn_ref| {
++                let control = footnote_control(fn_ref, paragraphs)?;
++                (control.number != fn_ref.number)
++                    .then(|| (control as *const Footnote as usize, fn_ref.number))
++            })
++            .collect();
++        Self(PAGE_FOOTNOTE_NUMBERS.with(|cell| cell.replace(numbers)))
++    }
++}
++
++impl Drop for PageFootnoteNumbers {
++    fn drop(&mut self) {
++        let previous = std::mem::take(&mut self.0);
++        PAGE_FOOTNOTE_NUMBERS.with(|cell| *cell.borrow_mut() = previous);
++    }
++}
++
++/// 이 쪽에서 `footnote`에 매긴 번호(저장 번호와 같으면 `None`).
++pub(super) fn page_footnote_number(footnote: &Footnote) -> Option<u16> {
++    let key = footnote as *const Footnote as usize;
++    PAGE_FOOTNOTE_NUMBERS.with(|cell| {
++        cell.borrow()
++            .iter()
++            .find(|(k, _)| *k == key)
++            .map(|(_, n)| *n)
++    })
++}
++
+ fn get_footnote_paragraphs<'a>(
+     fn_ref: &FootnoteRef,
+     paragraphs: &'a [Paragraph],
+ ) -> &'a [Paragraph] {
+-    match &fn_ref.source {
++    footnote_control(fn_ref, paragraphs).map_or(&[], |footnote| &footnote.paragraphs)
++}
++
++fn footnote_control<'a>(fn_ref: &FootnoteRef, paragraphs: &'a [Paragraph]) -> Option<&'a Footnote> {
++    let found = match &fn_ref.source {
+         FootnoteSource::Body {
+             para_index,
+             control_index,
+         } => {
+             if let Some(para) = paragraphs.get(*para_index) {
+                 if let Some(Control::Footnote(footnote)) = para.controls.get(*control_index) {
+-                    return &footnote.paragraphs;
++                    return Some(footnote);
+                 }
+             }
+-            &[]
++            None
+         }
+         FootnoteSource::TableCell {
+             para_index,
+@@ -1951,13 +1997,13 @@ fn get_footnote_paragraphs<'a>(
+                             if let Some(Control::Footnote(footnote)) =
+                                 cp.controls.get(*cell_control_index)
+                             {
+-                                return &footnote.paragraphs;
++                                return Some(footnote);
+                             }
+                         }
+                     }
+                 }
+             }
+-            &[]
++            None
+         }
+         FootnoteSource::ShapeTextBox {
+             para_index,
+@@ -1972,15 +2018,16 @@ fn get_footnote_paragraphs<'a>(
+                             if let Some(Control::Footnote(footnote)) =
+                                 tp.controls.get(*tb_control_index)
+                             {
+-                                return &footnote.paragraphs;
++                                return Some(footnote);
+                             }
+                         }
+                     }
+                 }
+             }
+-            &[]
++            None
+         }
+-    }
++    };
++    found
+ }
+ 
+ fn note_number_format_from_hwp_code(code: u8) -> NumFmt {
+diff --git a/src/renderer/pagination.rs b/src/renderer/pagination.rs
+index b9f0058..62572f7 100644
+--- a/src/renderer/pagination.rs
++++ b/src/renderer/pagination.rs
+@@ -407,7 +407,7 @@ impl ActiveHeaderFooter {
+ }
+ 
+ /// 각주 출처 (본문 문단 또는 표 셀 내)
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum FootnoteSource {
+     /// 본문 문단 내 각주
+     Body {

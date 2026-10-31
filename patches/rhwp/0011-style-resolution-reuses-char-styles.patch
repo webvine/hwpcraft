@@ -1,0 +1,247 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 09a01b0..df57672 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -343,6 +343,7 @@ impl DocumentCore {
+             model_stamp_clock: 0,
+             untracked_model_edit: false,
+             derived_layout_contract: None,
++            char_style_inputs: None,
+             next_snapshot_id: 0,
+             fragment_store: Vec::new(),
+             next_fragment_id: 0,
+diff --git a/src/document_core/commands/formatting.rs b/src/document_core/commands/formatting.rs
+index 8774486..d6b5b02 100644
+--- a/src/document_core/commands/formatting.rs
++++ b/src/document_core/commands/formatting.rs
+@@ -1056,7 +1056,11 @@ impl DocumentCore {
+         // 텍스트 폭/높이에 영향을 주는 글자 모양 변경 시 LineSeg 재계산.
+         // 장평/자간은 글꼴 크기처럼 줄나눔과 페이지네이션을 바꾼다.
+         if char_shape_mods_affect_text_flow(&mods) {
+-            let styles = self.resolve_render_styles();
++            // `resolve_render_styles()` 와 같은 값이다. 지역 사본 대신 `self.styles` 에 다시
++            // 해소해(바뀌지 않은 글자 모양은 재사용) 빌려 쓰고, 그 값에 없던 캔버스 보조
++            // 메트릭만 잠시 뺀다. 여러 문단 서식에서 문단마다 표 전체를 해소하던 비용이다.
++            self.rebuild_resolved_styles();
++            let supplemental_metrics = self.styles.supplemental_metrics.take();
+             let section = &self.document.sections[sec_idx];
+             let page_def = &section.section_def.page_def;
+             let column_def = DocumentCore::find_initial_column_def(&section.paragraphs);
+@@ -1067,7 +1071,7 @@ impl DocumentCore {
+                 .map(|a| a.width)
+                 .unwrap_or(layout.body_area.width);
+             let para_shape_id = self.document.sections[sec_idx].paragraphs[para_idx].para_shape_id;
+-            let para_style = styles.para_styles.get(para_shape_id as usize);
++            let para_style = self.styles.para_styles.get(para_shape_id as usize);
+             // 본문: 열 상자.
+             let paragraph_box = ParagraphBox::body_for_style(col_width, para_style, self.dpi);
+             // 원본 LineSeg 무효화 → reflow가 max_font_size에서 새로 계산
+@@ -1077,9 +1081,10 @@ impl DocumentCore {
+             reflow_line_segs(
+                 &mut self.document.sections[sec_idx].paragraphs[para_idx],
+                 paragraph_box,
+-                &styles,
++                &self.styles,
+                 self.dpi,
+             );
++            self.styles.supplemental_metrics = supplemental_metrics;
+         }
+ 
+         self.document.sections[sec_idx].raw_stream = None;
+diff --git a/src/document_core/mod.rs b/src/document_core/mod.rs
+index 6358b48..ccce79c 100644
+--- a/src/document_core/mod.rs
++++ b/src/document_core/mod.rs
+@@ -159,6 +159,15 @@ impl TableTextReflowKey {
+     }
+ }
+ 
++/// 직전 스타일 해소의 글자 모양 입력. 같은 글꼴 표·DPI·글꼴 환경에서 글자 모양이 같은
++/// 항목은 다음 해소가 결과를 다시 만들지 않는다.
++pub(crate) struct CharStyleInputs {
++    pub(crate) dpi_bits: u64,
++    pub(crate) environment: Option<crate::renderer::font_environment::FontEnvironment>,
++    pub(crate) font_faces: Vec<Vec<crate::model::style::Font>>,
++    pub(crate) shapes: Vec<crate::model::style::CharShape>,
++}
++
+ /// 구역·DocInfo 내용의 판(版) 표식.
+ ///
+ /// 편집이 구역을 dirty 로 표시할 때마다 그 구역에 새 값을 준다 — 값이 같으면 내용도 같다.
+@@ -300,6 +309,8 @@ pub struct DocumentCore {
+     /// 모든 구역의 파생 상태를 만든 문서 전체 조판 계약. 증분 조판 중 계약이 바뀌어
+     /// 구역마다 다른 계약으로 만든 상태가 섞이면 `None`.
+     pub(crate) derived_layout_contract: Option<queries::rendering::LayoutContract>,
++    /// `styles.char_styles` 를 만든 글자 모양 입력 (`rebuild_resolved_styles` 만 쓴다).
++    pub(crate) char_style_inputs: Option<CharStyleInputs>,
+     /// 다음 스냅샷 ID
+     pub(crate) next_snapshot_id: u32,
+     /// [#5769] Undo/Redo용 삭제 조각 저장소 (ID → DeleteFragment).
+@@ -500,7 +511,36 @@ impl DocumentCore {
+ 
+     pub(crate) fn rebuild_resolved_styles(&mut self) {
+         self.model_stamps.doc_info = self.next_model_stamp();
+-        self.styles = self.resolve_render_styles();
++        // 서식 적용은 모양 하나를 덧붙일 때마다 여기로 온다. 바뀌지 않은 글자 모양의 해소
++        // 결과(글꼴 표 × 7언어 조회, 편람 약 1.5 ms)는 옮겨 쓴다.
++        let reuse = self
++            .char_style_inputs
++            .take()
++            .filter(|inputs| {
++                inputs.dpi_bits == self.dpi.to_bits()
++                    && inputs.environment == self.font_environment
++                    && inputs.shapes.len() == self.styles.char_styles.len()
++                    && crate::renderer::style_resolver::same_font_faces(
++                        &inputs.font_faces,
++                        &self.document.doc_info.font_faces,
++                    )
++            })
++            .map(|inputs| crate::renderer::style_resolver::CharStyleReuse {
++                shapes: inputs.shapes,
++                styles: std::mem::take(&mut self.styles.char_styles),
++            });
++        self.styles = crate::renderer::style_resolver::resolve_styles_with_environment_reusing(
++            &self.document,
++            self.dpi,
++            self.font_environment.as_ref(),
++            reuse,
++        );
++        self.char_style_inputs = Some(CharStyleInputs {
++            dpi_bits: self.dpi.to_bits(),
++            environment: self.font_environment.clone(),
++            font_faces: self.document.doc_info.font_faces.clone(),
++            shapes: self.document.doc_info.char_shapes.clone(),
++        });
+         self.styles.supplemental_metrics = self
+             .canvas_metrics
+             .as_ref()
+@@ -579,6 +619,7 @@ impl DocumentCore {
+             model_stamp_clock: 0,
+             untracked_model_edit: false,
+             derived_layout_contract: None,
++            char_style_inputs: None,
+             next_snapshot_id: 0,
+             fragment_store: Vec::new(),
+             next_fragment_id: 0,
+diff --git a/src/renderer/style_resolver.rs b/src/renderer/style_resolver.rs
+index 3ae3232..f08ea9c 100644
+--- a/src/renderer/style_resolver.rs
++++ b/src/renderer/style_resolver.rs
+@@ -470,8 +470,25 @@ pub fn resolve_styles(doc_info: &DocInfo, dpi: f64) -> ResolvedStyleSet {
+ /// Layout provenance itself remains owned by `LayoutCompatibilityProfile` and
+ /// is passed separately to consumers that need it.
+ pub(crate) fn resolve_styles_for_document(document: &Document, dpi: f64) -> ResolvedStyleSet {
++    resolve_styles_for_document_reusing(document, dpi, None)
++}
++
++/// 직전 해소의 글자 모양과 그 결과. 글꼴 표·DPI·글꼴 환경이 같을 때만 호출자가 넘긴다.
++pub(crate) struct CharStyleReuse {
++    pub(crate) shapes: Vec<CharShape>,
++    pub(crate) styles: Vec<ResolvedCharStyle>,
++}
++
++fn resolve_styles_for_document_reusing(
++    document: &Document,
++    dpi: f64,
++    reuse: Option<CharStyleReuse>,
++) -> ResolvedStyleSet {
+     let profile = document.layout_profile();
+-    let mut styles = resolve_styles_with_variant(&document.doc_info, dpi, profile.hwp3_layout());
++    // 아래 HWPX 저장 조판 보정은 본문 전체를 보고 정하므로 재사용하지 않는다.
++    let reuse = reuse.filter(|_| !profile.hwpx_stored_layout());
++    let mut styles =
++        resolve_styles_with_variant_reusing(&document.doc_info, dpi, profile.hwp3_layout(), reuse);
+     // [#7051] 계보 신호가 없는 저장본의 HFT ASCII 반각 판정은 로드 시 한 번 내려 출처에 둔다.
+     styles.hft_ascii_halfwidth |= document.provenance.hft_ascii_halfwidth_witnessed;
+     if profile.hwpx_stored_layout() {
+@@ -546,7 +563,18 @@ pub(crate) fn resolve_styles_with_environment(
+     dpi: f64,
+     environment: Option<&super::font_environment::FontEnvironment>,
+ ) -> ResolvedStyleSet {
+-    let mut styles = resolve_styles_for_document(document, dpi);
++    resolve_styles_with_environment_reusing(document, dpi, environment, None)
++}
++
++/// [`resolve_styles_with_environment`] 와 같되, `reuse` 의 글자 모양과 같은 항목은 직전 결과를
++/// 그대로 쓴다. 글꼴 환경 보정은 같은 환경에서 다시 적용해도 값이 같다.
++pub(crate) fn resolve_styles_with_environment_reusing(
++    document: &Document,
++    dpi: f64,
++    environment: Option<&super::font_environment::FontEnvironment>,
++    reuse: Option<CharStyleReuse>,
++) -> ResolvedStyleSet {
++    let mut styles = resolve_styles_for_document_reusing(document, dpi, reuse);
+     if environment.is_some() {
+         for (style, shape) in styles
+             .char_styles
+@@ -591,7 +619,16 @@ pub fn resolve_styles_with_variant(
+     dpi: f64,
+     is_hwp3_variant: bool,
+ ) -> ResolvedStyleSet {
+-    let char_styles = resolve_char_styles(doc_info, dpi);
++    resolve_styles_with_variant_reusing(doc_info, dpi, is_hwp3_variant, None)
++}
++
++fn resolve_styles_with_variant_reusing(
++    doc_info: &DocInfo,
++    dpi: f64,
++    is_hwp3_variant: bool,
++    reuse: Option<CharStyleReuse>,
++) -> ResolvedStyleSet {
++    let char_styles = resolve_char_styles(doc_info, dpi, reuse);
+     let para_styles = resolve_para_styles_with_variant(doc_info, dpi, is_hwp3_variant);
+     let border_styles = resolve_border_styles(doc_info);
+     let numberings = doc_info.numberings.clone();
+@@ -655,14 +692,50 @@ fn declared_space_advance_em(css_family_chain: &str, bold: bool, italic: bool) -
+ }
+ 
+ /// CharShape + FontFace → ResolvedCharStyle 목록
+-fn resolve_char_styles(doc_info: &DocInfo, dpi: f64) -> Vec<ResolvedCharStyle> {
++///
++/// 한 글자 모양의 해소 결과는 그 글자 모양·글꼴 표·DPI 만으로 정해진다. `reuse` 가 있으면
++/// 같은 자리의 글자 모양이 같은 항목은 직전 결과를 옮겨 쓰고, 나머지만 새로 해소한다.
++fn resolve_char_styles(
++    doc_info: &DocInfo,
++    dpi: f64,
++    reuse: Option<CharStyleReuse>,
++) -> Vec<ResolvedCharStyle> {
++    let (shapes, styles) = reuse.map_or((Vec::new(), Vec::new()), |r| (r.shapes, r.styles));
++    let mut previous = shapes.iter().zip(styles);
+     doc_info
+         .char_shapes
+         .iter()
+-        .map(|cs| resolve_single_char_style(cs, doc_info, dpi))
++        .map(|cs| match previous.next() {
++            Some((shape, style)) if shape == cs => style,
++            _ => resolve_single_char_style(cs, doc_info, dpi),
++        })
+         .collect()
+ }
+ 
++/// 글꼴 표가 필드 하나까지 같은가 (`Font` 에는 `PartialEq` 가 없다).
++pub(crate) fn same_font_faces(
++    a: &[Vec<crate::model::style::Font>],
++    b: &[Vec<crate::model::style::Font>],
++) -> bool {
++    use crate::model::style::Font;
++    let same_font = |a: &Font, b: &Font| {
++        a.raw_data == b.raw_data
++            && a.name == b.name
++            && a.alt_type == b.alt_type
++            && a.is_embedded == b.is_embedded
++            && a.bin_item_id_ref == b.bin_item_id_ref
++            && a.resolved_bin_data_id == b.resolved_bin_data_id
++            && a.alt_name == b.alt_name
++            && a.type_info == b.type_info
++            && a.default_name == b.default_name
++            && a.subst_font == b.subst_font
++    };
++    a.len() == b.len()
++        && a.iter()
++            .zip(b)
++            .all(|(a, b)| a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_font(a, b)))
++}
++
+ /// 개별 CharShape 해소
+ fn resolve_single_char_style(cs: &CharShape, doc_info: &DocInfo, dpi: f64) -> ResolvedCharStyle {
+     // base_size는 HWPUNIT 단위

@@ -51,6 +51,7 @@ impl Session {
 
     /// Vector PDF output with Print-profile filtering and clickable links intact.
     pub fn render_pdf(&self, pages: &[u32]) -> Result<Vec<u8>> {
+        self.guard_distribution()?;
         let options = hwpcraft_formats::pdf_options();
         let fields = self.page_field_layout()?;
         let core = fields.as_ref().map_or(&self.core, |layout| &layout.core);
@@ -63,9 +64,15 @@ impl Session {
                 break;
             }
         }
-        if rects.is_empty() && fields.is_none() && !has_chart_overrides {
+        // RHWP's own PDF path writes web links only; links inside the document need ours.
+        if rects.is_empty()
+            && fields.is_none()
+            && !has_chart_overrides
+            && !self.has_internal_links()
+        {
             return core
                 .render_pages_pdf_native_with_options(pages, &options)
+                .map(hwpcraft_formats::pdf_compact::compact)
                 .map_err(err);
         }
         self.pdf_job(pages)?.convert()
@@ -85,6 +92,7 @@ impl Session {
     /// Start preparing `pages` a few at a time (see [`Session::pdf_prepare_step`]),
     /// so a long document does not hold the window for seconds.
     pub fn pdf_prepare(&self, pages: &[u32]) -> Result<PdfPrep> {
+        self.guard_distribution()?;
         if pages.is_empty() {
             bail!("PDF로 내보낼 쪽이 없습니다.");
         }
@@ -112,6 +120,7 @@ impl Session {
         let core = fields.as_ref().map_or(&self.core, |layout| &layout.core);
         let _release = ReleaseRenderCaches([&self.core, core]);
         let rects = self.output_highlight_rects();
+        let bookmarks = self.bookmark_positions();
         while let Some(&page) = prep.pages.get(prep.svgs.len()) {
             let svg = match fields.as_ref() {
                 Some(layout) => layout.render_svg(page, RenderProfile::Print)?,
@@ -121,13 +130,31 @@ impl Session {
             };
             let svg = chart_creation::with_chart_overrides(core, page, RenderProfile::Print, svg)?;
             prep.svgs.push(with_highlights(svg, page, &rects)?);
-            prep.links.push(
-                core.page_hyperlinks_native(page, RenderProfile::Print)
-                    .map_err(err)?
-                    .iter()
-                    .map(|link| link.pdf_link())
-                    .collect::<Vec<_>>(),
-            );
+            let mut links: Vec<_> = core
+                .page_hyperlinks_native(page, RenderProfile::Print)
+                .map_err(err)?
+                .iter()
+                .map(|link| link.pdf_link())
+                .collect();
+            // 차례 항목과 상호 참조: a GoTo to the target's page when this PDF holds it.
+            for area in core
+                .page_internal_link_areas_native(page, RenderProfile::Print)
+                .map_err(err)?
+            {
+                let Some((target, x, y)) =
+                    self.internal_link_destination(core, &bookmarks, &area.uri)
+                else {
+                    continue;
+                };
+                if let Some(index) = prep.pages.iter().position(|&p| p == target) {
+                    links.push(hwpcraft_doc::PdfLink {
+                        uri: String::new(),
+                        rect: area.rect,
+                        dest: Some(hwpcraft_doc::PdfDest { page: index, x, y }),
+                    });
+                }
+            }
+            prep.links.push(links);
             if started.elapsed() >= budget {
                 break;
             }
@@ -143,17 +170,8 @@ impl Session {
         if prep.svgs.len() != prep.pages.len() {
             bail!("PDF 쪽 준비가 끝나지 않았습니다.");
         }
-        let options = hwpcraft_formats::pdf_options();
-        let PdfPrep {
-            pages, svgs, links, ..
-        } = prep;
-        Ok(PdfJob {
-            pages: pages.len(),
-            convert: Box::new(move || {
-                hwpcraft_doc::svgs_to_pdf_with_links(&svgs, &links, &options)
-                    .map_err(anyhow::Error::msg)
-            }),
-        })
+        let (svgs, links) = prep.into_parts();
+        Ok(PdfJob::from_svgs(svgs, links))
     }
 }
 
@@ -174,6 +192,11 @@ impl PdfPrep {
     }
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+    /// The prepared print SVGs and their links, in page order, for print layouts
+    /// (several pages per sheet, watermark) that rearrange them before conversion.
+    pub(crate) fn into_parts(self) -> (Vec<String>, Vec<Vec<hwpcraft_doc::PdfLink>>) {
+        (self.svgs, self.links)
     }
 }
 
@@ -196,6 +219,18 @@ pub struct PdfJob {
     convert: Box<dyn FnOnce() -> Result<Vec<u8>> + Send>,
 }
 impl PdfJob {
+    /// The job converting `svgs` (one PDF page each, with `links` in the same order).
+    pub(crate) fn from_svgs(svgs: Vec<String>, links: Vec<Vec<hwpcraft_doc::PdfLink>>) -> Self {
+        let options = hwpcraft_formats::pdf_options();
+        Self {
+            pages: svgs.len(),
+            convert: Box::new(move || {
+                hwpcraft_doc::svgs_to_pdf_with_links(&svgs, &links, &options)
+                    .map(hwpcraft_formats::pdf_compact::compact)
+                    .map_err(anyhow::Error::msg)
+            }),
+        }
+    }
     pub fn page_count(&self) -> usize {
         self.pages
     }

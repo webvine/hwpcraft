@@ -49,7 +49,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ),
     ("edit.overwrite", "삽입/수정 모드", "Insert"),
     ("edit.goto", "이동 (쪽·구역·문단·책갈피)", "Alt+G"),
-    ("hyperlink.jump", "캐럿의 하이퍼링크 주소", ""),
+    ("hyperlink.jump", "하이퍼링크 따라가기", ""),
     ("hyperlink.next", "하이퍼링크 다음", "Ctrl+Q,R"),
     ("hyperlink.prev", "하이퍼링크 이전", ""),
     ("edit.find_all", "모두 찾기 (일치 위치 목록)", ""),
@@ -65,74 +65,74 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "caret.move",
-        "motion: left|right|word_left|word_right|word_start|word_end|line_start|line_end|up|down|page_up|page_down|page_start|page_end|paragraph_start|paragraph_end|prev_paragraph_start|prev_paragraph_end|next_paragraph_start|list_start|list_end|document_start|document_end; extend keeps the anchor (Shift). Covers Hangul Move*/MoveSel*.",
+        "motion: left|right|word_left|word_right|word_start|word_end|line_start|line_end|up|down|page_up|page_down|page_start|page_end|paragraph_start|paragraph_end|prev_paragraph_start|prev_paragraph_end|next_paragraph_start|list_start|list_end|document_start|document_end. extend면 anchor를 유지합니다(Shift). 한글 Move*/MoveSel*에 대응합니다.",
         r#"{"motion":"word_right","extend":false}"#,
     ),
     (
         "select.all",
-        "No parameters; whole cell or the caret section's body.",
+        "매개 변수 없음. 셀 전체, 또는 캐럿 구역의 본문 전체를 선택합니다.",
         "{}",
     ),
     (
         "select.word",
-        "No parameters; the word (or run of spaces/punctuation) at the caret.",
+        "매개 변수 없음. 캐럿의 낱말(또는 이어진 공백·문장 부호)을 선택합니다.",
         "{}",
     ),
     ("select.paragraph", "No parameters.", "{}"),
     (
         "select.line",
-        "No parameters; the laid-out line under the caret.",
+        "매개 변수 없음. 캐럿 아래 조판된 줄을 선택합니다.",
         "{}",
     ),
     ("select.clear", "No parameters.", "{}"),
     (
         "select.get",
-        "No parameters; cursor, anchor, spanAnchor, hasSelection, text.",
+        "매개 변수 없음. cursor, anchor, spanAnchor, hasSelection, text.",
         "{}",
     ),
     (
         "edit.copy",
-        "No parameters; copies the selection to the internal clipboard (formats, tables, objects) and returns its text.",
+        "매개 변수 없음. 선택을 내부 클립보드에 복사(서식·표·개체 포함)하고 그 글을 돌려줍니다.",
         "{}",
     ),
     (
         "edit.cut",
-        "No parameters; copy plus one undoable deletion.",
+        "매개 변수 없음. 복사한 뒤 한 번 실행 취소로 지웁니다.",
         "{}",
     ),
     (
         "edit.paste",
-        "Without arguments pastes the internal clipboard. text pastes plain text (or, when it equals the last copy, the rich internal copy); html pastes with formatting; mode text_only forces plain text.",
+        "매개 변수가 없으면 내부 클립보드를 붙입니다. text는 일반 글로 붙이며(마지막 복사와 같으면 서식 있는 내부 사본), html은 서식과 함께 붙이고, mode text_only는 일반 글로만 붙입니다.",
         r#"{"text":"붙일 글"}"#,
     ),
     (
         "edit.clipboard.get",
-        "No parameters; text, hasControl (table/picture/shape), internal.",
+        "매개 변수 없음. text, hasControl(표·그림·도형), internal.",
         "{}",
     ),
     (
         "text.delete_word",
-        "No parameters; deletes from the caret to the next word start (Hangul Ctrl+T).",
+        "매개 변수 없음. 캐럿부터 다음 낱말 시작까지 지웁니다(한글 Ctrl+T).",
         "{}",
     ),
     (
         "text.delete_word_back",
-        "No parameters; deletes back to the word start (Ctrl+Backspace).",
+        "매개 변수 없음. 앞 낱말 시작까지 지웁니다(Ctrl+Backspace).",
         "{}",
     ),
     (
         "text.delete_line",
-        "No parameters; deletes the whole caret line, the paragraph when it is one line (Ctrl+Y).",
+        "매개 변수 없음. 캐럿 줄 전체를 지우고, 한 줄짜리 문단이면 문단을 지웁니다(Ctrl+Y).",
         "{}",
     ),
     (
         "text.delete_to_line_end",
-        "No parameters; deletes from the caret to the end of its line (Alt+Y).",
+        "매개 변수 없음. 캐럿부터 그 줄 끝까지 지웁니다(Alt+Y).",
         "{}",
     ),
     (
         "insert.line_break",
-        "No parameters; a line break inside the paragraph (saved as HWPX lineBreak).",
+        "매개 변수 없음. 문단 안 줄 바꿈(HWPX lineBreak로 저장).",
         "{}",
     ),
     ("insert.tab", "No parameters.", "{}"),
@@ -142,50 +142,54 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
         "No parameters; U+2007 고정폭 빈 칸.",
         "{}",
     ),
-    ("insert.soft_hyphen", "No parameters; U+00AD.", "{}"),
+    (
+        "insert.soft_hyphen",
+        "매개 변수 없음. U+00AD(선택적 하이픈)를 넣습니다.",
+        "{}",
+    ),
     (
         "insert.auto_text",
-        "kind: date|time|page_number|total_pages|page_of_total|file_name|user_name. date/time accept an optional strftime format (default 2026년 10월 25일 토요일 / 오후 3:04). Page fields are live auto-number controls in body text.",
+        "kind: date|time|page_number|total_pages|page_of_total|file_name|user_name. date/time은 strftime 형식(선택, 기본 2026년 10월 25일 토요일 / 오후 3:04)을 받습니다. 쪽 필드는 본문의 살아 있는 자동 번호 컨트롤입니다.",
         r#"{"kind":"date","format":"%Y-%m-%d"}"#,
     ),
     (
         "edit.overwrite",
-        "Optional value boolean; omit to toggle. Returns overwrite.",
+        "value(선택, bool). 생략하면 뒤집습니다. 결과: overwrite.",
         r#"{"value":true}"#,
     ),
     (
         "edit.goto",
-        "Exactly one of page (1-based), section (0-based), paragraph (0-based body paragraph of the caret section), bookmark (name).",
+        "page(1부터), section(0부터), paragraph(캐럿 구역 본문 문단, 0부터), bookmark(이름) 가운데 정확히 하나.",
         r#"{"page":2}"#,
     ),
     (
         "hyperlink.jump",
-        "No parameters; uri/text/fieldId of the link under the caret, for the caller to open.",
+        "매개 변수 없음. 캐럿 아래 링크의 uri/text/fieldId. 이 문서 안 링크(`?책갈피`)면 캐럿을 그곳으로 옮기고(jumped true, cursor), 다른 링크는 호출한 쪽이 열도록 둡니다(jumped false).",
         "{}",
     ),
     (
         "hyperlink.next",
-        "No parameters; selects the next link after the caret (no wrap). found false when none.",
+        "매개 변수 없음. 캐럿 뒤의 다음 링크를 선택합니다(되돌아가지 않음). 없으면 found false.",
         "{}",
     ),
     (
         "hyperlink.prev",
-        "No parameters; selects the previous link before the caret.",
+        "매개 변수 없음. 캐럿 앞의 이전 링크를 선택합니다.",
         "{}",
     ),
     (
         "edit.find_all",
-        "query (one line), case_sensitive (default false), include_cells (default true), limit 1–10000 (default 1000). Returns matches with cursor/length; nested cells carry cellPath only.",
+        "query(한 줄), case_sensitive(기본 false), include_cells(기본 true), limit 1–10000(기본 1000). 일치마다 length와 버전 2 address·kind를 주고, 본문·1단계 셀 글이면 cursor도 줍니다(글상자·중첩 셀·수식 글은 cursor 없이 nested:true, 수식은 equationControl). include(context.v2.list의 종류 배열, []이면 전부)를 주면 머리말·꼬리말·각주·미주·글상자·모든 깊이의 셀까지 찾고 일치마다 address·offset·length·readonly를 줍니다.",
         r#"{"query":"한글","case_sensitive":false}"#,
     ),
     (
         "document.statistics",
-        "No parameters; characters, charactersNoSpaces, words, lines, paragraphs, pages, sections, tables, pictures, shapes, equations, footnotes, endnotes, memos.",
+        "매개 변수 없음. characters, charactersNoSpaces, words, lines, paragraphs, pages, sections, tables, pictures, shapes, equations, footnotes, endnotes, memos.",
         "{}",
     ),
     (
         "document.outline",
-        "No parameters; outline paragraphs with level, number, title, page, section, paragraph.",
+        "매개 변수 없음. 개요 문단마다 level, number, title, page, section, paragraph.",
         "{}",
     ),
 ];
@@ -252,6 +256,9 @@ struct FindAll {
     include_cells: bool,
     #[serde(default = "thousand")]
     limit: usize,
+    /// Context kinds as in `context.v2.list` (empty: all); searches those instead.
+    #[serde(default)]
+    include: Option<Vec<String>>,
 }
 fn yes() -> bool {
     true
@@ -381,7 +388,14 @@ impl Session {
                 let link = self
                     .hyperlink_at_caret()?
                     .ok_or_else(|| anyhow!("캐럿 위치에 하이퍼링크가 없습니다."))?;
-                Ok(json!({"uri": link.uri, "text": link.text, "fieldId": link.field_id}))
+                let jumped = self.follow_internal_link(&link.uri)?;
+                Ok(json!({
+                    "uri": link.uri,
+                    "text": link.text,
+                    "fieldId": link.field_id,
+                    "jumped": jumped,
+                    "cursor": self.cursor,
+                }))
             }),
             "hyperlink.next" | "hyperlink.prev" => {
                 no_params(id, p).and_then(|()| self.hyperlink_step(id == "hyperlink.next"))
@@ -569,20 +583,23 @@ impl Session {
             "total_pages" => &["total"],
             _ => &["page", "/", "total"],
         };
+        // Each number is a native insert plus a paragraph relayout; paginate once.
         self.transaction(|s| {
-            s.delete_selection()?;
-            for k in kinds {
-                if *k == "/" {
-                    s.insert("/")?;
-                    continue;
+            s.deferred_layout(|s| {
+                s.delete_selection()?;
+                for k in kinds {
+                    if *k == "/" {
+                        s.insert("/")?;
+                        continue;
+                    }
+                    let c = s.cursor;
+                    s.insert_native_auto_number(c, k)?;
+                    s.cursor.offset += 1;
+                    s.anchor = None;
                 }
                 let c = s.cursor;
-                s.insert_native_auto_number(c, k)?;
-                s.cursor.offset += 1;
-                s.anchor = None;
-            }
-            s.relayout_after_marker()?;
-            Ok(())
+                s.relayout_after_marker(c)
+            })
         })?;
         Ok(kind.to_owned())
     }
@@ -623,9 +640,13 @@ impl Session {
             .iter()
             .zip(&actual)
             .filter(|(ctrl, pos)| {
+                // The placeholder lands at the caret character, behind every slot
+                // that precedes it there (section/column definitions, a field
+                // begin such as a memo start); only a number already at the caret
+                // keeps its place after the new one.
                 **pos < c.offset
                     || **pos == c.offset
-                        && matches!(ctrl, Control::SectionDef(_) | Control::ColumnDef(_))
+                        && !matches!(ctrl, Control::AutoNumber(_) | Control::NewNumber(_))
             })
             .count();
         let (list, stream) = self.root_stream_position(c)?;
@@ -668,6 +689,11 @@ impl Session {
         // source association so this is never a second shift of a native index.
         for (range, old) in para.field_ranges.iter_mut().zip(&before.field_ranges) {
             range.control_idx = old.control_idx + usize::from(old.control_idx >= index);
+            // A field that ended at the caret keeps ending there: its end slot
+            // stays in front of the new placeholder, so the number follows it.
+            if old.end_char_idx == c.offset {
+                range.end_char_idx = old.end_char_idx;
+            }
         }
         for (ctrl, pos) in before.controls.iter().zip(actual) {
             if matches!(ctrl, Control::AutoNumber(_)) {
@@ -678,7 +704,7 @@ impl Session {
             }
         }
         self.fix_number_stride(c)?;
-        self.relayout_after_marker()?;
+        self.relayout_after_marker(c)?;
         Ok(index)
     }
     /// RHWP leaves a plain space as the placeholder of a freshly inserted auto
@@ -776,13 +802,13 @@ impl Session {
             });
         }
     }
-    /// Rebuild RHWP's layout caches after a direct model edit (snapshot round trip,
-    /// like the format area does).
-    fn relayout_after_marker(&mut self) -> Result<()> {
-        let id = self.save_history_snapshot();
-        let r = self.core.restore_snapshot_native(id).map_err(err);
-        self.retire_history_snapshot(id);
-        r.map(|_| ())
+    /// Rebuild RHWP's layout caches after a direct model edit of the caret
+    /// paragraph. The snapshot round trip used before laid out the whole document.
+    fn relayout_after_marker(&mut self, c: Cursor) -> Result<()> {
+        self.core
+            .relayout_paragraph_native(c.section, c.paragraph, c.cell.map(|t| t.control))
+            .map_err(err)?;
+        Ok(())
     }
     /// RHWP root-list paragraph index and stream position of a body caret, counted
     /// the way RHWP's field queries do: a tab is 8 units, an extended control 8
@@ -947,6 +973,14 @@ impl Session {
         if !(1..=10_000).contains(&f.limit) {
             bail!("limit은 1–10000입니다.");
         }
+        if let Some(include) = &f.include {
+            crate::find::check_context_kinds(include)?;
+            let o = crate::FindOptions {
+                case_sensitive: f.case_sensitive,
+                ..Default::default()
+            };
+            return self.find_all_in_contexts(&f.query, o, include, f.limit);
+        }
         let raw = self
             .core
             .search_all_text_native(&f.query, f.case_sensitive, f.include_cells)
@@ -959,39 +993,59 @@ impl Session {
             .take(f.limit)
             .map(|h| {
                 let n = |v: &Value, k: &str| v[k].as_u64().map(|x| x as usize);
-                let (section, paragraph, offset) = (
+                let (section, mut paragraph, offset) = (
                     n(&h, "sec").unwrap_or(0),
                     n(&h, "para").unwrap_or(0),
                     n(&h, "charOffset").unwrap_or(0),
                 );
+                // RHWP gives a first-level cell or text box as `cellContext` and a
+                // deeper one as `cellPath`; a text box reads as cell 0 in both.
                 let ctx = &h["cellContext"];
-                let cursor = if ctx.is_null() {
-                    Some(Cursor {
-                        section,
-                        paragraph,
-                        offset,
-                        cell: None,
-                    })
-                } else if ctx.get("ctrlIdx").is_some() {
-                    Some(Cursor {
-                        section,
-                        paragraph: n(ctx, "parentPara").unwrap_or(paragraph),
-                        offset,
-                        cell: Some(Cell {
-                            control: n(ctx, "ctrlIdx").unwrap_or(0),
-                            index: n(ctx, "cellIdx").unwrap_or(0),
-                            paragraph: n(ctx, "cellPara").unwrap_or(0),
-                        }),
-                    })
+                let steps: Vec<(usize, usize, usize)> = if ctx.is_object() {
+                    paragraph = n(ctx, "parentPara").unwrap_or(paragraph);
+                    vec![(
+                        n(ctx, "ctrlIdx").unwrap_or(0),
+                        n(ctx, "cellIdx").unwrap_or(0),
+                        n(ctx, "cellPara").unwrap_or(0),
+                    )]
                 } else {
-                    None
+                    h["cellPath"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|s| {
+                            (
+                                n(s, "controlIndex").unwrap_or(0),
+                                n(s, "cellIndex").unwrap_or(0),
+                                n(s, "cellParaIndex").unwrap_or(0),
+                            )
+                        })
+                        .collect()
                 };
+                let address = self.search_hit_address(section, paragraph, &steps);
+                let equation = n(&h, "equationControl");
+                // Only body text and first-level cell text are caret positions; a match
+                // in an equation's script, a text box or a deeper cell is not.
+                let cursor = address
+                    .as_ref()
+                    .filter(|_| equation.is_none())
+                    .and_then(crate::find::legacy_cursor)
+                    .map(|c| Cursor { offset, ..c });
                 let mut m = json!({"length": n(&h, "length").unwrap_or(length)});
+                if let Some(a) = &address {
+                    m["address"] = json!(a);
+                    m["kind"] = json!(crate::find::context_kind(a));
+                }
+                if let Some(control) = equation {
+                    m["equationControl"] = json!(control);
+                }
                 match cursor {
                     Some(c) => m["cursor"] = json!(c),
                     None => {
                         m["nested"] = json!(true);
-                        m["cellPath"] = ctx.clone();
+                        if !h["cellPath"].is_null() {
+                            m["cellPath"] = h["cellPath"].clone();
+                        }
                         m["section"] = json!(section);
                         m["paragraph"] = json!(paragraph);
                         m["offset"] = json!(offset);

@@ -192,108 +192,108 @@ pub const COLOR_PRESETS: [(&str, &str, &str); 8] = [
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "format.bold",
-        "value?: bool; omitted toggles the shape under the caret. Selection, or future input at a collapsed caret.",
+        "value?: bool. 생략하면 캐럿 아래 모양을 뒤집습니다. 선택에, 선택이 없으면 캐럿에서 이어 칠 글에 적용합니다.",
         r##"{"value":true}"##,
     ),
-    ("format.italic", "value?: bool; omitted toggles.", "{}"),
+    ("format.italic", "value?: bool. 생략하면 뒤집습니다.", "{}"),
     (
         "format.underline",
-        "value?: bool; omitted toggles (underlineType Bottom/None).",
+        "value?: bool. 생략하면 뒤집습니다(underlineType Bottom/None).",
         "{}",
     ),
     (
         "format.strikethrough",
-        "value?: bool; omitted toggles.",
+        "value?: bool. 생략하면 뒤집습니다.",
         "{}",
     ),
     (
         "format.superscript",
-        "value?: bool; omitted toggles. Clears subscript.",
+        "value?: bool. 생략하면 뒤집습니다. 아래 첨자는 끕니다.",
         "{}",
     ),
     (
         "format.subscript",
-        "value?: bool; omitted toggles. Clears superscript.",
+        "value?: bool. 생략하면 뒤집습니다. 위 첨자는 끕니다.",
         "{}",
     ),
     (
         "format.superscript.cycle",
-        "No parameters; 보통 → 위 첨자 → 아래 첨자 → 보통 by the shape under the caret (Hangul CharShapeSuperSubscript).",
+        "매개 변수 없음. 캐럿 아래 모양에 따라 보통 → 위 첨자 → 아래 첨자 → 보통(한글 CharShapeSuperSubscript).",
         "{}",
     ),
     (
         "format.normal",
-        "No parameters; clears bold, italic, underline, strikethrough, scripts, outline, shadow, emboss, engrave.",
+        "매개 변수 없음. 굵게·기울임·밑줄·취소선·첨자·외곽선·그림자·양각·음각을 지웁니다.",
         "{}",
     ),
     (
         "format.highlight",
-        "color?: #rrggbb or name?: black|red|blue|green|yellow|violet|bluish|white (Hangul presets); neither removes the 형광펜. Selection or whole caret paragraph.",
+        "color?: #rrggbb 또는 name?: black|red|blue|green|yellow|violet|bluish|white(한글 기본 색). 둘 다 없으면 형광펜을 지웁니다. 선택, 또는 캐럿 문단 전체.",
         r##"{"color":"#ffff00"}"##,
     ),
     (
         "format.highlight.get",
-        "No parameters; highlight under the caret and the caret paragraph's ranges.",
+        "매개 변수 없음. 캐럿 아래 형광펜과 캐럿 문단의 형광펜 범위.",
         "{}",
     ),
     (
         "format.font_size.increase",
-        "No parameters; +1 pt (100 units) like Hangul, up to 4096 pt.",
+        "매개 변수 없음. 한글처럼 +1 pt(100단위), 4096 pt까지.",
         "{}",
     ),
     (
         "format.font_size.decrease",
-        "No parameters; −1 pt, down to 1 pt.",
+        "매개 변수 없음. −1 pt, 1 pt까지.",
         "{}",
     ),
     (
         "format.ratio.increase",
-        "No parameters; 장평 +1 % for all languages, up to 200 %.",
+        "매개 변수 없음. 모든 언어의 장평 +1 %, 200 %까지.",
         "{}",
     ),
     (
         "format.ratio.decrease",
-        "No parameters; 장평 −1 %, down to 50 %.",
+        "매개 변수 없음. 장평 −1 %, 50 %까지.",
         "{}",
     ),
     (
         "format.spacing.increase",
-        "No parameters; 자간 +1 %, up to 50 %.",
+        "매개 변수 없음. 자간 +1 %, 50 %까지.",
         "{}",
     ),
     (
         "format.spacing.decrease",
-        "No parameters; 자간 −1 %, down to −50 %.",
+        "매개 변수 없음. 자간 −1 %, −50 %까지.",
         "{}",
     ),
     (
         "format.text_color",
-        "color: #rrggbb or name: black|red|blue|green|yellow|violet|bluish|white (Hangul TextColor* presets).",
+        "color: #rrggbb 또는 name: black|red|blue|green|yellow|violet|bluish|white(한글 TextColor* 기본 색).",
         r##"{"name":"red"}"##,
     ),
     (
         "format.shade_color",
-        "color?: #rrggbb or name? (same presets); neither removes the 음영 (white).",
+        "color?: #rrggbb 또는 name?(같은 기본 색). 둘 다 없으면 음영을 지웁니다(흰색).",
         r##"{"name":"yellow"}"##,
     ),
     (
         "format.char_border",
-        "value?: bool, type?: 0–17 (HWP line type), width?: 0–15, color?: #rrggbb; all four sides. No parameters toggles a thin solid border.",
+        "value?: bool, type?: 0–17(HWP 선 종류), width?: 0–15, color?: #rrggbb. 네 변 모두. 매개 변수가 없으면 가는 실선 테두리를 뒤집습니다.",
         r##"{"type":1,"width":0,"color":"#000000"}"##,
     ),
     (
         "format.font.next",
-        "fonts?: [names] in Hangul's list order (the UI passes installed fonts); omitted cycles the document's fonts. All seven languages take the font.",
+        "fonts?: [이름] 한글 목록 순서(화면은 설치된 글꼴을 넘김). 생략하면 문서의 글꼴을 돌아가며 씁니다. 일곱 언어 모두 그 글꼴을 씁니다.",
         r##"{"fonts":["함초롬바탕","함초롬돋움"]}"##,
     ),
     (
         "format.font.prev",
-        "Same as format.font.next, backwards.",
+        "format.font.next와 같고 거꾸로 돕니다.",
         "{}",
     ),
     (
         "format.align.justify",
-        "No parameters; selected paragraphs.",
+        "매개 변수 없음. 선택한 문단을 양쪽 정렬합니다.",
         "{}",
     ),
     ("format.align.left", "No parameters.", "{}"),
@@ -303,12 +303,12 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ("format.align.split", "No parameters; 나눔 정렬.", "{}"),
     (
         "format.line_spacing.increase",
-        "No parameters; +10 % (percent mode) or +1 pt, like Hangul.",
+        "매개 변수 없음. 한글처럼 +10 %(퍼센트 방식) 또는 +1 pt.",
         "{}",
     ),
     (
         "format.line_spacing.decrease",
-        "No parameters; −10 % or −1 pt, down to 0.",
+        "매개 변수 없음. −10 % 또는 −1 pt, 0까지.",
         "{}",
     ),
     (
@@ -323,12 +323,12 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "format.indent.at_caret",
-        "No parameters; following lines start at the caret's x (negative indent), Hangul ParaShapeIndentAtCaret.",
+        "매개 변수 없음. 다음 줄들이 캐럿의 x 위치에서 시작합니다(내어쓰기, 한글 ParaShapeIndentAtCaret).",
         "{}",
     ),
     (
         "format.margin_left.increase",
-        "No parameters; 왼쪽 여백 +1 pt; margins may go negative like Hangul.",
+        "매개 변수 없음. 왼쪽 여백 +1 pt. 한글처럼 여백이 음수가 될 수 있습니다.",
         "{}",
     ),
     (
@@ -348,102 +348,102 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "format.margin.increase",
-        "No parameters; both margins +1 pt.",
+        "매개 변수 없음. 양쪽 여백 +1 pt.",
         "{}",
     ),
     (
         "format.margin.decrease",
-        "No parameters; both margins −1 pt.",
+        "매개 변수 없음. 양쪽 여백 −1 pt.",
         "{}",
     ),
     (
         "format.paragraph.up",
-        "No parameters; swaps the caret paragraph with the previous one in its container (body or cell). 구역 정의 stays first.",
+        "매개 변수 없음. 캐럿 문단을 같은 영역(본문·셀)의 앞 문단과 바꿉니다. 구역 정의는 맨 앞에 남습니다.",
         "{}",
     ),
     (
         "format.paragraph.down",
-        "No parameters; swaps with the next paragraph.",
+        "매개 변수 없음. 다음 문단과 바꿉니다.",
         "{}",
     ),
     (
         "format.paragraph.apply",
-        "format?: paragraph shape patch (format.paragraph keys), head?: {kind: none|outline|number|bullet, level?: 0–6}; one undo step.",
+        "format?: 문단 모양 패치(format.paragraph 키), head?: {kind: none|outline|number|bullet, level?: 0–6}. 한 번 실행 취소.",
         r##"{"format":{"alignment":"center"},"head":{"kind":"outline","level":0}}"##,
     ),
     (
         "format.style.list",
-        "No parameters; id, name, englishName, type, nextStyleId, shortcut, current.",
+        "매개 변수 없음. id, name, englishName, type, nextStyleId, shortcut, current.",
         "{}",
     ),
     (
         "format.style.detail",
-        "id: style index; returns its character and paragraph shapes.",
+        "id: 스타일 번호. 그 글자 모양과 문단 모양을 돌려줍니다.",
         r##"{"id":0}"##,
     ),
     (
         "format.style.create",
-        "name, englishName?, type?: paragraph|character, nextStyleId?, character?/paragraph?: shape patches; starts from the caret's shapes.",
+        "name, englishName?, type?: paragraph|character, nextStyleId?, character?/paragraph?: 모양 패치. 캐럿의 모양에서 시작합니다.",
         r##"{"name":"강조","type":"paragraph","character":{"bold":true}}"##,
     ),
     (
         "format.style.update",
-        "id, name?, englishName?, nextStyleId?, character?/paragraph?: patches; paragraphs using the style follow.",
+        "id, name?, englishName?, nextStyleId?, character?/paragraph?: 패치. 그 스타일을 쓰는 문단이 따라 바뀝니다.",
         r##"{"id":1,"character":{"italic":true}}"##,
     ),
     (
         "format.style.delete",
-        "id (not 0), replacement?: style for its paragraphs (default 바탕글).",
+        "id(0 아님), replacement?: 그 스타일 문단에 줄 스타일(기본 바탕글).",
         r##"{"id":3,"replacement":0}"##,
     ),
     (
         "format.style.shortcut",
-        "number: 1–9 and 0 or 10 (Ctrl+1 … Ctrl+0), 11–20 for StyleShortcut11–20; applies that style.",
+        "number: 1–9와 0 또는 10(Ctrl+1 … Ctrl+0), 11–20은 StyleShortcut11–20. 그 스타일을 적용합니다.",
         r##"{"number":2}"##,
     ),
     (
         "format.style.clear_char",
-        "No parameters; the selection (or caret paragraph) returns to its paragraph style's character shape (StyleClearCharStyle).",
+        "매개 변수 없음. 선택(또는 캐럿 문단)을 문단 스타일의 글자 모양으로 되돌립니다(StyleClearCharStyle).",
         "{}",
     ),
     (
         "format.style.update_from_caret",
-        "id?: style (default: the caret paragraph's); it takes the caret's character shape and paragraph shape (ChangeToCurrentStyle).",
+        "id?: 스타일(기본: 캐럿 문단의 스타일). 캐럿의 글자 모양과 문단 모양을 그 스타일에 넣습니다(ChangeToCurrentStyle).",
         r##"{"id":1}"##,
     ),
     (
         "format.style.move",
-        "id, direction: up|down; swaps list positions, 바탕글 stays first (StyleWSListUp/Down).",
+        "id, direction: up|down. 목록 위치를 바꾸며 바탕글은 맨 앞에 남습니다(StyleWSListUp/Down).",
         r##"{"id":2,"direction":"up"}"##,
     ),
     (
         "format.style.export",
-        "path?: write JSON there; otherwise returns {format, version, styles:[{name, englishName, type, nextStyle, character, paragraph}]}.",
+        "path?: 그곳에 JSON을 씁니다. 없으면 {format, version, styles:[{name, englishName, type, nextStyle, character, paragraph}]}를 돌려줍니다.",
         r##"{"path":"styles.json"}"##,
     ),
     (
         "format.style.import",
-        "path? or styles?: exported JSON; styles are matched by name (update) or added, nextStyle by name. One undo step.",
+        "path? 또는 styles?: 내보낸 JSON. 스타일을 이름으로 찾아 고치거나 더하며 nextStyle도 이름으로 잇습니다. 한 번 실행 취소.",
         r##"{"styles":[{"name":"강조","character":{"bold":true}}]}"##,
     ),
     (
         "format.numbering.list",
-        "No parameters; numberings, bullets, the section's outline id and preceding lists.",
+        "매개 변수 없음. 문단 번호·글머리표 목록, 구역의 개요 번호 id와 앞에 쓰인 목록.",
         "{}",
     ),
     (
         "format.numbering.create",
-        "levelFormats: 7 strings (^1. …), numberFormats: 7 codes 0–16, startNumber?.",
+        "levelFormats: 문자열 7개(^1. …), numberFormats: 코드 7개(0–16), startNumber?.",
         r##"{"levelFormats":["^1.","^2)","(^3)","(^4)","^5","^6)","^7)"],"numberFormats":[0,8,0,8,1,10,5]}"##,
     ),
     (
         "format.numbering.apply",
-        "kind: number|bullet|outline|none, id?, char? (bullet), level?: 0–6, levelFormats?/numberFormats?/startNumber? (inline numbering), restart?: {mode, start?}.",
+        "kind: number|bullet|outline|none, id?, char?(글머리표), level?: 0–6, levelFormats?/numberFormats?/startNumber?(번호 모양을 이 자리에서 바로 지정), restart?: {mode, start?}.",
         r##"{"kind":"number","level":0}"##,
     ),
     (
         "format.numbering.toggle",
-        "No parameters; 문단 번호 on/off by the caret paragraph.",
+        "매개 변수 없음. 캐럿 문단 기준으로 문단 번호를 켜고 끕니다.",
         "{}",
     ),
     (
@@ -451,35 +451,39 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
         "No parameters; 글머리표 on/off.",
         "{}",
     ),
-    ("format.outline.toggle", "No parameters; 개요 on/off.", "{}"),
+    (
+        "format.outline.toggle",
+        "매개 변수 없음. 개요를 켜고 끕니다.",
+        "{}",
+    ),
     (
         "format.outline.shape",
-        "levelFormats, numberFormats, startNumber?: the section's 개요 번호 모양.",
+        "levelFormats, numberFormats, startNumber?: 구역의 개요 번호 모양.",
         r##"{"levelFormats":["^1.","^2.","^3)","^4)","(^5)","(^6)","^7"],"numberFormats":[0,8,0,8,0,8,1]}"##,
     ),
     (
         "format.level.increase",
-        "No parameters; one level deeper for numbered paragraphs.",
+        "매개 변수 없음. 번호 문단을 한 수준 아래로.",
         "{}",
     ),
     (
         "format.level.decrease",
-        "No parameters; one level up.",
+        "매개 변수 없음. 한 수준 위로.",
         "{}",
     ),
     (
         "format.numbering.restart",
-        "mode: continue|previous|new, start?: 1–65535 with new.",
+        "mode: continue|previous|new, start?: new일 때 1–65535.",
         r##"{"mode":"new","start":1}"##,
     ),
     (
         "format.copy_shape.apply",
-        "character?/paragraph?: copied shape patches applied in one undo step (모양 복사 Alt+C).",
+        "character?/paragraph?: 복사한 모양 패치를 한 번 실행 취소로 적용합니다(모양 복사 Alt+C).",
         r##"{"character":{"bold":true},"paragraph":{"alignment":"center"}}"##,
     ),
     (
         "format.hf.character",
-        "header: bool, applyTo?: both|odd|even, paragraph?: index, start?/end?: offsets, format: character patch.",
+        "header: bool, applyTo?: both|odd|even, paragraph?: 번호, start?/end?: 오프셋, format: 글자 패치.",
         r##"{"header":true,"format":{"bold":true}}"##,
     ),
     (
@@ -489,7 +493,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "format.hf.paragraph",
-        "header, applyTo?, paragraph?, format: paragraph patch.",
+        "header, applyTo?, paragraph?, format: 문단 패치.",
         r##"{"header":false,"format":{"alignment":"right"}}"##,
     ),
     (
@@ -499,7 +503,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "format.footnote.paragraph",
-        "paragraph?: host paragraph (default caret), control: index of the footnote/endnote, footnoteParagraph?, format: paragraph patch.",
+        "paragraph?: 각주가 든 문단(기본 캐럿), control: 각주·미주 번호, footnoteParagraph?, format: 문단 패치.",
         r##"{"control":0,"format":{"alignment":"justify"}}"##,
     ),
     (
@@ -509,22 +513,22 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "format.char_overlap",
-        "chars: 1–9 characters drawn on top of each other at the caret (Hangul 글자 겹치기, HWP tcps); border?: 0 none|1 circle|2 reversed circle|3 square|4 reversed square|5 triangle|6 reversed triangle; size?: inner size % (1–127, default 100); expansion?: 1 overlap (default) | 0 spread. Body paragraphs only.",
+        "chars: 캐럿에 겹쳐 그릴 1–9자(한글 글자 겹치기, HWP tcps). border?: 0 없음|1 원|2 반전 원|3 사각형|4 반전 사각형|5 삼각형|6 반전 삼각형. size?: 안쪽 글자 크기 %(1–127, 기본 100). expansion?: 1 겹치기(기본) | 0 펼치기. 본문 문단에만.",
         r##"{"chars":"주의","border":1}"##,
     ),
     (
         "format.char_overlap.get",
-        "No parameters; the caret paragraph's 글자 겹치기 controls (control index, position, chars, border, size, expansion).",
+        "매개 변수 없음. 캐럿 문단의 글자 겹치기 컨트롤(control 번호, 위치, chars, border, size, expansion).",
         "{}",
     ),
     (
         "format.char_overlap.update",
-        "control: index from format.char_overlap.get; chars?/border?/size?/expansion? to change.",
+        "control: format.char_overlap.get의 번호. 바꿀 chars?/border?/size?/expansion?.",
         r##"{"control":0,"border":3}"##,
     ),
     (
         "format.char_overlap.delete",
-        "control: index of the 글자 겹치기 control in the caret paragraph.",
+        "control: 캐럿 문단에서 글자 겹치기 컨트롤의 번호.",
         r##"{"control":0}"##,
     ),
 ];
@@ -625,6 +629,46 @@ fn seven<T: TryFrom<i64>>(v: &Value) -> Option<[T; 7]> {
 }
 
 /// Validated JSON → RHWP mods. Fonts are resolved to ids by `character_parameters`.
+/// Apply `f` to every paragraph of `section`: body, table cells and captions, text
+/// boxes, notes, headers and footers, and master pages (both the section's copy and
+/// the one its definition control carries). `f` says whether it changed the
+/// paragraph. A section with a change is written from the model: its stored stream
+/// goes, and so do stored master-page records when a master-page paragraph changed
+/// (an HWP original writes master pages from them). A section nothing changed in
+/// keeps its stream; RHWP reads a sealed section without one as edited and drops the
+/// stored line rules for the whole document (a 381-page document laid out as 380).
+fn restyle_section(
+    section: &mut hwpcraft_doc::model::document::Section,
+    mut f: impl FnMut(&mut Paragraph) -> bool,
+) {
+    let mut changed = false;
+    crate::layout_cache::visit_paragraphs(&mut section.paragraphs, &mut |p| changed |= f(p));
+    let mut master = false;
+    for page in &mut section.section_def.master_pages {
+        crate::layout_cache::visit_paragraphs(&mut page.paragraphs, &mut |p| master |= f(p));
+    }
+    for para in &mut section.paragraphs {
+        for control in &mut para.controls {
+            if let Control::SectionDef(def) = control {
+                for page in &mut def.master_pages {
+                    crate::layout_cache::visit_paragraphs(&mut page.paragraphs, &mut |p| {
+                        master |= f(p)
+                    });
+                }
+                if master {
+                    def.extra_child_records.clear();
+                }
+            }
+        }
+    }
+    if master {
+        section.section_def.extra_child_records.clear();
+    }
+    if changed || master {
+        section.raw_stream = None;
+    }
+}
+
 fn char_mods(v: &Value) -> CharShapeMods {
     let b = |k: &str| v[k].as_bool();
     let n = |k: &str| v[k].as_i64();
@@ -966,7 +1010,7 @@ impl Session {
     }
     /// Rebuild derived layout state after direct model edits through public RHWP API:
     /// restoring a snapshot of the current document runs RHWP's full derived-state rebuild.
-    fn refresh_layout(&mut self) -> Result<()> {
+    pub(crate) fn refresh_layout(&mut self) -> Result<()> {
         let id = self.save_history_snapshot();
         let r = self.core.restore_snapshot_native(id).map_err(err);
         self.retire_history_snapshot(id);
@@ -1665,7 +1709,7 @@ impl Session {
         })
     }
     /// Append a validated style (and apply its shape patches), no transaction.
-    fn create_style_now(&mut self, n: NewStyle) -> Result<usize> {
+    pub(crate) fn create_style_now(&mut self, n: NewStyle) -> Result<usize> {
         let count = self.core.document().doc_info.styles.len();
         if count >= 255 {
             bail!("스타일은 255개까지 만들 수 있습니다.");
@@ -1803,45 +1847,56 @@ impl Session {
         target.raw_data = None;
         doc.doc_info.raw_stream_dirty = true;
         let paragraph_style = old.style_type == 0;
+        let restyle = |para: &mut Paragraph| {
+            if para.style_id as usize != id {
+                return false;
+            }
+            if paragraph_style && para.para_shape_id == old_ps {
+                para.para_shape_id = new_ps;
+            }
+            para.replace_style_char_shape_preserving_overrides(
+                u32::from(old_cs),
+                u32::from(new_cs),
+            );
+            true
+        };
+        // Body paragraphs and first-level cells using the style, reflowed below; the
+        // rest (headers, notes, text boxes, deeper cells) follow the section layout.
         let mut touched = Vec::new();
-        for (si, section) in doc.sections.iter_mut().enumerate() {
-            section.raw_stream = None;
-            for (pi, para) in section.paragraphs.iter_mut().enumerate() {
-                let mut visit = |para: &mut Paragraph, cell: Option<Cell>| {
-                    if para.style_id as usize == id {
-                        if paragraph_style && para.para_shape_id == old_ps {
-                            para.para_shape_id = new_ps;
-                        }
-                        para.replace_style_char_shape_preserving_overrides(
-                            u32::from(old_cs),
-                            u32::from(new_cs),
-                        );
-                        touched.push(Cursor {
-                            section: si,
-                            paragraph: pi,
-                            offset: 0,
-                            cell,
-                        });
-                    }
-                };
-                for (ci, control) in para.controls.iter_mut().enumerate() {
+        for (si, section) in doc.sections.iter().enumerate() {
+            for (pi, para) in section.paragraphs.iter().enumerate() {
+                for (ci, control) in para.controls.iter().enumerate() {
                     if let Control::Table(t) = control {
-                        for (ti, cell) in t.cells.iter_mut().enumerate() {
-                            for (k, cp) in cell.paragraphs.iter_mut().enumerate() {
-                                visit(
-                                    cp,
-                                    Some(Cell {
-                                        control: ci,
-                                        index: ti,
-                                        paragraph: k,
-                                    }),
-                                );
+                        for (ti, cell) in t.cells.iter().enumerate() {
+                            for (k, cp) in cell.paragraphs.iter().enumerate() {
+                                if cp.style_id as usize == id {
+                                    touched.push(Cursor {
+                                        section: si,
+                                        paragraph: pi,
+                                        offset: 0,
+                                        cell: Some(Cell {
+                                            control: ci,
+                                            index: ti,
+                                            paragraph: k,
+                                        }),
+                                    });
+                                }
                             }
                         }
                     }
                 }
-                visit(para, None);
+                if para.style_id as usize == id {
+                    touched.push(Cursor {
+                        section: si,
+                        paragraph: pi,
+                        offset: 0,
+                        cell: None,
+                    });
+                }
             }
+        }
+        for section in &mut doc.sections {
+            restyle_section(section, restyle);
         }
         self.refresh_layout()?;
         for c in touched {
@@ -1958,6 +2013,13 @@ impl Session {
             }
             let removed = p.id as u8;
             let doc = s.core.document_mut();
+            // Paragraphs the engine's entries do not reach (headers, notes, text boxes,
+            // deeper cells, master pages) take the replacement style and its shapes.
+            let (old, new) = (
+                doc.doc_info.styles[p.id].clone(),
+                doc.doc_info.styles[replacement].clone(),
+            );
+            let to = replacement as u8;
             doc.doc_info.styles.remove(p.id);
             for style in &mut doc.doc_info.styles {
                 if style.next_style_id == removed {
@@ -1966,23 +2028,27 @@ impl Session {
                     style.next_style_id -= 1;
                 }
             }
-            let shift = |para: &mut hwpcraft_doc::model::paragraph::Paragraph| {
+            let shift = |para: &mut Paragraph| {
+                let mut changed = false;
+                if para.style_id == removed {
+                    para.style_id = to;
+                    if old.style_type == 0 && para.para_shape_id == old.para_shape_id {
+                        para.para_shape_id = new.para_shape_id;
+                    }
+                    para.replace_style_char_shape_preserving_overrides(
+                        u32::from(old.char_shape_id),
+                        u32::from(new.char_shape_id),
+                    );
+                    changed = true;
+                }
                 if para.style_id > removed {
                     para.style_id -= 1;
+                    changed = true;
                 }
+                changed
             };
             for section in &mut doc.sections {
-                section.raw_stream = None;
-                for para in &mut section.paragraphs {
-                    for control in &mut para.controls {
-                        if let Control::Table(t) = control {
-                            for cell in &mut t.cells {
-                                cell.paragraphs.iter_mut().for_each(shift);
-                            }
-                        }
-                    }
-                    shift(para);
-                }
+                restyle_section(section, shift);
             }
             doc.doc_info.raw_stream_dirty = true;
             s.refresh_layout()?;
@@ -2184,6 +2250,8 @@ impl Session {
             bullet_char: ch,
             attr: 1 << 3,
             text_distance: 50,
+            // Hangul's own bullets follow the paragraph's character shape.
+            char_shape_id: u32::MAX,
             ..Default::default()
         });
         doc.doc_info.raw_stream_dirty = true;
@@ -2274,9 +2342,17 @@ impl Session {
         for (c, _) in self.selected_paragraphs()? {
             let mut patch = json!({ "headType": head });
             if let Some(id) = id {
-                let level = level.unwrap_or(self.para_shape_of(c)?.para_level.min(6));
+                let shape = self.para_shape_of(c)?;
+                let level = level.unwrap_or(shape.para_level.min(6));
                 patch["numberingId"] = json!(id);
                 patch["paraLevel"] = json!(level);
+                // Heads hang left of the text (automatic hanging indent). Hangul
+                // draws them inside the left margin it gives the paragraph and
+                // clips them at the body edge, so a paragraph with no margin of
+                // its own gets Hangul's 20 pt (+10 pt per level).
+                if matches!(kind, HeadKind::Bullet | HeadKind::Number) && shape.margin_left == 0 {
+                    patch["marginLeft"] = json!(4000 + 2000 * i32::from(level));
+                }
             }
             self.apply_paragraph_at(c, patch)?;
         }
@@ -2479,7 +2555,7 @@ struct StyleImport {
     #[serde(default)]
     styles: Option<Value>,
 }
-struct NewStyle {
+pub(crate) struct NewStyle {
     name: String,
     english: String,
     character: bool,
@@ -2488,6 +2564,21 @@ struct NewStyle {
     para_shape_id: u16,
     char_patch: Option<Value>,
     para_patch: Option<Value>,
+}
+impl NewStyle {
+    /// A paragraph style over existing shapes, followed by itself.
+    pub(crate) fn plain(name: &str, english: &str, para_shape_id: u16, char_shape_id: u16) -> Self {
+        Self {
+            name: name.to_owned(),
+            english: english.to_owned(),
+            character: false,
+            next: None,
+            char_shape_id,
+            para_shape_id,
+            char_patch: None,
+            para_patch: None,
+        }
+    }
 }
 /// `#rrggbb` from a color or a preset name; `None` when neither is given.
 fn preset_or_color(color: Option<&str>, name: Option<&str>) -> Result<Option<String>> {
@@ -2894,20 +2985,13 @@ impl Session {
                     para.style_id = b;
                 } else if para.style_id == b {
                     para.style_id = a;
+                } else {
+                    return false;
                 }
+                true
             };
             for section in &mut doc.sections {
-                section.raw_stream = None;
-                for para in &mut section.paragraphs {
-                    for control in &mut para.controls {
-                        if let Control::Table(t) = control {
-                            for cell in &mut t.cells {
-                                cell.paragraphs.iter_mut().for_each(remap);
-                            }
-                        }
-                    }
-                    remap(para);
-                }
+                restyle_section(section, remap);
             }
             doc.doc_info.raw_stream_dirty = true;
             s.refresh_layout()?;
@@ -3146,7 +3230,7 @@ struct ControlIndex {
     control: usize,
 }
 const CTRL_UNITS: u32 = 8;
-const CHAR_OVERLAP_CTRL_CHAR: u32 = 0x17;
+pub(crate) const CHAR_OVERLAP_CTRL_CHAR: u32 = 0x17;
 fn overlap_chars(s: &str) -> Result<Vec<char>> {
     let chars: Vec<char> = s.chars().collect();
     if chars.is_empty() || chars.len() > 9 {
@@ -3185,7 +3269,7 @@ fn overlap_fields(
 }
 /// Open an 8-unit stream slot for an inline control before text character `idx` (after
 /// controls already in that gap) and return the control index to insert at.
-fn open_control_slot(para: &mut Paragraph, idx: usize) -> usize {
+pub(crate) fn open_control_slot(para: &mut Paragraph, idx: usize) -> usize {
     let positions = para.control_text_positions();
     let control_index = positions
         .iter()
@@ -3260,8 +3344,10 @@ impl Session {
             let section = &mut s.core.document_mut().sections[c.section];
             section.raw_stream = None;
             let para = &mut section.paragraphs[c.paragraph];
-            control = open_control_slot(para, idx);
-            para.controls.insert(control, Control::CharOverlap(co));
+            // CTRL_DATA records and field ranges move with it (a 누름틀 after it kept
+            // pointing at it before: field.list lost it, an HWP save its value).
+            control =
+                crate::control_slots::insert_control(para, idx, Control::CharOverlap(co), None);
             para.control_mask |= 1 << CHAR_OVERLAP_CTRL_CHAR;
             s.refresh_layout()?;
             s.clear_selection();
@@ -3315,9 +3401,7 @@ impl Session {
         let c = self.body_paragraph_for_overlap()?;
         self.char_overlap_at(c, p.control)?;
         self.transaction(|s| {
-            s.core
-                .delete_control_native(c.section, c.paragraph, p.control)
-                .map_err(err)?;
+            s.delete_control_keeping_fields(c.section, c.paragraph, p.control, false)?;
             s.refresh_layout()?;
             s.clear_selection();
             Ok(())

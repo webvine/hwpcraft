@@ -28,6 +28,17 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "Ctrl+N,N / Ctrl+N,E",
     ),
     ("equation.insert", "수식 넣기 (색·기준선·글꼴)", "Ctrl+N,M"),
+    ("object.caption_text", "그림·개체 캡션 내용 고치기", ""),
+    ("object.caption_text.get", "그림·개체 캡션 내용", ""),
+    (
+        "equation.layout",
+        "수식 조각 배치와 스크립트 위치 (시각 편집)",
+        "",
+    ),
+    ("equation.macro.list", "수식 매크로 목록", ""),
+    ("equation.macro.get", "수식 매크로 스크립트 보기", ""),
+    ("equation.macro.save", "수식 매크로 저장", ""),
+    ("equation.macro.delete", "수식 매크로 지우기", ""),
     ("chart.list", "차트 목록", ""),
     ("chart.data.get", "차트 데이터 조회", ""),
     ("chart.data", "차트 데이터 고치기 (값·계열 이름)", ""),
@@ -48,6 +59,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("form.list", "양식 개체 목록", ""),
     ("form.get", "양식 개체 정보 조회", ""),
     ("form.set", "양식 개체 값 고치기 (value·text·caption)", ""),
+    (
+        "form.insert",
+        "양식 개체 넣기 (선택 상자·입력 상자·콤보 상자·라디오 단추·명령 단추)",
+        "",
+    ),
     (
         "object.align",
         "개체 맞춤 (왼쪽·가운데·오른쪽·위·중간·아래, 같은 너비·높이·크기, 가로·세로 간격 동일)",
@@ -90,6 +106,12 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "",
     ),
     (
+        "picture.effects",
+        "그림 효과 (그림자·네온·부드러운 가장자리·반사)",
+        "",
+    ),
+    ("picture.effects.get", "그림 효과 조회", ""),
+    (
         "insert.auto_number",
         "번호 넣기 (쪽·전체 쪽·그림·표·수식 번호)",
         "",
@@ -110,7 +132,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "picture.insert",
-        "path(PNG·JPG·BMP·GIF, 20 MB·8192 px 이하), width_mm(없으면 원본 비율), treat_as_char",
+        "path(PNG·JPG·BMP·GIF, 20 MB·8192 px 이하), width_mm(없으면 원본 비율), treat_as_char(생략하면 true=글자처럼 취급, 0.19부터; false면 캐럿 문단 기준·단 왼쪽·어울림으로 띄움). 표 셀 안에서는 treat_as_char와 관계없이 그 셀 왼쪽 위에 어울림으로 띄움(셀 안 글자처럼 그림은 아직 지원 안 함)",
         r##"{"path":"C:/img/logo.png","width_mm":60.0}"##,
     ),
     (
@@ -158,6 +180,37 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
         "script(수식 스크립트), size_pt, color(BGR), baseline, font_name → address",
         r##"{"script":"a^2+b^2=c^2","size_pt":10.0}"##,
     ),
+    (
+        "object.caption_text",
+        "address(그림·도형·묶음·차트·OLE), text(캡션 번호 뒤 문자열, 1,000자 이하) → 문서 정보. 캡션은 object.properties hasCaption으로 먼저 넣는다. 표는 table.caption_text",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"text":"분기별 매출 추이"}"##,
+    ),
+    (
+        "object.caption_text.get",
+        "address → text(캡션 번호 뒤 문자열)",
+        r##"{"address":{"section":0,"paragraph":0,"control":0}}"##,
+    ),
+    (
+        "equation.layout",
+        "script, size_pt → width·height·baseline(미리 보기 SVG 단위), items[{kind, text, x, y, width, height, start, end}](그려지는 조각과 그 조각을 만든 스크립트 범위, 유니코드 스칼라; 맞추지 못한 조각은 start·end null; kind slot은 빈 {} 칸), slots[](빈 {} 안쪽 위치)",
+        r##"{"script":"{a+b} over {}","size_pt":10.0}"##,
+    ),
+    (
+        "equation.macro.list",
+        "(없음) → macros[{name, script}] (설정 폴더 equation_macros.json)",
+        r##"{}"##,
+    ),
+    (
+        "equation.macro.get",
+        "name → script",
+        r##"{"name":"근의 공식"}"##,
+    ),
+    (
+        "equation.macro.save",
+        "name(1–40자), script(수식 넣기와 같은 검사) → 같은 이름은 바꿈, 200개까지",
+        r##"{"name":"근의 공식","script":"x = {-b +- sqrt {b^2 -4ac}} over {2a}"}"##,
+    ),
+    ("equation.macro.delete", "name", r##"{"name":"근의 공식"}"##),
     ("chart.list", "(없음) → 차트 목록", r##"{}"##),
     ("chart.data.get", "index → 계열·값", r##"{"index":0}"##),
     (
@@ -210,13 +263,18 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ("form.list", "(없음) → 양식 개체 목록", r##"{}"##),
     (
         "form.get",
-        "at{section,paragraph,control,cell?} → 종류·값",
+        "at{section,paragraph,control,cell?}(form.list·form.insert 가 돌려준 값, address 도 받음) → 종류·값",
         r##"{"at":{"section":0,"paragraph":0,"control":0}}"##,
     ),
     (
         "form.set",
-        "at, value|text|caption (종류별)",
-        r##"{"at":{"section":0,"paragraph":0,"control":0},"value":true}"##,
+        "at, value(선택 상자·라디오 단추: 1 또는 true=선택, 0 또는 false=해제)|text(입력·콤보)|caption(단추)",
+        r##"{"at":{"section":0,"paragraph":0,"control":0},"value":1}"##,
+    ),
+    (
+        "form.insert",
+        "kind check_box|edit|combo_box|radio_button|push_button, caption?(단추·상자 글, 기본 한글 기본값), text?(입력·콤보 값), checked?(선택·라디오), items?[](콤보 목록, 64개), group?(라디오 묶음), name?(문서에서 유일, 기본 CheckBox1…), width_mm?/height_mm?(3–200, 기본 한글 기본 크기) → at. 캐럿 자리에 글자처럼 넣는다(본문·표 셀)",
+        r##"{"kind":"check_box","caption":"동의합니다","checked":true}"##,
     ),
     (
         "object.align",
@@ -304,6 +362,16 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
         r##"{"address":{"section":0,"paragraph":0,"control":0},"mode":"grayscale"}"##,
     ),
     (
+        "picture.effects",
+        "address; 효과마다 객체=설정, null=해제, 없음=유지; clear=true면 모두 해제. shadow{style outside|inside, transparency 0–100, blur_mm, distance_mm, direction 0–360, color #RRGGBB}, glow{transparency, size_mm, color}, soft_edge{size_mm}, reflection{transparency_start, transparency_end, size 1–100(%), distance_mm, blur_mm} → effects. HWP(.hwp)는 아직 효과를 쓰지 못해 .hwp 저장은 거절된다(HWPX로 저장하거나 save_document dropPictureEffects:true로 효과를 빼고 저장)",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"shadow":{"transparency":60,"blur_mm":1.5,"distance_mm":2,"direction":45,"color":"#000000"},"glow":null}"##,
+    ),
+    (
+        "picture.effects.get",
+        "address → effects{shadow, glow, soft_edge, reflection} (없는 효과는 null)",
+        r##"{"address":{"section":0,"paragraph":0,"control":0}}"##,
+    ),
+    (
         "insert.auto_number",
         "kind page|total|picture|table|equation (본문 커서 위치)",
         r##"{"kind":"picture"}"##,
@@ -320,7 +388,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "note.shape",
-        "kind, section, props{numberFormat, prefixChar, suffixChar, startNumber, separatorEnabled, separatorLength(HWPUNIT; -1 단 폭), separatorLineType 0–17, separatorLineWidth, separatorColor \"#rrggbb\", numberCodeSuperscript, numbering continue|section|page}",
+        "kind, section, props{numberFormat, prefixChar, suffixChar, startNumber, separatorEnabled, separatorLength(HWPUNIT 0–32767, -1 = 5 cm(한글 기본), 미주만 -4 = 단 너비), separatorLineType 0–17, separatorLineWidth, separatorColor \"#rrggbb\", numberCodeSuperscript, numbering continue|section|page}",
         r##"{"kind":"footnote","props":{"separatorLength":5669,"startNumber":1}}"##,
     ),
     (
@@ -625,6 +693,19 @@ struct FormAt {
     #[serde(default)]
     cell: Option<Cell>,
 }
+/// A form value as an integer, or true/false for a check box or radio button.
+fn form_value<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Number(i64),
+        Flag(bool),
+    }
+    Ok(Option::<Value>::deserialize(d)?.map(|v| match v {
+        Value::Number(n) => n,
+        Value::Flag(b) => i64::from(b),
+    }))
+}
 pub(crate) fn form_type_name(t: hwpcraft_doc::model::control::FormType) -> &'static str {
     use hwpcraft_doc::model::control::FormType;
     match t {
@@ -691,8 +772,12 @@ impl Session {
                     path: std::path::PathBuf,
                     #[serde(default)]
                     width_mm: Option<f64>,
-                    #[serde(default)]
+                    /// Hangul's default for 그림 넣기 (0.19; false before).
+                    #[serde(default = "inline_by_default")]
                     treat_as_char: bool,
+                }
+                fn inline_by_default() -> bool {
+                    true
                 }
                 let p: Picture = serde_json::from_value(params)?;
                 let a = self.insert_picture(&p.path, p.width_mm, p.treat_as_char)?;
@@ -724,6 +809,63 @@ impl Session {
                 } else {
                     self.note_paragraphs(p.address)?
                 }}))
+            }
+            "object.caption_text" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Caption {
+                    address: ObjectAddress,
+                    text: String,
+                }
+                let p: Caption = serde_json::from_value(params)?;
+                self.set_object_caption_text(p.address, &p.text)?;
+                Ok(self.info())
+            }
+            "object.caption_text.get" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Get {
+                    address: ObjectAddress,
+                }
+                let p: Get = serde_json::from_value(params)?;
+                Ok(json!({"text": self.object_caption_text(p.address)?}))
+            }
+            "equation.layout" => {
+                let p: EquationOptions = serde_json::from_value(params)?;
+                Ok(serde_json::to_value(self.equation_layout(&p)?)?)
+            }
+            "equation.macro.list" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct NoParams {}
+                let _: NoParams = serde_json::from_value(params)?;
+                Ok(json!({"macros": crate::equation_macros::equation_macros()?}))
+            }
+            "equation.macro.get" | "equation.macro.delete" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Name {
+                    name: String,
+                }
+                let p: Name = serde_json::from_value(params)?;
+                if id == "equation.macro.get" {
+                    let script = crate::equation_macros::equation_macro(&p.name)?;
+                    Ok(json!({"name": p.name.trim(), "script": script}))
+                } else {
+                    crate::equation_macros::delete_equation_macro(&p.name)?;
+                    Ok(json!({"deleted": p.name.trim()}))
+                }
+            }
+            "equation.macro.save" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Save {
+                    name: String,
+                    script: String,
+                }
+                let p: Save = serde_json::from_value(params)?;
+                crate::equation_macros::save_equation_macro(&p.name, &p.script)?;
+                Ok(json!({"saved": p.name.trim()}))
             }
             "equation.insert" => {
                 #[derive(Deserialize)]
@@ -1017,7 +1159,13 @@ impl Session {
                 Ok(self.forms())
             }
             "form.get" => {
-                let p: Address = serde_json::from_value(params)?;
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct FormGet {
+                    #[serde(alias = "at")]
+                    address: ObjectAddress,
+                }
+                let p: FormGet = serde_json::from_value(params)?;
                 let a = p.address;
                 if !matches!(self.object(a)?, Control::Form(_)) {
                     bail!("양식 개체가 아닙니다.");
@@ -1029,12 +1177,16 @@ impl Session {
                         .map_err(err)?,
                 )
             }
+            "form.insert" => {
+                let p: crate::form_insert::FormSpec = serde_json::from_value(params)?;
+                Ok(json!({"at": self.insert_form(p)?}))
+            }
             "form.set" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct FormSet {
                     at: FormAt,
-                    #[serde(default)]
+                    #[serde(default, deserialize_with = "form_value")]
                     value: Option<i64>,
                     #[serde(default)]
                     text: Option<String>,
@@ -1265,6 +1417,32 @@ impl Session {
                     p.overwrite,
                 )?;
                 Ok(json!({"files":files}))
+            }
+            "picture.effects" => {
+                let mut p = params
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("picture.effects 인자는 객체입니다."))?;
+                let address: ObjectAddress = serde_json::from_value(
+                    p.remove("address")
+                        .ok_or_else(|| anyhow!("address가 필요합니다."))?,
+                )?;
+                if let Some(key) = p.keys().find(|k| {
+                    !["shadow", "glow", "soft_edge", "reflection", "clear"].contains(&k.as_str())
+                }) {
+                    bail!("picture.effects: 알 수 없는 항목 {key}");
+                }
+                self.set_picture_effects(address, &p)?;
+                Ok(json!({"effects": self.picture_effects(address)?}))
+            }
+            "picture.effects.get" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Get {
+                    address: ObjectAddress,
+                }
+                let p: Get = serde_json::from_value(params)?;
+                Ok(json!({"effects": self.picture_effects(p.address)?}))
             }
             "picture.recolor" => {
                 #[derive(Deserialize)]
@@ -1668,6 +1846,25 @@ impl Session {
         };
         let mut address = None;
         self.transaction(|s| {
+            // A paper-relative connector shows on its anchor paragraph's page: anchor it
+            // after its start object when the caret is on another page.
+            if let Some(e) = &ends
+                && s.page_of_object(ObjectAddress {
+                    control: 0,
+                    section: s.cursor.section,
+                    paragraph: s.cursor.paragraph,
+                })? != e.page
+            {
+                let at = Cursor {
+                    section: e.anchor.section,
+                    paragraph: e.anchor.paragraph,
+                    offset: 0,
+                    cell: None,
+                };
+                let len = s.paragraph(at)?.text.chars().count();
+                s.cursor = Cursor { offset: len, ..at };
+                s.anchor = None;
+            }
             let c = s.reserve_object_position()?;
             let response = s
                 .core
@@ -1896,8 +2093,12 @@ pub(crate) struct ConnectorEnds {
     start_point: u32,
     end_id: u32,
     end_point: u32,
-    /// (start x, start y, end x, end y)
+    /// (start x, start y, end x, end y), paper coordinates of the shared page.
     points: (i32, i32, i32, i32),
+    /// The page both objects are shown on.
+    page: u32,
+    /// The start object: a connector made elsewhere is anchored in its paragraph.
+    anchor: ObjectAddress,
 }
 
 impl Session {
@@ -1962,13 +2163,151 @@ impl Session {
             return Ok(());
         }
         self.core.update_connectors_in_section(a.section);
+        self.reroute_connectors_from_layout(a.section)?;
         self.relayout_object(a)
     }
 
+    /// RHWP routes connectors from their objects' stored offsets, which are paper
+    /// coordinates only for floating paper-relative objects. Connectors to any other
+    /// object (paragraph- or column-relative, treated as a character) are routed again
+    /// from where the layout shows the two objects, when both are on one page.
+    fn reroute_connectors_from_layout(&mut self, section: usize) -> Result<()> {
+        use hwpcraft_doc::model::shape::{HorzRelTo, VertRelTo};
+        let Some(sec) = self.core.document().sections.get(section) else {
+            return Ok(());
+        };
+        // Subject id → (address, routed correctly by RHWP).
+        let mut subjects = std::collections::HashMap::new();
+        let mut connectors = Vec::new();
+        for (pi, p) in sec.paragraphs.iter().enumerate() {
+            for (ci, c) in p.controls.iter().enumerate() {
+                let a = ObjectAddress {
+                    section,
+                    paragraph: pi,
+                    control: ci,
+                };
+                let (common, inst) = match c {
+                    Control::Shape(s) => {
+                        if let ShapeObject::Line(l) = s.as_ref() {
+                            if let Some(k) = &l.connector
+                                && l.common.vert_rel_to == VertRelTo::Paper
+                                && l.common.horz_rel_to == HorzRelTo::Paper
+                                && !l.common.treat_as_char
+                            {
+                                connectors.push((
+                                    a,
+                                    k.start_subject_id,
+                                    k.start_subject_index,
+                                    k.end_subject_id,
+                                    k.end_subject_index,
+                                ));
+                            }
+                            continue;
+                        }
+                        (s.common(), s.drawing().map(|d| d.inst_id).unwrap_or(0))
+                    }
+                    Control::Picture(p) => (&p.common, 0),
+                    _ => continue,
+                };
+                let paper = !common.treat_as_char
+                    && common.vert_rel_to == VertRelTo::Paper
+                    && common.horz_rel_to == HorzRelTo::Paper;
+                // The ids RHWP's connector routing accepts for an object.
+                let mut ids = vec![inst];
+                if common.instance_id != 0 {
+                    ids.extend([common.instance_id, (common.instance_id & 0x3FFF_FFFF) + 1]);
+                }
+                for id in ids.into_iter().filter(|id| *id != 0) {
+                    subjects.entry(id).or_insert((a, paper));
+                }
+            }
+        }
+        for (a, start_id, start_index, end_id, end_index) in connectors {
+            let (Some(&(start, start_paper)), Some(&(end, end_paper))) =
+                (subjects.get(&start_id), subjects.get(&end_id))
+            else {
+                continue;
+            };
+            if start_paper && end_paper {
+                continue;
+            }
+            let (Ok((s_page, s_pts)), Ok((e_page, e_pts))) =
+                (self.connection_points(start), self.connection_points(end))
+            else {
+                continue;
+            };
+            if s_page != e_page || self.page_of_object(a)? != s_page {
+                continue;
+            }
+            let (sx, sy) = s_pts[start_index.min(3) as usize];
+            let (ex, ey) = e_pts[end_index.min(3) as usize];
+            let doc = self.core.document_mut();
+            let sec = &mut doc.sections[section];
+            if let Some(Control::Shape(s)) = sec.paragraphs[a.paragraph].controls.get_mut(a.control)
+                && let ShapeObject::Line(line) = s.as_mut()
+            {
+                let (min_x, min_y) = (sx.min(ex), sy.min(ey));
+                let w = (sx.max(ex) - min_x).max(1) as u32;
+                let h = (sy.max(ey) - min_y).max(1) as u32;
+                line.common.horizontal_offset = min_x.max(0) as u32;
+                line.common.vertical_offset = min_y.max(0) as u32;
+                line.common.width = w;
+                line.common.height = h;
+                line.start.x = sx - min_x;
+                line.start.y = sy - min_y;
+                line.end.x = ex - min_x;
+                line.end.y = ey - min_y;
+                let attr = &mut line.drawing.shape_attr;
+                attr.current_width = w;
+                attr.original_width = w;
+                attr.current_height = h;
+                attr.original_height = h;
+                attr.rotation_center.x = w as i32 / 2;
+                attr.rotation_center.y = h as i32 / 2;
+                attr.raw_rendering = Vec::new();
+                sec.raw_stream = None;
+            }
+            self.core.recalculate_connector_routing(
+                a.section,
+                a.paragraph,
+                a.control,
+                start_index,
+                end_index,
+            );
+        }
+        Ok(())
+    }
+
+    /// Connection points of an object in paper HWPUNIT with its page. A floating
+    /// paper-relative object's offsets are exact paper coordinates; any other object
+    /// (paragraph- or column-relative, treated as a character) connects where the page
+    /// layout draws it.
+    fn connection_points(&self, a: ObjectAddress) -> Result<(u32, [(i32, i32); 4])> {
+        use hwpcraft_doc::model::shape::{HorzRelTo, VertRelTo};
+        let common = common_of(self.object(a)?).ok_or_else(|| anyhow!("그림·도형이 아닙니다."))?;
+        let (page, x, y, w, h) = if !common.treat_as_char
+            && common.vert_rel_to == VertRelTo::Paper
+            && common.horz_rel_to == HorzRelTo::Paper
+        {
+            (
+                self.page_of_object(a)?,
+                common.horizontal_offset as i32,
+                common.vertical_offset as i32,
+                common.width as i32,
+                common.height as i32,
+            )
+        } else {
+            let (page, [x, y, w, h]) = self.object_box(a)?;
+            let hu = |px: f64| (px * 75.0).round() as i32;
+            (page, hu(x), hu(y), hu(w), hu(h))
+        };
+        let (cx, cy) = (x + w / 2, y + h / 2);
+        Ok((page, [(cx, y), (x + w, cy), (cx, y + h), (x, cy)]))
+    }
     fn connector_ends(&self, start: ConnectorEnd, end: ConnectorEnd) -> Result<ConnectorEnds> {
-        /// (subject id, connection point index, the four connection points).
-        type Subject = (u32, u32, [(i32, i32); 4]);
-        let section = self.cursor.section;
+        /// (subject id, connection point index, page, the four connection points).
+        type Subject = (u32, u32, u32, [(i32, i32); 4]);
+        let section = start.address.section;
         let resolve = |e: ConnectorEnd| -> Result<Subject> {
             if e.address.section != section {
                 bail!("연결선과 연결할 도형은 같은 구역에 있어야 합니다.");
@@ -1976,39 +2315,32 @@ impl Session {
             if e.point >= CONNECT_POINTS {
                 bail!("연결점은 0(위)·1(오른쪽)·2(아래)·3(왼쪽)입니다.");
             }
-            let (common, id) = match self.object(e.address)? {
+            let id = match self.object(e.address)? {
                 Control::Shape(s) => {
                     if matches!(s.as_ref(), ShapeObject::Line(_)) {
                         bail!("직선·연결선에는 연결선을 붙일 수 없습니다.");
                     }
-                    let id = s
-                        .drawing()
+                    s.drawing()
                         .map(|d| d.inst_id)
                         .filter(|i| *i != 0)
-                        .unwrap_or(s.common().instance_id);
-                    (s.common(), id)
+                        .unwrap_or(s.common().instance_id)
                 }
-                Control::Picture(p) => (&p.common, p.common.instance_id),
+                Control::Picture(p) => p.common.instance_id,
                 _ => bail!("연결선은 도형·그림에만 붙일 수 있습니다."),
             };
-            if common.treat_as_char {
-                bail!("글자처럼 취급한 개체에는 연결선을 붙일 수 없습니다.");
-            }
             if id == 0 {
                 bail!("개체 식별자가 없어 연결선을 붙일 수 없습니다.");
             }
-            let (x, y) = (
-                common.horizontal_offset as i32,
-                common.vertical_offset as i32,
-            );
-            let (w, h) = (common.width as i32, common.height as i32);
-            let (cx, cy) = (x + w / 2, y + h / 2);
-            Ok((id, e.point, [(cx, y), (x + w, cy), (cx, y + h), (x, cy)]))
+            let (page, points) = self.connection_points(e.address)?;
+            Ok((id, e.point, page, points))
         };
-        let (start_id, start_point, s_pts) = resolve(start)?;
-        let (end_id, end_point, e_pts) = resolve(end)?;
+        let (start_id, start_point, s_page, s_pts) = resolve(start)?;
+        let (end_id, end_point, e_page, e_pts) = resolve(end)?;
         if start_id == end_id {
             bail!("연결선의 시작과 끝은 다른 개체여야 합니다.");
+        }
+        if s_page != e_page {
+            bail!("연결선으로 이을 두 개체는 같은 쪽에 있어야 합니다.");
         }
         let (sx, sy) = s_pts[start_point as usize % 4];
         let (ex, ey) = e_pts[end_point as usize % 4];
@@ -2018,6 +2350,8 @@ impl Session {
             end_id,
             end_point,
             points: (sx, sy, ex, ey),
+            page: s_page,
+            anchor: start.address,
         })
     }
     /// After RHWP created a one-way connector: attach ends, widen to both-way, add arrow heads.
@@ -2243,24 +2577,41 @@ impl Session {
     }
     /// 모두 풀기 (ShapeObjUnlockAll); returns how many objects were locked.
     pub fn unlock_all_objects(&mut self) -> Result<usize> {
-        let locked = self
-            .core
-            .document()
-            .sections
-            .iter()
-            .flat_map(|s| s.paragraphs.iter())
-            .flat_map(|p| p.controls.iter())
-            .filter_map(common_of)
-            .filter(|c| c.locked)
-            .count();
-        if locked == 0 {
+        let mut locked = Vec::new();
+        for (section, s) in self.core.document().sections.iter().enumerate() {
+            for (paragraph, p) in s.paragraphs.iter().enumerate() {
+                for (control, c) in p.controls.iter().enumerate() {
+                    if common_of(c).is_some_and(|c| c.locked) {
+                        locked.push(ObjectAddress {
+                            section,
+                            paragraph,
+                            control,
+                        });
+                    }
+                }
+            }
+        }
+        if locked.is_empty() {
             return Ok(0);
         }
+        // One object at a time: RHWP's all-objects call drops the stored stream of every
+        // section with a table, picture or shape, locked or not, and a sealed section
+        // without one makes RHWP lay the whole document out as edited.
         self.transaction(|s| {
-            ok_value(&s.core.set_control_lock(None, None, false).map_err(err)?)?;
+            for &a in &locked {
+                let pil = s.para_in_list(a);
+                let v = ok_value(
+                    &s.core
+                        .set_control_lock(Some(pil), Some(a.control), false)
+                        .map_err(err)?,
+                )?;
+                if v["touched"] != 1 {
+                    bail!("개체 보호를 풀지 못했습니다: {v}");
+                }
+            }
             Ok(())
         })?;
-        Ok(locked)
+        Ok(locked.len())
     }
     /// 대칭 toggle through RHWP's Hangul-measured flip (bits + matrix). Shapes only;
     /// pictures keep the `horzFlip`/`vertFlip` picture properties.
@@ -3423,13 +3774,58 @@ impl Session {
         })?;
         inserted.ok_or_else(|| anyhow!("번호를 넣지 못했습니다."))
     }
-    /// Recompose and repaginate a section after a model-only edit. The empty endnote
-    /// shape call is RHWP's public path that does exactly that.
+    /// Recompose and repaginate a section after a model-only edit of its notes, note
+    /// shapes or numbers. The section definition is copied into its SectionDef
+    /// controls (what the HWP writer reads), then each paragraph holding a footnote,
+    /// an endnote or an auto number (the first paragraph when none does) is laid out
+    /// again in one batch. RHWP's empty endnote-shape apply did this before, but it
+    /// also numbers the section's endnotes again from its start number, which undid
+    /// numbers carried on from earlier sections.
     pub(crate) fn relayout_section(&mut self, section: usize) -> Result<()> {
-        self.core
-            .apply_endnote_shape_native(section, "{}")
-            .map_err(err)?;
-        Ok(())
+        let sec = self
+            .core
+            .document_mut()
+            .sections
+            .get_mut(section)
+            .ok_or_else(|| anyhow!("구역이 없습니다."))?;
+        let endnotes = &mut sec.section_def.endnote_shape;
+        endnotes.attr = endnotes.encode_attr();
+        let def = sec.section_def.clone();
+        for control in sec
+            .paragraphs
+            .iter_mut()
+            .flat_map(|p| p.controls.iter_mut())
+        {
+            if let Control::SectionDef(d) = control {
+                **d = def.clone();
+            }
+        }
+        sec.raw_stream = None;
+        let mut paragraphs: Vec<usize> = sec
+            .paragraphs
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                p.controls.iter().any(|c| {
+                    matches!(
+                        c,
+                        Control::Footnote(_) | Control::Endnote(_) | Control::AutoNumber(_)
+                    )
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if paragraphs.is_empty() {
+            paragraphs.push(0);
+        }
+        self.deferred_layout(|s| {
+            for paragraph in paragraphs {
+                s.core
+                    .relayout_paragraph_native(section, paragraph, None)
+                    .map_err(err)?;
+            }
+            Ok(())
+        })
     }
 
     /// Footnote / endnote in the caret paragraph (first one at or after the caret).
@@ -3575,9 +3971,11 @@ impl Session {
             "startNumber": shape.start_number,
             "separatorEnabled": shape.separator_length != 0 || shape.separator_line_type != 0 || shape.separator_line_width != 0,
             "separatorLength": shape.separator_length,
+            // Same slots as the setter and RHWP's endnote getter: Hangul's "구분선 아래"
+            // is `note_spacing`, "주석 사이" the undocumented `raw_unknown`.
             "separatorMarginTop": shape.separator_margin_top,
-            "separatorMarginBottom": shape.separator_margin_bottom,
-            "noteSpacing": shape.note_spacing,
+            "separatorMarginBottom": shape.note_spacing,
+            "noteSpacing": shape.raw_unknown,
             "separatorLineType": shape.separator_line_type,
             "separatorLineWidth": shape.separator_line_width,
             "separatorColor": format!("#{:02x}{:02x}{:02x}", color & 0xff, (color >> 8) & 0xff, (color >> 16) & 0xff),
@@ -3608,7 +4006,11 @@ impl Session {
                             .all(|ch| !ch.is_control() && u32::from(ch) <= 0xFFFF)
                 }),
                 "startNumber" => v.as_u64().is_some_and(|n| (1..=9999).contains(&n)),
-                "separatorLength" => v.as_i64().is_some_and(|n| (-1..=170_079).contains(&n)),
+                // HWP keeps the length in 16 bits; -1 (5 cm) and, for endnotes, -4
+                // (column width) are the presets Hangul writes (RHWP samples).
+                "separatorLength" => v.as_i64().is_some_and(|n| {
+                    (-1..=i64::from(i16::MAX)).contains(&n) || (endnote && n == -4)
+                }),
                 "separatorMarginTop" | "separatorMarginBottom" | "noteSpacing" => {
                     v.as_i64().is_some_and(|n| (0..=28_346).contains(&n))
                 }
@@ -3641,6 +4043,21 @@ impl Session {
                     .apply_endnote_shape_native(section, &json)
                     .map_err(err)?;
                 ok_value(&raw)?;
+                // RHWP turns a negative preset into 0 (no line); keep the preset.
+                if let Some(n) = o.get("separatorLength").and_then(Value::as_i64)
+                    && n < 0
+                    && o.get("separatorEnabled") != Some(&Value::Bool(false))
+                {
+                    let sec = s
+                        .core
+                        .document_mut()
+                        .sections
+                        .get_mut(section)
+                        .ok_or_else(|| anyhow!("구역이 없습니다."))?;
+                    sec.section_def.endnote_shape.separator_length = n as i32;
+                    sec.raw_stream = None;
+                    s.relayout_section(section)?;
+                }
                 return Ok(());
             }
             {

@@ -70,6 +70,26 @@ HTTP는 `POST /mcp`를 사용합니다. `Content-Type: application/json`, `Accep
 
 `list_commands`와 `id` 없는 `hwp_action` 목록 조회에는 문서 핸들이 필요하지 않습니다. 나머지 도구에는 현재 discovery의 스키마에 따라 핸들을 명시하세요.
 
+## 데스크톱 창 연결
+
+실행 중인 HwpCraft 데스크톱 창의 문서를 MCP로 고칠 수 있습니다. 도구 탭의 **MCP 연결**(`tools.mcp_connect`)을 켜면 데스크톱 프로세스 안에서 같은 MCP 서버가 HTTP로 뜹니다.
+
+- 주소: `http://127.0.0.1:7083/mcp` (CLI HTTP 기본값 7082와 겹치지 않습니다). 루프백 전용입니다.
+- 인증: CLI HTTP와 같은 `Authorization: Bearer <token>`이며, 토큰은 설정 폴더의 `mcp-http-token`에 있습니다.
+- 연결 정보 창에 주소, 토큰 파일 위치, 연결된 문서 ID, 클라이언트 설정 예가 나옵니다.
+
+클라이언트는 `list_documents`로 창이 공유한 문서를 찾고(`source:"desktop"`), 그 `document_id`를 다른 문서 도구에 넘깁니다.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_documents","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+```
+
+- MCP로 고친 내용은 창에 바로 보이고 창의 실행 취소 기록에 들어갑니다.
+- 창 문서에 대한 `close_document`는 거절합니다(창을 닫지 않습니다). `new_document`·`open_document`는 창과 별개인 MCP 문서를 만듭니다.
+- 요청은 창의 화면 그리기 사이에 실행되며 한 프레임에 최대 30 ms를 씁니다. 편집 요청 하나가 실측 48 ms였습니다.
+- `list_documents`는 데스크톱이 공유한 문서만 돌려줍니다. MCP로 만든 문서의 핸들은 만든 클라이언트만 압니다.
+- 한계: 창의 문서 하나만 연결되며, 창을 닫거나 연결을 끄면 그 `document_id`는 더 쓸 수 없습니다.
+
 ## 도구와 결과 읽기
 
 | 도구 | 주요 인자·동작 (`document_id`는 위 규칙 적용) |
@@ -80,8 +100,9 @@ HTTP는 `POST /mcp`를 사용합니다. `Content-Type: application/json`, `Accep
 | `new_document` | `force?`: 새 독립 문서 또는 지정 문서 초기화 |
 | `open_document` | `path`, `force?`: 파일 열기 |
 | `open_protected_document` | `path`, `password`, `force?`: 암호 파일 열기 |
-| `save_document` | `path?`: HWP/HWPX 저장, PDF/TXT 내보내기. 생략하면 현재 저장 경로 |
+| `save_document` | `path?`: HWP/HWPX 저장, PDF/TXT/DOCX 내보내기(DOCX 결과의 `omitted`에 담지 못한 것 목록: 그리기 개체·수식·문단 번호 글자 등). 생략하면 현재 저장 경로. `acceptTrackChanges?`(기본 false): 한글 변경 추적 기록이 있는 문서는 HWP/HWPX 저장을 거절하며, true면 변경 내용을 지금 보이는 결과본으로 합치고 변경 기록을 지운 뒤 저장(`execute document.track_changes`로 상태 확인) `dropPictureEffects?`(기본 false): 그림 효과(그림자·네온·부드러운 가장자리·반사)는 아직 .hwp로 쓰지 못해, 모델에 효과가 있는 문서(`picture.effects`로 넣은 효과, HWPX에서 읽은 효과 포함)의 .hwp 저장은 거절됩니다. true면 효과를 뺀 뒤 저장하고(실행 취소 한 단계, 저장 실패 시 되돌림) 결과의 `droppedPictureEffects`에 뺀 수를 돌려줍니다. .hwp에서 연 효과는 원본 바이트로 왕복하므로 거절하지 않고, HWPX·PDF는 영향이 없습니다. |
 | `close_document` | `force?`: 지정 문서 닫기 |
+| `list_documents` | 입력 없음: 데스크톱 HwpCraft 사용자가 MCP에 공유한 문서의 `document_id`·제목·경로·미저장 여부. MCP로 만든 문서는 나열하지 않음 |
 | `type_text` | `text`: 선택 대체 또는 커서 입력, 줄바꿈은 새 문단 |
 | `select_text` | `text`, `occurrence?`: 문단 내 n번째 대소문자 구분 일치 선택 |
 | `get_text`, `inspect_document` | `start?`, `limit?`: 본문·1단계 표 셀 조회와 구조 조회 |
@@ -104,6 +125,7 @@ HTTP는 `POST /mcp`를 사용합니다. `Content-Type: application/json`, `Accep
 | `get_selection` | `cursor`, `anchor`, `spanAnchor`, `hasSelection`, `text`, `document_id` | |
 | `render_page` | `page`, `pages`, `width`, `height`, `document_id` | PNG는 별도 image content |
 | `close_document` | `closed`(true), `document_id` | |
+| `list_documents` | `documents[]`: `document_id`, `title`, `path`(null 가능), `source`(`desktop`), `dirty` | 공유한 데스크톱 문서가 없으면 빈 배열 |
 | `list_commands` | `items[]`: `id`, `label`, `shortcut`, `paramsHelp`, `paramsExample`, `hwpActions` | `paramsExample`은 명령마다 다름 |
 | `batch` | `results[]`: `command`, `ok`, (`result` 또는 `error`), `rolledBack`, `document_id` | 실패해도 같은 모양에 `message` 추가 |
 | `hwp_action` | 목록 `items[]` 또는 실행 `action`, `command`, `mapping`, `result`, `document_id` | `result`는 대응 명령의 결과 |

@@ -8,6 +8,7 @@ hwpcraft-engine.workspace = true
 hwpcraft-doc.workspace = true
 hwpcraft-render.workspace = true
 hwpcraft-formats.workspace = true
+hwpcraft-mcp.workspace = true
 egui.workspace = true
 eframe.workspace = true
 rfd.workspace = true

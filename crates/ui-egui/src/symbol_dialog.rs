@@ -485,7 +485,13 @@ impl HwpApp {
                 ui.separator();
                 // Right: 넣기 / 닫기 like Hangul's right-hand buttons.
                 ui.vertical(|ui| {
-                    let (ok, cancel) = chrome::actions(ui, !st.input.is_empty(), "넣기");
+                    let (ok, cancel) = chrome::actions(
+                        ui,
+                        st.input
+                            .is_empty()
+                            .then_some("넣을 문자를 표에서 고르거나 입력 칸에 넣으세요."),
+                        "넣기(D)",
+                    );
                     if ok {
                         insert = Some(st.input.clone());
                     }

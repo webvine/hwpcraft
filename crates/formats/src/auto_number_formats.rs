@@ -75,6 +75,12 @@ pub(crate) fn format_code(token: &str) -> Result<u8> {
     })
 }
 
+/// Opening and saving number the AutoNumbers from here up. The HWPX writer emits some
+/// autoNum elements from other state (a note created without its own number control
+/// is written with the note's number), so identities must not share their small range:
+/// only values from this base are identities, the rest stay as written.
+const EXPORT_IDENTITY_BASE: u16 = 0x8000;
+
 #[derive(Clone)]
 struct Identity {
     number: u16,
@@ -169,8 +175,8 @@ fn identity_xml(xml: &[u8], identities: &mut Vec<Identity>) -> Result<Vec<u8>> {
                     b"autoNum" => {
                         ensure!(current.is_none(), "중첩 자동 번호 XML은 지원하지 않습니다.");
                         ensure!(
-                            identities.len() < u16::MAX as usize,
-                            "자동 번호 65535개 제한을 초과했습니다."
+                            identities.len() < usize::from(u16::MAX - EXPORT_IDENTITY_BASE),
+                            "자동 번호 32767개 제한을 초과했습니다."
                         );
                         let number = attr_text(e, b"num", &reader)?
                             .unwrap_or_else(|| "0".into())
@@ -178,7 +184,8 @@ fn identity_xml(xml: &[u8], identities: &mut Vec<Identity>) -> Result<Vec<u8>> {
                             .context("HWPX 자동 번호 값 오류")?;
                         let index = identities.len();
                         identities.push(Identity { number, format: 0 });
-                        patch_attribute(xml, e, b"num", (index + 1).to_string(), &mut patches)?;
+                        let id = usize::from(EXPORT_IDENTITY_BASE) + index;
+                        patch_attribute(xml, e, b"num", id.to_string(), &mut patches)?;
                         if !empty {
                             current = Some(index);
                         }
@@ -213,10 +220,12 @@ fn restore_xml(xml: &[u8], identities: &[Identity], seen: &mut BTreeSet<usize>) 
                     let id: usize = attr_text(e, b"num", &reader)?
                         .ok_or_else(|| anyhow!("자동 번호 식별자 누락"))?
                         .parse()?;
-                    let index = id
-                        .checked_sub(1)
-                        .filter(|i| *i < identities.len())
-                        .ok_or_else(|| anyhow!("자동 번호 식별자 불일치"))?;
+                    // Written from other state than a model AutoNumber: keep as is.
+                    let Some(index) = id.checked_sub(usize::from(EXPORT_IDENTITY_BASE)) else {
+                        current = None;
+                        continue;
+                    };
+                    ensure!(index < identities.len(), "자동 번호 식별자 불일치");
                     ensure!(seen.insert(index), "중복 자동 번호 식별자");
                     patch_attribute(
                         xml,
@@ -480,7 +489,7 @@ fn restore(doc: &mut Document, identities: &[Identity]) -> Result<()> {
     let mut seen = BTreeSet::new();
     document(doc, |n| {
         let index = usize::from(n.assigned_number)
-            .checked_sub(1)
+            .checked_sub(usize::from(EXPORT_IDENTITY_BASE))
             .filter(|i| *i < identities.len())
             .ok_or_else(|| anyhow!("HWPX 자동 번호와 네이티브 제어의 식별자가 다릅니다."))?;
         seen.insert(index);
@@ -505,14 +514,14 @@ pub fn export(core: &DocumentCore, password: Option<&[u8]>) -> Result<Vec<u8>> {
     document(&mut doc, |n| {
         format_token(n.format)?;
         ensure!(
-            identities.len() < u16::MAX as usize,
-            "자동 번호 65535개 제한 초과"
+            identities.len() < usize::from(u16::MAX - EXPORT_IDENTITY_BASE),
+            "자동 번호 32767개 제한 초과"
         );
         identities.push(Identity {
             number: n.number,
             format: n.format,
         });
-        n.number = identities.len() as u16;
+        n.number = EXPORT_IDENTITY_BASE + (identities.len() - 1) as u16;
         n.assigned_number = n.number;
         Ok(())
     })?;
@@ -523,9 +532,9 @@ pub fn export(core: &DocumentCore, password: Option<&[u8]>) -> Result<Vec<u8>> {
         }
         .map_err(|e| anyhow!("{e}"));
     }
-    let mut transient = DocumentCore::new_empty();
-    transient.set_document(doc);
-    let native = transient.export_hwpx_native().map_err(|e| anyhow!("{e}"))?;
+    let native = crate::export_core(doc, core.source_format())
+        .export_hwpx_native()
+        .map_err(|e| anyhow!("{e}"))?;
     let mut seen = BTreeSet::new();
     let corrected = rewrite_package(&native, |xml| restore_xml(xml, &identities, &mut seen))?;
     ensure!(
@@ -546,6 +555,8 @@ pub fn export(core: &DocumentCore, password: Option<&[u8]>) -> Result<Vec<u8>> {
 /// gap and emits the same native AutoNumber control, whose parser restores SPACE.
 /// Only a proven existing control's one-scalar placeholder is changed in this
 /// transient export model; the editable document and saved control stay native.
+/// The returned core holds only the model (no layout): pass it to the HWP
+/// serializer and never render from it.
 pub fn prepare_hwp(core: &DocumentCore) -> Result<Option<DocumentCore>> {
     if !core
         .document()
@@ -614,9 +625,10 @@ pub fn prepare_hwp(core: &DocumentCore) -> Result<Option<DocumentCore>> {
     if !changed {
         return Ok(None);
     }
-    let mut prepared = DocumentCore::new_empty();
-    prepared.set_document(doc);
-    Ok(Some(prepared))
+    // `doc` is the HWP snapshot: the HWPX->HWP adapter already ran on it (before
+    // the U+FFFC placeholders above, so its full-width space fix saw the original
+    // text). As an `Hwp` source the HWP writer does not run the adapter again.
+    Ok(Some(crate::export_core(doc, hwpcraft_doc::FileFormat::Hwp)))
 }
 
 #[cfg(test)]

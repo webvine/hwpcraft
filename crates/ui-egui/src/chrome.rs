@@ -77,8 +77,39 @@ pub fn tabs(ui: &mut Ui, selected: &mut usize, labels: &[&str]) {
     });
     ui.separator();
 }
-pub fn actions(ui: &mut Ui, valid: bool, label: &str) -> (bool, bool) {
+/// Give a dialog's first text field the keyboard when the dialog opens: while nothing,
+/// or only the document page behind the dialog, holds it.
+pub fn first_focus(field: &egui::Response) {
+    let canvas = egui::Id::new("document-canvas");
+    if field
+        .ctx
+        .memory(|m| m.focused().is_none_or(|id| id == canvas))
+    {
+        field.request_focus();
+    }
+}
+/// The key of a button label's Hangul access letter, "설정(D)" → D.
+pub fn mnemonic(label: &str) -> Option<egui::Key> {
+    let inner = label.strip_suffix(')')?.rsplit_once('(')?.1;
+    let mut chars = inner.chars();
+    let c = chars.next().filter(|c| c.is_ascii_alphanumeric())?;
+    if chars.next().is_some() {
+        return None;
+    }
+    egui::Key::from_name(&c.to_ascii_uppercase().to_string())
+}
+/// The apply and 취소 buttons of a dialog. `grey` is why apply is unavailable (shown on
+/// the grey button), None when it can run. Enter applies (unless a text field has the
+/// keyboard) and Alt + the label's access letter applies too, as in the shell dialogs.
+pub fn actions(ui: &mut Ui, grey: Option<&str>, label: &str) -> (bool, bool) {
     ui.set_width(82.0);
+    let ctx = ui.ctx().clone();
+    let valid = grey.is_none();
+    let keyed = valid
+        && (mnemonic(label)
+            .is_some_and(|key| ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, key)))
+            || (!ctx.egui_wants_keyboard_input()
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))));
     let apply = ui
         .add_enabled(
             valid,
@@ -87,7 +118,9 @@ pub fn actions(ui: &mut Ui, valid: bool, label: &str) -> (bool, bool) {
                 .stroke(Stroke::new(1.5, Tokens::ACCENT))
                 .min_size(Vec2::new(80.0, 28.0)),
         )
-        .clicked();
+        .on_disabled_hover_text(grey.unwrap_or_default())
+        .clicked()
+        || keyed;
     let cancel = ui
         .add(egui::Button::new("취소").min_size(Vec2::new(80.0, 28.0)))
         .clicked();

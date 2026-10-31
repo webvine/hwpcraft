@@ -278,14 +278,20 @@ impl Session {
                 paragraph: index("paraIdx")?,
                 control: index("controlIdx")?,
             };
-            if treat_as_char {
+            // A floating picture is anchored where it is inserted (the caret
+            // paragraph, the column's left edge), not at the paper's corner. In a
+            // table cell RHWP already anchors it to the paper at that cell's
+            // top-left corner (a floating sibling of the table, as Hangul stores
+            // one); re-anchoring it to the host paragraph would move it to the
+            // table's first cell, or beside the table as a character.
+            if c.cell.is_none() {
+                let placement = if treat_as_char {
+                    r#"{"treatAsChar":true}"#
+                } else {
+                    r#"{"vertRelTo":"Para","vertOffset":0,"horzRelTo":"Column","horzOffset":0,"textWrap":"Square"}"#
+                };
                 s.core
-                    .set_picture_properties_native(
-                        a.section,
-                        a.paragraph,
-                        a.control,
-                        r#"{"treatAsChar":true}"#,
-                    )
+                    .set_picture_properties_native(a.section, a.paragraph, a.control, placement)
                     .map_err(err)?;
             }
             inserted = Some(a);
@@ -330,6 +336,10 @@ impl Session {
             .get(address.index)
             .ok_or_else(|| anyhow!("셀 범위를 벗어났습니다."))?;
         let (row, col) = (cell.row, cell.col);
+        // A row below or a column right of a merged cell goes after its last row or
+        // column, as in Hangul (a row inserted inside the span would widen the merge).
+        let last_row = row.saturating_add(cell.row_span.max(1)).saturating_sub(1);
+        let last_col = col.saturating_add(cell.col_span.max(1)).saturating_sub(1);
         let (rows, cols) = (t.row_count, t.col_count);
         let merge_end = if matches!(edit, TableEdit::MergeRight) {
             let next_col = col.saturating_add(cell.col_span);
@@ -375,22 +385,34 @@ impl Session {
         }
         self.transaction(|s| {
             let r = match edit {
-                TableEdit::RowAbove | TableEdit::RowBelow => s.core.insert_table_row_native(
+                TableEdit::RowAbove => s.core.insert_table_row_native(
                     c.section,
                     c.paragraph,
                     address.control,
                     row,
-                    matches!(edit, TableEdit::RowBelow),
+                    false,
                 ),
-                TableEdit::ColumnLeft | TableEdit::ColumnRight => {
-                    s.core.insert_table_column_native(
-                        c.section,
-                        c.paragraph,
-                        address.control,
-                        col,
-                        matches!(edit, TableEdit::ColumnRight),
-                    )
-                }
+                TableEdit::RowBelow => s.core.insert_table_row_native(
+                    c.section,
+                    c.paragraph,
+                    address.control,
+                    last_row,
+                    true,
+                ),
+                TableEdit::ColumnLeft => s.core.insert_table_column_native(
+                    c.section,
+                    c.paragraph,
+                    address.control,
+                    col,
+                    false,
+                ),
+                TableEdit::ColumnRight => s.core.insert_table_column_native(
+                    c.section,
+                    c.paragraph,
+                    address.control,
+                    last_col,
+                    true,
+                ),
                 TableEdit::DeleteRow => {
                     s.core
                         .delete_table_row_native(c.section, c.paragraph, address.control, row)
@@ -446,6 +468,17 @@ impl Session {
     }
     /// Tab / Shift+Tab inside a table: Hangul's TableRightCellAppend / TableLeftCell.
     pub fn move_cell(&mut self, backward: bool) -> Result<()> {
+        self.recorded(
+            || {
+                Some(crate::MacroStep {
+                    command: "caret.move_cell".into(),
+                    params: json!({ "backward": backward }),
+                })
+            },
+            |s| s.move_cell_unrecorded(backward),
+        )
+    }
+    fn move_cell_unrecorded(&mut self, backward: bool) -> Result<()> {
         let a = self.table_target(None)?;
         self.move_in_table(a, if backward { "prev" } else { "next" })?;
         Ok(())

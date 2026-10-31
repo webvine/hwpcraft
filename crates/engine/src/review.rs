@@ -18,7 +18,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[(
 /// Parameter help and JSON example per command, for `command_help`.
 pub const PARAMS: &[(&str, &str, &str)] = &[(
     "review.compare",
-    "path(필수): 비교할 HWP/HWPX/HML 파일. ignore_whitespace(선택): 띄어쓰기 차이 무시. password(선택): 암호 문서. 현재 문서를 수정본, 파일을 원본으로 보고 findings[]에 종류(label)·위치(section, paragraph, cursor)·내용(detail)을 돌려줍니다. 글상자·각주·머리말 안은 비교하지 않습니다.",
+    "path(필수): 비교할 HWP/HWPX/HML 파일. ignore_whitespace(선택): 띄어쓰기 차이 무시. password(선택): 암호 문서. 현재 문서를 수정본, 파일을 원본으로 보고 findings[]에 종류(label)·위치(section, paragraph, cursor)·내용(detail: RHWP 원문 A=현재·B=파일, text: 사용자 문구)을 돌려줍니다. 글상자·각주·머리말 안은 비교하지 않습니다.",
     r#"{"path":"original.hwpx","ignore_whitespace":true}"#,
 )];
 
@@ -51,6 +51,63 @@ fn label(kind: FindingKind) -> &'static str {
         FindingKind::StyleCountChanged => "스타일 수 변경",
         FindingKind::StyleChanged => "스타일 정의 변경",
     }
+}
+
+/// A finding's `detail` in the user's words: RHWP writes `A=… B=…` (A is the current
+/// document, B the file) and model field names such as `para_shape_id`.
+fn detail_text(detail: &str) -> String {
+    static CELL: std::sync::LazyLock<Option<regex::Regex>> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\(r(\d+),c(\d+)\)").ok());
+    const WORDS: [(&str, &str); 10] = [
+        ("B 에만 있는 문단", "비교 파일에만 있는 문단"),
+        ("A 에만 있는 문단", "현재 문서에만 있는 문단"),
+        ("para_shape_id", "문단 모양 번호"),
+        ("char_shape_id", "글자 모양 번호"),
+        ("style_id", "스타일 번호"),
+        ("컨트롤 수", "개체 수"),
+        ("컨트롤 종류", "개체 종류"),
+        ("영문이름", "영문 이름"),
+        ("행렬", "줄×칸"),
+        ("셀 주소", "셀 위치"),
+    ];
+    const KINDS: [(&str, &str); 14] = [
+        ("sectionDef", "구역 정의"),
+        ("columnDef", "단 정의"),
+        ("table", "표"),
+        ("shape", "도형"),
+        ("picture", "그림"),
+        ("header", "머리말"),
+        ("footer", "꼬리말"),
+        ("footnote", "각주"),
+        ("endnote", "미주"),
+        ("bookmark", "책갈피"),
+        ("hyperlink", "하이퍼링크"),
+        ("equation", "수식"),
+        ("field", "필드"),
+        ("form", "양식 개체"),
+    ];
+    let mut text = detail.to_owned();
+    for (from, to) in WORDS {
+        text = text.replace(from, to);
+    }
+    if text.starts_with("개체 종류") {
+        for (from, to) in KINDS {
+            text = text.replace(&format!("={from}"), &format!("={to}"));
+        }
+    }
+    let text = match CELL.as_ref() {
+        Some(cell) => cell
+            .replace_all(&text, |c: &regex::Captures| {
+                let n = |i: usize| {
+                    c[i].parse::<u32>()
+                        .map_or_else(|_| c[i].to_owned(), |v| (v + 1).to_string())
+                };
+                format!("{}줄 {}칸", n(1), n(2))
+            })
+            .into_owned(),
+        None => text,
+    };
+    text.replace("A=", "현재 ").replace(" B=", " · 파일 ")
 }
 
 impl Session {
@@ -146,6 +203,7 @@ impl Session {
                     "section": f.path.section(),
                     "paragraph": f.path.paragraph(),
                     "detail": f.detail,
+                    "text": detail_text(&f.detail),
                     "cursor": cursor,
                 })
             })
@@ -164,5 +222,38 @@ impl Session {
             "summary": summary,
             "findings": findings,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detail_text;
+
+    #[test]
+    fn details_read_as_current_and_file_without_model_names() {
+        assert_eq!(
+            detail_text(r#"A="새 문장" B="옛 문장""#),
+            r#"현재 "새 문장" · 파일 "옛 문장""#
+        );
+        assert_eq!(
+            detail_text("para_shape_id: A=3 B=5, style_id: A=0 B=2"),
+            "문단 모양 번호: 현재 3 · 파일 5, 스타일 번호: 현재 0 · 파일 2"
+        );
+        assert_eq!(
+            detail_text("컨트롤 종류: A=table B=picture"),
+            "개체 종류: 현재 표 · 파일 그림"
+        );
+        assert_eq!(
+            detail_text("셀 주소: A=(r0,c1) B=(r2,c3)"),
+            "셀 위치: 현재 1줄 2칸 · 파일 3줄 4칸"
+        );
+        assert_eq!(
+            detail_text(r#"B 에만 있는 문단: "둘째""#),
+            r#"비교 파일에만 있는 문단: "둘째""#
+        );
+        assert_eq!(
+            detail_text("행렬: A=2x3 B=3x3"),
+            "줄×칸: 현재 2x3 · 파일 3x3"
+        );
     }
 }

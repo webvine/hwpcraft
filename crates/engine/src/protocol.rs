@@ -29,242 +29,238 @@ struct Replace {
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "edit.delete_ctrl_marks",
-        "kinds array: table,picture,shape,equation,footnote,endnote,bookmark,hyperlink,hidden_comment,field.",
+        "kinds 배열: table,picture,shape,equation,footnote,endnote,bookmark,hyperlink,hidden_comment,field.",
         r##"{"kinds":["bookmark"]}"##,
     ),
     (
         "edit.find",
-        "query, optional replacement and options:{case_sensitive,whole_word,direction:down/up/all}.",
+        "query, replacement(선택), options:{case_sensitive,whole_word,direction:down/up/all}.",
         r##"{"query":"기존","replacement":"변경","options":{"case_sensitive":true,"direction":"all"}}"##,
     ),
     (
         "edit.paste_html",
-        "HTML fragment (max 4 MB) inserted at the caret with its formatting; the selection is replaced.",
+        "캐럿에 서식과 함께 넣을 HTML 조각(4 MB까지). 선택은 바뀝니다.",
         r##"{"html":"<p><b>굵게</b> 보통</p>"}"##,
     ),
     (
         "edit.replace",
-        "query, optional replacement and options:{case_sensitive,whole_word,direction:down/up/all}.",
+        "query, replacement(선택), options:{case_sensitive,whole_word,direction:down/up/all}.",
         r##"{"query":"기존","replacement":"변경","options":{"case_sensitive":true,"direction":"all"}}"##,
     ),
     (
         "edit.replace_all",
-        "query, optional replacement and options:{case_sensitive,whole_word,direction:down/up/all}.",
+        "query, replacement(선택), options:{case_sensitive,whole_word,direction:down/up/all}. 기본 범위는 본문과 1단계 셀입니다. include(context.v2.list의 종류 배열, []이면 전부)를 주면 머리말·꼬리말·각주·미주·글상자·모든 깊이의 셀도 한 번에(실행 취소 한 단계) 바꾸고, 보호·읽기 전용 문맥의 일치는 건너뛰어 skippedProtected로 셉니다. options가 없으면 대소문자를 가리는 그대로 찾기입니다.",
         r##"{"query":"기존","replacement":"변경","options":{"case_sensitive":true,"direction":"all"}}"##,
     ),
     (
         "file.new",
-        "Blank document; force:true explicitly discards unsaved changes.",
+        "빈 문서. force:true면 저장하지 않은 변경을 버립니다.",
         r##"{"force":false}"##,
     ),
     (
         "file.save",
-        "HWP/HWPX save or PDF/TXT export. Only file.save permits omitting path.",
+        "HWP/HWPX 저장 또는 PDF/TXT 내보내기. path를 생략할 수 있는 것은 file.save뿐입니다.",
         r##"{"path":"output.hwpx"}"##,
     ),
     (
         "file.save_as",
-        "HWP/HWPX save or PDF/TXT export. Only file.save permits omitting path.",
+        "HWP/HWPX 저장 또는 PDF/TXT 내보내기. path를 생략할 수 있는 것은 file.save뿐입니다.",
         r##"{"path":"output.hwpx"}"##,
     ),
     (
         "format.paragraph",
-        "Partial paragraph properties. Use format.paragraph.get to inspect.",
+        "문단 속성 일부. format.paragraph.get으로 확인하세요.",
         r##"{"alignment":"center","lineSpacing":160}"##,
     ),
     (
         "hyperlink.update",
-        "field_id from hyperlink.list; new uri (http/https) and/or one-line text. Equal values are a no-op.",
+        "field_id: hyperlink.list의 값. 새 uri(http/https)와/또는 한 줄 text. 같은 값이면 아무것도 하지 않습니다.",
         r##"{"field_id":1,"uri":"https://example.org","text":"새 표시 글"}"##,
     ),
     (
         "insert.equation",
-        "Hancom equation script, size_pt 4–100.",
+        "한컴 수식 스크립트, size_pt 4–100.",
         r##"{"script":"a over b","size_pt":12}"##,
     ),
     (
         "insert.hyperlink",
-        "HTTP/HTTPS uri and optional displayed text.",
+        "HTTP/HTTPS uri와 표시할 text(선택).",
         r##"{"uri":"https://example.com","text":"참고"}"##,
     ),
     (
         "insert.picture",
-        "Image path, subject to read root.",
+        "그림 파일 경로(읽기 허용 폴더 안).",
         r##"{"path":"picture.png"}"##,
     ),
     (
         "note.set",
-        "ObjectAddress and replacement text.",
+        "ObjectAddress와 바꿀 글.",
         r##"{"address":{"section":0,"paragraph":0,"control":0},"text":"수정한 내용"}"##,
     ),
     (
         "page.header_footer",
-        "Header or footer plain text.",
+        "머리말 또는 꼬리말 일반 글.",
         r##"{"is_header":true,"text":"보고서"}"##,
     ),
     (
         "page.setup",
-        "Partial page setup; dimensions/margins in mm, landscape bool.",
+        "용지 설정 일부. 크기·여백은 mm, landscape는 bool. apply_to: section(기본, 캐럿 구역)|document(모든 구역, 구역마다 주지 않은 항목은 그대로).",
         r##"{"landscape":false,"width_mm":210,"height_mm":297}"##,
     ),
     (
         "select.text",
-        "Case-sensitive search within a paragraph. occurrence starts at 1.",
+        "한 문단 안에서 대소문자를 가려 찾습니다. occurrence는 1부터.",
         r##"{"text":"한글","occurrence":1}"##,
     ),
     (
         "selection.set",
-        "Zero-based Unicode scalar offset. Optional cell:{control,index,paragraph}; anchor is a scalar offset in the same paragraph.",
+        "0부터 센 유니코드 스칼라 오프셋. cell:{control,index,paragraph}(선택), anchor는 같은 문단 안의 스칼라 오프셋.",
         r##"{"cursor":{"section":0,"paragraph":0,"offset":2,"cell":null},"anchor":0}"##,
     ),
     (
         "symbol.search",
-        "query: U+XXXX / hex / #decimal code point, a typed character, a special-character name, or set keywords (Korean or English).",
+        "query: U+XXXX / 16진수 / #10진수 코드 포인트, 입력한 글자, 특수 문자 이름, 또는 묶음 낱말(한국어·영어).",
         r##"{"query":"화살표"}"##,
     ),
     ("symbol.sets", "No parameters.", r##"{}"##),
     ("symbol.special", "No parameters.", r##"{}"##),
     (
         "textbox.set",
-        "ObjectAddress and replacement text.",
+        "ObjectAddress와 바꿀 글.",
         r##"{"address":{"section":0,"paragraph":0,"control":0},"text":"수정한 내용"}"##,
     ),
     (
         "file.open",
-        "HWP/HWPX/HWP3/HML input path; force:true explicitly discards unsaved changes.",
+        "HWP/HWPX/HWP3/HML 파일 경로. force:true면 저장하지 않은 변경을 버립니다.",
         r##"{"path":"input.hwpx","force":false}"##,
     ),
     (
         "file.pdf",
-        "Export to a .pdf path.",
+        ".pdf 경로로 내보냅니다.",
         r##"{"path":"output.pdf"}"##,
     ),
     (
         "file.password",
-        "password string sets the password used by later HWP/HWPX saves; null clears it. Never logged.",
+        "password: 이후 HWP/HWPX 저장에 쓸 암호 문자열, null이면 지웁니다. 기록에 남기지 않습니다.",
         r##"{"password":"비밀번호"}"##,
     ),
     (
         "text.insert",
-        "text string; newlines split paragraphs. Maximum 1 MB per call.",
+        "text 문자열. 줄 바꿈으로 문단을 나눕니다. 한 번에 1 MB까지.",
         r##"{"text":"안녕하세요"}"##,
     ),
     (
         "insert.footnote",
-        "text of the new footnote at the caret.",
+        "text: 캐럿에 넣을 새 각주의 글.",
         r##"{"text":"각주 내용"}"##,
     ),
     (
         "insert.endnote",
-        "text of the new endnote at the caret.",
+        "text: 캐럿에 넣을 새 미주의 글.",
         r##"{"text":"미주 내용"}"##,
     ),
     (
         "document.text",
-        "Paginated body and first-level cells; follow nextStart. start >= 0, limit 1–1000.",
+        "본문과 1단계 셀을 나눠 읽습니다(nextStart를 따라감). start ≥ 0, limit 1–1000.",
         r##"{"start":0,"limit":100}"##,
     ),
     (
         "document.inspect",
-        "Paginated structure with style/shape references and selection; start >= 0, limit 1–1000.",
+        "스타일·모양 참조와 선택을 포함한 구조를 나눠 읽습니다. start ≥ 0, limit 1–1000.",
         r##"{"start":0,"limit":100}"##,
     ),
     (
         "format.character",
-        "Partial character properties. fontSize is 1/100 pt, colors #RRGGBB. Use format.character.get to inspect.",
+        "글자 속성 일부. fontSize는 1/100 pt, 색은 #RRGGBB. format.character.get으로 확인하세요.",
         r##"{"bold":true,"fontSize":1200}"##,
     ),
     (
         "format.character.get",
-        "No parameters; properties at the caret (or selection start).",
+        "매개 변수 없음. 캐럿(또는 선택 시작)의 글자 속성.",
         r##"{}"##,
     ),
     (
         "format.paragraph.get",
-        "No parameters; paragraph properties at the caret.",
+        "매개 변수 없음. 캐럿의 문단 속성.",
         r##"{}"##,
     ),
     (
         "insert.table",
-        "rows 1–30, columns 1–12 at the caret (body only).",
+        "rows 1–30, columns 1–12, 캐럿에(본문만). 결과의 `table`은 새 표 주소로 table.*·캡션 명령에 바로 넘길 수 있습니다.",
         r##"{"rows":2,"columns":3}"##,
     ),
     (
         "bookmark.add",
-        "Bookmark name at the caret.",
+        "캐럿에 넣을 책갈피 이름.",
         r##"{"name":"요약"}"##,
     ),
     (
         "bookmark.goto",
-        "Bookmark name to move to.",
+        "옮겨 갈 책갈피 이름.",
         r##"{"name":"요약"}"##,
     ),
     (
         "bookmark.delete",
-        "Bookmark name to remove.",
+        "지울 책갈피 이름.",
         r##"{"name":"요약"}"##,
     ),
     ("bookmark.list", "No parameters.", r##"{}"##),
-    (
-        "style.apply",
-        "Existing numeric style ID from style.list.",
-        r##"{"id":0}"##,
-    ),
+    ("style.apply", "style.list의 스타일 번호.", r##"{"id":0}"##),
     ("style.list", "No parameters.", r##"{}"##),
     (
         "page.columns",
-        "Column count and spacing in mm for the caret section.",
+        "캐럿 구역의 단 수와 간격(mm).",
         r##"{"count":2,"spacing_mm":8}"##,
     ),
     (
         "object.delete",
-        "ObjectAddress from object.list, passed directly (no address wrapper).",
+        "object.list의 ObjectAddress를 그대로 넘깁니다(address로 감싸지 않음).",
         r##"{"section":0,"paragraph":0,"control":0}"##,
     ),
     ("object.list", "No parameters.", r##"{}"##),
     (
         "shape.resize",
-        "ObjectAddress and dimensions in mm.",
+        "ObjectAddress와 mm 크기.",
         r##"{"address":{"section":0,"paragraph":0,"control":0},"width_mm":40,"height_mm":20}"##,
     ),
     (
         "equation.set",
-        "ObjectAddress and options:{script,size_pt}.",
+        "ObjectAddress와 options:{script,size_pt}.",
         r##"{"address":{"section":0,"paragraph":0,"control":0},"options":{"script":"x^2","size_pt":12}}"##,
     ),
     (
         "insert.shape",
-        "kind rectangle/ellipse/line/textbox/arc/polygon/curve, dimensions mm, text required.",
+        "kind rectangle/ellipse/line/textbox/arc/polygon/curve, 크기 mm, text 필수.",
         r##"{"kind":"rectangle","width_mm":40,"height_mm":20,"text":""}"##,
     ),
     (
         "edit.sort",
-        "key text/number, descending and case_sensitive booleans. Selected body paragraphs or whole section.",
+        "key text/number, descending·case_sensitive bool. 선택한 본문 문단 또는 구역 전체.",
         r##"{"key":"text","descending":false,"case_sensitive":false}"##,
     ),
     (
         "table.edit",
-        "action: row_above,row_below,column_left,column_right,delete_row,delete_column,fit_page,merge_right,split_merged. Select a cell first.",
-        r##"{"action":"row_below"}"##,
+        "action: row_above,row_below,column_left,column_right,delete_row,delete_column,fit_page,merge_right,split_merged; table?{section,paragraph,control}+row,col(0부터, 그 셀로 캐럿을 옮겨 편집) — 없으면 캐럿이 있는 셀",
+        r##"{"action":"row_below","table":{"section":0,"paragraph":0,"control":0},"row":0,"col":0}"##,
     ),
     (
         "insert.symbol",
-        "문자표: text (1–1000 characters, no line breaks) inserted at the caret; optional font applied to them only.",
+        "문자표: text(1–1000자, 줄 바꿈 없음)를 캐럿에 넣고, font(선택)는 그 글자에만 적용합니다.",
         r##"{"text":"★","font":"Segoe UI Symbol"}"##,
     ),
     (
         "symbol.list",
-        "set id from symbol.sets (hnc.*, ks.*, u.<hex>, emoji.*, special); start offset, limit 1–4096 (default 256).",
+        "set: symbol.sets의 id(hnc.*, ks.*, u.<hex>, emoji.*, special), start 오프셋, limit 1–4096(기본 256).",
         r##"{"set":"hnc.circled","start":0,"limit":64}"##,
     ),
     (
         "hyperlink.list",
-        "No parameters; links of the caret paragraph with fieldId/start/end/text/uri.",
+        "매개 변수 없음. 캐럿 문단의 링크: fieldId/start/end/text/uri.",
         r##"{}"##,
     ),
     (
         "hyperlink.remove",
-        "field_id from hyperlink.list; restore_format puts back the colour/underline the link covered.",
+        "field_id: hyperlink.list의 값. restore_format이면 링크가 덮었던 색·밑줄을 되돌립니다.",
         r##"{"field_id":1,"restore_format":true}"##,
     ),
     ("edit.undo", "No parameters.", r##"{}"##),
@@ -272,15 +268,11 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ("text.backspace", "No parameters.", r##"{}"##),
     ("text.delete", "No parameters.", r##"{}"##),
     ("paragraph.split", "No parameters.", r##"{}"##),
-    ("insert.page_break", "No parameters; body only.", r##"{}"##),
-    (
-        "insert.column_break",
-        "No parameters; body only.",
-        r##"{}"##,
-    ),
+    ("insert.page_break", "매개 변수 없음. 본문만.", r##"{}"##),
+    ("insert.column_break", "매개 변수 없음. 본문만.", r##"{}"##),
     (
         "insert.page_number",
-        "No parameters; centred page number in a new footer of the caret section.",
+        "매개 변수 없음. 캐럿 구역에 새 꼬리말을 만들고 가운데 쪽 번호를 넣습니다.",
         r##"{}"##,
     ),
 ];
@@ -289,6 +281,13 @@ impl Session {
     /// The CLI and automation share the exact desktop editing transactions.
     /// File destinations stay at the application boundary, never in a document command.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value> {
+        // 배포용 문서: read-only commands only, and no text in their results.
+        self.guard_distribution_command(id)?;
+        let step = self.record_run(id, &params);
+        let value = self.recorded(|| step, |s| s.run_unrecorded(id, params))?;
+        Ok(self.scrub_distribution(value))
+    }
+    fn run_unrecorded(&mut self, id: &str, params: Value) -> Result<Value> {
         let object = params
             .as_object()
             .context("명령 params는 JSON 객체여야 합니다.")?;
@@ -431,9 +430,25 @@ impl Session {
                 #[serde(deny_unknown_fields)]
                 struct Edit {
                     action: crate::TableEdit,
+                    #[serde(default)]
+                    table: Option<crate::ObjectAddress>,
+                    #[serde(default)]
+                    row: Option<u16>,
+                    #[serde(default)]
+                    col: Option<u16>,
                 }
                 let p: Edit = serde_json::from_value(params)?;
-                self.edit_table(p.action)?;
+                let before = self.cursor;
+                match (p.row, p.col) {
+                    (Some(row), Some(col)) => self.caret_to_table_cell(p.table, row, col)?,
+                    (None, None) if p.table.is_none() => {}
+                    _ => bail!("표 셀은 row와 col을 함께 지정하세요."),
+                }
+                if let Err(e) = self.edit_table(p.action) {
+                    // A refused edit leaves the caret where the caller had it.
+                    let _ = self.select(before, false);
+                    return Err(e);
+                }
                 return Ok(self.info());
             }
             "insert.hyperlink" => {
@@ -590,21 +605,88 @@ impl Session {
                 }
             }
             "page.setup" => {
-                let mut current = serde_json::to_value(self.page_setup()?)?;
-                let target = current
-                    .as_object_mut()
-                    .context("편집 용지 정보를 읽지 못했습니다.")?;
-                for (key, value) in object {
-                    if !target.contains_key(key) {
-                        bail!("알 수 없는 편집 용지 항목: {key}");
+                let mut object = object.clone();
+                // 적용 범위: the caret's section (default) or every section, each
+                // keeping the items not given (Hangul's ApplyTo 현재 구역 / 문서 전체).
+                let everywhere = match object.remove("apply_to") {
+                    None => false,
+                    Some(v) => match v.as_str() {
+                        Some("section") => false,
+                        Some("document") => true,
+                        _ => bail!("apply_to는 section 또는 document입니다."),
+                    },
+                };
+                let merged =
+                    |page: &hwpcraft_doc::model::page::PageDef| -> Result<crate::PageSetup> {
+                        let mut current = serde_json::to_value(crate::PageSetup::from_page(page))?;
+                        let target = current
+                            .as_object_mut()
+                            .context("편집 용지 정보를 읽지 못했습니다.")?;
+                        for (key, value) in &object {
+                            if !target.contains_key(key) {
+                                bail!("알 수 없는 편집 용지 항목: {key}");
+                            }
+                            target.insert(key.clone(), value.clone());
+                        }
+                        Ok(serde_json::from_value(current)?)
+                    };
+                if everywhere {
+                    let setups = self
+                        .core
+                        .document()
+                        .sections
+                        .iter()
+                        .map(|s| merged(&s.section_def.page_def))
+                        .collect::<Result<Vec<_>>>()?;
+                    for setup in &setups {
+                        setup.validate()?;
                     }
-                    target.insert(key.clone(), value.clone());
+                    self.guard_protected()?;
+                    self.transaction(|s| {
+                        s.deferred_layout(|s| {
+                            for (section, setup) in setups.iter().enumerate() {
+                                s.core
+                                    .set_page_def_native(section, &setup.properties().to_string())
+                                    .map_err(crate::err)?;
+                            }
+                            Ok(())
+                        })
+                    })?;
+                    return Ok(self.info());
                 }
-                Command::PageSetup(serde_json::from_value(current)?)
+                let section = self.cursor.section;
+                let page = &self
+                    .core
+                    .document()
+                    .sections
+                    .get(section)
+                    .context("편집 용지 정보를 읽지 못했습니다.")?
+                    .section_def
+                    .page_def;
+                Command::PageSetup(merged(page)?)
             }
             // Without `options` the legacy exact (case-sensitive) replacement is kept.
             "edit.replace_all" => {
-                let r: Replace = serde_json::from_value(params)?;
+                // `include` (context kinds as in `context.v2.list`, empty: all) is
+                // this command's own; the rest is shared with find and replace.
+                let mut object = object.clone();
+                let include = match object.remove("include") {
+                    Some(v) => Some(serde_json::from_value::<Vec<String>>(v)?),
+                    None => None,
+                };
+                let r: Replace = serde_json::from_value(Value::Object(object))?;
+                if let Some(include) = include {
+                    crate::find::check_context_kinds(&include)?;
+                    // Without `options`, the exact (case-sensitive) match, as below.
+                    let o = r.options.unwrap_or(crate::FindOptions {
+                        case_sensitive: true,
+                        ..Default::default()
+                    });
+                    let (replaced, skipped, truncated) =
+                        self.replace_all_in_contexts(&r.query, &r.replacement, o, &include)?;
+                    return Ok(json!({"replaced": replaced, "skippedProtected": skipped,
+                        "truncated": truncated}));
+                }
                 let replaced = match r.options {
                     Some(o) => self.replace_all_with(&r.query, &r.replacement, o)?,
                     None => self.replace_all(&r.query, &r.replacement)?,
@@ -653,7 +735,14 @@ impl Session {
             }
             _ => return self.run_extension(id, params),
         };
+        self.created_table = None;
         self.execute(command)?;
-        Ok(self.info())
+        let mut info = self.info();
+        // Hand a new table's address back so an automation client can caption or
+        // format it without searching the document.
+        if let Some(table) = self.created_table.take() {
+            info["table"] = serde_json::to_value(table)?;
+        }
+        Ok(info)
     }
 }

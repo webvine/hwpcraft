@@ -4,6 +4,18 @@
 use super::*;
 use chrome::Tokens;
 
+mod autocorrect;
+mod autosave;
+mod bench;
+mod links;
+pub(crate) use bench::Laps;
+mod hanja_view;
+mod macros;
+mod raster;
+mod settings;
+mod windows;
+pub(crate) use macros::MOUSE_NOTE;
+
 /// Hangul's zoom range is 10–500 %; pages are rasterised at a step near the zoom
 /// (`raster_scale`) and the texture is scaled to the exact zoom.
 pub(crate) const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.1..=5.0;
@@ -99,12 +111,22 @@ pub(crate) enum Dialog {
     MasterPage {
         kind: usize,
         list: serde_json::Value,
+        /// 양쪽 바탕쪽 글 being edited.
+        text: String,
+        /// `page.master.object.list` of the current section.
+        objects: serde_json::Value,
+        /// The picture or shape 넣기 makes.
+        object: MasterObject,
     },
     Print {
         range: usize,
         pages: String,
         copies: u32,
         to_file: bool,
+        /// 인쇄 상세: odd/even, reverse, collate, 모아 찍기 (copies come from `copies`).
+        layout: hwpcraft_engine::PrintLayout,
+        /// 워터마크 글 (empty: none).
+        watermark: String,
     },
     DocInfo {
         tab: usize,
@@ -132,10 +154,7 @@ pub(crate) enum Dialog {
         selected: Vec<bool>,
     },
     /// 미리 보기: one page rendered through the same renderer as the editor.
-    Preview {
-        page: u32,
-        texture: Option<(u32, u64, egui::TextureHandle, Vec2)>,
-    },
+    Preview(Box<PreviewState>),
     /// 구역 설정.
     Section {
         /// 쪽·그림·표·수식 start numbers (0 = 앞 구역에 이어서).
@@ -143,6 +162,17 @@ pub(crate) enum Dialog {
         tab_mm: f64,
         hide: [bool; 6],
         whole_document: bool,
+        /// 줄 번호 표시 as opened and as now (sent only when changed).
+        line_numbers: [bool; 2],
+    },
+    /// 줄 번호 설정.
+    LineNumbers(LineNumberSettings),
+    /// 문서 이력 관리: `review.history.list` as read when the dialog opened.
+    History(serde_json::Value),
+    /// 창 전환: the other windows when the dialog opened.
+    SwitchWindow {
+        peers: Vec<windows::Peer>,
+        selected: usize,
     },
     /// 그림 파일로 저장 (PNG).
     SavePicture {
@@ -153,6 +183,64 @@ pub(crate) enum Dialog {
     ViewColorCustom {
         paper: Color32,
         text: Color32,
+    },
+    /// 라벨: preset index and the label grid in millimetres.
+    Label {
+        preset: usize,
+        rows: u32,
+        columns: u32,
+        width: f64,
+        height: f64,
+        gap: f64,
+    },
+    /// 개인 정보 바꾸기: the name being edited.
+    UserInfo(String),
+    /// 빠른 교정: the list being edited.
+    AutoCorrect(Box<autocorrect::AutoCorrectDraft>),
+    /// 변경 추적 문서 저장 / 그림 효과가 있는 문서 저장: the file the user asked to save,
+    /// whether Hangul track changes would be merged, and how many picture effects an
+    /// .hwp save would drop.
+    TrackedSave {
+        path: PathBuf,
+        tracked: bool,
+        effects: usize,
+    },
+    /// 단 정의 나누기: columns from the caret on.
+    ColumnBreak {
+        count: u16,
+        spacing: f64,
+    },
+    /// 환경 설정.
+    Options(Box<settings::Settings>),
+    /// 사용자 설정 → 단축키.
+    Shortcuts(Box<settings::ShortcutDraft>),
+    /// 문서마당: the user's templates.
+    Templates {
+        list: Vec<serde_json::Value>,
+        selected: usize,
+        /// Name for saving the current document as a template.
+        name: String,
+    },
+    /// 문서 복구: copies left by a window that ended unexpectedly.
+    Recover {
+        orphans: Vec<autosave::Orphan>,
+        selected: usize,
+    },
+    /// 안내선 넣기: direction and distance from the paper edge.
+    Guide {
+        vertical: bool,
+        mm: f32,
+    },
+    /// 매크로 정의 끝: name the recording (cancel discards it).
+    MacroName {
+        name: String,
+        steps: Vec<hwpcraft_engine::MacroStep>,
+    },
+    /// 매크로 실행: saved macros, run (with repeat) or delete.
+    Macros {
+        list: Vec<hwpcraft_engine::SavedMacro>,
+        selected: usize,
+        repeat: u32,
     },
     /// 다른 이름으로 저장 → 현재 쪽만 / 쪽 범위.
     SavePages {
@@ -171,10 +259,49 @@ pub(crate) enum KeyTips {
     Items,
 }
 
+/// Common A4 label sheets: (name, rows, columns, width mm, height mm, gap between
+/// columns mm). The last entry is 사용자 지정.
+const LABEL_PRESETS: &[(&str, u32, u32, f64, f64, f64)] = &[
+    ("2칸 × 8줄 (99.1 × 34 mm)", 8, 2, 99.1, 34.0, 2.5),
+    ("2칸 × 7줄 (99.1 × 38.1 mm)", 7, 2, 99.1, 38.1, 2.5),
+    ("2칸 × 5줄 (99.1 × 57 mm)", 5, 2, 99.1, 57.0, 2.5),
+    ("3칸 × 7줄 (63.5 × 38.1 mm)", 7, 3, 63.5, 38.1, 2.5),
+    ("3칸 × 8줄 (70 × 37 mm)", 8, 3, 70.0, 37.0, 0.0),
+    ("사용자 지정", 8, 2, 99.1, 34.0, 2.5),
+];
+
+/// 줄 번호 설정 dialog state; `restart` is the stored value (1 page, 2 section, 3 continue).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LineNumberSettings {
+    pub show: bool,
+    pub start: u32,
+    pub count_by: u32,
+    pub distance_mm: f64,
+    pub restart: u8,
+    pub all_sections: bool,
+}
+
+/// 미리 보기: the sheet shown, the print settings tried there and the sheet bitmap
+/// (sheet, document generation, settings key, texture, size).
+#[derive(Default)]
+pub(crate) struct PreviewState {
+    pub sheet: usize,
+    pub sheets: usize,
+    pub layout: hwpcraft_engine::PrintLayout,
+    pub watermark: String,
+    pub texture: Option<(usize, u64, String, egui::TextureHandle, Vec2)>,
+}
+
 /// Most recently used documents kept in the local settings folder (Hangul shows 9).
 pub(crate) const RECENT_LIMIT: usize = 9;
 
 /// Dialog and tool state owned by this module. Stored in `HwpApp::ext.shell`.
+impl State {
+    /// A `--view bench*` run is going (frames are timed part by part).
+    pub(crate) fn bench_running(&self) -> bool {
+        self.bench.is_some()
+    }
+}
 pub(crate) struct State {
     pub show_status_bar: bool,
     /// 보기 → 지원하지 않는 명령: show unsupported commands (grey) in the ribbon.
@@ -192,6 +319,31 @@ pub(crate) struct State {
     pub chords_record_only: bool,
     /// `--view tooltip-<command id>`: keep that ribbon command's tooltip open (captures).
     pub pinned_tip: Option<String>,
+    /// `--view bench`: scripted scroll/zoom/resize run that logs frame times.
+    bench: Option<bench::Bench>,
+    /// Page rasterizations since the bench last looked (full pages and bands).
+    rasters: u32,
+    /// Page texture pixels uploaded since the bench last looked.
+    uploaded: usize,
+    /// The last pass split into its parts while a bench runs (`bench::Laps`).
+    pub laps: [f64; 8],
+    /// The window title last sent (sent again only when it changes).
+    pub window_title: String,
+    /// eframe's time for the last whole frame, ui and painting (bench log).
+    pub frame_cpu_ms: Option<f64>,
+    /// The document generation last seen by the prefetch and when it changed (None: the
+    /// first one seen), so pages out of view wait while the user is typing.
+    edit_seen: (u64, Option<std::time::Instant>),
+    /// Milliseconds spent making page SVG and rasterizing it, for the bench log.
+    raster_ms: std::cell::Cell<[f64; 2]>,
+    /// Rasterize new pages and zoom steps on worker threads (off in unit tests, which
+    /// expect a page bitmap in the same pass; `raster_tests` turns it on).
+    pub async_raster: bool,
+    raster: Option<raster::Rasterizer>,
+    /// Pass in which a page SVG was made for a worker (one per pass).
+    raster_svg_pass: Option<u64>,
+    /// 1×1 paper-coloured texture shown while a new page is being rasterized.
+    blank: Option<(Option<(Color32, Color32)>, egui::TextureHandle)>,
     /// Selected object kind last frame, to open its context tab once.
     pub object_kind: Option<&'static str>,
     /// 문단 부호 · 조판 부호 · 투명 선 (screen only; re-applied after a document is replaced).
@@ -202,6 +354,24 @@ pub(crate) struct State {
     recent_loaded: bool,
     last_path: Option<PathBuf>,
     pub keytips: KeyTips,
+    /// A modal dialog was open last frame (the page gets the keyboard back when it closes).
+    pub modal_was_open: bool,
+    /// keytips-folded capture: the key tip pressed once the narrow ribbon has been drawn.
+    view_keytip: Option<&'static str>,
+    /// fit-more-* captures: the popup opened once the narrow window has been drawn.
+    view_popup: Option<egui::Id>,
+    /// Ribbon group widths as last drawn: (tab, unsupported hidden, group, level) → px.
+    pub ribbon_widths: std::collections::HashMap<(usize, bool, usize, u8), f32>,
+    /// Width of the 지원 안 함 chip (and its note) per (tab, unsupported hidden).
+    pub ribbon_chip: std::collections::HashMap<(usize, bool), f32>,
+    /// Right edge the ribbon drew to, and the right edge it had (tests and captures).
+    pub ribbon_fit: (f32, f32),
+    /// Right edge of the menu tabs, and left edge of the search box beside them.
+    pub tabs_fit: (f32, f32),
+    /// 서식 도구 줄 piece widths as last drawn: (piece, narrowed) → px.
+    pub format_widths: std::collections::HashMap<(usize, bool), f32>,
+    /// Right edge the 서식 도구 줄 drew to, its right edge, and how many pieces went behind ».
+    pub format_fit: (f32, f32, usize),
     alt_down: bool,
     alt_alone: bool,
     /// 문서 보기 색 (screen only) and the colours of its 사용자 설정 entry.
@@ -209,6 +379,29 @@ pub(crate) struct State {
     pub custom_colors: (Color32, Color32),
     /// 보기 → 그림: off draws only picture frames.
     pub show_pictures: bool,
+    /// 보기 → 격자 (screen only).
+    pub show_grid: bool,
+    /// 쪽 윤곽 (Ctrl+G,L): false shows only the body text of each page, stacked with a
+    /// dotted line between pages (no margins, header, footer or page frame).
+    pub page_outline: bool,
+    /// Body band of each page as (top, bottom) in page units, for 쪽 윤곽 off.
+    pub page_bodies: Vec<(f32, f32)>,
+    /// 환경 설정 and user shortcuts (view.txt).
+    pub settings: settings::Settings,
+    /// 자동 복구: this window's lock and copy (see `autosave`).
+    recovery: Option<autosave::Recovery>,
+    /// Recovery was set up or deliberately skipped (unit tests, screenshots).
+    recovery_started: bool,
+    /// `--view bench-ime`: input events for the next frame (see `bench`).
+    pub bench_events: Vec<egui::Event>,
+    /// 보기 → 한자 발음 표시 (screen only, see `hanja_view`).
+    pub hanja_readings: bool,
+    /// 창 배열·창 전환: this window's place in the window list (see `windows`).
+    windows: Option<windows::Windows>,
+    windows_started: bool,
+    /// 보기 → 안내선: (vertical, millimetres from the paper's left/top edge).
+    pub guides: Vec<(bool, f32)>,
+    pub show_guides: bool,
     /// 맞쪽 보기 request; the continuous page view (core area) lays pages out.
     pub mirror_pages: bool,
     /// Header/footer editor to open next frame (이전/다음 inside the editor).
@@ -239,6 +432,8 @@ pub(crate) struct State {
     caret_page: Option<(u64, u32)>,
     /// Print request waiting for its background PDF: file, copies, page count.
     print_after: Option<(PathBuf, u32, usize)>,
+    /// 인쇄 상세 for the next PDF preparation started by the print dialog.
+    next_print_layout: Option<hwpcraft_engine::PrintLayout>,
     /// A PDF whose pages are being prepared a slice per frame.
     pdf_preparing: Option<PdfPreparing>,
     /// Preparation time per frame before the first restart (tests use zero: one page).
@@ -257,6 +452,18 @@ impl Default for State {
             last_chord: None,
             chords_record_only: false,
             pinned_tip: None,
+            bench: None,
+            uploaded: 0,
+            laps: [0.0; 8],
+            window_title: String::new(),
+            frame_cpu_ms: None,
+            edit_seen: (u64::MAX, None),
+            rasters: 0,
+            raster_ms: Default::default(),
+            async_raster: !cfg!(test),
+            raster: None,
+            raster_svg_pass: None,
+            blank: None,
             object_kind: None,
             marks: [false; 3],
             marks_applied: u64::MAX,
@@ -264,11 +471,32 @@ impl Default for State {
             recent_loaded: false,
             last_path: None,
             keytips: KeyTips::Off,
+            modal_was_open: false,
+            view_keytip: None,
+            view_popup: None,
+            ribbon_widths: Default::default(),
+            ribbon_chip: Default::default(),
+            ribbon_fit: (0.0, 0.0),
+            tabs_fit: (0.0, 0.0),
+            format_widths: Default::default(),
+            format_fit: (0.0, 0.0, 0),
             alt_down: false,
             alt_alone: false,
             view_color: ViewColor::Light,
             custom_colors: (Color32::WHITE, Color32::BLACK),
             show_pictures: true,
+            show_grid: false,
+            page_outline: true,
+            page_bodies: Vec::new(),
+            guides: Vec::new(),
+            recovery: None,
+            recovery_started: cfg!(test),
+            windows: None,
+            windows_started: false,
+            hanja_readings: false,
+            bench_events: Vec::new(),
+            settings: Default::default(),
+            show_guides: true,
             mirror_pages: false,
             hf_next: None,
             selection: None,
@@ -282,6 +510,7 @@ impl Default for State {
             requested: (u64::MAX, Default::default(), Default::default()),
             caret_page: None,
             print_after: None,
+            next_print_layout: None,
             pdf_preparing: None,
             pdf_budget: PDF_PREPARE_BUDGET,
         }
@@ -314,8 +543,34 @@ impl HwpApp {
             | "view.link_prev"
             | "view.paragraph_marks"
             | "view.control_codes"
-            | "view.transparent_lines" => true,
+            | "view.transparent_lines"
+            | "view.grid"
+            | "view.page_outline"
+            | "view.split"
+            | "view.split.side"
+            | "view.new_window"
+            | "view.open_in_new_window"
+            | "view.arrange"
+            | "view.arrange.side"
+            | "view.arrange.stacked"
+            | "view.switch_window"
+            | "review.history"
+            | "view.hanja_pronounce"
+            | "view.guides"
+            | "view.guides.add"
+            | "file.template"
+            | "tools.options"
+            | "tools.user_info"
+            | "tools.autocorrect"
+            | "tools.customize"
+            | "page.label" => true,
+            "page.column_def_break" | "page.section_break" => body,
+            "view.guides.clear" => !self.ext.shell.guides.is_empty(),
+            "view.split.none" => self.split.is_some(),
             "page.number" | "page.new_number" | "page.hide" | "page.section_dialog" => body,
+            "page.line_numbers.toggle"
+            | "page.line_numbers.dialog"
+            | "page.line_numbers.skip_paragraph" => body,
             "page.header" | "page.footer" | "page.border_fill" | "page.master" | "file.print"
             | "file.doc_info" | "file.exit" | "page.setup_dialog" | "page.margins"
             | "file.preview" | "file.save_hml" | "file.save_pages" | "security.password"
@@ -346,6 +601,7 @@ impl HwpApp {
             }
             "page.section.prev" => self.session.cursor.section > 0,
             "file.save_block" => body && self.session.has_selection(),
+            id if id.starts_with("macro.") => return self.macro_enabled(id),
             _ => return None,
         })
     }
@@ -359,6 +615,14 @@ impl HwpApp {
             "view.control_codes" => self.ext.shell.marks[1],
             "view.transparent_lines" => self.ext.shell.marks[2],
             "view.pictures" => self.ext.shell.show_pictures,
+            "view.grid" => self.ext.shell.show_grid,
+            "page.line_numbers.toggle" => self.line_numbers_shown(),
+            "view.hanja_pronounce" => self.ext.shell.hanja_readings,
+            "page.line_numbers.skip_paragraph" => self.line_number_skipped(),
+            "view.page_outline" => self.ext.shell.page_outline,
+            "view.guides" => self.ext.shell.show_guides,
+            "view.split" => self.split.as_ref().is_some_and(|s| !s.side_by_side),
+            "view.split.side" => self.split.as_ref().is_some_and(|s| s.side_by_side),
             "view.mirror_pages" => self.ext.shell.mirror_pages,
             id if id.starts_with("view.color.") => self.ext.shell.view_color.id() == id,
             _ => false,
@@ -366,13 +630,94 @@ impl HwpApp {
     }
     /// Return true when the command id was handled.
     pub(crate) fn shell_ext_dispatch(&mut self, id: &str, ctx: &egui::Context) -> bool {
+        if id.starts_with("macro.") {
+            return self.macro_dispatch(id);
+        }
         match id {
+            "page.line_numbers.skip_paragraph" => {
+                let skip = !self.line_number_skipped();
+                if self.run("page.line_numbers.skip", json!({ "skip": skip })) {
+                    self.message = if skip {
+                        "이 문단은 줄 번호를 건너뜁니다. HWPX로 저장할 때만 남고 HWP로 저장하면 사라집니다.".into()
+                    } else {
+                        "이 문단에 다시 줄 번호를 매깁니다.".into()
+                    };
+                }
+            }
+            "page.line_numbers.toggle" => {
+                let show = !self.line_numbers_shown();
+                if self.run("page.line_numbers", json!({ "show": show })) {
+                    self.message = if show {
+                        "이 구역에 줄 번호를 보입니다. 설정은 쪽 → 줄 번호 → 줄 번호 설정에서 바꿉니다.".into()
+                    } else {
+                        "이 구역의 줄 번호를 감췄습니다.".into()
+                    };
+                }
+            }
             "view.zoom_100" => self.set_zoom(1.0),
             "view.zoom_fit_width" => self.zoom_to_fit(true),
             "view.zoom_fit_page" => self.zoom_to_fit(false),
             "view.zoom_in" => self.set_zoom(self.zoom + 0.1),
             "view.zoom_out" => self.set_zoom(self.zoom - 0.1),
             "view.status_bar" => self.ext.shell.show_status_bar ^= true,
+            "view.guides" => self.ext.shell.show_guides ^= true,
+            "view.guides.clear" => {
+                self.ext.shell.guides.clear();
+                self.message = "안내선을 모두 지웠습니다.".into();
+            }
+            "view.split" => self.set_split(Some(false)),
+            "view.split.side" => self.set_split(Some(true)),
+            "view.split.none" => self.set_split(None),
+            "view.arrange" => self.arrange_windows(ctx, windows::Arrangement::Cascade),
+            "view.arrange.side" => self.arrange_windows(ctx, windows::Arrangement::SideBySide),
+            "view.arrange.stacked" => self.arrange_windows(ctx, windows::Arrangement::Stacked),
+            "view.hanja_pronounce" => {
+                self.ext.shell.hanja_readings = !self.ext.shell.hanja_readings;
+                self.restyle_pages();
+                self.message = if self.ext.shell.hanja_readings {
+                    "한자 위에 한글 발음을 작게 보입니다(화면에만, 인쇄·PDF는 그대로).".into()
+                } else {
+                    "한자 발음 표시를 껐습니다.".into()
+                };
+            }
+            "review.history" => match self.session.run("review.history.list", json!({})) {
+                Ok(list) => self.ext.shell.dialog = Some(Dialog::History(list)),
+                Err(e) => self.message = format!("문서 이력을 읽지 못했습니다: {e}"),
+            },
+            "view.switch_window" => {
+                let peers = self.other_windows();
+                if peers.is_empty() {
+                    self.message = "다른 HwpCraft 창이 없습니다. 보기 → 새 창으로 엽니다.".into();
+                } else {
+                    self.ext.shell.dialog = Some(Dialog::SwitchWindow { peers, selected: 0 });
+                }
+            }
+            "view.new_window" => self.open_new_window(None),
+            "view.open_in_new_window" => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("한글 문서", &["hwp", "hwpx"])
+                    .pick_file()
+                {
+                    self.open_new_window(Some(path));
+                }
+            }
+            "view.page_outline" => {
+                self.ext.shell.page_outline ^= true;
+                self.scroll_to_caret = true;
+                self.message = if self.ext.shell.page_outline {
+                    "쪽 윤곽을 보입니다.".into()
+                } else {
+                    "쪽 윤곽을 껐습니다: 본문만 이어서 보이고, 쪽 경계는 점선입니다. 머리말·꼬리말·쪽 번호는 보이지 않습니다.".into()
+                };
+            }
+            "view.grid" => {
+                self.ext.shell.show_grid ^= true;
+                self.message = if self.ext.shell.show_grid {
+                    "격자를 5 mm 간격으로 보입니다. 화면에만 보이고 인쇄·저장되지 않습니다.".into()
+                } else {
+                    "격자를 감췄습니다.".into()
+                };
+            }
             "view.doc_tabs" => self.ext.shell.show_doc_tabs ^= true,
             "view.link_next" | "view.link_prev" => {
                 let step = if id == "view.link_next" {
@@ -411,6 +756,14 @@ impl HwpApp {
             }
             "page.paste" | "page.delete" | "page.section.next" | "page.section.prev" => {
                 self.run(id, json!({}));
+            }
+            "page.section_break" => {
+                if self.run(id, json!({})) {
+                    let n = self.session.cursor.section + 1;
+                    self.message = format!(
+                        "구역 나누기: 여기서부터 {n}구역입니다. 쪽 설정과 바탕쪽을 이어받았습니다."
+                    );
+                }
             }
             "file.insert" => self.insert_document(),
             "file.save_block" => self.save_block(),
@@ -522,24 +875,79 @@ impl HwpApp {
                     },
                 }
             }
-            "page.master" => Dialog::MasterPage {
-                kind: 0,
-                list: self
+            "page.master" => {
+                let current = self
                     .session
-                    .run("page.master.list", json!({}))
-                    .unwrap_or_default(),
-            },
+                    .run("page.master.get", json!({}))
+                    .unwrap_or_default();
+                Dialog::MasterPage {
+                    kind: 0,
+                    list: self
+                        .session
+                        .run("page.master.list", json!({}))
+                        .unwrap_or_default(),
+                    text: current["text"].as_str().unwrap_or("").to_owned(),
+                    objects: self
+                        .session
+                        .run("page.master.object.list", json!({}))
+                        .unwrap_or_default(),
+                    object: MasterObject::default(),
+                }
+            }
             "file.print" => Dialog::Print {
                 range: 0,
                 pages: String::new(),
                 copies: 1,
                 to_file: false,
+                layout: Default::default(),
+                watermark: String::new(),
             },
             "file.doc_info" => Dialog::DocInfo {
                 tab: 2,
                 info: self.session.run("file.doc_info", json!({})).ok()?,
             },
             "page.new_number" => Dialog::NewNumber { start: 1 },
+            "file.template" => Dialog::Templates {
+                list: self.template_list(),
+                selected: 0,
+                name: self
+                    .session
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.file_stem())
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            },
+            "tools.options" => Dialog::Options(Box::new(settings::Settings {
+                show_unsupported: self.ext.shell.show_unsupported,
+                ..self.ext.shell.settings.clone()
+            })),
+            "tools.customize" => Dialog::Shortcuts(Box::default()),
+            "tools.user_info" => Dialog::UserInfo(self.ext.shell.settings.user_name.clone()),
+            "tools.autocorrect" => Dialog::AutoCorrect(Box::new(autocorrect::AutoCorrectDraft {
+                enabled: self.ext.shell.settings.autocorrect_enabled,
+                entries: self.ext.shell.settings.autocorrect.clone(),
+                ..Default::default()
+            })),
+            "page.column_def_break" => Dialog::ColumnBreak {
+                count: 2,
+                spacing: 8.0,
+            },
+            "page.label" => {
+                let (_, rows, columns, width, height, gap) = LABEL_PRESETS[0];
+                Dialog::Label {
+                    preset: 0,
+                    rows,
+                    columns,
+                    width,
+                    height,
+                    gap,
+                }
+            }
+            "view.guides.add" => Dialog::Guide {
+                vertical: true,
+                mm: 30.0,
+            },
             "security.password" | "security.password_change" => Dialog::Password {
                 change: self.session.has_password(),
                 password: String::new(),
@@ -561,12 +969,28 @@ impl HwpApp {
                 let (paper, text) = self.ext.shell.custom_colors;
                 Dialog::ViewColorCustom { paper, text }
             }
-            "file.preview" => Dialog::Preview {
-                page: self.page,
-                texture: None,
-            },
+            "file.preview" => Dialog::Preview(Box::new(PreviewState {
+                sheet: self.page as usize,
+                ..Default::default()
+            })),
+            "page.line_numbers.dialog" => {
+                let v = self.session.run("page.line_numbers.get", json!({})).ok()?;
+                let n = |k: &str| v[k].as_u64().unwrap_or(0) as u32;
+                Dialog::LineNumbers(LineNumberSettings {
+                    show: true,
+                    start: n("start").max(1),
+                    count_by: n("countBy").clamp(1, 100),
+                    distance_mm: v["distanceMm"].as_f64().unwrap_or(0.0),
+                    restart: match n("restart") {
+                        1 | 2 => n("restart") as u8,
+                        _ => 3,
+                    },
+                    all_sections: false,
+                })
+            }
             "page.section_dialog" => {
                 let v = self.session.run("page.section.get", json!({})).ok()?;
+                let shown = self.line_numbers_shown();
                 let n = |k: &str| v[k].as_u64().unwrap_or(0).min(u64::from(u16::MAX)) as u16;
                 let b = |k: &str| v[k].as_bool().unwrap_or(false);
                 Dialog::Section {
@@ -586,6 +1010,7 @@ impl HwpApp {
                         b("hideEmptyLine"),
                     ],
                     whole_document: false,
+                    line_numbers: [shown; 2],
                 }
             }
             "file.save_pages" => Dialog::SavePages {
@@ -614,6 +1039,14 @@ impl HwpApp {
     /// Called every frame after the built-in dialogs.
     pub(crate) fn shell_ext_dialogs(&mut self, ctx: &egui::Context) {
         self.shell_ext_frame();
+        self.prefetch_pages(ctx);
+        // Captures and benchmarks run on a fixed script: no recovery prompt or copies.
+        if self.screenshot.is_some() || self.ext.shell.bench.is_some() {
+            self.ext.shell.recovery_started = true;
+        }
+        self.autosave_frame(ctx);
+        self.windows_frame(ctx);
+        self.bench_frame(ctx);
         self.poll_pdf_prepare(ctx);
         let Some(mut dialog) = self.ext.shell.dialog.take() else {
             return;
@@ -626,13 +1059,19 @@ impl HwpApp {
                 remove,
             } => self.password_dialog(ctx, *change, password, confirm, remove),
             Dialog::Privacy { .. } => self.privacy_dialog(ctx, &mut dialog),
-            Dialog::Preview { page, texture } => self.preview_dialog(ctx, page, texture),
+            Dialog::Preview(preview) => self.preview_dialog(ctx, preview),
             Dialog::Section {
                 numbers,
                 tab_mm,
                 hide,
                 whole_document,
-            } => self.section_dialog(ctx, numbers, tab_mm, hide, whole_document),
+                line_numbers,
+            } => self.section_dialog(ctx, numbers, tab_mm, hide, whole_document, line_numbers),
+            Dialog::LineNumbers(settings) => self.line_numbers_dialog(ctx, settings),
+            Dialog::History(list) => self.history_dialog(ctx, list),
+            Dialog::SwitchWindow { peers, selected } => {
+                self.switch_window_dialog(ctx, peers, selected)
+            }
             Dialog::SavePages {
                 current_only,
                 from,
@@ -650,13 +1089,21 @@ impl HwpApp {
                 template,
             } => self.header_footer_dialog(ctx, header, apply, template),
             Dialog::BorderFill { .. } => self.border_fill_dialog(ctx, &mut dialog),
-            Dialog::MasterPage { kind, list } => master_page_dialog(ctx, kind, list),
+            Dialog::MasterPage {
+                kind,
+                list,
+                text,
+                objects,
+                object,
+            } => self.master_page_dialog(ctx, kind, list, text, objects, object),
             Dialog::Print {
                 range,
                 pages,
                 copies,
                 to_file,
-            } => self.print_dialog(ctx, range, pages, copies, to_file),
+                layout,
+                watermark,
+            } => self.print_dialog(ctx, range, pages, copies, to_file, layout, watermark),
             Dialog::DocInfo { tab, info } => doc_info_dialog(ctx, tab, info),
             Dialog::NewNumber { start } => self.new_number_dialog(ctx, start),
             Dialog::Hide { flags } => self.hide_dialog(ctx, flags),
@@ -666,6 +1113,73 @@ impl HwpApp {
             Dialog::ViewColorCustom { paper, text } => {
                 self.view_color_custom_dialog(ctx, paper, text)
             }
+            Dialog::MacroName { name, steps } => self.macro_name_dialog(ctx, name, steps),
+            Dialog::Guide { vertical, mm } => self.guide_dialog(ctx, vertical, mm),
+            Dialog::Options(draft) => self.options_dialog(ctx, draft),
+            Dialog::UserInfo(name) => self.user_info_dialog(ctx, name),
+            Dialog::AutoCorrect(draft) => self.autocorrect_dialog(ctx, draft),
+            Dialog::TrackedSave {
+                path,
+                tracked,
+                effects,
+            } => self.tracked_save_dialog(ctx, path, *tracked, *effects),
+            Dialog::ColumnBreak { count, spacing } => {
+                let button = self::dialog(
+                    ctx,
+                    "단 정의 나누기",
+                    380.0,
+                    &["나누기(D)", "취소"],
+                    |ui| {
+                        group(ui, "여기부터");
+                        ui.horizontal(|ui| {
+                            ui.label("단 수");
+                            ui.add(egui::DragValue::new(count).range(1..=6));
+                            ui.label("단 사이");
+                            ui.add(
+                                egui::DragValue::new(spacing)
+                                    .range(0.0..=50.0)
+                                    .speed(0.5)
+                                    .suffix(" mm"),
+                            );
+                        });
+                        notice(
+                            ui,
+                            "캐럿에서 문단을 나누고, 그 문단부터 새 단 설정을 씁니다. 예: 제목은 1단, 본문은 2단.",
+                        );
+                    },
+                );
+                match button {
+                    Some(0) => {
+                        let r = self.session.run(
+                            "page.column_def_break",
+                            json!({ "count": *count, "spacing_mm": *spacing }),
+                        );
+                        self.result(r).is_none()
+                    }
+                    Some(_) => false,
+                    None => true,
+                }
+            }
+            Dialog::Label {
+                preset,
+                rows,
+                columns,
+                width,
+                height,
+                gap,
+            } => self.label_dialog(ctx, preset, rows, columns, width, height, gap),
+            Dialog::Shortcuts(draft) => self.shortcuts_dialog(ctx, draft),
+            Dialog::Templates {
+                list,
+                selected,
+                name,
+            } => self.templates_dialog(ctx, list, selected, name),
+            Dialog::Recover { orphans, selected } => self.recover_dialog(ctx, orphans, selected),
+            Dialog::Macros {
+                list,
+                selected,
+                repeat,
+            } => self.macros_dialog(ctx, list, selected, repeat),
         };
         if keep && self.ext.shell.dialog.is_none() {
             self.ext.shell.dialog = Some(dialog);
@@ -678,6 +1192,12 @@ impl HwpApp {
         // COMMAND is Ctrl on Windows/Linux and Cmd on macOS.
         let ctrl = Modifiers::COMMAND;
         if self.keytip_shortcuts(ctx) {
+            return true;
+        }
+        // 문서마당 (Ctrl+Alt+N).
+        if ctx.input_mut(|i| i.consume_key(ctrl | Modifiers::ALT, Key::N)) {
+            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_))));
+            self.shell_ext_dispatch("file.template", ctx);
             return true;
         }
         if let Some(prefix) = self.ext.shell.chord {
@@ -783,6 +1303,87 @@ impl HwpApp {
             self.ext.shell.pinned_tip = Some(id.to_owned());
             return true;
         }
+        // 매크로 captures: recording (status chip), and the name dialog after one step.
+        if name == "macro-record" || name == "macro-name" {
+            self.tab = 8;
+            self.macro_dispatch("macro.record.start");
+            if name == "macro-name" {
+                let _ = self
+                    .session
+                    .execute(hwpcraft_engine::Command::Insert("매크로 ".into()));
+                self.macro_dispatch("macro.record.stop");
+            }
+            return true;
+        }
+        // Key tips of one tab (keytips-8 = 도구), or the tab tips (keytips-tabs).
+        if let Some(rest) = name.strip_prefix("keytips-")
+            && rest != "folded"
+        {
+            self.ext.shell.keytips = if rest == "tabs" {
+                KeyTips::Tabs
+            } else {
+                let Ok(tab @ 1..=8) = rest.parse::<usize>() else {
+                    return false;
+                };
+                self.tab = tab;
+                KeyTips::Items
+            };
+            return true;
+        }
+        // The » lists of a 400 px window: the tabs (검토 unfolded) and the 서식 도구 줄.
+        if name == "fit-more-tabs" || name == "fit-more-format" {
+            self.tab = 1;
+            self.ctx
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(400.0, 560.0)));
+            self.ext.shell.view_popup = Some(if name == "fit-more-tabs" {
+                let review = egui::Id::new(("hwp-more-tab", 7usize));
+                self.ctx
+                    .data_mut(|d| d.insert_temp(review.with("unfold"), true));
+                egui::Id::new("hwp-more-tabs")
+            } else {
+                egui::Id::new("hwp-more-format")
+            });
+            return true;
+        }
+        // Ribbon fit captures: fit-<window width>-<tab>, with the key tips showing.
+        if let Some((width, tab)) = name.strip_prefix("fit-").and_then(|r| r.split_once('-')) {
+            let (Ok(width), Ok(tab @ 1..=8)) = (width.parse::<f32>(), tab.parse::<usize>()) else {
+                return false;
+            };
+            self.tab = tab;
+            self.ext.shell.keytips = KeyTips::Items;
+            self.ctx
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(width, 560.0)));
+            return true;
+        }
+        // A narrow window folds the right-hand 입력 groups; the 상용구 tip opens its group,
+        // then the menu inside it.
+        if name == "keytips-folded" {
+            self.tab = 3;
+            self.ctx
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(900.0, 640.0)));
+            self.ext.shell.view_keytip = Some("menu:상용구");
+            return true;
+        }
+        // The save prompt and the error box on the shared dialog frame.
+        if name == "save-prompt" {
+            self.pending = Some(Pending::New);
+            return true;
+        }
+        if name == "error-dialog" {
+            self.error = Some("저장하지 못했습니다: 이 폴더에 쓸 권한이 없습니다.".into());
+            return true;
+        }
+        if name == "bench" || name == "bench-sync" || name == "bench-edit" {
+            // bench-sync: the same run with pages rasterized in the frame, for comparison.
+            self.ext.shell.async_raster = name != "bench-sync";
+            self.start_bench(name == "bench-edit");
+            return true;
+        }
+        if name == "bench-ime" {
+            self.start_ime_bench();
+            return true;
+        }
         let id = match name {
             "page-number" => "page.number",
             "header-footer" => "page.header",
@@ -797,6 +1398,8 @@ impl HwpApp {
             "preview" => "file.preview",
             "section" => "page.section_dialog",
             "save-pages" => "file.save_pages",
+            "user-info" => "tools.user_info",
+            "autocorrect" => "tools.autocorrect",
             "hf-fields" => {
                 let _ = self.run("page.header", json!({"apply_to": "both", "template": 0}));
                 self.open_header_footer_editor(true, 0);
@@ -822,6 +1425,61 @@ impl HwpApp {
             "keytips" => {
                 self.tab = 5;
                 self.ext.shell.keytips = KeyTips::Items;
+                return true;
+            }
+            "split" | "split-side" => {
+                self.tab = 2;
+                self.set_split(Some(name == "split-side"));
+                if let Some(split) = self.split.as_mut() {
+                    split.set_other_page(2);
+                }
+                return true;
+            }
+            // 변경 추적 문서 저장 확인 창 (the document needs Hangul track changes).
+            "tracked-save" => {
+                let path = std::env::temp_dir().join("hwpcraft-tracked-save.hwpx");
+                return self.confirm_tracked_save(&path);
+            }
+            "preview-4up" => {
+                let ctx = self.ctx.clone();
+                self.shell_ext_dispatch("file.preview", &ctx);
+                if let Some(Dialog::Preview(preview)) = self.ext.shell.dialog.as_mut() {
+                    preview.layout.n_up = 4;
+                    preview.watermark = "대외비".into();
+                    preview.sheet = 2;
+                }
+                return true;
+            }
+            "grid" => {
+                self.tab = 2;
+                self.ext.shell.show_grid = true;
+                return true;
+            }
+            "hanja-readings" => {
+                let ctx = self.ctx.clone();
+                self.tab = 2;
+                self.shell_ext_dispatch("view.hanja_pronounce", &ctx);
+                return true;
+            }
+            "history" => {
+                let ctx = self.ctx.clone();
+                self.tab = 7;
+                self.shell_ext_dispatch("review.history", &ctx);
+                return true;
+            }
+            "page-outline-off" => {
+                self.tab = 2;
+                self.ext.shell.page_outline = false;
+                return true;
+            }
+            // Line numbers on in the caret section; with -dialog, 줄 번호 설정 open as well.
+            "line-numbers" | "line-numbers-dialog" => {
+                let ctx = self.ctx.clone();
+                self.tab = 5;
+                self.shell_ext_dispatch("page.line_numbers.toggle", &ctx);
+                if name == "line-numbers-dialog" {
+                    self.shell_ext_dispatch("page.line_numbers.dialog", &ctx);
+                }
                 return true;
             }
             "view-marks" => {
@@ -1224,6 +1882,7 @@ impl HwpApp {
     }
 
     // ----- 인쇄 (600×806) -----
+    #[allow(clippy::too_many_arguments)]
     fn print_dialog(
         &mut self,
         ctx: &egui::Context,
@@ -1231,6 +1890,8 @@ impl HwpApp {
         pages: &mut String,
         copies: &mut u32,
         to_file: &mut bool,
+        layout: &mut hwpcraft_engine::PrintLayout,
+        watermark: &mut String,
     ) -> bool {
         let count = self.layout_page_count();
         let button = dialog(ctx, "인쇄", 600.0, &["인쇄(D)", "취소"], |ui| {
@@ -1278,11 +1939,89 @@ impl HwpApp {
                         ui.label("매수");
                         ui.add(egui::DragValue::new(copies).range(1..=99));
                     });
+                    ui.add_enabled(
+                        *copies > 1,
+                        egui::Checkbox::new(&mut layout.collate, "한 부씩 찍기"),
+                    )
+                    .on_disabled_hover_text("매수가 2부 이상일 때 고릅니다.");
+                    ui.checkbox(&mut layout.reverse, "역순으로 찍기");
+                    group(ui, "인쇄 방식");
+                    egui::Grid::new("print-layout")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("쪽 고르기");
+                            egui::ComboBox::from_id_salt("print-odd-even")
+                                .width(110.0)
+                                .selected_text(match layout.odd_even.as_str() {
+                                    "odd" => "홀수 쪽만",
+                                    "even" => "짝수 쪽만",
+                                    _ => "모든 쪽",
+                                })
+                                .show_ui(ui, |ui| {
+                                    for (value, label) in [
+                                        ("all", "모든 쪽"),
+                                        ("odd", "홀수 쪽만"),
+                                        ("even", "짝수 쪽만"),
+                                    ] {
+                                        if ui
+                                            .selectable_label(layout.odd_even == value, label)
+                                            .clicked()
+                                        {
+                                            layout.odd_even = value.into();
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+                            ui.label("모아 찍기");
+                            egui::ComboBox::from_id_salt("print-n-up")
+                                .width(110.0)
+                                .selected_text(if layout.n_up == 1 {
+                                    "한 장에 1쪽".to_owned()
+                                } else {
+                                    format!("한 장에 {}쪽", layout.n_up)
+                                })
+                                .show_ui(ui, |ui| {
+                                    for n in [1, 2, 4, 8] {
+                                        ui.selectable_value(
+                                            &mut layout.n_up,
+                                            n,
+                                            format!("한 장에 {n}쪽"),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                            ui.label("워터마크");
+                            ui.add(
+                                egui::TextEdit::singleline(watermark)
+                                    .desired_width(110.0)
+                                    .char_limit(40)
+                                    .hint_text("예: 대외비"),
+                            );
+                            ui.end_row();
+                        });
                 });
             });
+            notice(
+                ui,
+                "워터마크와 모아 찍기는 인쇄물(PDF)에만 들어가고 문서에는 저장되지 않습니다.",
+            );
         });
         match button {
-            Some(0) => self.print(*range, pages, *copies, *to_file),
+            Some(0) => {
+                let mut layout = layout.clone();
+                layout.watermark =
+                    (!watermark.trim().is_empty()).then(|| hwpcraft_engine::Watermark {
+                        text: watermark.trim().to_owned(),
+                        opacity: None,
+                    });
+                // A file gets the copies written into it; paper gets them from the printer.
+                layout.copies = if *to_file { *copies } else { 1 };
+                self.ext.shell.next_print_layout = Some(layout);
+                let keep = self.print(*range, pages, *copies, *to_file);
+                self.ext.shell.next_print_layout = None;
+                keep
+            }
             Some(_) => false,
             None => true,
         }
@@ -1337,8 +2076,14 @@ impl HwpApp {
                 self.message = format!("{count}쪽을 {copies}부 기본 프린터로 보냈습니다.");
             }
             crate::platform::PrintOutcome::Opened => {
+                // The viewer prints one copy unless told otherwise there.
+                let copies = if copies > 1 {
+                    format!(" 부수({copies}부)는 그 인쇄 창에서 정하세요.")
+                } else {
+                    String::new()
+                };
                 self.message = format!(
-                    "{count}쪽 PDF를 기본 보기 프로그램으로 열었습니다. 거기서 인쇄하세요."
+                    "{count}쪽 PDF를 기본 보기 프로그램으로 열었습니다. 거기서 인쇄하세요.{copies}"
                 );
             }
             crate::platform::PrintOutcome::Failed => {
@@ -1414,6 +2159,21 @@ pub(crate) fn dialog(
     buttons: &[&str],
     body: impl FnOnce(&mut egui::Ui),
 ) -> Option<usize> {
+    let buttons: Vec<(&str, Option<&str>)> = buttons.iter().map(|b| (*b, None)).collect();
+    dialog_with(ctx, title, width, &buttons, body)
+}
+
+/// [`dialog`] whose buttons can be grey: `(label, Some(reason))` shows the button
+/// disabled with `reason` as its tooltip; it neither clicks nor answers Enter.
+/// The last button still closes (title ×, Esc).
+#[track_caller]
+pub(crate) fn dialog_with(
+    ctx: &egui::Context,
+    title: &str,
+    width: f32,
+    buttons: &[(&str, Option<&str>)],
+    body: impl FnOnce(&mut egui::Ui),
+) -> Option<usize> {
     let mut clicked = None;
     let site = std::panic::Location::caller();
     let id = (
@@ -1428,18 +2188,36 @@ pub(crate) fn dialog(
         if chrome::title(ui, title) {
             clicked = Some(buttons.len() - 1);
         }
+        // Buttons keep their label on one line: a long label widens the button column
+        // and narrows the body by as much (the usual labels fit in 80 px).
+        let label_width = buttons
+            .iter()
+            .map(|(label, _)| {
+                egui::WidgetText::from(*label)
+                    .into_galley(
+                        ui,
+                        Some(egui::TextWrapMode::Extend),
+                        f32::INFINITY,
+                        egui::TextStyle::Button,
+                    )
+                    .size()
+                    .x
+                    + 2.0 * ui.spacing().button_padding.x
+                    + 4.0
+            })
+            .fold(80.0_f32, f32::max);
         ui.horizontal_top(|ui| {
             egui::Frame::NONE
                 .stroke(Stroke::new(1.0, Color32::from_gray(227)))
                 .inner_margin(egui::Margin::symmetric(14, 8))
                 .show(ui, |ui| {
-                    ui.set_width(width - 24.0 - 120.0);
+                    ui.set_width(width - 24.0 - 120.0 - (label_width - 80.0));
                     ui.vertical(body);
                 });
             ui.add_space(10.0);
             ui.vertical(|ui| {
-                for (i, label) in buttons.iter().enumerate() {
-                    let (width, color) = if i == 0 {
+                for (i, (label, grey)) in buttons.iter().enumerate() {
+                    let (width, color) = if i == 0 && grey.is_none() {
                         (1.5, Tokens::ACCENT)
                     } else {
                         (1.0, Tokens::BORDER)
@@ -1447,8 +2225,13 @@ pub(crate) fn dialog(
                     let b = egui::Button::new(*label)
                         .fill(Color32::WHITE)
                         .stroke(Stroke::new(width, color))
-                        .min_size(Vec2::new(80.0, 28.0));
-                    if ui.add(b).clicked() {
+                        .min_size(Vec2::new(label_width, 28.0));
+                    let response = ui.add_enabled(grey.is_none(), b);
+                    let response = match grey {
+                        Some(reason) => response.on_disabled_hover_text(*reason),
+                        None => response,
+                    };
+                    if response.clicked() {
                         clicked = Some(i);
                     }
                     ui.add_space(4.0);
@@ -1459,7 +2242,16 @@ pub(crate) fn dialog(
     if response.should_close() && clicked.is_none() {
         clicked = Some(buttons.len() - 1);
     }
+    // Alt + the letter in "(D)" presses that button, as in Hangul's dialogs.
+    if clicked.is_none() {
+        clicked = buttons.iter().position(|(label, grey)| {
+            grey.is_none()
+                && chrome::mnemonic(label)
+                    .is_some_and(|key| ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, key)))
+        });
+    }
     if clicked.is_none()
+        && buttons.first().is_some_and(|(_, grey)| grey.is_none())
         && !ctx.egui_wants_keyboard_input()
         && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
     {
@@ -1754,54 +2546,331 @@ fn border_preview(ui: &mut egui::Ui, sides: &mut [Line; 4], pen: Line) {
 }
 
 // ----- 바탕쪽 (391×369) -----
-fn master_page_dialog(ctx: &egui::Context, kind: &mut usize, list: &serde_json::Value) -> bool {
-    let button = dialog(ctx, "바탕쪽", 391.0, &["만들기(D)", "취소"], |ui| {
-        group(ui, "종류");
-        for (i, label) in [
-            "양쪽",
-            "홀수 쪽",
-            "짝수 쪽",
-            "현재 구역의 마지막 쪽",
-            "현재 구역 안 임의 쪽",
-        ]
-        .iter()
-        .enumerate()
-        {
-            ui.radio_value(kind, i, *label);
+/// The picture and shape kinds 바탕쪽 넣기 offers: (`page.master.object.insert` kind, label).
+const MASTER_OBJECT_KINDS: [(&str, &str); 4] = [
+    ("picture", "그림"),
+    ("rectangle", "직사각형"),
+    ("ellipse", "타원"),
+    ("line", "직선"),
+];
+
+/// 바탕쪽 창의 그림·도형 넣기 칸: placed on the paper, measured from its top-left corner.
+pub(crate) struct MasterObject {
+    /// Index into `MASTER_OBJECT_KINDS`.
+    kind: usize,
+    /// Picture file (그림 only).
+    path: String,
+    x_mm: f64,
+    y_mm: f64,
+    width_mm: f64,
+    /// Shapes only: a picture keeps its proportions.
+    height_mm: f64,
+    /// 글 앞 (otherwise 글 뒤, like the master page's text).
+    front: bool,
+}
+
+impl Default for MasterObject {
+    fn default() -> Self {
+        Self {
+            kind: 1,
+            path: String::new(),
+            x_mm: 20.0,
+            y_mm: 20.0,
+            width_mm: 40.0,
+            height_mm: 20.0,
+            front: false,
         }
-        group(ui, "속성");
-        ui.add_enabled(
-            false,
-            egui::Checkbox::new(&mut false, "기존 바탕쪽과 겹치게 하기"),
-        );
-        ui.add_enabled(
-            false,
-            egui::Checkbox::new(&mut false, "인쇄할 때 바탕쪽 맨 위로 보내기"),
-        );
-        group(ui, "현재 구역의 바탕쪽");
-        let pages = list["masterPages"].as_array().cloned().unwrap_or_default();
-        if pages.is_empty() {
-            ui.label("없음");
+    }
+}
+
+impl MasterObject {
+    /// `page.master.object.insert` parameters for the master page `apply_to`.
+    fn params(&self, apply_to: &str) -> serde_json::Value {
+        let (kind, _) = MASTER_OBJECT_KINDS[self.kind.min(MASTER_OBJECT_KINDS.len() - 1)];
+        let mut params = json!({
+            "applyTo": apply_to,
+            "kind": kind,
+            "x_mm": self.x_mm,
+            "y_mm": self.y_mm,
+            "width_mm": self.width_mm,
+            "wrap": if self.front { "front" } else { "behind" },
+        });
+        if kind == "picture" {
+            params["path"] = json!(self.path.trim());
+        } else {
+            params["height_mm"] = json!(self.height_mm);
         }
-        for m in pages {
-            ui.label(format!(
-                "{} · {}",
-                m["applyTo"].as_str().unwrap_or("?"),
-                m["text"]
-                    .as_str()
-                    .unwrap_or("")
-                    .chars()
-                    .take(40)
-                    .collect::<String>()
-            ));
-        }
-        notice(
-            ui,
-            "바탕쪽 만들기·편집은 아직 지원하지 않습니다. 기존 문서의 바탕쪽은 그대로 표시·저장됩니다.",
+        params
+    }
+}
+
+impl HwpApp {
+    /// 바탕쪽: 양쪽·홀수·짝수 바탕쪽의 글을 만들고 고치거나 지우고, 그림·도형을 넣고
+    /// 지운다. Other kinds stay as they are (the reason is shown).
+    fn master_page_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        kind: &mut usize,
+        list: &mut serde_json::Value,
+        text: &mut String,
+        objects: &mut serde_json::Value,
+        object: &mut MasterObject,
+    ) -> bool {
+        // The kinds HwpCraft edits, by radio index: (applyTo, model name).
+        const KINDS: [(&str, &str); 3] = [("both", "Both"), ("odd", "Odd"), ("even", "Even")];
+        let page_of = |kind: usize| {
+            let (_, model) = KINDS.get(kind)?;
+            list["masterPages"]
+                .as_array()?
+                .iter()
+                .find(|m| m["applyTo"] == *model && m["extension"] == false)
+                .cloned()
+        };
+        let exists = page_of(*kind).is_some();
+        let blocked = list["reason"].as_str();
+        let why = if *kind >= KINDS.len() {
+            Some(
+                "마지막 쪽·임의 쪽 바탕쪽은 아직 만들 수 없습니다. 양쪽·홀수 쪽·짝수 쪽 중에서 고르세요.",
+            )
+        } else {
+            blocked
+        };
+        let delete_why = if !exists {
+            Some("이 구역에는 지울 그 종류의 바탕쪽이 없습니다.")
+        } else {
+            blocked
+        };
+        let apply_to = KINDS.get(*kind).map_or("both", |(name, _)| *name);
+        // 넣기 or an object's 지우기, run when the dialog has been drawn.
+        let mut request = None;
+        let button = dialog_with(
+            ctx,
+            "바탕쪽",
+            460.0,
+            &[
+                (
+                    if exists {
+                        "고치기(D)"
+                    } else {
+                        "만들기(D)"
+                    },
+                    why,
+                ),
+                ("지우기", delete_why),
+                ("취소", None),
+            ],
+            |ui| {
+                group(ui, "종류");
+                let before = *kind;
+                for (i, label) in [
+                    "양쪽",
+                    "홀수 쪽",
+                    "짝수 쪽",
+                    "현재 구역의 마지막 쪽",
+                    "현재 구역 안 임의 쪽",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    ui.radio_value(kind, i, *label);
+                }
+                if *kind != before {
+                    *text = page_of(*kind)
+                        .and_then(|m| m["text"].as_str().map(str::to_owned))
+                        .unwrap_or_default();
+                }
+                group(ui, "바탕쪽 글");
+                ui.add_enabled(
+                    why.is_none(),
+                    egui::TextEdit::multiline(text)
+                        .desired_rows(4)
+                        .desired_width(300.0)
+                        .hint_text("예: 대외비"),
+                );
+                group(ui, "현재 구역의 바탕쪽");
+                let pages = list["masterPages"].as_array().cloned().unwrap_or_default();
+                if pages.is_empty() {
+                    ui.label("없음");
+                }
+                for m in pages {
+                    let kind = match m["applyTo"].as_str().unwrap_or("") {
+                        "Both" => "양쪽",
+                        "Odd" => "홀수 쪽",
+                        "Even" => "짝수 쪽",
+                        other => other,
+                    };
+                    ui.label(format!(
+                        "{kind}{} · {}",
+                        if m["extension"] == true {
+                            " (확장)"
+                        } else {
+                            ""
+                        },
+                        m["text"]
+                            .as_str()
+                            .unwrap_or("")
+                            .chars()
+                            .take(40)
+                            .collect::<String>()
+                    ));
+                }
+                group(ui, "그림·도형");
+                let mm = |v: &serde_json::Value| format!("{:.1}", v.as_f64().unwrap_or(0.0));
+                let mine: Vec<&serde_json::Value> = objects["objects"]
+                    .as_array()
+                    .map(|all| all.iter().filter(|o| o["applyTo"] == apply_to).collect())
+                    .unwrap_or_default();
+                if mine.is_empty() || why.is_some() {
+                    ui.label("없음");
+                }
+                for o in mine.into_iter().filter(|_| why.is_none()) {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{} · 자리 {}×{} mm · 크기 {}×{} mm · {}",
+                            if o["kind"] == "picture" {
+                                "그림"
+                            } else {
+                                "도형"
+                            },
+                            mm(&o["x_mm"]),
+                            mm(&o["y_mm"]),
+                            mm(&o["width_mm"]),
+                            mm(&o["height_mm"]),
+                            if o["wrap"] == "front" {
+                                "글 앞"
+                            } else {
+                                "글 뒤"
+                            }
+                        ));
+                        if ui.small_button("지우기").clicked() {
+                            request = Some((
+                                "page.master.object.delete",
+                                json!({"applyTo": apply_to, "index": o["index"]}),
+                            ));
+                        }
+                    });
+                }
+                ui.add_enabled_ui(why.is_none(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("종류");
+                        egui::ComboBox::from_id_salt("master-object-kind")
+                            .width(91.0)
+                            .selected_text(MASTER_OBJECT_KINDS[object.kind].1)
+                            .show_ui(ui, |ui| {
+                                for (i, (_, label)) in MASTER_OBJECT_KINDS.iter().enumerate() {
+                                    ui.selectable_value(&mut object.kind, i, *label);
+                                }
+                            });
+                        ui.radio_value(&mut object.front, false, "글 뒤");
+                        ui.radio_value(&mut object.front, true, "글 앞");
+                    });
+                    if object.kind == 0 {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut object.path)
+                                    .desired_width(240.0)
+                                    .hint_text("그림 파일"),
+                            );
+                            if ui.button("찾기…").clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("그림 파일", &["png", "jpg", "jpeg", "bmp", "gif"])
+                                    .pick_file()
+                            {
+                                object.path = path.display().to_string();
+                            }
+                        });
+                    }
+                    fn length(value: &mut f64, min: f64) -> egui::DragValue<'_> {
+                        egui::DragValue::new(value)
+                            .range(min..=1000.0)
+                            .speed(0.5)
+                            .suffix(" mm")
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("가로");
+                        ui.add(length(&mut object.x_mm, 0.0));
+                        ui.label("세로");
+                        ui.add(length(&mut object.y_mm, 0.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("너비");
+                        ui.add(length(&mut object.width_mm, 1.0));
+                        if object.kind == 0 {
+                            ui.label("(높이는 그림 비율대로)");
+                        } else {
+                            ui.label("높이");
+                            ui.add(length(&mut object.height_mm, 1.0));
+                        }
+                    });
+                    let ready = object.kind != 0 || !object.path.trim().is_empty();
+                    if ui.add_enabled(ready, egui::Button::new("넣기")).clicked() {
+                        request = Some(("page.master.object.insert", object.params(apply_to)));
+                    }
+                });
+                notice(
+                    ui,
+                    &match blocked {
+                        Some(reason) => reason.to_owned(),
+                        None => "바탕쪽 글은 쪽의 본문 뒤에 깔립니다. 각 줄이 한 문단이 됩니다. \
+                                 홀수 쪽·짝수 쪽 바탕쪽은 그 쪽에서 양쪽 바탕쪽 대신 쓰입니다. \
+                                 그림·도형은 종이 왼쪽 위에서 잰 자리에 놓이고, 넣기·지우기는 \
+                                 바로 문서에 들어갑니다(실행 취소로 되돌림)."
+                            .to_owned(),
+                    },
+                );
+            },
         );
-    });
-    // 만들기 stays unavailable: RHWP keeps master pages as render-only data.
-    !matches!(button, Some(1))
+        if let Some((id, params)) = request {
+            self.master_object_request(id, params, list, objects);
+            return true;
+        }
+        let (id, params) = match button {
+            Some(0) => (
+                "page.master.set",
+                json!({ "applyTo": apply_to, "text": text.as_str() }),
+            ),
+            Some(1) => ("page.master.delete", json!({ "applyTo": apply_to })),
+            Some(_) => return false,
+            None => return true,
+        };
+        let r = self.session.run(id, params);
+        if self.result(r).is_some() {
+            self.message = if id == "page.master.delete" {
+                "바탕쪽을 지웠습니다.".into()
+            } else {
+                "바탕쪽을 저장했습니다. 실행 취소로 되돌릴 수 있습니다.".into()
+            };
+            return false;
+        }
+        true
+    }
+
+    /// Run 바탕쪽 창's 넣기 or 지우기 for a picture or shape, then show the section's
+    /// master pages and objects again (넣기 makes the master page when it is missing).
+    fn master_object_request(
+        &mut self,
+        id: &str,
+        params: serde_json::Value,
+        list: &mut serde_json::Value,
+        objects: &mut serde_json::Value,
+    ) {
+        let r = self.session.run(id, params);
+        if self.result(r).is_some() {
+            self.message = if id == "page.master.object.delete" {
+                "바탕쪽 그림·도형을 지웠습니다. 실행 취소로 되돌릴 수 있습니다.".into()
+            } else {
+                "바탕쪽에 그림·도형을 넣었습니다. 실행 취소로 되돌릴 수 있습니다.".into()
+            };
+        }
+        *list = self
+            .session
+            .run("page.master.list", json!({}))
+            .unwrap_or_default();
+        *objects = self
+            .session
+            .run("page.master.object.list", json!({}))
+            .unwrap_or_default();
+    }
 }
 
 // ----- 문서 정보 (620×520) -----
@@ -2022,10 +3091,9 @@ fn view_file() -> Option<PathBuf> {
 }
 const SHOW_UNSUPPORTED: &str = "show_unsupported_commands";
 /// 지원하지 않는 명령 보기 from `view.txt`; anything unreadable means off.
+#[cfg(test)]
 pub(crate) fn parse_view(text: &str) -> bool {
-    text.lines()
-        .filter_map(|l| l.split_once('='))
-        .any(|(k, v)| k.trim() == SHOW_UNSUPPORTED && v.trim() == "1")
+    settings::Settings::parse(text).show_unsupported
 }
 /// Recent documents are kept as absolute paths with one separator style, so a
 /// document opened from a relative path or with `/` is still found (and not listed
@@ -2115,7 +3183,7 @@ pub(crate) const ALT_KEYS: &[(usize, char, &str)] = &[
     (1, 'S', "format.style.dialog"),
     (1, 'G', "page.portrait"),
     (1, 'D', "page.landscape"),
-    (1, 'J', "page.margins"),
+    (1, 'J', "menu:쪽 여백"),
     (1, 'E', "page.master"),
     (1, 'U', "page.columns"),
     (1, 'I', "insert.picture_dialog"),
@@ -2127,7 +3195,7 @@ pub(crate) const ALT_KEYS: &[(usize, char, &str)] = &[
     (1, 'N', "edit.replace"),
     (1, 'O', "edit.sort"),
     (2, 'L', "view.page_outline"),
-    (2, 'C', "view.color_mode"),
+    (2, 'C', "menu:문서 보기 색"),
     (2, 'H', "view.paragraph_marks"),
     (2, 'I', "view.pictures"),
     (2, 'R', "view.control_codes"),
@@ -2142,7 +3210,7 @@ pub(crate) const ALT_KEYS: &[(usize, char, &str)] = &[
     (2, 'P', "view.hanja_pronounce"),
     (2, 'W', "view.task_pane"),
     (2, 'B', "view.split"),
-    (2, 'O', "view.arrange"),
+    (2, 'O', "menu:창 배열"),
     (2, 'K', "view.switch_window"),
     (2, 'U', "view.zoom_out"),
     (2, 'N', "view.zoom_in"),
@@ -2155,7 +3223,7 @@ pub(crate) const ALT_KEYS: &[(usize, char, &str)] = &[
     (3, 'W', "insert.textart"),
     (3, 'E', "insert.equation"),
     (3, 'O', "insert.ole"),
-    (3, 'L', "insert.form_object"),
+    (3, 'L', "menu:양식 개체"),
     (3, 'K', "insert.field"),
     (3, 'F', "insert.footnote"),
     (3, 'D', "insert.endnote"),
@@ -2192,7 +3260,7 @@ pub(crate) const ALT_KEYS: &[(usize, char, &str)] = &[
     (5, 'J', "page.setup_dialog"),
     (5, 'O', "page.portrait"),
     (5, 'Y', "page.landscape"),
-    (5, 'Z', "page.margins"),
+    (5, 'Z', "menu:쪽 여백"),
     (5, 'C', "page.text_direction"),
     (5, 'F', "page.master"),
     (5, 'H', "page.header"),
@@ -2201,7 +3269,7 @@ pub(crate) const ALT_KEYS: &[(usize, char, &str)] = &[
     (5, 'G', "page.number"),
     (5, 'W', "page.new_number"),
     (5, 'I', "page.hide"),
-    (5, 'M', "page.line_numbers"),
+    (5, 'M', "menu:줄 번호"),
     (5, 'P', "insert.page_break"),
     (5, 'D', "insert.column_break"),
     (5, 'R', "page.delete"),
@@ -2242,8 +3310,8 @@ pub(crate) const ALT_KEYS: &[(usize, char, &str)] = &[
     (8, 'B', "tools.bibliography"),
     (8, 'Y', "tools.bibliography_style"),
     (8, 'F', "tools.bibliography_refresh"),
-    (8, 'L', "table.block_calc"),
-    (8, 'R', "tools.macro"),
+    (8, 'L', "menu:블록 계산"),
+    (8, 'R', "macro.record.start"),
     (8, 'S', "review.spelling"),
     (8, 'Q', "tools.autocorrect"),
     (8, 'A', "tools.dictionary"),
@@ -2253,7 +3321,130 @@ pub(crate) const ALT_KEYS: &[(usize, char, &str)] = &[
     (8, 'Z', "tools.customize"),
     (8, 'U', "tools.options"),
     (8, 'E', "tools.user_info"),
-    (8, 'H', "tools.assets"),
+    // Big buttons, menus and contextual tabs that had no tip. A drop-down menu is
+    // "menu:<label>" and opens on its letter; Hangul's letter where it is free, then
+    // the first free letter or digit.
+    (1, 'H', "insert.shape.rectangle"),
+    (1, 'W', "object.unlock_all"),
+    (1, 'X', "menu:찾기"),
+    (1, 'Z', "menu:문서 영역 편집"),
+    (2, 'Y', "menu:안내선"),
+    (2, 'Z', "menu:편집 화면 나누기"),
+    (2, '1', "menu:새 창"),
+    (2, '2', "view.editor"),
+    (3, 'A', "menu:표"),
+    (3, 'G', "menu:차트"),
+    (3, 'I', "menu:번호 넣기"),
+    (3, 'J', "menu:각주/미주 모양"),
+    (3, 'Q', "note.convert"),
+    (3, 'V', "note.delete"),
+    (3, 'X', "field.delete"),
+    (3, 'Z', "view.link_prev"),
+    (3, '1', "view.link_next"),
+    (3, '2', "format.char_overlap.dialog"),
+    (3, '3', "format.ruby.dialog"),
+    (3, '4', "menu:세로 글상자"),
+    (3, '5', "menu:상용구"),
+    (4, 'A', "format.font.prev"),
+    (4, 'G', "format.font.next"),
+    (4, 'O', "format.superscript.cycle"),
+    (4, 'Q', "menu:문단 정렬"),
+    (4, 'S', "format.margin_left.decrease"),
+    (4, 'Z', "format.margin_left.increase"),
+    (4, '1', "format.drop_cap"),
+    (4, '2', "format.indent.positive"),
+    (4, '3', "format.indent.negative"),
+    (4, '4', "format.indent.at_caret"),
+    (4, '7', "format.paragraph.up"),
+    (4, '8', "format.paragraph.down"),
+    (7, 'T', "memo.list"),
+    (8, 'J', "menu:스크립트 매크로"),
+    (8, 'M', "menu:MCP 연결"),
+    (8, 'N', "object.list"),
+    (8, 'O', "help.search"),
+    (8, 'V', "help"),
+    (9, 'A', "table.select"),
+    (9, 'B', "table.properties"),
+    (9, 'C', "table.style"),
+    (9, 'D', "table.cell_border_fill"),
+    (9, 'E', "table.cell_shade.darker"),
+    (9, 'F', "table.cell_shade.lighter"),
+    (9, 'G', "table.draw"),
+    (9, 'H', "table.eraser"),
+    (9, 'I', "table.caption_text"),
+    (9, 'J', "table.delete"),
+    (10, 'A', "table.split"),
+    (10, 'B', "table.merge"),
+    (10, 'C', "table.equal_height"),
+    (10, 'D', "table.equal_width"),
+    (10, 'E', "table.text_direction"),
+    (10, 'F', "table.align.top"),
+    (10, 'G', "table.align.center"),
+    (10, 'H', "table.align.bottom"),
+    (10, 'I', "table.cell_margin"),
+    (10, 'J', "table.margin"),
+    (10, 'K', "table.transpose"),
+    (10, 'L', "table.split_table"),
+    (10, 'M', "table.merge_table"),
+    (10, 'N', "table.formula"),
+    (10, 'O', "table.block_sum"),
+    (10, 'P', "table.block_average"),
+    (10, 'Q', "table.block_product"),
+    (10, 'R', "table.thousands"),
+    (10, 'S', "table.thousands_remove"),
+    (10, 'T', "menu:배치"),
+    (10, 'U', "table.caption_text"),
+    (10, 'V', "table.cell_block"),
+    (10, 'W', "menu:셀 이동"),
+    (10, 'X', "table.sort"),
+    (10, 'Y', "menu:채우기"),
+    (10, 'Z', "table.to_text"),
+    (11, 'A', "object.properties"),
+    (11, 'B', "object.caption"),
+    (11, 'C', "menu:배치"),
+    (11, 'D', "menu:회전"),
+    (11, 'E', "picture.save"),
+    (11, 'F', "picture.save_all"),
+    (11, 'G', "menu:색 조정"),
+    (11, 'H', "menu:맞춤"),
+    (11, 'I', "object.protect_size"),
+    (11, 'J', "menu:바깥 여백"),
+    (11, 'K', "object.format.copy"),
+    (11, 'L', "object.format.paste"),
+    (11, 'M', "object.next"),
+    (11, 'N', "object.prev"),
+    (11, 'O', "object.delete"),
+    (11, 'P', "object.list"),
+    (12, 'A', "object.properties"),
+    (12, 'B', "object.caption"),
+    (12, 'C', "menu:배치"),
+    (12, 'D', "menu:회전"),
+    (12, 'E', "object.group"),
+    (12, 'F', "object.ungroup"),
+    (12, 'G', "object.z_order.front"),
+    (12, 'H', "object.z_order.forward"),
+    (12, 'I', "object.z_order.back"),
+    (12, 'J', "object.z_order.backward"),
+    (12, 'K', "menu:채우기 색"),
+    (12, 'L', "menu:선 색"),
+    (12, 'M', "menu:선 종류"),
+    (12, 'N', "menu:선 굵기"),
+    (12, 'O', "menu:끝 화살표"),
+    (12, 'P', "menu:시작 화살표"),
+    (12, 'Q', "menu:그림자"),
+    (12, 'R', "menu:연결선 종류"),
+    (12, 'S', "menu:글상자 정렬"),
+    (12, 'T', "menu:글자 방향"),
+    (12, 'U', "menu:글상자 여백"),
+    (12, 'V', "menu:맞춤"),
+    (12, 'W', "object.protect_size"),
+    (12, 'X', "menu:바깥 여백"),
+    (12, 'Y', "object.format.copy"),
+    (12, 'Z', "object.format.paste"),
+    (12, '1', "object.next"),
+    (12, '2', "object.prev"),
+    (12, '3', "object.delete"),
+    (12, '4', "object.list"),
 ];
 /// Letter shown for a command id in the given tab.
 pub(crate) fn alt_letter(tab: usize, id: &str) -> Option<char> {
@@ -2274,12 +3465,9 @@ impl HwpApp {
             "지원하지 않는 명령을 리본에서 숨겼습니다. 탭 끝의 [지원 안 함]에서 목록을 볼 수 있습니다."
                 .into()
         };
-        if let Some(file) = view_file() {
-            if let Some(dir) = file.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(file, format!("{SHOW_UNSUPPORTED}={}\n", u8::from(show)));
-        }
+        // Keep the other settings (자동 복구, 확대, 단축키) in the same file.
+        self.ext.shell.settings.show_unsupported = show;
+        self.ext.shell.settings.save();
     }
     /// Per-frame bookkeeping: recent documents and view marks that follow document replacement.
     fn shell_ext_frame(&mut self) {
@@ -2289,7 +3477,13 @@ impl HwpApp {
                 self.ext.shell.recent = parse_recent(&text);
             }
             if let Some(text) = view_file().and_then(|p| std::fs::read_to_string(p).ok()) {
-                self.ext.shell.show_unsupported = parse_view(&text);
+                let settings = settings::Settings::parse(&text);
+                self.ext.shell.show_unsupported = settings.show_unsupported;
+                // Captures and tests keep the default zoom.
+                if !cfg!(test) && self.screenshot.is_none() {
+                    self.set_zoom(settings.start_zoom as f32 / 100.0);
+                }
+                self.ext.shell.settings = settings;
             }
         }
         if self.session.path != self.ext.shell.last_path {
@@ -2316,6 +3510,406 @@ impl HwpApp {
         if let Some((header, apply)) = self.ext.shell.hf_next.take() {
             self.open_header_footer_editor(header, apply);
         }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn label_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        preset: &mut usize,
+        rows: &mut u32,
+        columns: &mut u32,
+        width: &mut f64,
+        height: &mut f64,
+        gap: &mut f64,
+    ) -> bool {
+        let why = self
+            .session
+            .dirty()
+            .then_some("저장하지 않은 변경 내용이 있습니다. 먼저 저장하거나 [새 창]에서 만드세요.");
+        let button = dialog_with(
+            ctx,
+            "라벨 문서 만들기",
+            460.0,
+            &[("만들기(D)", why), ("취소", None)],
+            |ui| {
+                group(ui, "라벨 종류 (A4)");
+                for (i, (name, r, c, w, h, g)) in LABEL_PRESETS.iter().enumerate() {
+                    if ui.radio_value(preset, i, *name).clicked() && i + 1 < LABEL_PRESETS.len() {
+                        (*rows, *columns, *width, *height, *gap) = (*r, *c, *w, *h, *g);
+                    }
+                }
+                group(ui, "크기");
+                let custom = *preset + 1 == LABEL_PRESETS.len();
+                ui.add_enabled_ui(custom, |ui| {
+                    egui::Grid::new("label-size")
+                        .num_columns(4)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("줄");
+                            ui.add(egui::DragValue::new(rows).range(1..=40));
+                            ui.label("칸");
+                            ui.add(egui::DragValue::new(columns).range(1..=10));
+                            ui.end_row();
+                            ui.label("너비");
+                            ui.add(
+                                egui::DragValue::new(width)
+                                    .range(5.0..=300.0)
+                                    .speed(0.1)
+                                    .suffix(" mm"),
+                            );
+                            ui.label("높이");
+                            ui.add(
+                                egui::DragValue::new(height)
+                                    .range(5.0..=300.0)
+                                    .speed(0.1)
+                                    .suffix(" mm"),
+                            );
+                            ui.end_row();
+                            ui.label("칸 사이");
+                            ui.add(
+                                egui::DragValue::new(gap)
+                                    .range(0.0..=30.0)
+                                    .speed(0.1)
+                                    .suffix(" mm"),
+                            );
+                            ui.end_row();
+                        });
+                });
+                notice(
+                    ui,
+                    "새 A4 문서에 테두리 없는 표로 라벨 칸을 만듭니다. 각 칸에 글을 넣으세요. \
+                     [보기 → 투명 선]을 켜면 칸 경계가 보입니다.",
+                );
+            },
+        );
+        match button {
+            Some(0) => {
+                let r = self.session.run(
+                    "page.label",
+                    json!({
+                        "rows": *rows, "columns": *columns,
+                        "labelWidthMm": *width, "labelHeightMm": *height, "gapXMm": *gap,
+                    }),
+                );
+                if let Some(v) = self.result(r) {
+                    self.page = 0;
+                    self.message = format!("라벨 {}칸짜리 새 문서를 만들었습니다.", v["labels"]);
+                    false
+                } else {
+                    true
+                }
+            }
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    /// Saving a document that holds Hangul track changes (as HWP, HWPX or DOCX) or picture
+    /// effects (as HWP) opens [`Dialog::TrackedSave`] instead; true when it did. One
+    /// window asks about both when both apply.
+    pub(crate) fn confirm_tracked_save(&mut self, path: &std::path::Path) -> bool {
+        let editable = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            ["hwp", "hwpx", "docx"]
+                .iter()
+                .any(|x| e.eq_ignore_ascii_case(x))
+        });
+        let tracked = editable && self.session.has_unkept_track_changes();
+        let effects = self.session.picture_effects_blocking_save(path);
+        if tracked || effects > 0 {
+            self.ext.shell.dialog = Some(Dialog::TrackedSave {
+                path: path.to_owned(),
+                tracked,
+                effects,
+            });
+            return true;
+        }
+        false
+    }
+
+    fn tracked_save_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        path: &std::path::Path,
+        tracked: bool,
+        effects: usize,
+    ) -> bool {
+        let (title, accept) = match (tracked, effects > 0) {
+            (true, true) => (
+                "변경 추적·그림 효과가 있는 문서 저장",
+                "결과본·효과 빼고 저장(D)",
+            ),
+            (false, true) => ("그림 효과가 있는 문서 저장", "효과 빼고 저장(D)"),
+            _ => ("변경 추적 문서 저장", "결과본으로 저장(D)"),
+        };
+        let other = if effects > 0 {
+            "HWPX로 저장…"
+        } else {
+            "다른 이름으로 저장…"
+        };
+        let button = dialog(ctx, title, 480.0, &[accept, other, "취소"], |ui| {
+            if tracked {
+                ui.label(
+                    "이 문서에는 한글의 변경 추적 기록이 있습니다. HwpCraft는 변경 추적 기록을 \
+                     보존하지 못합니다. 저장하면 변경 내용이 지금 보이는 결과본으로 합쳐지고 \
+                     변경 기록은 사라집니다. 원본을 남기려면 다른 이름으로 저장하세요.",
+                );
+            }
+            if effects > 0 {
+                if tracked {
+                    ui.add_space(6.0);
+                }
+                ui.label(format!(
+                    "이 문서의 그림 효과 {effects}개(그림자·네온·부드러운 가장자리·반사)는 아직 \
+                     HWP(.hwp)로 저장할 수 없습니다. 효과를 빼고 저장하거나, 효과를 남기려면 \
+                     HWPX로 저장하세요."
+                ));
+            }
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!("저장할 파일: {}", path.display()))
+                    .color(Color32::from_gray(110)),
+            );
+        });
+        match button {
+            Some(0) if effects > 0 => {
+                self.ext.shell.dialog = None;
+                let r = self.session.save_dropping_picture_effects(path, tracked);
+                if let Some(n) = self.result(r) {
+                    self.message = format!("그림 효과 {n}개를 빼고 저장 완료 · {}", path.display());
+                }
+                false
+            }
+            Some(0)
+                if path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("docx")) =>
+            {
+                self.ext.shell.dialog = None;
+                self.export_docx(path, true);
+                false
+            }
+            Some(0) => {
+                let r = self.session.save_accepting_track_changes(path);
+                if self.result(r).is_some() {
+                    self.message = format!("결과본으로 저장 완료 · {}", path.display());
+                }
+                false
+            }
+            Some(1) => {
+                // A new name keeps the original file; HWPX keeps the picture effects.
+                self.ext.shell.dialog = None;
+                self.save(true, (effects > 0).then_some("hwpx"));
+                false
+            }
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    /// Word 문서 (DOCX) export: the document keeps its own file and saved state. What
+    /// DOCX cannot hold is named in the message line. `accept` merges Hangul track
+    /// changes into the result (after the 변경 추적 문서 저장 question).
+    pub(crate) fn export_docx(&mut self, path: &std::path::Path, accept: bool) -> bool {
+        let r = self.session.export_docx(path, accept);
+        let Some(missing) = self.result(r) else {
+            return false;
+        };
+        self.message = if missing.is_empty() {
+            format!("DOCX로 내보냈습니다 · {}", path.display())
+        } else {
+            format!(
+                "DOCX로 내보냈습니다 · {} — 담지 못한 것: {}",
+                path.display(),
+                missing.join(", ")
+            )
+        };
+        true
+    }
+
+    fn template_list(&mut self) -> Vec<serde_json::Value> {
+        self.session
+            .run("file.template.list", json!({}))
+            .ok()
+            .and_then(|v| v["templates"].as_array().cloned())
+            .unwrap_or_default()
+    }
+
+    /// 문서마당: start a new document from a saved template, delete one, or save the
+    /// current document as a template.
+    fn templates_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        list: &mut Vec<serde_json::Value>,
+        selected: &mut usize,
+        name: &mut String,
+    ) -> bool {
+        let chosen = list
+            .get(*selected)
+            .and_then(|t| t["name"].as_str())
+            .map(str::to_owned);
+        let open_why = if chosen.is_none() {
+            Some("문서마당에 서식이 없습니다. 아래에서 현재 문서를 서식으로 저장하세요.")
+        } else if self.session.dirty() {
+            Some(
+                "저장하지 않은 변경 내용이 있습니다. 먼저 저장하거나 [새 창]에서 문서마당을 여세요.",
+            )
+        } else {
+            None
+        };
+        let delete_why = chosen.is_none().then_some("지울 서식이 없습니다.");
+        let mut save = false;
+        let button = dialog_with(
+            ctx,
+            "문서마당",
+            520.0,
+            &[
+                ("새 문서 만들기(D)", open_why),
+                ("지우기", delete_why),
+                ("닫기", None),
+            ],
+            |ui| {
+                group(ui, "내 서식");
+                if list.is_empty() {
+                    ui.label(
+                        RichText::new("저장한 서식이 없습니다.").color(Color32::from_gray(120)),
+                    );
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for (i, t) in list.iter().enumerate() {
+                            let label = format!(
+                                "{}    {}",
+                                t["name"].as_str().unwrap_or("?"),
+                                t["format"].as_str().unwrap_or("").to_uppercase()
+                            );
+                            ui.selectable_value(selected, i, label);
+                        }
+                    });
+                group(ui, "현재 문서를 서식으로 저장");
+                ui.horizontal(|ui| {
+                    ui.label("서식 이름");
+                    ui.add(
+                        egui::TextEdit::singleline(name)
+                            .desired_width(200.0)
+                            .char_limit(60),
+                    );
+                    save = ui
+                        .add_enabled(!name.trim().is_empty(), egui::Button::new("저장"))
+                        .clicked();
+                });
+                notice(
+                    ui,
+                    "서식은 설정 폴더의 templates 폴더에 저장됩니다. 서식으로 만든 새 문서는 \
+                     파일 이름이 없어서, 처음 저장할 때 위치를 고릅니다.",
+                );
+            },
+        );
+        if save {
+            let r = self
+                .session
+                .run("file.template.save", json!({ "name": name.trim() }));
+            if self.result(r).is_some() {
+                self.message = format!("현재 문서를 문서마당 [{}]로 저장했습니다.", name.trim());
+                *list = self.template_list();
+            }
+            return true;
+        }
+        match (button, chosen) {
+            (Some(0), Some(template)) => {
+                let r = self
+                    .session
+                    .run("file.template.new", json!({ "name": template }));
+                if self.result(r).is_some() {
+                    self.message = format!("문서마당 [{template}]로 새 문서를 만들었습니다.");
+                    self.page = 0;
+                }
+                false
+            }
+            (Some(1), Some(template)) => {
+                let r = self
+                    .session
+                    .run("file.template.delete", json!({ "name": template }));
+                if self.result(r).is_some() {
+                    *list = self.template_list();
+                    *selected = 0;
+                }
+                true
+            }
+            (Some(_), _) => false,
+            (None, _) => true,
+        }
+    }
+
+    fn guide_dialog(&mut self, ctx: &egui::Context, vertical: &mut bool, mm: &mut f32) -> bool {
+        let button = dialog(
+            ctx,
+            "안내선 넣기",
+            360.0,
+            &["넣기(D)", "취소"],
+            |ui| {
+                group(ui, "방향");
+                ui.horizontal(|ui| {
+                    ui.radio_value(vertical, true, "세로선");
+                    ui.radio_value(vertical, false, "가로선");
+                });
+                group(ui, "위치");
+                ui.horizontal(|ui| {
+                    ui.label(if *vertical {
+                        "용지 왼쪽에서"
+                    } else {
+                        "용지 위에서"
+                    });
+                    ui.add(
+                        egui::DragValue::new(mm)
+                            .range(0.0..=1000.0)
+                            .speed(0.5)
+                            .suffix(" mm"),
+                    );
+                });
+                notice(ui, "안내선은 화면에만 보이고 인쇄·저장되지 않습니다.");
+            },
+        );
+        match button {
+            Some(0) => {
+                self.ext.shell.guides.push((*vertical, *mm));
+                self.ext.shell.show_guides = true;
+                self.message = format!(
+                    "{}을 {:.1} mm에 넣었습니다.",
+                    if *vertical {
+                        "세로 안내선"
+                    } else {
+                        "가로 안내선"
+                    },
+                    mm
+                );
+                false
+            }
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    /// 새 창: start another HwpCraft (same executable) with `path`, or an empty document.
+    pub(crate) fn open_new_window(&mut self, path: Option<PathBuf>) {
+        let started = std::env::current_exe().and_then(|exe| {
+            let mut command = std::process::Command::new(exe);
+            if let Some(path) = &path {
+                command.arg(path);
+            }
+            command.spawn()
+        });
+        self.message = match (started, path) {
+            (Ok(_), Some(path)) => format!(
+                "새 창에서 엽니다: {}",
+                path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned()
+                )
+            ),
+            (Ok(_), None) => "새 창을 열었습니다.".into(),
+            (Err(e), _) => format!("새 창을 열지 못했습니다: {e}"),
+        };
     }
     /// Push the 보기 check boxes into the engine (screen only; bumps the page cache).
     pub(crate) fn apply_marks(&mut self) {
@@ -2394,6 +3988,16 @@ impl HwpApp {
     /// Alt+letter pressed together switches tabs directly (Alt+F opens the file menu).
     fn keytip_shortcuts(&mut self, ctx: &egui::Context) -> bool {
         use egui::{Key, Modifiers};
+        if self.frames >= 4
+            && let Some(id) = self.ext.shell.view_keytip.take()
+        {
+            self.ribbon_keytip(id, ctx);
+        }
+        if self.frames >= 4
+            && let Some(popup) = self.ext.shell.view_popup.take()
+        {
+            egui::Popup::open_id(ctx, popup);
+        }
         let tab_keys: [(Key, usize); 9] = [
             (Key::F, 0),
             (Key::E, 1),
@@ -2429,7 +4033,7 @@ impl HwpApp {
                 _ => KeyTips::Off,
             };
             self.message = if self.ext.shell.keytips == KeyTips::Tabs {
-                "Alt 키팁: 메뉴 탭 글자(F E U D J W R H K)를 누르세요. Esc로 닫습니다.".into()
+                "Alt 키팁: 메뉴 탭 글자(F E U D J W R H K, 표·그림·도형 탭 Y L P X)를 누르세요. Esc로 닫습니다.".into()
             } else {
                 String::new()
             };
@@ -2480,11 +4084,15 @@ impl HwpApp {
         ctx.input_mut(|i| i.events.clear());
         match self.ext.shell.keytips {
             KeyTips::Tabs => {
-                if let Some((_, index)) = tab_keys
+                // The contextual tabs (Y L P X) are reached from the tab tips only: Alt+L and
+                // Alt+P pressed together stay 글자 모양 and 인쇄.
+                if let Some(index) = tab_keys
                     .iter()
                     .find(|(k, _)| k.name() == letter.to_string())
+                    .map(|(_, index)| *index)
+                    .or_else(|| self.keytip_context_tab(letter))
                 {
-                    self.keytip_tab(*index, ctx);
+                    self.keytip_tab(index, ctx);
                 }
             }
             KeyTips::Items => {
@@ -2541,12 +4149,15 @@ impl HwpApp {
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
                     ui.label("암호");
-                    ui.add_enabled(
+                    let field = ui.add_enabled(
                         !*remove,
                         egui::TextEdit::singleline(password)
                             .password(true)
                             .desired_width(220.0),
                     );
+                    if !*remove {
+                        chrome::first_focus(&field);
+                    }
                     ui.end_row();
                     ui.label("암호 확인");
                     ui.add_enabled(
@@ -2823,61 +4434,60 @@ impl HwpApp {
     }
 
     // ----- 미리 보기 -----
-    fn preview_dialog(
-        &mut self,
-        ctx: &egui::Context,
-        page: &mut u32,
-        texture: &mut Option<(u32, u64, egui::TextureHandle, Vec2)>,
-    ) -> bool {
-        let count = self.layout_page_count().max(1);
-        *page = (*page).min(count - 1);
-        let sizes = self.page_sizes();
-        let size = sizes
-            .get(*page as usize)
-            .copied()
-            .unwrap_or(Vec2::new(794.0, 1123.0));
-        let scale = (520.0 / size.y.max(1.0)).clamp(0.25, 1.0);
+    /// 미리 보기: the sheets as they print — print profile, odd/even pages, 모아 찍기
+    /// and watermark — one sheet at a time. 인쇄 carries the settings to the print window.
+    fn preview_dialog(&mut self, ctx: &egui::Context, preview: &mut PreviewState) -> bool {
+        let mut layout = preview.layout.clone();
+        layout.watermark =
+            (!preview.watermark.trim().is_empty()).then(|| hwpcraft_engine::Watermark {
+                text: preview.watermark.trim().to_owned(),
+                opacity: None,
+            });
+        let key = format!("{layout:?}");
         let generation = self.session.generation;
-        if texture
-            .as_ref()
-            .is_none_or(|(p, g, _, _)| *p != *page || *g != generation)
-        {
-            match self
+        if preview.texture.as_ref().is_none_or(|(sheet, g, k, _, _)| {
+            *sheet != preview.sheet || *g != generation || *k != key
+        }) {
+            let sheet = self
                 .session
-                .render_page_svg(*page)
-                .and_then(|svg| self.renderer.screen(&svg, scale))
-            {
-                Ok(p) => {
+                .print_preview_sheet(preview.sheet, &layout)
+                .and_then(|(svg, sheets)| Ok((self.renderer.screen(&svg, 0.75)?, sheets)));
+            match sheet {
+                Ok((p, sheets)) => {
+                    preview.sheets = sheets;
+                    preview.sheet = preview.sheet.min(sheets.saturating_sub(1));
                     let image = egui::ColorImage::from_rgba_premultiplied(
                         [p.width as usize, p.height as usize],
                         &p.rgba,
                     );
                     let handle = ctx.load_texture(
-                        format!("preview-{page}-{generation}"),
+                        format!("preview-{}-{generation}", preview.sheet),
                         image,
                         egui::TextureOptions::LINEAR,
                     );
-                    *texture = Some((
-                        *page,
+                    preview.texture = Some((
+                        preview.sheet,
                         generation,
+                        key,
                         handle,
                         Vec2::new(p.width as f32, p.height as f32),
                     ));
                 }
                 Err(e) => {
-                    self.error = Some(format!("{e:#}"));
-                    return false;
+                    self.message = format!("미리 보기를 만들지 못했습니다: {e:#}");
+                    preview.texture = None;
                 }
             }
         }
-        let mut go: Option<u32> = None;
+        let count = preview.sheets.max(1);
+        let mut go: Option<usize> = None;
         let mut print = false;
-        let button = dialog(ctx, "미리 보기", 720.0, &["인쇄(D)", "닫기"], |ui| {
+        let button = dialog(ctx, "미리 보기", 760.0, &["인쇄(D)", "닫기"], |ui| {
             ui.horizontal(|ui| {
                 for (label, target) in [
                     ("처음", 0),
-                    ("이전", page.saturating_sub(1)),
-                    ("다음", (*page + 1).min(count - 1)),
+                    ("이전", preview.sheet.saturating_sub(1)),
+                    ("다음", (preview.sheet + 1).min(count - 1)),
                     ("끝", count - 1),
                 ] {
                     if ui.button(label).clicked() {
@@ -2885,20 +4495,73 @@ impl HwpApp {
                     }
                 }
                 ui.add_space(12.0);
-                ui.label(format!("{} / {} 쪽", *page + 1, count));
+                ui.label(if preview.layout.n_up > 1 {
+                    format!("{} / {} 장", preview.sheet + 1, count)
+                } else {
+                    format!("{} / {} 쪽", preview.sheet + 1, count)
+                });
                 ui.add_space(12.0);
                 if ui.button("PDF로 저장").clicked() {
                     print = true;
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("쪽 고르기");
+                egui::ComboBox::from_id_salt("preview-odd-even")
+                    .width(96.0)
+                    .selected_text(match preview.layout.odd_even.as_str() {
+                        "odd" => "홀수 쪽만",
+                        "even" => "짝수 쪽만",
+                        _ => "모든 쪽",
+                    })
+                    .show_ui(ui, |ui| {
+                        for (value, label) in [
+                            ("all", "모든 쪽"),
+                            ("odd", "홀수 쪽만"),
+                            ("even", "짝수 쪽만"),
+                        ] {
+                            if ui
+                                .selectable_label(preview.layout.odd_even == value, label)
+                                .clicked()
+                            {
+                                preview.layout.odd_even = value.into();
+                                preview.sheet = 0;
+                            }
+                        }
+                    });
+                ui.label("모아 찍기");
+                egui::ComboBox::from_id_salt("preview-n-up")
+                    .width(96.0)
+                    .selected_text(format!("한 장에 {}쪽", preview.layout.n_up))
+                    .show_ui(ui, |ui| {
+                        for n in [1, 2, 4, 8] {
+                            if ui
+                                .selectable_label(
+                                    preview.layout.n_up == n,
+                                    format!("한 장에 {n}쪽"),
+                                )
+                                .clicked()
+                            {
+                                preview.layout.n_up = n;
+                                preview.sheet = 0;
+                            }
+                        }
+                    });
+                ui.checkbox(&mut preview.layout.reverse, "역순");
+                ui.label("워터마크");
+                ui.add(
+                    egui::TextEdit::singleline(&mut preview.watermark)
+                        .desired_width(110.0)
+                        .char_limit(40)
+                        .hint_text("예: 대외비"),
+                );
+            });
             ui.add_space(6.0);
-            if let Some((_, _, handle, size)) = texture.as_ref() {
-                let (area, _) =
-                    ui.allocate_exact_size(Vec2::new(560.0, 540.0), egui::Sense::hover());
-                ui.painter().rect_filled(area, 0.0, Color32::from_gray(235));
+            let (area, _) = ui.allocate_exact_size(Vec2::new(600.0, 540.0), egui::Sense::hover());
+            ui.painter().rect_filled(area, 0.0, Color32::from_gray(235));
+            if let Some((_, _, _, handle, size)) = preview.texture.as_ref() {
                 let fit = (area.width() / size.x).min(area.height() / size.y).min(1.0);
-                let shown = *size * fit;
-                let rect = Rect::from_center_size(area.center(), shown);
+                let rect = Rect::from_center_size(area.center(), *size * fit);
                 ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
                 ui.painter().image(
                     handle.id(),
@@ -2915,11 +4578,11 @@ impl HwpApp {
             }
             note(
                 ui,
-                "화면과 같은 RHWP 조판으로 그립니다. 인쇄는 인쇄 창으로 이어집니다.",
+                "인쇄될 모습(인쇄용 조판·모아 찍기·워터마크)으로 보입니다. 설정은 인쇄 창으로 이어집니다.",
             );
         });
-        if let Some(p) = go {
-            *page = p;
+        if let Some(sheet) = go {
+            preview.sheet = sheet;
         }
         if print || button == Some(0) {
             self.ext.shell.dialog = Some(Dialog::Print {
@@ -2927,6 +4590,8 @@ impl HwpApp {
                 pages: String::new(),
                 copies: 1,
                 to_file: print,
+                layout: preview.layout.clone(),
+                watermark: preview.watermark.clone(),
             });
             return false;
         }
@@ -2941,6 +4606,7 @@ impl HwpApp {
         tab_mm: &mut f64,
         hide: &mut [bool; 6],
         whole_document: &mut bool,
+        line_numbers: &mut [bool; 2],
     ) -> bool {
         let button = dialog(ctx, "구역 설정", 520.0, &["설정(D)", "취소"], |ui| {
             group(ui, "번호 시작");
@@ -2996,8 +4662,10 @@ impl HwpApp {
                 }
             });
             group(ui, "줄 번호");
-            ui.add_enabled(false, egui::Checkbox::new(&mut false, "줄 번호 표시"))
-                .on_disabled_hover_text("RHWP에 줄 번호 API가 없어 지원하지 않습니다.");
+            ui.checkbox(&mut line_numbers[1], "줄 번호 표시")
+                .on_hover_text(
+                    "간격·시작 번호 같은 설정은 쪽 → 줄 번호 → 줄 번호 설정에서 바꿉니다.",
+                );
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label("적용 범위");
@@ -3015,19 +4683,181 @@ impl HwpApp {
             });
         });
         match button {
+            Some(0) => {
+                let applied = self.run(
+                    "page.section",
+                    json!({
+                        "pageNum": numbers[0], "pictureNum": numbers[1],
+                        "tableNum": numbers[2], "equationNum": numbers[3],
+                        "defaultTabSpacingMm": *tab_mm,
+                        "hideHeader": hide[0], "hideFooter": hide[1], "hideMasterPage": hide[2],
+                        "hideBorder": hide[3], "hideFill": hide[4], "hideEmptyLine": hide[5],
+                        "wholeDocument": *whole_document,
+                    }),
+                );
+                // 줄 번호 표시 goes only when it changed, so its settings are left alone.
+                let numbers_applied = line_numbers[0] == line_numbers[1]
+                    || self.run(
+                        "page.line_numbers",
+                        json!({"show": line_numbers[1], "all_sections": *whole_document}),
+                    );
+                !(applied && numbers_applied)
+            }
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    /// Whether the caret paragraph skips line numbering (줄 번호 건너뜀).
+    pub(crate) fn line_number_skipped(&self) -> bool {
+        let c = self.session.cursor;
+        let doc = self.session.core.document();
+        doc.sections
+            .get(c.section)
+            .and_then(|s| s.paragraphs.get(c.paragraph))
+            .and_then(|p| doc.doc_info.para_shapes.get(p.para_shape_id as usize))
+            .is_some_and(|shape| shape.suppress_line_numbers)
+    }
+
+    /// Whether the caret's section shows line numbers.
+    pub(crate) fn line_numbers_shown(&self) -> bool {
+        let section = self.session.cursor.section;
+        self.session
+            .core
+            .document()
+            .sections
+            .get(section)
+            .is_some_and(|s| s.section_def.show_line_number)
+    }
+
+    // ----- 줄 번호 설정 (한글 배치: 표시 · 시작 번호 · 번호 간격 · 본문과의 간격 · 번호 매기기) -----
+    fn line_numbers_dialog(&mut self, ctx: &egui::Context, s: &mut LineNumberSettings) -> bool {
+        let button = dialog(
+            ctx,
+            "줄 번호 설정",
+            440.0,
+            &["설정(D)", "취소"],
+            |ui| {
+                ui.checkbox(&mut s.show, "줄 번호 표시");
+                group(ui, "번호");
+                egui::Grid::new("line-number-grid")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("시작 번호");
+                        ui.add(egui::DragValue::new(&mut s.start).range(1..=65535));
+                        ui.end_row();
+                        ui.label("번호 간격");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut s.count_by).range(1..=100));
+                            ui.label("줄마다");
+                        });
+                        ui.end_row();
+                        ui.label("본문과의 간격");
+                        ui.add(
+                            egui::DragValue::new(&mut s.distance_mm)
+                                .range(0.0..=100.0)
+                                .speed(0.1)
+                                .max_decimals(1)
+                                .suffix(" mm"),
+                        );
+                        ui.end_row();
+                    });
+                group(ui, "번호 매기기");
+                ui.radio_value(&mut s.restart, 1, "쪽마다 새 번호로 시작");
+                ui.radio_value(&mut s.restart, 2, "구역마다 새 번호로 시작");
+                ui.radio_value(&mut s.restart, 3, "이전 번호에 이어서");
+                ui.horizontal(|ui| {
+                    ui.label("적용 범위");
+                    egui::ComboBox::from_id_salt("line-number-scope")
+                        .width(150.0)
+                        .selected_text(if s.all_sections {
+                            "문서 전체"
+                        } else {
+                            "현재 구역"
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut s.all_sections, false, "현재 구역");
+                            ui.selectable_value(&mut s.all_sections, true, "문서 전체");
+                        });
+                });
+                notice(
+                    ui,
+                    "본문 줄마다 번호를 붙입니다(표·글상자·각주 안의 줄은 세지 않음). 번호의 위치·글꼴은 한글 화면과 대조하지 못했습니다.",
+                );
+            },
+        );
+        match button {
             Some(0) => !self.run(
-                "page.section",
+                "page.line_numbers",
                 json!({
-                    "pageNum": numbers[0], "pictureNum": numbers[1],
-                    "tableNum": numbers[2], "equationNum": numbers[3],
-                    "defaultTabSpacingMm": *tab_mm,
-                    "hideHeader": hide[0], "hideFooter": hide[1], "hideMasterPage": hide[2],
-                    "hideBorder": hide[3], "hideFill": hide[4], "hideEmptyLine": hide[5],
-                    "wholeDocument": *whole_document,
+                    "show": s.show,
+                    "start": s.start,
+                    "count_by": s.count_by,
+                    "distance_mm": s.distance_mm,
+                    "restart": s.restart,
+                    "all_sections": s.all_sections,
                 }),
             ),
             Some(_) => false,
             None => true,
+        }
+    }
+
+    // ----- 문서 이력 관리 (읽기만: 한글이 HWP에 기록한 버전) -----
+    fn history_dialog(&mut self, ctx: &egui::Context, list: &serde_json::Value) -> bool {
+        let entries = list["entries"].as_array().cloned().unwrap_or_default();
+        let last = list["lastVersion"].as_bool() == Some(true);
+        let buttons: &[&str] = if last {
+            &["마지막 버전 저장(S)...", "닫기"]
+        } else {
+            &["닫기"]
+        };
+        let button = dialog(ctx, "문서 이력 관리", 560.0, buttons, |ui| {
+            if entries.is_empty() {
+                ui.label(if list["file"].is_null() {
+                    "저장된 파일이 없어 이력이 없습니다."
+                } else {
+                    "이 문서 파일에는 한글이 기록한 이력이 없습니다."
+                });
+            } else {
+                egui::Grid::new("history-grid")
+                    .num_columns(4)
+                    .striped(true)
+                    .spacing([14.0, 6.0])
+                    .show(ui, |ui| {
+                        for head in ["버전", "날짜", "작성자", "설명"] {
+                            ui.strong(head);
+                        }
+                        ui.end_row();
+                        for e in &entries {
+                            ui.label((e["index"].as_u64().unwrap_or(0) + 1).to_string());
+                            ui.label(e["date"].as_str().unwrap_or("—"));
+                            ui.label(e["writer"].as_str().unwrap_or(""));
+                            ui.label(e["description"].as_str().unwrap_or(""));
+                            ui.end_row();
+                        }
+                    });
+            }
+            notice(
+                ui,
+                "한글의 문서 이력 관리로 기록된 버전을 보여 주기만 합니다. 새 버전 기록, 이전 버전 보기·되돌리기는 하지 않습니다. 기록은 HWP로 저장해도 그대로 남습니다.",
+            );
+        });
+        match (button, last) {
+            (Some(0), true) => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("HML 문서", &["hml"])
+                    .set_file_name("마지막 이력 버전.hml")
+                    .save_file()
+                    && self.run("review.history.save_last", json!({"path": path}))
+                {
+                    self.message = "마지막 이력 버전을 HML로 저장했습니다. HwpCraft는 이 HML(HWPML 2.5)을 열지 못합니다.".into();
+                }
+                true
+            }
+            (Some(_), _) => false,
+            (None, _) => true,
         }
     }
 
@@ -3344,7 +5174,7 @@ mod tests {
         assert_eq!(alt_letter(5, "page.section_dialog"), Some('E'));
         assert_eq!(alt_letter(6, "security.password"), Some('W'));
         assert_eq!(alt_letter(1, "security.password"), None);
-        for tab in 1..=8usize {
+        for tab in 1..=12usize {
             let mut letters: Vec<char> = ALT_KEYS
                 .iter()
                 .filter(|(t, _, _)| *t == tab)
@@ -3355,6 +5185,30 @@ mod tests {
             letters.dedup();
             assert_eq!(letters.len(), n, "tab {tab} has duplicate Alt letters");
         }
+    }
+
+    #[test]
+    fn key_tips_open_ribbon_menus_and_the_contextual_tabs() -> anyhow::Result<()> {
+        use egui::{Key, Modifiers};
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        // Alt, K (도구), M opens the MCP 연결 menu.
+        a.ext.shell.keytips = KeyTips::Tabs;
+        press(&mut a, &[(Modifiers::NONE, Key::K)]);
+        assert_eq!((a.tab, a.ext.shell.keytips), (8, KeyTips::Items));
+        press(&mut a, &[(Modifiers::NONE, Key::M)]);
+        let menu = egui::Id::new(("hwp-menu", "MCP\n연결", 8usize));
+        assert!(egui::Popup::is_id_open(&a.ctx, menu));
+        assert_eq!(a.ext.shell.keytips, KeyTips::Off);
+        // 그림 (P) is a tab tip only while a picture is selected.
+        a.ext.shell.keytips = KeyTips::Tabs;
+        press(&mut a, &[(Modifiers::NONE, Key::P)]);
+        assert_eq!(a.tab, 8);
+        a.ext.shell.object_kind = Some("picture");
+        press(&mut a, &[(Modifiers::NONE, Key::P)]);
+        assert_eq!((a.tab, a.ext.shell.keytips), (11, KeyTips::Items));
+        // Its items have tips too: A is 그림 속성.
+        assert_eq!(alt_letter(11, "object.properties"), Some('A'));
+        Ok(())
     }
 }
 
@@ -3424,21 +5278,106 @@ pub(crate) const MARGIN_PRESETS: &[(&str, &str)] = &[
     ("page.margins.wide", "넓게"),
 ];
 
-/// Map every grey pixel of a rendered page from white→`paper` and black→`text`; coloured
-/// pixels (pictures, highlights, coloured text) are left alone, like Hangul's dark mode.
-fn recolor(rgba: &mut [u8], paper: Color32, text: Color32) {
-    let lerp = |a: u8, b: u8, t: f32| (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8;
-    for px in rgba.as_chunks_mut::<4>().0 {
-        let (r, g, b) = (px[0], px[1], px[2]);
-        let saturation = r.max(g).max(b) - r.min(g).min(b);
-        if saturation > 40 {
-            continue;
-        }
-        let lum = (0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)) / 255.0;
-        px[0] = lerp(text.r(), paper.r(), lum);
-        px[1] = lerp(text.g(), paper.g(), lum);
-        px[2] = lerp(text.b(), paper.b(), lum);
+/// A page SVG in a screen colour mode: the paper becomes `paper`, and every fill, stroke
+/// and gradient colour is mapped with [`view_color`]. Pictures are left alone. Recolouring
+/// before rasterizing keeps glyph edges clean (recolouring pixels afterwards turned the
+/// anti-aliased edge of coloured text into a light fringe).
+pub(crate) fn view_colors_svg(svg: &str, paper: Color32, text: Color32) -> String {
+    let mut out = String::with_capacity(svg.len() + 128);
+    let mut rest = svg;
+    // Paper first, in root coordinates and large enough for any cropped view box.
+    if let Some(open) = rest.find("<svg")
+        && let Some(end) = rest[open..].find('>')
+    {
+        let end = open + end + 1;
+        out.push_str(&rest[..end]);
+        out.push_str(&format!(
+            "\n<rect x=\"-100000\" y=\"-100000\" width=\"200000\" height=\"200000\" fill=\"#{:02x}{:02x}{:02x}\"/>",
+            paper.r(),
+            paper.g(),
+            paper.b()
+        ));
+        rest = &rest[end..];
     }
+    while let Some(at) = rest.find("=\"#") {
+        let name_start = rest[..at]
+            .rfind(|c: char| c.is_whitespace() || c == '<' || c == ';')
+            .map_or(0, |i| i + 1);
+        let name = &rest[name_start..at];
+        let value = &rest[at + 3..];
+        let hex = value
+            .find('"')
+            .map(|end| &value[..end])
+            .filter(|h| h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+        match hex {
+            Some(hex) if matches!(name, "fill" | "stroke" | "stop-color" | "flood-color") => {
+                let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap_or(0);
+                let [r, g, b] = view_color([channel(0), channel(2), channel(4)], paper, text);
+                out.push_str(&rest[..at + 3]);
+                out.push_str(&format!("{r:02x}{g:02x}{b:02x}"));
+                rest = &value[6..];
+            }
+            _ => {
+                out.push_str(&rest[..at + 3]);
+                rest = value;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One document colour in a screen colour mode. Greys go from white→`paper` to
+/// black→`text` as before; a colour keeps its hue and has its lightness turned over
+/// within the paper–text range, so dark blue headings become light blue on dark paper.
+pub(crate) fn view_color(rgb: [u8; 3], paper: Color32, text: Color32) -> [u8; 3] {
+    let [r, g, b] = rgb.map(|v| f32::from(v) / 255.0);
+    let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    let mix = |a: u8, b: u8, t: f32| f32::from(a) + (f32::from(b) - f32::from(a)) * t;
+    let grey = [
+        mix(text.r(), paper.r(), lum),
+        mix(text.g(), paper.g(), lum),
+        mix(text.b(), paper.b(), lum),
+    ];
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let chroma = max - min;
+    if chroma < 0.02 {
+        return grey.map(|v| v.round().clamp(0.0, 255.0) as u8);
+    }
+    let lightness = (max + min) / 2.0;
+    let saturation = chroma / (1.0 - (2.0 * lightness - 1.0).abs()).max(1e-3);
+    let hue = if max == r {
+        ((g - b) / chroma).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / chroma + 2.0
+    } else {
+        (r - g) / chroma + 4.0
+    };
+    let light = |c: Color32| {
+        let [r, g, b] = [c.r(), c.g(), c.b()].map(|v| f32::from(v) / 255.0);
+        (r.max(g).max(b) + r.min(g).min(b)) / 2.0
+    };
+    let (paper_l, text_l) = (light(paper), light(text));
+    let l = paper_l + (text_l - paper_l) * (1.0 - lightness);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * saturation.min(1.0);
+    let x = c * (1.0 - (hue.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match hue as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let colour = [r1 + m, g1 + m, b1 + m].map(|v| v * 255.0);
+    // Nearly grey colours stay close to the grey mapping (and its tint).
+    let weight = (chroma * 2.0).min(1.0);
+    [0, 1, 2].map(|i| {
+        (grey[i] + (colour[i] - grey[i]) * weight)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    })
 }
 
 fn svg_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
@@ -3530,9 +5469,17 @@ impl HwpApp {
         scale: f32,
         band: Option<(usize, usize)>,
     ) -> anyhow::Result<egui::ColorImage> {
+        let t0 = std::time::Instant::now();
         let mut svg = self.session.render_page_svg(index)?;
+        let t1 = std::time::Instant::now();
         if !self.ext.shell.show_pictures {
             svg = picture_placeholders(&svg);
+        }
+        if self.ext.shell.hanja_readings {
+            svg = hanja_view::hanja_readings_svg(&svg);
+        }
+        if let Some((paper, text)) = self.page_style().1 {
+            svg = view_colors_svg(&svg, paper, text);
         }
         if let Some((y0, y1)) = band {
             svg = crop_rows(&svg, y0 as f32 / scale, (y1 - y0) as f32 / scale)
@@ -3540,18 +5487,14 @@ impl HwpApp {
         }
         // Screen raster: large embedded pictures come from pixel-identical stand-ins.
         let page = self.renderer.screen(&svg, scale)?;
-        let mut rgba = page.rgba;
-        if let Some((paper, text)) = self
-            .ext
-            .shell
-            .view_color
-            .colors(self.ext.shell.custom_colors)
-        {
-            recolor(&mut rgba, paper, text);
-        }
+        let [a, b] = self.ext.shell.raster_ms.get();
+        self.ext.shell.raster_ms.set([
+            a + (t1 - t0).as_secs_f64() * 1000.0,
+            b + t1.elapsed().as_secs_f64() * 1000.0,
+        ]);
         Ok(egui::ColorImage::from_rgba_premultiplied(
             [page.width as usize, page.height as usize],
-            &rgba,
+            &page.rgba,
         ))
     }
 
@@ -4131,8 +6074,88 @@ pub(crate) fn crop_rows(svg: &str, top: f32, height: f32) -> Option<String> {
     out.push_str(&root[first.1..second.0]);
     out.push_str(&second.2);
     out.push_str(&root[second.1..]);
-    out.push_str(&svg[end..]);
+    cull_text_rows(&svg[end..], y + top, y + top + height, &mut out);
     Some(out)
+}
+
+/// Copy `body` into `out` without the plain `<text>` elements that cannot reach rows
+/// `top..bottom`: a band of a dense page then parses its own few dozen glyph runs rather
+/// than the page's thousand or so, and draws the same pixels. Only a `<text x y>` holding
+/// bare characters, under nothing but untransformed `<g>`s, is judged; from 2 em above
+/// its baseline to 1 em below it must miss the rows. A clipped group is drawn on a layer
+/// as large as its contents, so the texts on each group's first and last baseline and at
+/// its left and right ends stay too: the layer, and so every pixel, stays the same.
+/// Everything else is kept.
+fn cull_text_rows(body: &str, top: f32, bottom: f32, out: &mut String) {
+    let attr = |tag: &str, name: &str| -> Option<f32> {
+        let key = format!(" {name}=\"");
+        let start = tag.find(&key)? + key.len();
+        tag[start..].split('"').next()?.parse().ok()
+    };
+    // Judged texts: (start, end, group, x, y, outside the rows).
+    let mut texts: Vec<(usize, usize, usize, f32, f32, bool)> = Vec::new();
+    // Open elements below the root: (start, true where a text inside may not be judged).
+    let mut open: Vec<(usize, bool)> = Vec::new();
+    let mut at = 0;
+    while let Some(found) = body[at..].find('<') {
+        let start = at + found;
+        let Some(close) = body[start..].find('>').map(|c| start + c) else {
+            break;
+        };
+        let tag = &body[start..=close];
+        at = close + 1;
+        if tag.starts_with("<!--") {
+            at = body[start..]
+                .find("-->")
+                .map_or(body.len(), |e| start + e + 3);
+            continue;
+        }
+        if tag.starts_with("<?") || tag.starts_with("<!") {
+            continue;
+        }
+        if tag.starts_with("</") {
+            open.pop();
+        } else if tag.starts_with("<text ") && !tag.ends_with("/>") {
+            let element = body[start..]
+                .find("</text>")
+                .map(|e| start + e + "</text>".len());
+            let judged = !open.iter().any(|(_, blocked)| *blocked) && !tag.contains(" transform=");
+            if let (true, Some(element)) = (judged, element) {
+                let content = &body[close + 1..element - "</text>".len()];
+                let place = (attr(tag, "x"), attr(tag, "y"), attr(tag, "font-size"));
+                if let (false, (Some(x), Some(y), Some(size))) = (content.contains('<'), place) {
+                    let group = open.last().map_or(usize::MAX, |(s, _)| *s);
+                    let outside = y + size < top || y - 2.0 * size > bottom;
+                    texts.push((start, element, group, x, y, outside));
+                    at = element;
+                    continue;
+                }
+            }
+            open.push((start, true));
+        } else if !tag.ends_with("/>") {
+            let plain_group = tag.starts_with("<g") && !tag.contains(" transform=");
+            open.push((start, !plain_group));
+        }
+    }
+    // Each group's extremes.
+    let mut ends: std::collections::HashMap<usize, [f32; 4]> = std::collections::HashMap::new();
+    for &(_, _, group, x, y, _) in &texts {
+        let e = ends.entry(group).or_insert([x, x, y, y]);
+        *e = [e[0].min(x), e[1].max(x), e[2].min(y), e[3].max(y)];
+    }
+    let mut last = 0;
+    for &(start, end, group, x, y, outside) in &texts {
+        let [x0, x1, y0, y1] = ends[&group];
+        if !outside || x == x0 || x == x1 || y == y0 || y == y1 {
+            continue;
+        }
+        out.push_str(&body[last..start]);
+        last = end;
+        if body[last..].starts_with('\n') {
+            last += 1;
+        }
+    }
+    out.push_str(&body[last..]);
 }
 
 fn scale_key(scale: f32) -> u16 {
@@ -4144,7 +6167,9 @@ impl HwpApp {
     /// each edit. A page drawn for an older document generation stays on screen and at
     /// most one such page is redrawn per pass, the caret's page first; the rest follow
     /// on the next passes (a repaint is requested). A page that has no texture yet, for
-    /// example one scrolled into view, is always drawn at once.
+    /// example one scrolled into view, and a page drawn at another zoom step go to the
+    /// raster workers; meanwhile the first shows blank paper and the second its old
+    /// bitmap.
     pub(crate) fn shell_page_texture(
         &mut self,
         ctx: &egui::Context,
@@ -4152,6 +6177,9 @@ impl HwpApp {
     ) -> anyhow::Result<egui::TextureHandle> {
         let generation = self.session.generation;
         let pass = ctx.cumulative_pass_nr();
+        if self.ext.shell.requested.0 != pass {
+            self.receive_rasters(ctx);
+        }
         let requested = &mut self.ext.shell.requested;
         if requested.0 != pass {
             requested.2 = std::mem::take(&mut requested.1);
@@ -4177,12 +6205,22 @@ impl HwpApp {
                 }
                 return Ok(texture);
             }
+            (Some(texture), Some(drawn)) if drawn == generation && self.raster_async() => {
+                // Only the zoom step changed: keep showing the old bitmap meanwhile.
+                let texture = texture.clone();
+                self.queue_raster(ctx, index, scale);
+                return Ok(texture);
+            }
             (Some(texture), Some(_)) => {
                 if !self.may_redraw_page(pass, index, generation, scale) {
                     ctx.request_repaint();
                     return Ok(texture.clone());
                 }
                 true
+            }
+            _ if self.raster_async() => {
+                self.queue_raster(ctx, index, scale);
+                return Ok(self.blank_page(ctx));
             }
             _ => false,
         };
@@ -4197,28 +6235,8 @@ impl HwpApp {
         // The shell-page area applies the document view colour and picture
         // placeholder options on top of the renderer's bitmap.
         let image = self.shell_page_image(index, scale)?;
-        if cfg!(debug_assertions) {
-            self.ext.shell.page_images.insert(index, image.clone());
-        }
-        let size = Vec2::new(image.size[0] as f32 / scale, image.size[1] as f32 / scale);
-        let texture = ctx.load_texture(
-            format!("page-{index}-{generation}"),
-            image,
-            egui::TextureOptions::LINEAR,
-        );
-        if !self.pages.contains_key(&index)
-            && self.pages.len() >= 8
-            && let Some(far) = self.pages.keys().copied().max_by_key(|k| k.abs_diff(index))
-        {
-            self.pages.remove(&far);
-            self.ext.shell.page_drawn.remove(&far);
-            self.ext.shell.page_scale.remove(&far);
-            self.ext.shell.page_images.remove(&far);
-        }
-        self.pages.insert(index, (texture.clone(), size));
-        self.ext.shell.page_drawn.insert(index, generation);
-        self.ext.shell.page_scale.insert(index, scale_key(scale));
-        self.note_caret_extent(index, generation);
+        self.ext.shell.rasters += 1;
+        let texture = self.install_page(ctx, index, generation, scale, image);
         if stale {
             self.ext.shell.redraw_pass = Some(pass);
             if self
@@ -4230,6 +6248,51 @@ impl HwpApp {
             }
         }
         Ok(texture)
+    }
+
+    /// Keep `image` as page `index`'s texture, evicting the page farthest away when
+    /// eight are kept already.
+    fn install_page(
+        &mut self,
+        ctx: &egui::Context,
+        index: u32,
+        generation: u64,
+        scale: f32,
+        image: egui::ColorImage,
+    ) -> egui::TextureHandle {
+        if cfg!(debug_assertions) {
+            self.ext.shell.page_images.insert(index, image.clone());
+        }
+        let size = Vec2::new(image.size[0] as f32 / scale, image.size[1] as f32 / scale);
+        self.ext.shell.uploaded += image.size[0] * image.size[1];
+        let texture = ctx.load_texture(
+            format!("page-{index}-{generation}"),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        // Up to 16 page bitmaps (about 6 MB each at 1.25x, so about 100 MB), enough
+        // for two panes of a split view. The page farthest away goes first, never one
+        // drawn in this pass or the last (the other pane's pages).
+        let (_, now, before) = &self.ext.shell.requested;
+        if !self.pages.contains_key(&index)
+            && self.pages.len() >= 16
+            && let Some(far) = self
+                .pages
+                .keys()
+                .copied()
+                .filter(|k| !now.contains(k) && !before.contains(k))
+                .max_by_key(|k| k.abs_diff(index))
+        {
+            self.pages.remove(&far);
+            self.ext.shell.page_drawn.remove(&far);
+            self.ext.shell.page_scale.remove(&far);
+            self.ext.shell.page_images.remove(&far);
+        }
+        self.pages.insert(index, (texture.clone(), size));
+        self.ext.shell.page_drawn.insert(index, generation);
+        self.ext.shell.page_scale.insert(index, scale_key(scale));
+        self.note_caret_extent(index, generation);
+        texture
     }
 
     /// Measure the caret paragraph if it lies on `page` (body text only).
@@ -4341,6 +6404,7 @@ impl HwpApp {
             self.ext.shell.page_images.insert(page, patched);
         }
         texture.set_partial([0, y0], band, egui::TextureOptions::LINEAR);
+        self.ext.shell.rasters += 1;
         self.ext.shell.page_drawn.insert(page, generation);
         self.ext.shell.caret_extent = Some(now);
         self.ext.shell.band_redraws += 1;
@@ -4426,6 +6490,72 @@ mod redraw_tests {
         assert!(band.contains(r#"viewBox="0 50 100 20""#), "{band}");
         assert!(band.ends_with("<rect/></svg>"));
         assert!(crop_rows("<svg>", 0.0, 1.0).is_none());
+    }
+
+    #[test]
+    fn a_band_drops_only_text_that_cannot_reach_it() {
+        let svg = concat!(
+            r#"<svg width="100" height="400" viewBox="0 0 100 400"><g clip-path="url(#c)">"#,
+            r#"<text x="1" y="10" font-size="10">첫</text>"#,
+            r#"<text x="50" y="20" font-size="10">위</text>"#,
+            "\n",
+            r#"<text x="50" y="105" font-size="10">안</text>"#,
+            r#"<text x="50" y="300" font-size="10">아래</text>"#,
+            r#"<text x="90" y="200" font-size="10">오른</text>"#,
+            r#"<text x="50" y="125" font-size="10">걸침</text>"#,
+            r#"<text x="50" y="390" font-size="10">끝</text>"#,
+            r#"</g><g transform="rotate(90)"><text x="1" y="20" font-size="10">돌림</text></g>"#,
+            r#"<defs><text x="1" y="20" font-size="10">정의</text></defs>"#,
+            r#"<text x="1" y="20" font-size="10"><tspan>속</tspan></text><!-- <text> --></svg>"#,
+        );
+        let band = crop_rows(svg, 100.0, 10.0).unwrap();
+        // Far above and below go; the band's own, one reaching in from below, the group's
+        // first and last lines and its left and right ends (they size the clipped layer),
+        // and any under a transform, inside defs or with markup stay, as do comments.
+        assert!(!band.contains(">위<") && !band.contains(">아래<"), "{band}");
+        for kept in [
+            ">안<",
+            ">걸침<",
+            ">첫<",
+            ">끝<",
+            ">오른<",
+            ">돌림<",
+            ">정의<",
+            "<tspan>속</tspan>",
+            "<!-- <text> -->",
+        ] {
+            assert!(band.contains(kept), "{kept}: {band}");
+        }
+        assert!(band.ends_with("</svg>"));
+    }
+
+    #[test]
+    fn a_culled_band_of_a_dense_page_draws_the_same_pixels() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let line = "본 절에서는 사업 추진 현황과 성과를 정리하고 하반기 계획을 제시한다. ";
+        for i in 0..40 {
+            a.session
+                .execute(Command::Insert(format!("{i}. {}\n", line.repeat(3))))?;
+        }
+        let svg = a.session.render_page_svg(0)?;
+        let renderer = hwpcraft_render::Renderer::default();
+        for (top, height) in [(140.0, 40.0), (400.0, 24.0), (700.0, 60.0)] {
+            let culled = crop_rows(&svg, top, height).unwrap();
+            assert!(culled.matches("<text").count() * 4 < svg.matches("<text").count());
+            // The same band with every text kept, as before the culling.
+            let whole = format!(
+                "{}{}",
+                &culled[..culled.find('>').unwrap()],
+                &svg[svg.find('>').unwrap()..]
+            );
+            let (a, b) = (
+                renderer.screen(&culled, 1.25)?,
+                renderer.screen(&whole, 1.25)?,
+            );
+            assert_eq!((a.width, a.height), (b.width, b.height));
+            assert!(a.rgba == b.rgba, "band at {top} differs");
+        }
+        Ok(())
     }
 
     fn typing_app() -> anyhow::Result<HwpApp> {
@@ -4661,6 +6791,8 @@ pub(crate) struct PdfPreparing {
     restarts: u32,
     /// Copies to print once the file is written (인쇄 to paper).
     print: Option<u32>,
+    /// 인쇄 상세 applied when the pages are finished (인쇄 only).
+    layout: Option<hwpcraft_engine::PrintLayout>,
     /// The progress line last shown; refreshed only while nothing replaced it.
     progress: String,
 }
@@ -4715,6 +6847,7 @@ impl HwpApp {
             budget: self.ext.shell.pdf_budget,
             restarts: 0,
             print,
+            layout: self.ext.shell.next_print_layout.take(),
             progress: String::new(),
         });
         // The first slice at once: a short document goes straight to conversion.
@@ -4765,7 +6898,14 @@ impl HwpApp {
                 true
             }
             Ok(true) => {
-                let finished = job.pages.session(&self.session).pdf_finish(job.prep);
+                let session = job.pages.session(&self.session);
+                let finished = match job.layout.as_ref() {
+                    Some(layout) if *layout != hwpcraft_engine::PrintLayout::default() => job
+                        .pages
+                        .pages(&self.session)
+                        .and_then(|pages| session.pdf_finish_with(job.prep, &pages, layout)),
+                    _ => session.pdf_finish(job.prep),
+                };
                 let Some(pdf) = self.result(finished) else {
                     return false;
                 };
@@ -4919,6 +7059,35 @@ mod pdf_tests {
     }
 
     #[test]
+    fn print_details_reach_the_background_pdf() -> anyhow::Result<()> {
+        let dir = tempfile_dir("bg-pdf-layout")?;
+        let mut a = three_pages()?;
+        let print = dir.join("two-up.pdf");
+        a.ext.shell.next_print_layout = Some(hwpcraft_engine::PrintLayout {
+            n_up: 2,
+            watermark: Some(hwpcraft_engine::Watermark {
+                text: "대외비".into(),
+                opacity: None,
+            }),
+            ..Default::default()
+        });
+        assert!(a.start_print_pdf(print.clone(), "all", 1, true));
+        assert!(
+            a.ext.shell.next_print_layout.is_none(),
+            "taken by this PDF only"
+        );
+        wait(&mut a);
+        let bytes = std::fs::read(&print)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let pages = text.matches("/Type /Page").count() + text.matches("/Type/Page").count()
+            - text.matches("/Type /Pages").count()
+            - text.matches("/Type/Pages").count();
+        assert_eq!(pages, 2, "three pages, two to a sheet");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
     fn a_second_pdf_waits_for_the_first_and_printing_waits_for_its_file() -> anyhow::Result<()> {
         let dir = tempfile_dir("bg-pdf-busy")?;
         let mut a = three_pages()?;
@@ -4994,6 +7163,88 @@ mod dialog_tests {
         clicked
     }
 
+    #[test]
+    fn a_modal_dialog_takes_the_keyboard_and_gives_it_back() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        let canvas = egui::Id::new("document-canvas");
+        // The page registers the canvas; the dialogs come after the keyboard, as in a frame.
+        let run = |a: &mut HwpApp| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1500.0, 916.0))),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                a.page_view(ui);
+                a.keyboard(ui.ctx());
+                a.dialogs(ui.ctx());
+            });
+            output.textures_delta.clear();
+            ctx.memory(|m| m.focused())
+        };
+        ctx.memory_mut(|m| m.request_focus(canvas));
+        // While 변경 내용 저장 is up the page lets go (Tab then walks the dialog) ...
+        a.pending = Some(crate::Pending::New);
+        assert_eq!(run(&mut a), None);
+        assert_eq!(run(&mut a), None);
+        // ... and typing goes back to the page once it closes, without a click.
+        a.pending = None;
+        run(&mut a);
+        assert_eq!(run(&mut a), Some(canvas));
+        // A dialog with a text field gives it the keyboard first.
+        a.shell_ext_view("user-info");
+        run(&mut a);
+        assert!(run(&mut a).is_some_and(|id| id != canvas));
+        a.ext.shell.dialog = None;
+        run(&mut a);
+        assert_eq!(run(&mut a), Some(canvas));
+        Ok(())
+    }
+
+    #[test]
+    fn alt_and_the_access_letter_press_that_button() {
+        let alt = |k| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::ALT,
+        };
+        assert_eq!(chrome::mnemonic("설정(D)"), Some(egui::Key::D));
+        assert_eq!(chrome::mnemonic("저장 안 함(N)"), Some(egui::Key::N));
+        assert_eq!(chrome::mnemonic("취소"), None);
+        assert_eq!(chrome::mnemonic("(가)"), None);
+        let ctx = egui::Context::default();
+        frame(&ctx, vec![], None);
+        assert_eq!(frame(&ctx, vec![alt(egui::Key::D)], None), Some(0));
+        // Even while a text field has the keyboard (Enter stays with the field).
+        let ctx = egui::Context::default();
+        frame(&ctx, vec![], Some(true));
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("multi")));
+        frame(&ctx, vec![], Some(true));
+        assert_eq!(frame(&ctx, vec![alt(egui::Key::D)], Some(true)), Some(0));
+        // chrome::actions: Enter and Alt+D apply when the button is enabled.
+        for (events, valid, applied) in [
+            (vec![key(egui::Key::Enter)], true, true),
+            (vec![alt(egui::Key::D)], true, true),
+            (vec![key(egui::Key::Enter)], false, false),
+        ] {
+            let ctx = egui::Context::default();
+            let mut apply = false;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    apply = chrome::actions(ui, (!valid).then_some("고를 것이 없음"), "넣기(D)").0;
+                },
+            );
+            output.textures_delta.clear();
+            assert_eq!(apply, applied);
+        }
+    }
+
     /// Layers shown by one frame of a fresh context that draws `draw`.
     fn layers(draw: impl Fn(&egui::Context)) -> Vec<egui::LayerId> {
         let ctx = egui::Context::default();
@@ -5035,6 +7286,293 @@ mod dialog_tests {
     }
 
     #[test]
+    fn a_grey_default_button_ignores_enter_and_clicks_but_escape_still_cancels() {
+        let ctx = egui::Context::default();
+        let run = |events: Vec<egui::Event>| {
+            let mut clicked = None;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |_| {
+                    clicked = dialog_with(
+                        &ctx,
+                        "시험",
+                        400.0,
+                        &[("만들기(D)", Some("먼저 고르세요.")), ("취소", None)],
+                        |_| {},
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            clicked
+        };
+        assert_eq!(run(vec![]), None);
+        assert_eq!(run(vec![key(egui::Key::Enter)]), None);
+        assert_eq!(run(vec![key(egui::Key::Escape)]), Some(1));
+    }
+
+    #[test]
+    fn saving_a_track_changes_document_asks_and_saves_the_result() -> anyhow::Result<()> {
+        let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../rhwp/samples/issue5169_viewtext_changetracking.hwp");
+        if !sample.is_file() {
+            return Ok(());
+        }
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        a.session.open(&sample)?;
+        if !a.session.has_unkept_track_changes() {
+            return Ok(());
+        }
+        let dir = std::env::temp_dir().join(format!("hwpcraft-tracked-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let target = dir.join("result.hwpx");
+        assert!(
+            !a.confirm_tracked_save(&dir.join("out.pdf")),
+            "PDF is not asked"
+        );
+        assert!(a.confirm_tracked_save(&target));
+        let ctx = a.ctx.clone();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![key(egui::Key::Enter)],
+                ..Default::default()
+            },
+            |_| a.shell_ext_dialogs(&ctx),
+        );
+        output.textures_delta.clear();
+        assert!(target.is_file(), "{}", a.message);
+        assert!(a.ext.shell.dialog.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn templates_open_only_without_unsaved_changes() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        a.shell_ext_dispatch("file.template", &ctx.clone());
+        let Some(Dialog::Templates { list, .. }) = &a.ext.shell.dialog else {
+            panic!("문서마당");
+        };
+        let _ = list;
+        a.session.execute(Command::Insert("고친 글".into()))?;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![key(egui::Key::Enter)],
+                ..Default::default()
+            },
+            |_| a.shell_ext_dialogs(&ctx),
+        );
+        output.textures_delta.clear();
+        assert!(
+            a.ext.shell.dialog.is_some() && a.session.dirty(),
+            "Enter does not replace a changed document"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_hwp_save_with_picture_effects_asks_and_drops_them() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        let dir = std::env::temp_dir().join(format!("hwpcraft-effects-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let png = dir.join("p.png");
+        image::RgbImage::from_fn(30, 20, |x, y| image::Rgb([x as u8 * 8, y as u8 * 12, 90]))
+            .save_with_format(&png, image::ImageFormat::Png)?;
+        let v = a
+            .session
+            .run("picture.insert", json!({"path": png, "width_mm": 30.0}))?;
+        a.session.run(
+            "picture.effects",
+            json!({"address": v["address"], "glow": {}}),
+        )?;
+        let out = dir.join("out.hwp");
+        assert!(a.confirm_tracked_save(&out));
+        assert!(matches!(
+            a.ext.shell.dialog,
+            Some(Dialog::TrackedSave {
+                tracked: false,
+                effects: 1,
+                ..
+            })
+        ));
+        // HWPX keeps the effects: no question there.
+        assert_eq!(
+            a.session
+                .picture_effects_blocking_save(&dir.join("out.hwpx")),
+            0
+        );
+        for events in [vec![], vec![key(egui::Key::Enter)]] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |_| a.shell_ext_dialogs(&ctx),
+            );
+            output.textures_delta.clear();
+        }
+        assert!(a.ext.shell.dialog.is_none(), "{}", a.message);
+        assert!(out.exists());
+        assert!(
+            a.message.starts_with("그림 효과 1개를 빼고 저장 완료"),
+            "{}",
+            a.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn a_docx_export_leaves_the_document_file_and_saved_state() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let dir = std::env::temp_dir().join(format!("hwpcraft-docx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        a.session
+            .execute(hwpcraft_engine::Command::Insert("내보낼 글".into()))?;
+        let own = dir.join("own.hwpx");
+        a.session.save(&own)?;
+        a.session
+            .execute(hwpcraft_engine::Command::Insert(" 더".into()))?;
+        assert!(a.session.dirty());
+        let docx = dir.join("out.docx");
+        assert!(a.export_docx(&docx, false));
+        assert!(docx.exists());
+        assert_eq!(a.session.path.as_deref(), Some(own.as_path()));
+        assert!(a.session.dirty(), "an export does not save the document");
+        assert!(
+            a.message.starts_with("DOCX로 내보냈습니다"),
+            "{}",
+            a.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn master_page_dialog_saves_its_text_and_deletes_it() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        let frame = |a: &mut HwpApp, events: Vec<egui::Event>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |_| a.shell_ext_dialogs(&ctx),
+            );
+            output.textures_delta.clear();
+        };
+        a.shell_ext_dispatch("page.master", &ctx.clone());
+        if let Some(Dialog::MasterPage { text, .. }) = a.ext.shell.dialog.as_mut() {
+            *text = "대외비".into();
+        }
+        frame(&mut a, vec![]);
+        frame(&mut a, vec![key(egui::Key::Enter)]);
+        assert!(a.ext.shell.dialog.is_none(), "saved and closed");
+        assert_eq!(
+            a.session.run("page.master.get", json!({}))?["text"],
+            "대외비"
+        );
+        // Reopened, it shows the text and offers 지우기.
+        a.shell_ext_dispatch("page.master", &ctx.clone());
+        let Some(Dialog::MasterPage { text, .. }) = &a.ext.shell.dialog else {
+            panic!("dialog");
+        };
+        assert_eq!(text, "대외비");
+        assert!(a.ext.shell.dialog.is_some());
+        let _ = a.session.run("page.master.delete", json!({}))?;
+        assert_eq!(
+            a.session.run("page.master.get", json!({}))?["exists"],
+            false
+        );
+        // 홀수 쪽 picked in the dialog saves an odd-page master page only.
+        a.shell_ext_dispatch("page.master", &ctx.clone());
+        if let Some(Dialog::MasterPage { kind, text, .. }) = a.ext.shell.dialog.as_mut() {
+            *kind = 1;
+            *text = "홀".into();
+        }
+        frame(&mut a, vec![]);
+        frame(&mut a, vec![key(egui::Key::Enter)]);
+        assert!(a.ext.shell.dialog.is_none(), "saved and closed");
+        let odd = a
+            .session
+            .run("page.master.get", json!({"applyTo": "odd"}))?;
+        assert_eq!(odd["text"], "홀");
+        assert_eq!(
+            a.session.run("page.master.get", json!({}))?["exists"],
+            false
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn master_page_dialog_puts_a_shape_on_the_paper_and_removes_it() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        a.shell_ext_dispatch("page.master", &ctx.clone());
+        let Some(Dialog::MasterPage {
+            list,
+            objects,
+            object,
+            ..
+        }) = a.ext.shell.dialog.take()
+        else {
+            panic!("dialog");
+        };
+        let (mut list, mut objects) = (list, objects);
+        // 넣기 with the defaults: a rectangle behind the text, on a new 양쪽 바탕쪽.
+        let params = object.params("both");
+        assert_eq!(params["kind"], "rectangle");
+        assert_eq!(params["height_mm"], 20.0);
+        a.master_object_request("page.master.object.insert", params, &mut list, &mut objects);
+        assert!(a.error.is_none(), "{:?}", a.error);
+        let shown = objects["objects"].as_array().cloned().unwrap_or_default();
+        assert_eq!(shown.len(), 1, "{objects}");
+        assert_eq!(shown[0]["applyTo"], "both");
+        assert_eq!(shown[0]["wrap"], "behind");
+        assert_eq!(shown[0]["x_mm"], 20.0);
+        assert!(
+            list["masterPages"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|m| m["applyTo"] == "Both")),
+            "the master page was made: {list}"
+        );
+        // A picture needs its file; the dialog draws with the object listed.
+        let picture = MasterObject {
+            kind: 0,
+            ..MasterObject::default()
+        };
+        assert_eq!(picture.params("odd")["path"], "");
+        assert!(picture.params("odd").get("height_mm").is_none());
+        a.ext.shell.dialog = Some(Dialog::MasterPage {
+            kind: 0,
+            list: list.clone(),
+            text: String::new(),
+            objects: objects.clone(),
+            object: picture,
+        });
+        let mut output = ctx.run_ui(Default::default(), |_| a.shell_ext_dialogs(&ctx));
+        output.textures_delta.clear();
+        assert!(a.ext.shell.dialog.is_some(), "still open");
+        // 지우기 removes it again; one undo brings it back.
+        a.master_object_request(
+            "page.master.object.delete",
+            json!({"applyTo": "both", "index": 0}),
+            &mut list,
+            &mut objects,
+        );
+        assert_eq!(objects["objects"].as_array().map(Vec::len), Some(0));
+        a.session.execute(Command::Undo)?;
+        let back = a.session.run("page.master.object.list", json!({}))?;
+        assert_eq!(back["objects"].as_array().map(Vec::len), Some(1));
+        Ok(())
+    }
+
+    #[test]
     fn enter_in_a_multi_line_field_stays_a_newline() {
         let ctx = egui::Context::default();
         frame(&ctx, vec![], Some(true));
@@ -5050,5 +7588,133 @@ mod dialog_tests {
             frame(&ctx, vec![key(egui::Key::Enter)], Some(false)),
             Some(0)
         );
+    }
+}
+
+#[cfg(test)]
+mod page_outline_tests {
+    use super::*;
+
+    /// One full frame of the page view in a 1500 x 916 window.
+    fn frame(a: &mut HwpApp) {
+        let ctx = a.ctx.clone();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1500.0, 916.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| a.page_view(ui));
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn page_outline_off_stacks_only_the_body_of_each_page() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        a.session.execute(Command::Insert("첫 쪽".into()))?;
+        a.session.execute(Command::PageBreak)?;
+        a.session.execute(Command::Insert("둘째 쪽".into()))?;
+        a.zoom = 0.5;
+        frame(&mut a);
+        let pages = |a: &HwpApp| a.wheel_zoom.pages.clone();
+        let on = pages(&a);
+        assert_eq!(on.len(), 2, "{on:?}");
+        let height = on[0].1.height();
+        // 쪽 윤곽 on: whole pages with a gap.
+        assert!(on[1].1.min.y >= on[0].1.max.y + 1.0);
+        a.shell_ext_dispatch("view.page_outline", &a.ctx.clone());
+        assert!(!a.ext.shell.page_outline && !a.shell_ext_checked("view.page_outline"));
+        frame(&mut a);
+        let off = pages(&a);
+        let (top, bottom) = a.ext.shell.page_bodies[0];
+        assert!(top > 0.0 && bottom < height / a.zoom, "{top} {bottom}");
+        // Each page rectangle keeps its full size, but the second one starts where the
+        // first one's body ends: margins, header and footer are scrolled out of view.
+        assert_eq!(off[0].1.height(), height);
+        let body_end = off[0].1.min.y + bottom * a.zoom;
+        let (top1, _) = a.ext.shell.page_bodies[1];
+        assert!(
+            (off[1].1.min.y + top1 * a.zoom - body_end).abs() < 0.5,
+            "{off:?}"
+        );
+        a.shell_ext_dispatch("view.page_outline", &a.ctx.clone());
+        assert!(a.ext.shell.page_outline);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod line_number_tests {
+    use super::*;
+
+    #[test]
+    fn the_line_number_menu_turns_numbering_on_and_opens_its_settings() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        a.session
+            .execute(Command::Insert("첫 줄\n둘째 줄\n셋째 줄".into()))?;
+        let before = a.session.render_page_svg(0)?;
+        assert!(!a.line_numbers_shown() && !a.shell_ext_checked("page.line_numbers.toggle"));
+        assert_eq!(a.shell_ext_enabled("page.line_numbers.toggle"), Some(true));
+        // 줄 번호 표시: on, drawn (RHWP 0037), and off again.
+        a.shell_ext_dispatch("page.line_numbers.toggle", &ctx);
+        assert!(a.line_numbers_shown() && a.shell_ext_checked("page.line_numbers.toggle"));
+        assert_ne!(a.session.render_page_svg(0)?, before, "numbers are drawn");
+        // 줄 번호 설정 opens with the stored values (restart shown as 이어서 when unset).
+        a.shell_ext_dispatch("page.line_numbers.dialog", &ctx);
+        let Some(Dialog::LineNumbers(s)) = &a.ext.shell.dialog else {
+            anyhow::bail!("dialog");
+        };
+        assert_eq!(
+            (s.show, s.start, s.count_by, s.restart, s.all_sections),
+            (true, 1, 1, 3, false)
+        );
+        a.ext.shell.dialog = None;
+        // 현재 문단 건너뜀: checked while the caret paragraph skips numbering.
+        assert_eq!(
+            a.shell_ext_enabled("page.line_numbers.skip_paragraph"),
+            Some(true)
+        );
+        assert!(!a.shell_ext_checked("page.line_numbers.skip_paragraph"));
+        let numbered = a.session.render_page_svg(0)?;
+        a.shell_ext_dispatch("page.line_numbers.skip_paragraph", &ctx);
+        assert!(a.shell_ext_checked("page.line_numbers.skip_paragraph"));
+        assert_ne!(a.session.render_page_svg(0)?, numbered);
+        a.shell_ext_dispatch("page.line_numbers.skip_paragraph", &ctx);
+        assert!(!a.shell_ext_checked("page.line_numbers.skip_paragraph"));
+        a.shell_ext_dispatch("page.line_numbers.toggle", &ctx);
+        assert!(!a.line_numbers_shown());
+        assert_eq!(
+            a.session.render_page_svg(0)?,
+            before,
+            "off draws the page as before"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn document_history_lists_the_versions_hangul_recorded() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        assert_eq!(a.shell_ext_enabled("review.history"), Some(true));
+        a.shell_ext_dispatch("review.history", &ctx);
+        let Some(Dialog::History(list)) = &a.ext.shell.dialog else {
+            anyhow::bail!("dialog");
+        };
+        assert_eq!(list["entries"], json!([]), "a new document has no history");
+        a.ext.shell.dialog = None;
+        a.session.open(std::path::Path::new(
+            "../../../rhwp/samples/basic/treatise sample.hwp",
+        ))?;
+        a.shell_ext_dispatch("review.history", &ctx);
+        let Some(Dialog::History(list)) = &a.ext.shell.dialog else {
+            anyhow::bail!("dialog");
+        };
+        assert_eq!(list["entries"].as_array().map(Vec::len), Some(4));
+        assert_eq!(list["lastVersion"], true);
+        Ok(())
     }
 }

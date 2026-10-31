@@ -64,6 +64,8 @@ fn patch() -> Value {
 
 #[test]
 fn selection_matches_paragraph_by_paragraph_and_the_reopened_file() -> anyhow::Result<()> {
+    // Saving stamps the document's times; the byte comparison needs one instant.
+    hwpcraft_engine::fixed_clock(Some(1_767_225_600));
     let dir = tempfile::tempdir()?;
     let mut whole = document(&dir)?;
     let original = saved(&mut whole, &dir, "original.hwpx")?;

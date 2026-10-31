@@ -22,6 +22,22 @@ pub fn extension_commands()
         .chain(hwp_parameters::COMMANDS)
         .chain(hwp_action_defaults::COMMANDS)
         .chain(chart_creation::COMMANDS)
+        .chain(macros::COMMANDS)
+        .chain(toc::COMMANDS)
+        .chain(cross_ref::COMMANDS)
+        .chain(date_fields::COMMANDS)
+        .chain(doc_merge::COMMANDS)
+        .chain(style_sets::COMMANDS)
+        .chain(index::COMMANDS)
+        .chain(drop_cap::COMMANDS)
+        .chain(picture_bullet::COMMANDS)
+        .chain(ruby::COMMANDS)
+        .chain(track_changes::COMMANDS)
+        .chain(table_styles::COMMANDS)
+        .chain(nested_tables::COMMANDS)
+        .chain(object_moves::COMMANDS)
+        .chain(inline_moves::COMMANDS)
+        .chain(master_objects::COMMANDS)
 }
 
 /// Every documented command: (id, parameter help, JSON example).
@@ -45,6 +61,22 @@ pub fn command_help_entries() -> impl Iterator<Item = (&'static str, &'static st
         .chain(hwp_parameters::PARAMS)
         .chain(hwp_action_defaults::PARAMS)
         .chain(chart_creation::PARAMS)
+        .chain(macros::PARAMS)
+        .chain(toc::PARAMS)
+        .chain(cross_ref::PARAMS)
+        .chain(date_fields::PARAMS)
+        .chain(doc_merge::PARAMS)
+        .chain(style_sets::PARAMS)
+        .chain(index::PARAMS)
+        .chain(drop_cap::PARAMS)
+        .chain(picture_bullet::PARAMS)
+        .chain(ruby::PARAMS)
+        .chain(track_changes::PARAMS)
+        .chain(table_styles::PARAMS)
+        .chain(nested_tables::PARAMS)
+        .chain(object_moves::PARAMS)
+        .chain(inline_moves::PARAMS)
+        .chain(master_objects::PARAMS)
         .map(|(id, help, example)| {
             (
                 *id,
@@ -66,7 +98,7 @@ type Handler = fn(&mut Session, &str, &Value) -> Option<Result<Value>>;
 
 impl Session {
     pub(crate) fn run_extension(&mut self, id: &str, params: Value) -> Result<Value> {
-        let handlers: [Handler; 17] = [
+        let handlers: [Handler; 33] = [
             Self::run_caret_ext,
             Self::run_format_ext,
             Self::run_table_ext,
@@ -84,6 +116,22 @@ impl Session {
             Self::run_hwp_parameter_ext,
             Self::run_hwp_action_defaults_ext,
             Self::run_chart_creation,
+            Self::run_macro_ext,
+            Self::run_toc_ext,
+            Self::run_cross_ref_ext,
+            Self::run_date_fields_ext,
+            Self::run_doc_merge_ext,
+            Self::run_style_sets_ext,
+            Self::run_index_ext,
+            Self::run_drop_cap_ext,
+            Self::run_picture_bullet_ext,
+            Self::run_ruby_ext,
+            Self::run_track_changes_ext,
+            Self::run_table_style_ext,
+            Self::run_nested_table_ext,
+            Self::run_object_moves_ext,
+            Self::run_inline_moves_ext,
+            Self::run_master_objects_ext,
         ];
         for handler in handlers {
             if let Some(result) = handler(self, id, &params) {

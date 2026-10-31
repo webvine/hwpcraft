@@ -228,6 +228,15 @@ impl Session {
                 .filter(|(_, c)| *c == '\t')
                 .map(|(offset, _)| offset)
                 .collect();
+            // Every tab already stored: nothing to fill, so skip the caret layout
+            // queries (most of the save time on long documents).
+            if records.len() >= tabs.len()
+                && records[..tabs.len()]
+                    .iter()
+                    .all(|r| !tab_ext_is_placeholder(r))
+            {
+                continue;
+            }
             for (n, offset) in tabs.into_iter().enumerate() {
                 let existing = records
                     .get(n)
@@ -260,12 +269,40 @@ impl Session {
     }
     /// Save with laid-out tab widths, keeping the live model unchanged.
     pub(crate) fn save_with_tab_widths(&mut self, path: &Path) -> Result<()> {
+        self.save_with_tab_widths_for(path, false)
+    }
+    /// `copy`: a file only HwpCraft reads back (자동 복구, 문서마당). It keeps the live
+    /// rows instead of laying the document out afresh for an HWP file (about 180 ms on
+    /// a 44-page report, which a periodic recovery save would spend on the UI thread).
+    pub(crate) fn save_with_tab_widths_for(&mut self, path: &Path, copy: bool) -> Result<()> {
+        self.guard_distribution()?;
+        // HWP5 picture-effect fields are not written yet: refuse rather than drop
+        // them. Effects kept as raw bytes from an opened .hwp are not modelled here.
+        self.refuse_picture_effects_save(path)?;
         let saved = self.materialize_tabs();
+        // See `layout_cache`: a document HwpCraft wrote hands out no row caches.
+        let hidden = (self.authored
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("hwpx")))
+        .then(|| crate::layout_cache::hide(self.core.document_mut()));
+        // An HWP file keeps rows: a document HwpCraft wrote gets the fresh ones its
+        // HWPX copy is laid out with (`layout_cache::with_fresh_rows`).
+        let fresh = (self.authored
+            && !copy
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("hwp")))
+        .then(|| crate::layout_cache::with_fresh_rows(&self.core))
+        .flatten()
+        // Swapped into this core, so the writers still see its source format.
+        .map(|doc| std::mem::replace(self.core.document_mut(), doc));
+        let core = &self.core;
         *self.page_field_cache.borrow_mut() = None;
         *self.render_highlights.borrow_mut() = None;
         let result = (|| match self.password.as_deref() {
             Some(password) if is_hwp(path) => {
-                hwpcraft_formats::save_with_password(&self.core, path, password)
+                hwpcraft_formats::save_with_password(core, path, password)
             }
             _ if path
                 .extension()
@@ -274,8 +311,14 @@ impl Session {
                 self.render_pdf(&(0..self.page_count()?).collect::<Vec<_>>())
                     .and_then(|bytes| hwpcraft_formats::atomic_write(path, &bytes))
             }
-            _ => hwpcraft_formats::save(&self.core, path),
+            _ => hwpcraft_formats::save(core, path),
         })();
+        if let Some(tags) = hidden {
+            crate::layout_cache::restore(self.core.document_mut(), tags);
+        }
+        if let Some(live) = fresh {
+            *self.core.document_mut() = live;
+        }
         self.restore_tabs(saved);
         *self.page_field_cache.borrow_mut() = None;
         *self.render_highlights.borrow_mut() = None;

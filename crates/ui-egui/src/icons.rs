@@ -172,6 +172,11 @@ pub enum Icon {
     Freeline,
     VTextbox,
     Connector,
+    ConnectorArrow,
+    ConnectorBoth,
+    Elbow,
+    ElbowArrow,
+    ElbowBoth,
 }
 
 const TILES: usize = Icon::FitTable as usize + 1;
@@ -491,7 +496,7 @@ fn draw_glyph(ui: &Ui, rect: Rect, icon: Icon, enabled: bool) -> bool {
     true
 }
 
-/// Shape gallery and lock symbols, drawn as vectors in a grey/blue palette.
+/// Shape gallery and lock symbols, drawn as vectors: grey ink, blue only for the lock.
 fn draw_local(ui: &Ui, rect: Rect, icon: Icon, enabled: bool) {
     let ink = if enabled {
         Color32::from_gray(90)
@@ -582,16 +587,51 @@ fn draw_local(ui: &Ui, rect: Rect, icon: Icon, enabled: bool) {
                 let x = r.left() + r.width() * f;
                 p.line_segment(
                     [Pos2::new(x, r.top() + 3.0), Pos2::new(x, r.bottom() - 3.0)],
-                    Stroke::new(stroke.width, blue),
+                    Stroke::new(stroke.width, ink),
                 );
             }
         }
-        Icon::Connector => {
+        Icon::Connector
+        | Icon::ConnectorArrow
+        | Icon::ConnectorBoth
+        | Icon::Elbow
+        | Icon::ElbowArrow
+        | Icon::ElbowBoth => {
             let a = r.left_bottom();
             let b = r.right_top();
-            p.line_segment([a, b], stroke);
-            p.circle_filled(a, stroke.width * 1.6, blue);
-            p.circle_filled(b, stroke.width * 1.6, blue);
+            let elbow = matches!(icon, Icon::Elbow | Icon::ElbowArrow | Icon::ElbowBoth);
+            // Straight: corner to corner. Elbow: across, up, across.
+            let points = if elbow {
+                let mid = r.center().x;
+                vec![a, Pos2::new(mid, a.y), Pos2::new(mid, b.y), b]
+            } else {
+                vec![a, b]
+            };
+            p.add(egui::Shape::line(points.clone(), stroke));
+            let arrow_end = matches!(
+                icon,
+                Icon::ConnectorArrow | Icon::ConnectorBoth | Icon::ElbowArrow | Icon::ElbowBoth
+            );
+            let arrow_start = matches!(icon, Icon::ConnectorBoth | Icon::ElbowBoth);
+            let size = (stroke.width * 3.2).max(4.5);
+            let end = |tip: Pos2, from: Pos2, arrow: bool| {
+                if arrow {
+                    let d = (tip - from).normalized();
+                    let n = Vec2::new(-d.y, d.x);
+                    let base = tip - d * size;
+                    p.add(egui::Shape::convex_polygon(
+                        vec![tip, base + n * size * 0.55, base - n * size * 0.55],
+                        ink,
+                        Stroke::NONE,
+                    ));
+                } else {
+                    // A connection point.
+                    p.circle_stroke(tip, stroke.width * 1.4, stroke);
+                }
+            };
+            let n = points.len();
+            end(points[n - 1], points[n - 2], arrow_end);
+            end(points[0], points[1], arrow_start);
         }
         _ => {}
     }

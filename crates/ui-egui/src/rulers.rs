@@ -257,15 +257,58 @@ impl HwpApp {
                     if cell(ui, mode.into(), "삽입/수정 전환 (Insert)").clicked() {
                         self.session.overwrite = !self.session.overwrite;
                     }
-                    if self.session.has_track_change_records() {
+                    if self.session.has_unkept_track_changes() {
                         ui.add_enabled_ui(false, |ui| {
                             cell(
                                 ui,
-                                "변경 기록 보존됨(표시 미지원)".into(),
-                                "이 문서에는 변경 내용 추적 기록이 있습니다. 저장할 때 그대로 \
-                                 보존하지만, 본문에 변경 표시를 그리지는 못합니다.",
+                                "변경 추적 기록 있음(저장 시 결과본)".into(),
+                                "이 문서에는 한글의 변경 추적 기록이 있습니다. HwpCraft는 지금 보이는 \
+                                 결과본을 보여 주며 변경 표시는 그리지 않습니다. HWP/HWPX로 저장하면 \
+                                 확인 뒤 변경 내용이 결과본으로 합쳐지고 변경 기록은 지워집니다.",
                             );
                         });
+                    }
+                    // Running states the user should not forget: a macro being recorded and
+                    // an AI client connection. Each chip opens what ends or explains it.
+                    if self.session.is_distribution() {
+                        status_chip(
+                            ui,
+                            "배포용 문서(읽기 전용)",
+                            Color32::from_rgb(150, 90, 0),
+                            Color32::from_rgb(253, 243, 224),
+                        )
+                        .on_hover_text(hwpcraft_engine::DISTRIBUTION_READ_ONLY);
+                    }
+                    if let Some(steps) = self.session.macro_recording() {
+                        let tip = format!(
+                            "누르면 기록을 끝내고 이름을 정합니다 (Alt+Shift+H). {}",
+                            super::ext_shell::MOUSE_NOTE
+                        );
+                        if status_chip(
+                            ui,
+                            &format!("● 매크로 기록 중 ({steps}단계)"),
+                            Color32::from_rgb(200, 40, 40),
+                            Color32::from_rgb(253, 236, 236),
+                        )
+                        .on_hover_text(tip)
+                        .clicked()
+                        {
+                            self.ext_dispatch("macro.record.stop", &ctx);
+                        }
+                    }
+                    if let Some(status) = self.mcp_status()
+                        && status_chip(
+                            ui,
+                            status,
+                            Color32::from_rgb(30, 120, 70),
+                            Color32::from_rgb(232, 246, 238),
+                        )
+                        .on_hover_text(
+                            "AI 도우미(MCP 클라이언트)가 이 문서에 연결할 수 있습니다.                              누르면 연결 정보를 봅니다.",
+                        )
+                        .clicked()
+                    {
+                        self.ext_dispatch("tools.mcp_info", &ctx);
                     }
                     if !self.message.is_empty() && !start_hint_is_stale(self) {
                         ui.add_space(12.0);
@@ -772,6 +815,27 @@ fn tab_kind_marker(ui: &egui::Ui, corner: Rect) {
 const START_HINT: &str = "문서를 열거나 흰 쪽을 클릭해 입력하세요.";
 
 /// The start-up hint no longer applies once a file is open or the document has content.
+/// A rounded status-bar chip for an ongoing state (macro recording, MCP connection).
+fn status_chip(ui: &mut egui::Ui, text: &str, ink: Color32, fill: Color32) -> egui::Response {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), egui::FontId::proportional(11.5), ink);
+    ui.add_space(6.0);
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(galley.size().x + 16.0, 20.0),
+        egui::Sense::click(),
+    );
+    let fill = if response.hovered() {
+        fill.gamma_multiply(0.9)
+    } else {
+        fill
+    };
+    ui.painter().rect_filled(rect, 10.0, fill);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, ink);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 fn start_hint_is_stale(app: &HwpApp) -> bool {
     use hwpcraft_doc::model::control::Control;
     app.message == START_HINT

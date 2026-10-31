@@ -241,6 +241,8 @@ mod tests {
     fn full_existing_undo_and_redo_sequences_survive_a_failed_preparation() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("same-own-original.hwpx");
+        // Saving stamps the document's times; both copies must be written at the same instant.
+        hwpcraft_engine::fixed_clock(Some(1_767_225_600));
         let mut baseline = old_session(&path)?;
         let mut actual = old_session(&path)?;
         assert_eq!(fingerprint(&actual), fingerprint(&baseline));

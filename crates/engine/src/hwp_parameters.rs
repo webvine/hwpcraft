@@ -11,18 +11,38 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "hwp.parameters.apply",
-        "id: CharShape|ParagraphShape|TableCreate, parameterSet: native field JSON. Pure editing only; IO actions are rejected. Unsupported fields fail before editing.",
+        "id: CharShape|ParagraphShape|TableCreate|InsertText|PageSetup|PageMarginSetup|AllReplace|ExecReplace|RepeatFind|FindDlg|FindAll, parameterSet: 네이티브 필드 JSON(PageSetup은 {\"PageDef\":{…},\"ApplyTo\":3}처럼 하위 묶음). 순수 편집만 하며 입출력 액션은 거절합니다. 지원하지 않는 필드는 편집 전에 실패합니다.",
         r#"{"id":"CharShape","parameterSet":{"Height":1600,"Bold":1}}"#,
     ),
     (
         "hwp.parameters.schema",
-        "id: CharShape|ParagraphShape|TableCreate. Reports supported fields and limitations.",
+        "id: CharShape|ParagraphShape|TableCreate|InsertText|PageSetup|PageMarginSetup|AllReplace|ExecReplace|RepeatFind|FindDlg|FindAll. 지원 필드와 한계를 알려 줍니다.",
         r#"{"id":"ParagraphShape"}"#,
     ),
 ];
 
 const LANGUAGES: [&str; 7] = [
     "Hangul", "Latin", "Hanja", "Japanese", "Other", "Symbol", "User",
+];
+/// 찾기 / 바꾸기 actions taking the FindReplace set.
+const FIND_ACTIONS: [&str; 5] = [
+    "AllReplace",
+    "ExecReplace",
+    "RepeatFind",
+    "FindDlg",
+    "FindAll",
+];
+/// PageDef lengths (HWPUNIT) and the `page.setup` item each sets (mm).
+const PAGE_DEF: [(&str, &str); 9] = [
+    ("PaperWidth", "width_mm"),
+    ("PaperHeight", "height_mm"),
+    ("LeftMargin", "left_mm"),
+    ("RightMargin", "right_mm"),
+    ("TopMargin", "top_mm"),
+    ("BottomMargin", "bottom_mm"),
+    ("HeaderLen", "header_mm"),
+    ("FooterLen", "footer_mm"),
+    ("GutterLen", "gutter_mm"),
 ];
 
 pub struct PreparedHwpAction {
@@ -63,6 +83,12 @@ fn choice(value: &Value, field: &str, choices: &[&str]) -> Result<Value> {
         .and_then(|i| choices.get(i))
         .ok_or_else(|| anyhow!("{field}: 지원하지 않는 열거 값 {i}"))?;
     Ok(json!(value))
+}
+fn string(value: &Value, field: &str) -> Result<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("{field}: 문자열이 필요합니다."))
 }
 fn absolute_urc(value: &Value, field: &str) -> Result<Value> {
     let value = integer(value, field)?;
@@ -151,6 +177,46 @@ pub fn hwp_parameter_schema(action: &str) -> Option<Value> {
             "TableCreation",
             ["Rows", "Cols", "ColWidth"].map(str::to_owned).to_vec(),
         ),
+        "InsertText" => ("InsertText", vec!["Text".to_owned()]),
+        "PageSetup" | "PageMarginSetup" => (
+            "SecDef",
+            PAGE_DEF
+                .iter()
+                .map(|(field, _)| format!("PageDef.{field}"))
+                .chain(
+                    [
+                        "PageDef.Landscape",
+                        "PageDef.GutterType",
+                        "ApplyTo",
+                        "ApplyClass",
+                    ]
+                    .map(str::to_owned),
+                )
+                .collect(),
+        ),
+        id if FIND_ACTIONS.contains(&id) => (
+            "FindReplace",
+            [
+                "FindString",
+                "ReplaceString",
+                "Direction",
+                "MatchCase",
+                "WholeWordOnly",
+                "UseWildCards",
+                "SeveralWords",
+                "FindRegExp",
+                "HanjaFromHangul",
+                "FindCharShape.Bold",
+                "FindCharShape.Italic",
+                "FindCharShape.UnderlineType",
+                "FindCharShape.Height",
+                "IgnoreMessage",
+                "ReplaceMode",
+                "FindType",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        ),
         _ => return None,
     };
     Some(
@@ -230,6 +296,9 @@ impl Session {
                 "CharShape" => self.native_character(native)?,
                 "ParagraphShape" => self.native_paragraph(native)?,
                 "TableCreate" => native_table(native)?,
+                "InsertText" => native_insert_text(native)?,
+                "PageSetup" | "PageMarginSetup" => native_page_setup(native)?,
+                id if FIND_ACTIONS.contains(&id) => native_find(id, native)?,
                 _ => bail!("{id}: 공개 ParameterSet 어댑터가 아직 없습니다."),
             };
             if id == "CharShape" {
@@ -428,7 +497,7 @@ impl Session {
                 }
                 .map_err(err)?;
                 if range.start == 0 {
-                    insertion_shape::align_selected_leading(session.core.document_mut(), cursor)?;
+                    insertion_shape::align_selected_leading(&mut session.core, cursor)?;
                 }
             }
             insertion_shape::validate_resources(session.core.document())?;
@@ -564,5 +633,182 @@ fn native_table(native: &Map<String, Value>) -> Result<Map<String, Value>> {
     {
         bail!("ColWidth 개수는 Cols와 같아야 합니다.");
     }
+    Ok(out)
+}
+
+/// InsertText: `Text` is the text to insert.
+fn native_insert_text(native: &Map<String, Value>) -> Result<Map<String, Value>> {
+    let mut out = Map::new();
+    for (key, value) in native {
+        match key.as_str() {
+            "Text" => {
+                out.insert("text".to_owned(), json!(string(value, key)?));
+            }
+            _ => bail!("InsertText: 지원하지 않는 공개 인자 {key}"),
+        }
+    }
+    if !out.contains_key("text") {
+        bail!("InsertText: Text가 필요합니다.");
+    }
+    Ok(out)
+}
+
+/// SecDef for 편집 용지: the `PageDef` lengths in HWPUNIT, `Landscape` (0 좁게, 1 넓게),
+/// `GutterType` (0 한쪽, 1 맞쪽, 2 위로 넘기기) and `ApplyTo` (0·2 현재 구역, 3 문서 전체).
+fn native_page_setup(native: &Map<String, Value>) -> Result<Map<String, Value>> {
+    let mut out = Map::new();
+    for (key, value) in native {
+        match key.as_str() {
+            "PageDef" => {
+                let def = value.as_object().ok_or_else(|| {
+                    anyhow!("PageDef는 하위 ParameterSet(JSON 객체)이어야 합니다.")
+                })?;
+                for (field, value) in def {
+                    if let Some((_, target)) = PAGE_DEF.iter().find(|(name, _)| name == field) {
+                        let n = integer(value, field)?;
+                        if n < 0 {
+                            bail!("PageDef.{field}: 0 이상의 HWPUNIT이 필요합니다.");
+                        }
+                        out.insert((*target).to_owned(), json!(n as f64 * 25.4 / 7200.0));
+                        continue;
+                    }
+                    match field.as_str() {
+                        "Landscape" => {
+                            out.insert("landscape".to_owned(), flag(value, field)?);
+                        }
+                        "GutterType" => {
+                            let n = integer(value, field)?;
+                            if !(0..=2).contains(&n) {
+                                bail!("PageDef.GutterType: 0–2가 필요합니다.");
+                            }
+                            out.insert("binding".to_owned(), json!(n));
+                        }
+                        _ => bail!("PageDef: 지원하지 않는 공개 인자 {field}"),
+                    }
+                }
+            }
+            "ApplyTo" => match integer(value, key)? {
+                0 | 2 => {}
+                3 => {
+                    out.insert("apply_to".to_owned(), json!("document"));
+                }
+                n => bail!(
+                    "ApplyTo {n}: 선택된 문자열·새 구역에 적용하는 편집 용지는 아직 지원하지 않습니다."
+                ),
+            },
+            // The dialog's list of choices only.
+            "ApplyClass" => {
+                integer(value, key)?;
+            }
+            _ => bail!("SecDef: 지원하지 않는 공개 인자 {key}"),
+        }
+    }
+    Ok(out)
+}
+
+/// FindReplace for the 찾기 / 바꾸기 actions. Switches HwpCraft does not have are
+/// accepted only when off (0, empty), as a set filled by GetDefault carries them.
+fn native_find(id: &str, native: &Map<String, Value>) -> Result<Map<String, Value>> {
+    let mut query = None;
+    let mut replacement = None;
+    let mut options = Map::new();
+    for (key, value) in native {
+        let option = match key.as_str() {
+            "FindString" => {
+                query = Some(string(value, key)?);
+                continue;
+            }
+            "ReplaceString" => {
+                replacement = Some(string(value, key)?);
+                continue;
+            }
+            "Direction" => {
+                options.insert(
+                    "direction".to_owned(),
+                    choice(value, key, &["down", "up", "all"])?,
+                );
+                continue;
+            }
+            "MatchCase" => "case_sensitive",
+            "WholeWordOnly" => "whole_word",
+            "UseWildCards" => "wildcards",
+            "SeveralWords" => "any_word",
+            "FindRegExp" => "regex",
+            "HanjaFromHangul" => "hanja_by_hangul",
+            "FindCharShape" => {
+                let shape = value.as_object().ok_or_else(|| {
+                    anyhow!("FindCharShape는 하위 ParameterSet(JSON 객체)이어야 합니다.")
+                })?;
+                for (field, value) in shape {
+                    let (target, converted) = match field.as_str() {
+                        "Bold" => ("bold", flag(value, field)?),
+                        "Italic" => ("italic", flag(value, field)?),
+                        "UnderlineType" => ("underline", json!(integer(value, field)? != 0)),
+                        "Height" => {
+                            let height = integer(value, field)?;
+                            if height <= 0 || height % 100 != 0 {
+                                bail!("FindCharShape.Height: 1 pt(100) 단위 양수만 지원합니다.");
+                            }
+                            ("size_pt", json!(height / 100))
+                        }
+                        _ => bail!("FindCharShape: 지원하지 않는 공개 인자 {field}"),
+                    };
+                    options.insert(target.to_owned(), converted);
+                }
+                continue;
+            }
+            // Message boxes and dialog modes: HwpCraft shows neither.
+            "IgnoreMessage" | "ReplaceMode" | "FindType" => {
+                flag(value, key)?;
+                continue;
+            }
+            "AllWordForms"
+            | "AutoSpell"
+            | "FindJaso"
+            | "IgnoreFindString"
+            | "IgnoreReplaceString" => {
+                if flag(value, key)? == true {
+                    bail!("FindReplace: {key}는 아직 지원하지 않습니다(0만 받습니다).");
+                }
+                continue;
+            }
+            "FindStyle" | "ReplaceStyle" => {
+                if !string(value, key)?.is_empty() {
+                    bail!("FindReplace: {key}는 아직 지원하지 않습니다(빈 문자열만 받습니다).");
+                }
+                continue;
+            }
+            "FindParaShape" | "ReplaceCharShape" | "ReplaceParaShape" => {
+                if value.as_object().is_none_or(|set| !set.is_empty()) {
+                    bail!("FindReplace: {key}는 아직 지원하지 않습니다(빈 묶음만 받습니다).");
+                }
+                continue;
+            }
+            _ => bail!("FindReplace: 지원하지 않는 공개 인자 {key}"),
+        };
+        options.insert(option.to_owned(), flag(value, key)?);
+    }
+    let query = query.ok_or_else(|| anyhow!("FindReplace: FindString이 필요합니다."))?;
+    let mut out = Map::new();
+    out.insert("query".to_owned(), json!(query));
+    if id == "FindAll" {
+        // 모두 찾기 takes case sensitivity only and always searches the whole document.
+        for (key, value) in &options {
+            if key != "case_sensitive" && key != "direction" && value != &json!(false) {
+                bail!("FindAll: {key}는 모두 찾기에서 아직 지원하지 않습니다.");
+            }
+        }
+        if let Some(case) = options.get("case_sensitive") {
+            out.insert("case_sensitive".to_owned(), case.clone());
+        }
+        return Ok(out);
+    }
+    if matches!(id, "AllReplace" | "ExecReplace") {
+        out.insert(
+            "replacement".to_owned(),
+            json!(replacement.unwrap_or_default()),
+        );
+    }
+    out.insert("options".to_owned(), Value::Object(options));
     Ok(out)
 }

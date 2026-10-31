@@ -92,3 +92,41 @@ fn high_page_restart_reopens_with_cached_values_and_dynamic_outputs_preserved() 
     }
     Ok(())
 }
+
+/// A section start number (구역 시작 쪽 번호, not a NewNumber) is the first page's
+/// printing number too: Hangul prints 65530 for every PAGE field of that page.
+/// A later section with no start number continues from it.
+#[test]
+fn section_start_numbers_are_printed_and_continued() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    for (start, count) in [(65535_u16, 2_usize), (65530, 7), (7, 3)] {
+        let mut source = Session::new()?;
+        source.execute(Command::Insert("구역 시작 번호 ".into()))?;
+        for _ in 0..count {
+            source.run("insert.auto_text", json!({"kind":"page_number"}))?;
+            source.execute(Command::Insert(" | ".into()))?;
+        }
+        source.run("insert.auto_text", json!({"kind":"total_pages"}))?;
+        source.run("page.section", json!({"pageNum": start}))?;
+        assert_values(&source, start, count)?;
+        for extension in ["hwp", "hwpx"] {
+            let path = dir.path().join(format!("section-{start}.{extension}"));
+            source.save(&path)?;
+            let mut reopened = Session::new()?;
+            reopened.open(&path)?;
+            assert_eq!(numbers(&reopened), numbers(&source), "{extension}");
+            assert_values(&reopened, start, count)?;
+        }
+    }
+    let mut two = Session::new()?;
+    two.run("page.section", json!({"pageNum": 7}))?;
+    two.run("page.section_break", json!({}))?;
+    two.run("insert.auto_text", json!({"kind":"page_number"}))?;
+    assert_eq!(two.page_count()?, 2);
+    let svg = two.render_page_svg(1)?;
+    assert!(
+        svg.contains("data-hwpcraft-page-field=\"page\" data-value=\"8\""),
+        "the second section continues from 7"
+    );
+    Ok(())
+}

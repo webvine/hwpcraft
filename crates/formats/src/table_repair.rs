@@ -18,6 +18,18 @@ const MAX_DEPTH: usize = 64;
 /// Repair every table in the document. Returns how many tables changed; the
 /// derived layout is rebuilt only when at least one did.
 pub(crate) fn repair(core: &mut DocumentCore) -> usize {
+    // Mutable access makes RHWP distrust its layout caches on the next undo, so
+    // look first and take it only for a damaged document.
+    if !core.document().sections.iter().any(|section| {
+        damaged(&section.paragraphs, 0)
+            || section
+                .section_def
+                .master_pages
+                .iter()
+                .any(|master| damaged(&master.paragraphs, 0))
+    }) {
+        return 0;
+    }
     let mut repaired = 0;
     for section in &mut core.document_mut().sections {
         paragraphs(&mut section.paragraphs, 0, &mut repaired);
@@ -30,6 +42,72 @@ pub(crate) fn repair(core: &mut DocumentCore) -> usize {
         core.set_document(doc);
     }
     repaired
+}
+
+/// Read-only twin of `paragraphs`: does any reachable table need `table`?
+fn damaged(paras: &[Paragraph], depth: usize) -> bool {
+    let caption =
+        |value: Option<&Caption>| value.is_some_and(|c| damaged(&c.paragraphs, depth + 1));
+    depth <= MAX_DEPTH
+        && paras
+            .iter()
+            .flat_map(|para| &para.controls)
+            .any(|control| match control {
+                Control::Table(value) => damaged_table(value, depth + 1),
+                Control::Shape(value) => damaged_shape(value, depth + 1),
+                Control::Picture(picture) => caption(picture.caption.as_ref()),
+                Control::Header(header) => damaged(&header.paragraphs, depth + 1),
+                Control::Footer(footer) => damaged(&footer.paragraphs, depth + 1),
+                Control::Footnote(note) => damaged(&note.paragraphs, depth + 1),
+                Control::Endnote(note) => damaged(&note.paragraphs, depth + 1),
+                Control::HiddenComment(comment) => damaged(&comment.paragraphs, depth + 1),
+                _ => false,
+            })
+}
+
+fn damaged_table(value: &Table, depth: usize) -> bool {
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    let extent = |start: u16, span: u16| start.saturating_add(span.max(1));
+    let rows = value.cells.iter().map(|c| extent(c.row, c.row_span)).max();
+    let cols = value.cells.iter().map(|c| extent(c.col, c.col_span)).max();
+    matches!((rows, cols), (Some(rows), Some(cols)) if value.row_count < rows || value.col_count < cols)
+        || value
+            .caption
+            .as_ref()
+            .is_some_and(|c| damaged(&c.paragraphs, depth + 1))
+        || value
+            .cells
+            .iter()
+            .any(|cell| damaged(&cell.paragraphs, depth + 1))
+}
+
+fn damaged_shape(value: &ShapeObject, depth: usize) -> bool {
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    let caption =
+        |value: Option<&Caption>| value.is_some_and(|c| damaged(&c.paragraphs, depth + 1));
+    value.drawing().is_some_and(|drawing| {
+        drawing
+            .text_box
+            .as_ref()
+            .is_some_and(|text| damaged(&text.paragraphs, depth + 1))
+            || caption(drawing.caption.as_ref())
+    }) || match value {
+        ShapeObject::Group(group) => {
+            caption(group.caption.as_ref())
+                || group
+                    .children
+                    .iter()
+                    .any(|child| damaged_shape(child, depth + 1))
+        }
+        ShapeObject::Picture(picture) => caption(picture.caption.as_ref()),
+        ShapeObject::Chart(chart) => caption(chart.caption.as_ref()),
+        ShapeObject::Ole(ole) => caption(ole.caption.as_ref()),
+        _ => false,
+    }
 }
 
 fn table(value: &mut Table, depth: usize, repaired: &mut usize) {

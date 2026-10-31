@@ -1,0 +1,56 @@
+diff --git a/src/renderer/composer/line_breaking.rs b/src/renderer/composer/line_breaking.rs
+index 98d7544..a88c847 100644
+--- a/src/renderer/composer/line_breaking.rs
++++ b/src/renderer/composer/line_breaking.rs
+@@ -2633,11 +2633,36 @@ fn floating_anchor_font_size_px(
+         .fold(0.0, f64::max)
+ }
+ 
++/// 글자처럼 그림의 위·아래 캡션이 차지하는 세로 길이(HWPUNIT) — 간격 + 캡션 문단 높이.
++/// 렌더러는 그림·캡션 상자(`tac_object_box_height_px`)를 줄 baseline 에 앉히므로 줄
++/// 높이도 같은 상자로 세야 다음 줄이 캡션을 덮지 않는다. 좌·우 캡션은 높이를 늘리지 않는다.
++fn tac_picture_caption_extent_hwp(pic: &crate::model::image::Picture) -> i32 {
++    use crate::model::shape::CaptionDirection;
++    let Some(cap) = &pic.caption else {
++        return 0;
++    };
++    if !matches!(
++        cap.direction,
++        CaptionDirection::Top | CaptionDirection::Bottom
++    ) || cap.paragraphs.is_empty()
++    {
++        return 0;
++    }
++    // 7200 dpi 의 px 는 HWPUNIT 과 같다.
++    let height = crate::renderer::composer::caption_height_px(&pic.caption, 7200.0).round() as i32;
++    if height <= 0 {
++        return 0;
++    }
++    i32::from(cap.spacing).saturating_add(height)
++}
++
+ fn inline_control_line_height_hwp(para: &Paragraph) -> Option<i32> {
+     para.controls
+         .iter()
+         .filter_map(|ctrl| match ctrl {
+-            Control::Picture(pic) if pic.common.treat_as_char => Some(pic.common.height as i32),
++            Control::Picture(pic) if pic.common.treat_as_char => {
++                Some((pic.common.height as i32).saturating_add(tac_picture_caption_extent_hwp(pic)))
++            }
+             Control::Shape(shape) if shape.common().treat_as_char => Some(shape.flow_height_hu()),
+             Control::Table(table) if table.common.treat_as_char => Some(table.common.height as i32),
+             Control::Equation(eq) if eq.common.treat_as_char => {
+@@ -2652,9 +2677,10 @@ fn inline_control_line_height_hwp(para: &Paragraph) -> Option<i32> {
+ 
+ fn inline_control_size_hwp(ctrl: &Control) -> Option<(i32, i32)> {
+     let (width, height) = match ctrl {
+-        Control::Picture(pic) if pic.common.treat_as_char => {
+-            (pic.common.width as i32, pic.common.height as i32)
+-        }
++        Control::Picture(pic) if pic.common.treat_as_char => (
++            pic.common.width as i32,
++            (pic.common.height as i32).saturating_add(tac_picture_caption_extent_hwp(pic)),
++        ),
+         Control::Shape(shape) if shape.common().treat_as_char => (
+             (shape.common().width as i32).max(shape.shape_attr().current_width as i32),
+             shape.flow_height_hu(),

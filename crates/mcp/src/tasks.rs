@@ -1,7 +1,7 @@
 //! MCP Tasks extension (`io.modelcontextprotocol/tasks`) for long file work.
 //!
-//! Only opening and saving become tasks: a 383-page PDF export can take about
-//! a minute, beyond common client request timeouts. Everything else stays a
+//! Only opening and saving become tasks: a 381-page PDF export takes 11–22 s
+//! and longer on a busy machine, near common client request timeouts. Everything else stays a
 //! direct result. A task is created only when the request itself declares the
 //! extension in its client capabilities; other clients see no change.
 //!
@@ -17,6 +17,10 @@ use serde_json::Value;
 /// terminal ones for one more window).
 pub(crate) const TTL_MS: u64 = 10 * 60 * 1000;
 pub(crate) const POLL_INTERVAL_MS: u64 = 1000;
+/// Tasks still running at once. Beyond this an eligible call runs directly and
+/// returns its result, which the extension allows, so a client that floods
+/// task-creating calls cannot pile up unbounded background work.
+pub(crate) const MAX_RUNNING: usize = 64;
 
 /// Engine commands that read or write a whole document file.
 const FILE_COMMANDS: &[&str] = &[

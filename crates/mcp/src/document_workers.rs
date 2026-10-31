@@ -37,7 +37,32 @@ struct Worker {
     state: Arc<AtomicU8>,
     finished: CancellationToken,
     activity: Arc<Activity>,
+    /// Called after a job is queued for an external document, whose jobs are
+    /// served by another loop (the desktop window) that must be woken up.
+    wake: Option<Wake>,
+    /// Title and state of an external (desktop) document, kept by its owner.
+    external: Option<Arc<Mutex<ExternalInfo>>>,
 }
+
+/// What `list_documents` shows for a desktop document.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExternalInfo {
+    pub(crate) title: String,
+    pub(crate) path: Option<String>,
+    pub(crate) dirty: bool,
+}
+
+/// One listed document. Only documents the desktop user attached are listed:
+/// an id MCP created is a capability its client holds, never enumerated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DocumentEntry {
+    pub(crate) id: String,
+    pub(crate) source: &'static str,
+    pub(crate) info: ExternalInfo,
+}
+
+/// Wakes the loop that serves an external document's jobs.
+pub(crate) type Wake = Arc<dyn Fn() + Send + Sync>;
 
 /// What the async side may know about a worker without asking its thread.
 /// Only a hint for choosing an eviction candidate: the worker thread itself
@@ -360,6 +385,8 @@ impl DocumentWorkers {
             state: Arc::new(AtomicU8::new(STARTING)),
             finished: CancellationToken::new(),
             activity: Arc::new(Activity::new()),
+            wake: None,
+            external: None,
         };
         let (ready_sender, ready_receiver) = oneshot::channel();
         let roots = self.roots.clone();
@@ -400,6 +427,137 @@ impl DocumentWorkers {
             bail!("문서 worker 스레드를 만들지 못했습니다.");
         }
         Ok((id, worker, ready_receiver))
+    }
+}
+
+impl DocumentWorkers {
+    /// The attached desktop documents, by id. MCP-created documents are not listed.
+    pub(crate) fn list(&self) -> Vec<DocumentEntry> {
+        let Ok(registry) = self.registry.lock() else {
+            return Vec::new();
+        };
+        let mut entries: Vec<DocumentEntry> = registry
+            .iter()
+            .filter(|(_, worker)| worker.state.load(Ordering::Acquire) == ACTIVE)
+            .filter_map(|(id, worker)| {
+                let info = worker.external.as_ref()?.lock().ok()?.clone();
+                Some(DocumentEntry {
+                    id: id.clone(),
+                    source: "desktop",
+                    info,
+                })
+            })
+            .collect();
+        entries.sort_by(|a, b| a.info.title.cmp(&b.info.title).then(a.id.cmp(&b.id)));
+        entries
+    }
+
+    /// Register a document whose engine lives on the caller's thread (the desktop
+    /// window). Its jobs are queued like any other document's and served by
+    /// [`ExternalDocument::serve`]; `wake` is called after each job is queued.
+    /// MCP cannot close or evict it; dropping the handle detaches it.
+    pub(crate) fn attach_external(
+        &self,
+        wake: Wake,
+        info: ExternalInfo,
+    ) -> Result<ExternalDocument> {
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| anyhow!("문서 목록을 사용할 수 없습니다."))?;
+        registry.retain(|_, worker| worker.state.load(Ordering::Acquire) != CLOSED);
+        if registry.len() >= MAX_DOCUMENTS {
+            bail!("문서는 동시에 16개까지 열 수 있습니다.");
+        }
+        let id = loop {
+            let candidate = uuid::Uuid::new_v4().to_string();
+            if !registry.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
+        let worker = Worker {
+            sender,
+            state: Arc::new(AtomicU8::new(ACTIVE)),
+            finished: CancellationToken::new(),
+            activity: Arc::new(Activity::new()),
+            wake: Some(wake),
+            external: Some(Arc::new(Mutex::new(info))),
+        };
+        self.subscriptions.register(&id)?;
+        registry.insert(id.clone(), worker.clone());
+        Ok(ExternalDocument {
+            id,
+            receiver,
+            info: worker.external.clone().unwrap_or_default(),
+            state: worker.state,
+            activity: worker.activity,
+            subscriptions: Arc::clone(&self.subscriptions),
+            registry: Arc::downgrade(&self.registry),
+        })
+    }
+}
+
+/// A document served on its owner's thread; see [`DocumentWorkers::attach_external`].
+pub(crate) struct ExternalDocument {
+    id: String,
+    receiver: mpsc::Receiver<Job>,
+    info: Arc<Mutex<ExternalInfo>>,
+    state: Arc<AtomicU8>,
+    activity: Arc<Activity>,
+    subscriptions: Arc<DocumentSubscriptions>,
+    registry: Weak<Registry>,
+}
+
+impl ExternalDocument {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+    /// Update what `list_documents` shows (title, path, unsaved changes).
+    pub(crate) fn set_info(&self, info: ExternalInfo) {
+        if let Ok(mut current) = self.info.lock()
+            && *current != info
+        {
+            *current = info;
+        }
+    }
+    /// Run queued jobs on `backend` until none is left or `budget` has passed
+    /// (at least one runs). Returns how many ran.
+    pub(crate) fn serve(&mut self, backend: &mut Headless, budget: Duration) -> usize {
+        let started = Instant::now();
+        let mut served = 0;
+        while let Ok(job) = self.receiver.try_recv() {
+            served += 1;
+            process(
+                backend,
+                job,
+                &self.state,
+                &self.subscriptions,
+                &self.id,
+                &self.activity,
+                true,
+            );
+            if started.elapsed() >= budget {
+                break;
+            }
+        }
+        served
+    }
+}
+
+impl Drop for ExternalDocument {
+    fn drop(&mut self) {
+        self.state.store(CLOSED, Ordering::Release);
+        self.subscriptions.closed(&self.id);
+        if let Some(registry) = self.registry.upgrade() {
+            remove(&registry, &self.id);
+        }
+        self.receiver.close();
+        while let Ok(job) = self.receiver.try_recv() {
+            let _ = job
+                .reply
+                .send(Err(anyhow!("데스크톱 문서 연결이 끊겼습니다.")));
+        }
     }
 }
 
@@ -502,6 +660,9 @@ async fn dispatch(
                 anyhow!("문서 worker가 종료됐습니다.")
             }
         })?;
+    if let Some(wake) = &worker.wake {
+        wake();
+    }
     let result = cancel
         .run_until_cancelled(receive)
         .await
@@ -535,110 +696,139 @@ fn run(
         return;
     }
     while let Some(job) = receiver.blocking_recv() {
-        let _done = JobDone {
+        if process(
+            &mut backend,
+            job,
+            state,
+            subscriptions,
+            document_id,
             activity,
-            // An eviction check must not make the document look used.
-            touch: !matches!(job.operation, Operation::Evict { .. }),
-        };
-        if state.load(Ordering::Acquire) == CLOSED {
-            let _ = job.reply.send(Err(anyhow!("문서가 닫혔습니다.")));
-            continue;
-        }
-        if job.cancel.is_cancelled() {
-            let _ = job.reply.send(Err(cancelled()));
-            continue;
-        }
-        // A request cancelled while its synchronous call runs must not replace
-        // a file: atomic writes check this scope just before they persist.
-        let _cancel_scope = hwpcraft_formats::file_access::cancel_scope({
-            let token = job.cancel.clone();
-            move || token.is_cancelled()
-        });
-        let (result, closed) = match job.operation {
-            Operation::Call { tool, args } => {
-                let before = DocumentStamp::capture(&backend.session);
-                let roots = backend.roots.clone();
-                let result = hwpcraft_formats::file_access::confine(roots.as_ref(), || {
-                    tools::call(&mut backend, &tool, args)
-                });
-                if backend.usable && before != DocumentStamp::capture(&backend.session) {
-                    subscriptions.changed(document_id);
-                }
-                (result, false)
-            }
-            Operation::Close { force } => match backend.require_discard(force) {
-                Ok(()) => {
-                    state.store(CLOSED, Ordering::Release);
-                    (tools::result(json!({"closed":true}), false), true)
-                }
-                Err(error) => (error_result(&error.to_string()), false),
-            },
-            Operation::Evict { idle } => {
-                let quiet =
-                    activity.pending.load(Ordering::Acquire) == 1 && activity.idle_for() >= idle;
-                if quiet && backend.require_discard(false).is_ok() {
-                    state.store(CLOSED, Ordering::Release);
-                    (json!({"closed":true}), true)
-                } else {
-                    (json!({"closed":false}), false)
-                }
-            }
-            #[cfg(test)]
-            Operation::Block { entered, release } => {
-                let _ = entered.send(());
-                let _ = release.recv();
-                (tools::result(json!({"blocked":false}), false), false)
-            }
-            #[cfg(test)]
-            Operation::BlockThenCall {
-                entered,
-                release,
-                tool,
-                args,
-            } => {
-                let _ = entered.send(());
-                let _ = release.recv();
-                (tools::call(&mut backend, &tool, args), false)
-            }
-            #[cfg(test)]
-            Operation::InvalidateRollback => {
-                let result = (|| -> Result<()> {
-                    let checkpoint = backend.session.full_checkpoint()?;
-                    backend
-                        .session
-                        .core
-                        .create_blank_document_native()
-                        .map_err(|e| anyhow!("{e}"))?;
-                    crate::atomic_batch::rollback(&mut backend, checkpoint)
-                })();
-                (
-                    match result {
-                        Ok(()) => tools::result(json!({"unexpectedRestoreSuccess":true}), false),
-                        Err(error) => error_result(&error.to_string()),
-                    },
-                    false,
-                )
-            }
-            #[cfg(test)]
-            Operation::Panic => std::panic::resume_unwind(Box::new("private-test-panic-password")),
-        };
-        if !backend.usable {
-            state.store(CLOSED, Ordering::Release);
-        }
-        activity
-            .dirty
-            .store(backend.usable && backend.session.dirty(), Ordering::Release);
-        // Cancellation after a synchronous call does not rewind it: file side
-        // effects and path/password replacement cannot be generally rolled back.
-        if job.cancel.is_cancelled() {
-            let _ = job.reply.send(Err(cancelled()));
-        } else {
-            let _ = job.reply.send(Ok(result));
-        }
-        if closed || state.load(Ordering::Acquire) == CLOSED {
+            false,
+        ) {
             break;
         }
     }
+}
+
+/// Run one job on `backend`; true when the document is now closed. An external
+/// document (the desktop window's) is never closed or evicted through MCP.
+fn process(
+    backend: &mut Headless,
+    job: Job,
+    state: &AtomicU8,
+    subscriptions: &DocumentSubscriptions,
+    document_id: &str,
+    activity: &Activity,
+    external: bool,
+) -> bool {
+    let _done = JobDone {
+        activity,
+        // An eviction check must not make the document look used.
+        touch: !matches!(job.operation, Operation::Evict { .. }),
+    };
+    if state.load(Ordering::Acquire) == CLOSED {
+        let _ = job.reply.send(Err(anyhow!("문서가 닫혔습니다.")));
+        return true;
+    }
+    if job.cancel.is_cancelled() {
+        let _ = job.reply.send(Err(cancelled()));
+        return false;
+    }
+    // A request cancelled while its synchronous call runs must not replace
+    // a file: atomic writes check this scope just before they persist.
+    let _cancel_scope = hwpcraft_formats::file_access::cancel_scope({
+        let token = job.cancel.clone();
+        move || token.is_cancelled()
+    });
+    let (result, closed) = match job.operation {
+        Operation::Call { tool, args } => {
+            let before = DocumentStamp::capture(&backend.session);
+            let roots = backend.roots.clone();
+            let result = hwpcraft_formats::file_access::confine(roots.as_ref(), || {
+                tools::call(backend, &tool, args)
+            });
+            if backend.usable && before != DocumentStamp::capture(&backend.session) {
+                subscriptions.changed(document_id);
+            }
+            (result, false)
+        }
+        Operation::Close { .. } if external => (
+            error_result(
+                "데스크톱 창에서 연 문서는 MCP로 닫을 수 없습니다. 데스크톱에서 닫거나 연결을 끄세요.",
+            ),
+            false,
+        ),
+        Operation::Evict { .. } if external => (json!({"closed":false}), false),
+        Operation::Close { force } => match backend.require_discard(force) {
+            Ok(()) => {
+                state.store(CLOSED, Ordering::Release);
+                (tools::result(json!({"closed":true}), false), true)
+            }
+            Err(error) => (error_result(&error.to_string()), false),
+        },
+        Operation::Evict { idle } => {
+            let quiet =
+                activity.pending.load(Ordering::Acquire) == 1 && activity.idle_for() >= idle;
+            if quiet && backend.require_discard(false).is_ok() {
+                state.store(CLOSED, Ordering::Release);
+                (json!({"closed":true}), true)
+            } else {
+                (json!({"closed":false}), false)
+            }
+        }
+        #[cfg(test)]
+        Operation::Block { entered, release } => {
+            let _ = entered.send(());
+            let _ = release.recv();
+            (tools::result(json!({"blocked":false}), false), false)
+        }
+        #[cfg(test)]
+        Operation::BlockThenCall {
+            entered,
+            release,
+            tool,
+            args,
+        } => {
+            let _ = entered.send(());
+            let _ = release.recv();
+            (tools::call(backend, &tool, args), false)
+        }
+        #[cfg(test)]
+        Operation::InvalidateRollback => {
+            let result = (|| -> Result<()> {
+                let checkpoint = backend.session.full_checkpoint()?;
+                backend
+                    .session
+                    .core
+                    .create_blank_document_native()
+                    .map_err(|e| anyhow!("{e}"))?;
+                crate::atomic_batch::rollback(backend, checkpoint)
+            })();
+            (
+                match result {
+                    Ok(()) => tools::result(json!({"unexpectedRestoreSuccess":true}), false),
+                    Err(error) => error_result(&error.to_string()),
+                },
+                false,
+            )
+        }
+        #[cfg(test)]
+        Operation::Panic => std::panic::resume_unwind(Box::new("private-test-panic-password")),
+    };
+    if !backend.usable {
+        state.store(CLOSED, Ordering::Release);
+    }
+    activity
+        .dirty
+        .store(backend.usable && backend.session.dirty(), Ordering::Release);
+    // Cancellation after a synchronous call does not rewind it: file side
+    // effects and path/password replacement cannot be generally rolled back.
+    if job.cancel.is_cancelled() {
+        let _ = job.reply.send(Err(cancelled()));
+    } else {
+        let _ = job.reply.send(Ok(result));
+    }
+    closed || state.load(Ordering::Acquire) == CLOSED
 }
 
 #[cfg(test)]

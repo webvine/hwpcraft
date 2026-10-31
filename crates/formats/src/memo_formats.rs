@@ -24,14 +24,23 @@ const MEMO_LIST: u16 = 93;
 
 pub(crate) fn export_hwp(core: &DocumentCore, password: Option<&[u8]>) -> Result<Vec<u8>> {
     let snapshot = core.prepare_hwp_export_snapshot();
-    let has_memos = snapshot.document().sections.iter().any(|section| {
-        section.paragraphs.iter().any(|paragraph| {
-            paragraph.controls.iter().any(|control| {
-                matches!(control, Control::Field(field)
-                    if field.field_type == FieldType::Memo && !field.memo_paragraphs.is_empty())
+    // Memos in table cells count too: the section tail lists them with the body's.
+    fn has_memo(paragraphs: &[hwpcraft_doc::model::paragraph::Paragraph]) -> bool {
+        paragraphs.iter().any(|paragraph| {
+            paragraph.controls.iter().any(|control| match control {
+                Control::Field(field) => {
+                    field.field_type == FieldType::Memo && !field.memo_paragraphs.is_empty()
+                }
+                Control::Table(table) => table.cells.iter().any(|cell| has_memo(&cell.paragraphs)),
+                _ => false,
             })
         })
-    });
+    }
+    let has_memos = snapshot
+        .document()
+        .sections
+        .iter()
+        .any(|section| has_memo(&section.paragraphs));
     if !has_memos {
         return match password {
             Some(password) => snapshot.serialize_with_password(password),

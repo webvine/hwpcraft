@@ -1,0 +1,181 @@
+diff --git a/src/document_core/queries/hwpctrl_sets.rs b/src/document_core/queries/hwpctrl_sets.rs
+index ce65f572..96b5f24e 100644
+--- a/src/document_core/queries/hwpctrl_sets.rs
++++ b/src/document_core/queries/hwpctrl_sets.rs
+@@ -814,7 +814,11 @@ impl DocumentCore {
+                     let common = match ctrl {
+                         Control::Table(t) => Some(&mut t.common),
+                         Control::Shape(s) => Some(s.common_mut()),
+-                        Control::Picture(p) => Some(&mut p.common),
++                        Control::Picture(p) => {
++                            // [HwpCraft 0050] HWPX 저장기가 보는 그림 자체의 잠금도 맞춘다.
++                            p.lock = locked;
++                            Some(&mut p.common)
++                        }
+                         _ => None,
+                     };
+                     let Some(c) = common else { continue };
+@@ -2481,6 +2485,67 @@ mod tests {
+             .find_map(|child| first_table_cell_width(child, model_cell_index))
+     }
+ 
++    /// [HwpCraft 0050] 편집으로 건 개체 보호가 HWP·HWPX 저장 뒤에도 남는다.
++    #[test]
++    fn a_lock_set_by_editing_survives_hwp_and_hwpx_saves() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().expect("blank document");
++        let created: serde_json::Value =
++            serde_json::from_str(&core.create_table_native(0, 0, 0, 1, 2).expect("table"))
++                .expect("table result");
++        let para = created["paraIdx"].as_u64().expect("paraIdx") as usize;
++        let ctrl = created["controlIdx"].as_u64().expect("controlIdx") as usize;
++        const PNG: &[u8] = &[
++            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
++            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
++            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
++            0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0, 0x1F, 0x00, 0x05, 0x00, 0x01, 0xFF, 0x89, 0x99,
++            0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
++        ];
++        let pic: serde_json::Value = serde_json::from_str(
++            &core
++                .insert_picture_native(0, 0, 0, &[], PNG, 2000, 2000, 1, 1, "png", "", None, None)
++                .expect("picture"),
++        )
++        .expect("picture result");
++        let pic_para = pic["paraIdx"].as_u64().expect("paraIdx") as usize;
++        let pic_ctrl = pic["controlIdx"].as_u64().expect("controlIdx") as usize;
++        let table_ctrl = if pic_para == para && pic_ctrl <= ctrl {
++            ctrl + 1
++        } else {
++            ctrl
++        };
++        core.set_control_lock(Some(para), Some(table_ctrl), true)
++            .expect("lock table");
++        core.set_control_lock(Some(pic_para), Some(pic_ctrl), true)
++            .expect("lock picture");
++        let locks = |core: &DocumentCore| {
++            let mut out = Vec::new();
++            for p in &core.document.sections[0].paragraphs {
++                for c in &p.controls {
++                    match c {
++                        Control::Table(t) => out.push(("table", t.common.locked)),
++                        Control::Picture(p) => out.push(("picture", p.common.locked)),
++                        _ => {}
++                    }
++                }
++            }
++            out
++        };
++        let mut want = locks(&core);
++        want.sort();
++        assert_eq!(want, vec![("picture", true), ("table", true)]);
++        for (name, bytes) in [
++            ("hwp", core.export_hwp_native().expect("hwp")),
++            ("hwpx", core.export_hwpx_native().expect("hwpx")),
++        ] {
++            let back = DocumentCore::from_bytes(&bytes).expect("reopen");
++            let mut got = locks(&back);
++            got.sort();
++            assert_eq!(got, want, "{name}");
++        }
++    }
++
+     fn clearing_table_cells_invalidates_measurement_and_page_tree_owners() {
+         let mut core = DocumentCore::new_empty();
+         core.create_blank_document_native().expect("blank document");
+diff --git a/src/parser/hwpx/section.rs b/src/parser/hwpx/section.rs
+index ac219782..2686de43 100644
+--- a/src/parser/hwpx/section.rs
++++ b/src/parser/hwpx/section.rs
+@@ -3401,6 +3401,8 @@ fn parse_picture(
+     pic.img_dim = img_dim;
+     pic.reverse = reverse;
+     pic.lock = lock;
++    // [HwpCraft 0050] 잠금 조회·편집과 HWP 저장은 `common.locked` 를 본다(표·도형과 같다).
++    pic.common.locked = lock;
+ 
+     Ok(Control::Picture(Box::new(pic)))
+ }
+diff --git a/src/serializer/control.rs b/src/serializer/control.rs
+index 56992b3d..bf142fe6 100644
+--- a/src/serializer/control.rs
++++ b/src/serializer/control.rs
+@@ -624,6 +624,9 @@ fn serialize_table(table: &Table, level: u16, records: &mut Vec<Record>) {
+     // (HWP3 변환본 크롤 스윕 COM 이등분: 40429 표 attr bit29 로 확정, 양방향 반증).
+     // HWP3 어댑터·HWPX 출처는 캡션을 방출하면서도 이 비트를 안 켰다. 방출 직전 강제한다.
+     let ctrl_data = apply_caption_attr_bit(ctrl_data, table.caption.is_some());
++    // [HwpCraft 0050] 개체 보호(bit 30)도 IR 이 정본이다. 새로 만든 표는 봉인 없는 raw 를
++    // 그대로 쓰므로, 만든 뒤 건 잠금이 여기서 덮이지 않으면 저장에서 사라진다.
++    let ctrl_data = apply_lock_attr_bit(&ctrl_data, table.common.locked);
+     records.push(make_ctrl_record(tags::CTRL_TABLE, level, &ctrl_data));
+ 
+     // 캡션 (TABLE 이전, level+1)
+@@ -2211,8 +2214,9 @@ fn serialize_text_box_if_present(drawing: &DrawingObjAttr, level: u16, records:
+ /// [#5592] `pack_common_attr_bits` 가 의미 필드에서 재구성하는 비트 전체.
+ ///
+ /// 이 마스크 안은 IR enum/bool 필드가 정본이고, 밖(예: bit 1·27·31, 캡션 bit 29 —
+-/// 방출 직전 `apply_caption_attr_bit` 가 강제, 잠금 bit 30 — pack 미방출이라 raw 보존)
+-/// 은 파스 시점 raw 를 보존한다.
++/// 방출 직전 `apply_caption_attr_bit` 가 강제)은 파스 시점 raw 를 보존한다.
++/// [HwpCraft 0050] 잠금 bit 30 도 `common.locked` 가 정본이다 — raw 로 두면 편집으로 건
++/// 개체 보호가 HWP 저장에서 사라지고, HWPX 에서 온 잠긴 개체가 HWP 로 바꿀 때 풀린다.
+ const COMMON_ATTR_SEMANTIC_MASK: u32 = 0x01            // treat_as_char
+     | (1 << 2)                                          // affect_line_spacing
+     | (0x03 << 3)                                       // vert_rel_to
+@@ -2227,7 +2231,8 @@ const COMMON_ATTR_SEMANTIC_MASK: u32 = 0x01            // treat_as_char
+     | (0x07 << 21)                                      // text_wrap
+     | (0x03 << 24)                                      // text_flow
+     | (1 << 26)                                         // hwp5_gen_shape_attr_bit26
+-    | (1 << 28); // hwp5_gen_shape_attr_bit28
++    | (1 << 28)                                         // hwp5_gen_shape_attr_bit28
++    | (1 << 30); // locked (개체 보호)
+ 
+ fn serialize_common_obj_attr(common: &CommonObjAttr) -> Vec<u8> {
+     let mut w = ByteWriter::new();
+@@ -2287,6 +2292,22 @@ fn apply_caption_attr_bit(ctrl_data: &[u8], has_caption: bool) -> Vec<u8> {
+     out
+ }
+ 
++/// [HwpCraft 0050] CTRL_HEADER attr **bit 30 = 개체 보호**를 IR(`common.locked`)에 맞춘다.
++fn apply_lock_attr_bit(ctrl_data: &[u8], locked: bool) -> Vec<u8> {
++    const LOCK_ATTR_BIT: u32 = 1 << 30;
++    let mut out = ctrl_data.to_vec();
++    if out.len() >= 4 {
++        let mut attr = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
++        if locked {
++            attr |= LOCK_ATTR_BIT;
++        } else {
++            attr &= !LOCK_ATTR_BIT;
++        }
++        out[0..4].copy_from_slice(&attr.to_le_bytes());
++    }
++    out
++}
++
+ /// `CommonObjAttr` 의 enum 필드들로부터 attr u32 비트를 합성한다.
+ ///
+ /// [#4400] `document_core/converters/common_obj_attr_writer.rs` 에서 이 파일로 이동했다
+@@ -2345,6 +2366,9 @@ pub(crate) fn pack_common_attr_bits(common: &CommonObjAttr) -> u32 {
+     if common.hwp5_gen_shape_attr_bit28 {
+         a |= 1 << 28;
+     }
++    if common.locked {
++        a |= 1 << 30;
++    }
+     a
+ }
+ 
+diff --git a/src/serializer/hwpx/picture.rs b/src/serializer/hwpx/picture.rs
+index 7f5f881c..468ee887 100644
+--- a/src/serializer/hwpx/picture.rs
++++ b/src/serializer/hwpx/picture.rs
+@@ -66,7 +66,8 @@ pub fn write_picture<W: Write>(
+     let reverse = bool01(pic.reverse);
+     // [#2875] 개체 잠금 — 종전 하드코딩 "0" 은 lock="1" 로 저장된 그림의 잠금 정보를
+     // 왕복 시 소실시켰다 (#2861 reverse, #2855 hp:tbl lock 과 동일 패턴).
+-    let lock = bool01(pic.lock);
++    // [HwpCraft 0050] HWP 에서 읽거나 편집으로 건 잠금은 `common.locked` 에만 있다.
++    let lock = bool01(pic.lock || pic.common.locked);
+     // [#2697 동형] numberingType 은 IR(common.numbering_type)을 보존한다. 종전 "PICTURE"
+     // 하드코딩은 그림에 번호 범주를 변경한(예: NONE) 문서에서 저장 시 원본 속성이 유실됐다.
+     // 도형·표 계열은 이미 #1379/#2697 에서 IR 보존으로 정리됐다.

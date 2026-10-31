@@ -1,0 +1,89 @@
+diff --git a/src/document_core/hyperlink.rs b/src/document_core/hyperlink.rs
+index 71a01d4..91929b2 100644
+--- a/src/document_core/hyperlink.rs
++++ b/src/document_core/hyperlink.rs
+@@ -545,6 +545,55 @@ fn raw_boundary(p: &Paragraph, offset: usize) -> u32 {
+ 
+ /// 8-unit 마커를 넣거나 빼며 모든 raw UTF-16 참조 축을 함께 옮긴다.
+ /// 첫 글자 서식의 0 anchor는 그대로 둔다. 표시 문자 인덱스는 변하지 않는다.
++#[cfg(test)]
++mod hwpcraft_link_end_tests {
++    use super::HyperlinkTarget;
++    use crate::document_core::DocumentCore;
++    use crate::model::control::{Control, FieldType};
++
++    fn links(core: &DocumentCore) -> Vec<(usize, usize)> {
++        let p = &core.document().sections[0].paragraphs[0];
++        p.field_ranges
++            .iter()
++            .filter(|r| {
++                matches!(p.controls.get(r.control_idx),
++                    Some(Control::Field(f)) if f.field_type == FieldType::Hyperlink)
++            })
++            .map(|r| (r.start_char_idx, r.end_char_idx))
++            .collect()
++    }
++
++    /// Text typed after a link that ends the paragraph goes after the link's end
++    /// slot, so a second link in the paragraph keeps its place in an HWPX save.
++    #[test]
++    fn two_links_typed_one_after_another_survive_an_hwpx_save() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        let target = HyperlinkTarget::body(0, 0);
++        core.insert_text_native(0, 0, 0, "앞 링크A").unwrap();
++        core.insert_hyperlink_native(&target, 2, 5, "https://a.example")
++            .unwrap();
++        core.insert_text_native(0, 0, 5, " 가운데 링크B").unwrap();
++        let offsets = &core.document().sections[0].paragraphs[0].char_offsets;
++        assert_eq!(offsets[5], offsets[4] + 1 + 8, "after the end slot");
++        core.insert_hyperlink_native(&target, 10, 13, "https://b.example")
++            .unwrap();
++        core.insert_text_native(0, 0, 13, " 끝").unwrap();
++        assert_eq!(links(&core), [(2, 5), (10, 13)]);
++        for bytes in [
++            core.export_hwpx_native().unwrap(),
++            core.export_hwp_native().unwrap(),
++        ] {
++            let reopened = DocumentCore::from_bytes(&bytes).unwrap();
++            assert_eq!(links(&reopened), [(2, 5), (10, 13)]);
++            assert_eq!(
++                reopened.document().sections[0].paragraphs[0].text,
++                "앞 링크A 가운데 링크B 끝"
++            );
++        }
++    }
++}
++
+ fn shift_axis(p: &mut Paragraph, boundary: u32, delta: i32) -> Result<(), HwpError> {
+     let shift = |v: &mut u32| -> Result<(), HwpError> {
+         if *v >= boundary {
+diff --git a/src/model/paragraph.rs b/src/model/paragraph.rs
+index 9a4eaee..2ab19ac 100644
+--- a/src/model/paragraph.rs
++++ b/src/model/paragraph.rs
+@@ -1207,9 +1207,23 @@ impl Paragraph {
+             } else {
+                 0
+             };
++            // [HwpCraft 0048] 문단 끝에서 닫히는 링크의 FIELD_END 칸(8)도 건너뛴다. 링크
++            // 끝에 친 글자는 링크 밖이다(아래 field_ranges 는 범위를 늘리지 않는다). 칸을
++            // 건너뛰지 않으면 새 글자가 끝 칸 자리에 앉아, HWPX 저장이 그 문단의 다음
++            // 링크 시작 표식을 제자리에 쓰지 못하고 문단 끝으로 민다(다시 열면 그 링크가 없다).
++            let link_ends = self
++                .field_ranges
++                .iter()
++                .filter(|range| {
++                    range.start_char_idx < range.end_char_idx
++                        && range.end_char_idx == text_len
++                        && matches!(self.controls.get(range.control_idx),
++                            Some(Control::Field(field)) if field.field_type == FieldType::Hyperlink)
++                })
++                .count() as u32;
+             self.char_offsets[last_idx]
+                 + Self::char_stream_len(text_chars[last_idx])
+-                + trailing_ctrl_count * 8
++                + (trailing_ctrl_count + link_ends) * 8
+         } else {
+             // 텍스트가 비어있을 때: 기존 컨트롤 뒤에 삽입 (각 컨트롤 = 8 code units)
+             (self.controls.len() as u32) * 8

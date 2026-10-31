@@ -1,0 +1,93 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 590d321..92793f5 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -1631,6 +1631,14 @@ impl DocumentCore {
+ 
+             let mut min_reflowed_idx: Option<usize> = None;
+             let mut latest_non_tac_picture_host = None;
++            // A section without one stored row (a file written without line caches,
++            // such as a new document's HWPX) has no stored geometry to keep: every
++            // paragraph, empty ones too, gets rows and they form one flow.
++            let no_stored_rows = section.paragraphs.iter().all(|p| {
++                p.line_segs.iter().all(|l| {
++                    l.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
++                })
++            });
+             let mut pi = 0usize;
+             while pi < section.paragraphs.len() {
+                 if section.paragraphs[pi].controls.iter().any(|control| {
+@@ -1638,7 +1646,12 @@ impl DocumentCore {
+                 }) {
+                     latest_non_tac_picture_host = Some(pi);
+                 }
+-                if Self::needs_reflow_broadly(&section.paragraphs[pi]) {
++                let paragraph = &section.paragraphs[pi];
++                if Self::needs_reflow_broadly(paragraph)
++                    || (no_stored_rows
++                        && paragraph.line_segs.is_empty()
++                        && paragraph.char_count > 0)
++                {
+                     // A damaged successor can still belong to a stored
+                     // Picture host. The forward walk records the latest
+                     // possible owner, resolves its own physical column, and
+@@ -1772,10 +1785,14 @@ impl DocumentCore {
+             // 의 vpos 연속성이 깨짐. paginator 의 vpos_h 기반 current_height 조정이
+             // 잘못된 값으로 적용되어 페이지가 과다 분할되는 회귀의 원인.
+             if let Some(start) = min_reflowed_idx {
++                // Fresh rows all start at 0: with nothing stored, each paragraph
++                // joins the flow after the previous one (otherwise every one after
++                // `start` carried the same delta and they stacked at one vpos).
++                let fresh_flow = no_stored_rows.then(|| start..section.paragraphs.len());
+                 crate::renderer::composer::recalculate_section_vpos(
+                     &mut section.paragraphs,
+                     start,
+-                    None,
++                    fresh_flow,
+                     None,
+                     &self.styles,
+                     self.dpi,
+@@ -4146,3 +4163,43 @@ mod set_document_tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++mod fresh_flow_tests {
++    use crate::document_core::DocumentCore;
++
++    /// A section written without any line cache (a new document saved as HWPX) is
++    /// laid out as one flow: every paragraph, empty ones too, gets rows that start
++    /// after the previous paragraph, as in the live layout.
++    #[test]
++    fn a_section_without_stored_rows_flows_like_the_live_layout() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        core.insert_text_native(0, 0, 0, &"긴 문단입니다 ".repeat(20))
++            .unwrap();
++        let len = core.document().sections[0].paragraphs[0]
++            .text
++            .chars()
++            .count();
++        core.split_paragraph_native(0, 0, len, None).unwrap();
++        core.split_paragraph_native(0, 1, 0, None).unwrap();
++        core.insert_text_native(0, 2, 0, "끝 문단").unwrap();
++        let rows = |core: &DocumentCore| -> Vec<Vec<i32>> {
++            core.document().sections[0]
++                .paragraphs
++                .iter()
++                .map(|p| p.line_segs.iter().map(|l| l.vertical_pos).collect())
++                .collect()
++        };
++        let live = rows(&core);
++        assert!(live[0].len() > 1 && live.iter().all(|r| !r.is_empty()));
++        let mut doc = core.document().clone();
++        for p in &mut doc.sections[0].paragraphs {
++            p.line_segs.clear();
++        }
++        core.set_document(doc);
++        core.validation_report = DocumentCore::validate_linesegs(&core.document, true);
++        core.reflow_linesegs_on_demand();
++        assert_eq!(rows(&core), live);
++    }
++}

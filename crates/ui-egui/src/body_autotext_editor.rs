@@ -216,7 +216,7 @@ impl State {
         let mut params = self.selected_params()?;
         params["expected_generation"] = json!(generation);
         call("tools.autotext.body.insert", params)?;
-        self.status = "현재 본문 경계에 상용구를 넣었습니다.".into();
+        self.status = "캐럿 자리에 상용구를 넣었습니다.".into();
         Ok(())
     }
 

@@ -9,6 +9,13 @@ use super::*;
 use egui::{Key, Modifiers};
 use serde_json::Value;
 
+mod cross_ref_dialog;
+mod drop_cap_dialog;
+mod index_dialog;
+mod ruby_dialog;
+mod style_set_dialog;
+mod toc_dialog;
+
 /// Hangul 2024 문단 번호 모양 presets (label, level formats, number format codes).
 const NUMBERINGS: [(&str, [&str; 7], [u8; 7]); 10] = [
     (
@@ -144,6 +151,12 @@ pub(crate) struct State {
     highlight: Option<String>,
     copied: Option<(Value, Value)>,
     overlap: Option<OverlapDialog>,
+    toc: Option<toc_dialog::TocDialog>,
+    drop_cap: Option<drop_cap_dialog::DropCapDialog>,
+    cross_ref: Option<cross_ref_dialog::CrossRefDialog>,
+    ruby: Option<ruby_dialog::RubyDialog>,
+    style_set: Option<style_set_dialog::StyleSetDialog>,
+    index: Option<index_dialog::IndexDialog>,
 }
 /// 글자 겹치기 window: `control` is set when editing the control under the caret.
 struct OverlapDialog {
@@ -255,16 +268,14 @@ const ENGINE_IDS: &[&str] = &[
     "format.style.update_from_caret",
 ];
 /// Hangul commands shown on the ribbon that HwpCraft cannot perform yet.
-const UNSUPPORTED: &[&str] = &[
-    "format.style.gallery",
-    "format.drop_cap",
-    "format.picture_bullet",
-];
+const UNSUPPORTED: &[&str] = &[];
 const UI_IDS: &[&str] = &[
     "format.character_dialog",
     "format.paragraph_dialog",
     "format.style.dialog",
     "format.style.create",
+    "format.style.gallery",
+    "tools.index",
     "format.copy_shape",
     "format.highlight",
     "format.text_color",
@@ -295,6 +306,28 @@ impl HwpApp {
         if id == "format.copy_shape" {
             return Some(true);
         }
+        if id == "format.picture_bullet" {
+            return Some(true);
+        }
+        if id == "format.ruby.dialog" {
+            // Needs text selected in one body paragraph.
+            return Some(
+                self.session.cursor.cell.is_none()
+                    && self.session.has_selection()
+                    && self.session.span_anchor.is_none(),
+            );
+        }
+        if id == "insert.cross_reference" {
+            // The window also refreshes; it greys 넣기 with the reason where it cannot go.
+            return Some(true);
+        }
+        if id == "format.drop_cap" {
+            return Some(self.session.cursor.cell.is_none());
+        }
+        if id == "tools.toc" {
+            // The table goes into the body, never inside a table cell.
+            return Some(self.session.cursor.cell.is_none());
+        }
         (ENGINE_IDS.contains(&id) || UI_IDS.contains(&id)).then_some(true)
     }
     /// Return true when the command id was handled.
@@ -312,8 +345,23 @@ impl HwpApp {
             "format.paragraph_border" => self.open_shape(false, 3),
             "format.style.dialog" | "format.style" => self.open_style(false),
             "format.style.create" => self.open_style(true),
+            "format.style.gallery" => self.open_style_set(),
+            "tools.index" => self.open_index(),
             "format.numbering.dialog" => self.open_numbering(1),
             "format.outline.dialog" => self.open_outline(),
+            "tools.toc" => self.open_toc(),
+            "format.drop_cap" => self.open_drop_cap(),
+            "insert.cross_reference" => self.open_cross_ref(),
+            "format.ruby.dialog" => self.open_ruby(),
+            "format.picture_bullet" => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("그림 글머리표")
+                    .add_filter("그림 파일", &["png", "jpg", "jpeg", "bmp", "gif"])
+                    .pick_file()
+                {
+                    self.run("format.bullet.picture", json!({ "path": path }));
+                }
+            }
             "format.numbering.restart" => {
                 self.run("format.numbering.restart", json!({"mode": "new"}));
             }
@@ -694,6 +742,14 @@ impl HwpApp {
     }
     /// `--view` names: format-style, numbering, bullet, tabs, paragraph-border, character-border.
     pub(crate) fn format_ext_view(&mut self, name: &str) -> bool {
+        // Dialog checks at a window width: at-<width>-<view>, e.g. at-900-cross-ref.
+        if let Some((width, view)) = name.strip_prefix("at-").and_then(|r| r.split_once('-'))
+            && let Ok(width @ 400.0..=2400.0) = width.parse::<f32>()
+        {
+            self.ctx
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(width, 800.0)));
+            return self.set_initial_view(view).is_ok();
+        }
         match name {
             "format-style" => self.open_style(false),
             "format-style-add" => self.open_style(true),
@@ -706,6 +762,12 @@ impl HwpApp {
             "character-ext" => self.open_shape(true, 1),
             "character-border" => self.open_shape(true, 2),
             "char-overlap" => self.open_overlap(),
+            "toc" => self.open_toc(),
+            "drop-cap" => self.open_drop_cap(),
+            "cross-ref" => self.open_cross_ref(),
+            "ruby" => self.open_ruby(),
+            "style-sets" => self.open_style_set(),
+            "index" => self.open_index(),
             _ => return false,
         }
         true
@@ -715,6 +777,12 @@ impl HwpApp {
         self.ext.format.style.is_some()
             || self.ext.format.numbering.is_some()
             || self.ext.format.overlap.is_some()
+            || self.ext.format.toc.is_some()
+            || self.ext.format.drop_cap.is_some()
+            || self.ext.format.cross_ref.is_some()
+            || self.ext.format.ruby.is_some()
+            || self.ext.format.style_set.is_some()
+            || self.ext.format.index.is_some()
     }
     /// Called every frame after the built-in dialogs.
     pub(crate) fn format_ext_dialogs(&mut self, ctx: &egui::Context) {
@@ -730,6 +798,12 @@ impl HwpApp {
         self.style_dialog(ctx);
         self.numbering_dialog(ctx);
         self.overlap_dialog(ctx);
+        self.toc_dialog(ctx);
+        self.drop_cap_dialog(ctx);
+        self.cross_ref_dialog(ctx);
+        self.ruby_dialog(ctx);
+        self.style_set_dialog(ctx);
+        self.index_dialog(ctx);
     }
 
     // ---- 스타일 (F6) ----
@@ -1214,7 +1288,7 @@ impl HwpApp {
                 ui.vertical(|ui| {
                     let (a, c) = chrome::actions(
                         ui,
-                        !edit.name.trim().is_empty(),
+                        edit.name.trim().is_empty().then_some("스타일 이름을 넣으세요."),
                         if edit.id.is_some() { "설정(D)" } else { "추가(D)" },
                     );
                     apply = a;
@@ -1333,7 +1407,9 @@ impl HwpApp {
                     });
                 });
                 ui.vertical(|ui| {
-                    let (a, c) = chrome::actions(ui, replacement != d.selected, "지우기(D)");
+                    let grey = (replacement == d.selected)
+                        .then_some("지울 스타일이 아닌 다른 대치할 스타일을 고르세요.");
+                    let (a, c) = chrome::actions(ui, grey, "지우기(D)");
                     apply = a;
                     close |= c;
                 });
@@ -1380,7 +1456,11 @@ impl HwpApp {
                         .inner_margin(egui::Margin::symmetric(14, 6))
                         .show(ui, |ui| {
                             ui.set_width(431.0);
-                            ui.set_min_height(470.0);
+                            // Bullet and numbering tabs share one height so switching
+                            // tabs does not move the buttons; 개요 번호 has one page only.
+                            if d.tab < 3 {
+                                ui.set_min_height(470.0);
+                            }
                             if d.tab < 3 {
                                 chrome::tabs(
                                     ui,
@@ -1393,16 +1473,17 @@ impl HwpApp {
                                     group(ui, "글머리표 모양", |ui| {
                                         let mut items = vec![None];
                                         items.extend(BULLETS.iter().map(|c| Some(*c)));
+                                        // All seventeen fit without a scroll bar.
                                         gallery(
                                             ui,
                                             "bullets",
                                             &mut d.bullet,
                                             items.len(),
-                                            3,
+                                            (Vec2::new(80.0, 72.0), 5, 4),
                                             |p, r, i| {
                                                 if let Some(Some(c)) = items.get(i) {
                                                     for row in 0..2 {
-                                                        let y = r.top() + 28.0 + row as f32 * 34.0;
+                                                        let y = r.top() + 22.0 + row as f32 * 28.0;
                                                         p.text(
                                                             Pos2::new(r.left() + 18.0, y),
                                                             egui::Align2::CENTER_CENTER,
@@ -1421,14 +1502,12 @@ impl HwpApp {
                                             },
                                         );
                                     });
-                                    group(ui, "확인용 글머리표 모양", |ui| {
-                                        ui.label(
-                                            RichText::new(
-                                                "확인용 글머리표는 아직 지원하지 않습니다.",
-                                            )
-                                            .weak(),
-                                        );
-                                    });
+                                    ui.label(
+                                        RichText::new(
+                                            "확인용 글머리표(☐/☑)는 아직 지원하지 않습니다.",
+                                        )
+                                        .weak(),
+                                    );
                                 }
                                 1 => {
                                     group(ui, "문단 번호 모양", |ui| {
@@ -1437,7 +1516,7 @@ impl HwpApp {
                                             "numberings",
                                             &mut d.numbering,
                                             NUMBERINGS.len() + 1,
-                                            3,
+                                            (Vec2::splat(96.0), 4, 3),
                                             numbering_preview,
                                         );
                                     });
@@ -1480,7 +1559,7 @@ impl HwpApp {
                                             "outline-shapes",
                                             &mut d.numbering,
                                             NUMBERINGS.len() + 1,
-                                            3,
+                                            (Vec2::splat(96.0), 4, 3),
                                             numbering_preview,
                                         );
                                     });
@@ -1517,8 +1596,12 @@ impl HwpApp {
                 });
                 ui.add_space(12.0);
                 ui.vertical(|ui| {
-                    let valid = d.tab < 2 || (d.tab == 3 && d.numbering > 0);
-                    let (a, c) = chrome::actions(ui, valid, "설정(D)");
+                    let grey = match d.tab {
+                        2 => Some("그림 글머리표는 서식 탭의 그림 글머리표 단추로 넣습니다."),
+                        3 if d.numbering == 0 => Some("개요 번호 모양을 고르세요."),
+                        _ => None,
+                    };
+                    let (a, c) = chrome::actions(ui, grey, "설정(D)");
                     apply = a;
                     close |= c;
                 });
@@ -1625,7 +1708,7 @@ impl HwpApp {
                     }
                 });
                 self.ext.format.font_language = lang;
-                r.on_hover_text("글꼴 언어")
+                r.on_hover_text("글꼴 언어: 대표를 고르면 오른쪽 글꼴이 모든 언어에 함께 적용됩니다. 한글·영문·한자 같은 언어를 고르면 그 언어의 글꼴만 바뀝니다.")
             }
             "format.font_face" => {
                 let lang = self.ext.format.font_language;
@@ -1796,8 +1879,8 @@ impl HwpApp {
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
         let main = Rect::from_min_max(rect.min, Pos2::new(rect.right() - 14.0, rect.bottom()));
         let arrow = Rect::from_min_max(Pos2::new(rect.right() - 14.0, rect.top()), rect.max);
-        let main_resp = ui.interact(main, egui::Id::new((id, "main")), egui::Sense::click());
-        let arrow_resp = ui.interact(arrow, egui::Id::new((id, "arrow")), egui::Sense::click());
+        let main_resp = ui.interact(main, ui.id().with((id, "main")), egui::Sense::click());
+        let arrow_resp = ui.interact(arrow, ui.id().with((id, "arrow")), egui::Sense::click());
         let p = ui.painter();
         if on || main_resp.hovered() || arrow_resp.hovered() {
             p.rect(
@@ -1855,7 +1938,7 @@ impl HwpApp {
             }
         }
         egui::Popup::from_toggle_button_response(&arrow_resp)
-            .id(egui::Id::new((id, "popup")))
+            .id(ui.id().with((id, "popup")))
             .show(|ui| match id {
                 "format.text_color" => {
                     ui.label("글자 색");
@@ -2059,7 +2142,7 @@ impl HwpApp {
             self.run(id, json!({}));
         }
         egui::Popup::from_response(&response)
-            .id(egui::Id::new((id, "gallery")))
+            .id(ui.id().with((id, "gallery")))
             .open_memory((response.clicked() && arrow).then_some(egui::containers::SetOpenCommand::Toggle))
             .show(|ui| {
                 ui.set_width(250.0);
@@ -2235,7 +2318,7 @@ fn hwp_combo(
     );
     thin_chevron(p, Pos2::new(rect.right() - 9.0, rect.center().y));
     egui::Popup::from_toggle_button_response(&response)
-        .id(egui::Id::new(("tb-combo", id)))
+        .id(ui.id().with(("tb-combo", id)))
         .show(|ui| {
             ui.set_min_width(size.x);
             list(ui);
@@ -2269,7 +2352,7 @@ fn hwp_spin(ui: &mut egui::Ui, id: &str, size: Vec2, spin: Spin) -> (bool, egui:
     );
     let decimals = spin.decimals;
     let format = |v: f64| format!("{v:.decimals$}");
-    let edit_id = egui::Id::new(("tb-spin-text", id));
+    let edit_id = ui.id().with(("tb-spin-text", id));
     let mut text: String = ui
         .data_mut(|d| d.get_temp(edit_id))
         .unwrap_or_else(|| format(*spin.value));
@@ -2313,7 +2396,7 @@ fn hwp_spin(ui: &mut egui::Ui, id: &str, size: Vec2, spin: Spin) -> (bool, egui:
     );
     let unit_resp = ui.interact(
         unit,
-        egui::Id::new(("tb-spin-unit", id)),
+        ui.id().with(("tb-spin-unit", id)),
         egui::Sense::click(),
     );
     for (i, sign) in [(0, 1.0f64), (1, -1.0)] {
@@ -2324,7 +2407,7 @@ fn hwp_spin(ui: &mut egui::Ui, id: &str, size: Vec2, spin: Spin) -> (bool, egui:
             ),
             Vec2::new(buttons.width(), buttons.height() / 2.0),
         );
-        let resp = ui.interact(r, egui::Id::new(("tb-spin", id, i)), egui::Sense::click());
+        let resp = ui.interact(r, ui.id().with(("tb-spin", id, i)), egui::Sense::click());
         if resp.hovered() {
             p.rect_filled(r, 0.0, Color32::from_gray(232));
         }
@@ -2348,7 +2431,7 @@ fn hwp_spin(ui: &mut egui::Ui, id: &str, size: Vec2, spin: Spin) -> (bool, egui:
     );
     if !spin.presets.is_empty() {
         egui::Popup::from_toggle_button_response(&unit_resp)
-            .id(egui::Id::new(("tb-spin-list", id)))
+            .id(ui.id().with(("tb-spin-list", id)))
             .show(|ui| {
                 ui.set_min_width(size.x);
                 for v in spin.presets {
@@ -2377,22 +2460,23 @@ fn lines(p: &egui::Painter, at: Pos2, width: f32, count: usize) {
     }
 }
 /// Hangul's 96×96 shape grid: item 0 is (없음), drawn as a crossed box.
+/// `layout` is (cell size, cells per row, rows shown before scrolling).
 fn gallery(
     ui: &mut egui::Ui,
     id: &str,
     selected: &mut usize,
     count: usize,
-    rows_visible: usize,
+    layout: (Vec2, usize, usize),
     paint: impl Fn(&egui::Painter, Rect, usize),
 ) {
+    let (cell, columns, rows_visible) = layout;
     egui::ScrollArea::vertical()
         .id_salt(id)
-        .max_height(96.0 * rows_visible as f32 + 8.0)
+        .max_height(cell.y * rows_visible as f32 + 8.0)
         .show(ui, |ui| {
             egui::Grid::new(id).spacing([0.0, 0.0]).show(ui, |ui| {
                 for i in 0..count {
-                    let (rect, resp) =
-                        ui.allocate_exact_size(Vec2::splat(96.0), egui::Sense::click());
+                    let (rect, resp) = ui.allocate_exact_size(cell, egui::Sense::click());
                     let p = ui.painter();
                     if *selected == i {
                         p.rect(
@@ -2423,7 +2507,7 @@ fn gallery(
                     if resp.clicked() {
                         *selected = i;
                     }
-                    if i % 4 == 3 {
+                    if i % columns == columns - 1 {
                         ui.end_row();
                     }
                 }

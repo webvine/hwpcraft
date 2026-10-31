@@ -12,12 +12,12 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "page.number.format",
-        "format: HWP number format code. Changes only the existing page-number position control's format in the caret section. Position, decorations and start are preserved. A missing control is rejected; use page.number with an explicit position first.",
+        "format: HWP 번호 모양 코드. 캐럿 구역에 이미 있는 쪽 번호 위치 컨트롤의 모양만 바꿉니다. 위치·장식·시작 번호는 그대로입니다. 컨트롤이 없으면 거절하니 먼저 page.number로 위치를 지정하세요.",
         r#"{"format":2}"#,
     ),
     (
         "page.columns.count",
-        "count: 1-6. Changes only the existing initial equal-width column definition's count. Spacing, separator, direction and type are preserved. Multiple definitions or unequal widths requiring redistribution are rejected.",
+        "count: 1–6. 이미 있는 첫 같은 너비 단 정의의 단 수만 바꿉니다. 간격·구분선·방향·종류는 그대로입니다. 단 정의가 여럿이거나 너비가 달라 다시 나눠야 하면 거절합니다.",
         r#"{"count":2}"#,
     ),
 ];

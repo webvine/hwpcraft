@@ -1,0 +1,49 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 92793f5..89de74b 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -2543,6 +2543,19 @@ impl DocumentCore {
+         &self.document
+     }
+ 
++    /// The format the document was read from (`Hwp` for a new document).
++    pub fn source_format(&self) -> crate::parser::FileFormat {
++        self.source_format
++    }
++
++    /// Set the source format of a core built only to serialize another core's
++    /// document, so the writers treat it as that document: an HWPX source gets the
++    /// HWPX→HWP adapter on an HWP save and no `rhwp-hwp5-origin` marker on an HWPX
++    /// save (a fresh core counts as `Hwp`, and its HWPX copy was marked HWP5-origin).
++    pub fn set_source_format(&mut self, format: crate::parser::FileFormat) {
++        self.source_format = format;
++    }
++
+     /// [Task #741 후속] 문서의 IR mutable 참조를 반환한다.
+     /// WASM 영역 영역 외부 image inject 영역 의 영역 영역 영역.
+     pub fn document_mut(&mut self) -> &mut Document {
+@@ -4203,3 +4216,24 @@ mod fresh_flow_tests {
+         assert_eq!(rows(&core), live);
+     }
+ }
++
++#[cfg(test)]
++mod source_format_tests {
++    use crate::document_core::DocumentCore;
++    use crate::parser::FileFormat;
++
++    /// A core made only to serialize an HWPX document's model keeps that source
++    /// format: its HWPX carries no `rhwp-hwp5-origin` marker.
++    #[test]
++    fn a_serializing_core_keeps_the_source_format_it_is_given() {
++        let marker = b"rhwp-hwp5-origin";
++        let has_marker = |bytes: &[u8]| bytes.windows(marker.len()).any(|w| w == marker);
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        assert_eq!(core.source_format(), FileFormat::Hwp);
++        assert!(has_marker(&core.export_hwpx_native().unwrap()));
++        core.set_source_format(FileFormat::Hwpx);
++        assert_eq!(core.source_format(), FileFormat::Hwpx);
++        assert!(!has_marker(&core.export_hwpx_native().unwrap()));
++    }
++}

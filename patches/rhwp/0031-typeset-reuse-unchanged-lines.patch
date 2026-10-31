@@ -1,0 +1,624 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 590d321..8cf8182 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -342,6 +342,8 @@ impl DocumentCore {
+             model_stamps: crate::document_core::ModelStamps::default(),
+             model_stamp_clock: 0,
+             untracked_model_edit: false,
++            typeset_reuse: Vec::new(),
++            typeset_marks: Vec::new(),
+             derived_layout_contract: None,
+             char_style_inputs: None,
+             batch_recompose_sections: std::collections::BTreeSet::new(),
+@@ -2532,6 +2534,10 @@ impl DocumentCore {
+         self.flush_cell_format_vpos();
+         // 무엇이 바뀌는지 모르므로 스냅샷 복원은 다음 전체 재구성까지 구역을 재사용하지 않는다.
+         self.untracked_model_edit = true;
++        // [HwpCraft 0031] 조판 결과 재사용도 구역마다 다음 전체 조판까지 하지 않는다.
++        for marks in &mut self.typeset_marks {
++            marks.untracked = true;
++        }
+         &mut self.document
+     }
+ 
+diff --git a/src/document_core/commands/text_editing.rs b/src/document_core/commands/text_editing.rs
+index 5474174..d0ee54e 100644
+--- a/src/document_core/commands/text_editing.rs
++++ b/src/document_core/commands/text_editing.rs
+@@ -711,6 +711,10 @@ impl DocumentCore {
+         }
+ 
+         self.pagination = std::mem::take(&mut staged.pagination);
++        // [HwpCraft 0031] 넘겨받은 쪽 목록은 이 코어의 재사용 원본에서 만든 것이 아니다.
++        for marks in &mut self.typeset_marks {
++            marks.generation = 0;
++        }
+         self.composed = std::mem::take(&mut staged.composed);
+         self.render_normalization = std::mem::take(&mut staged.render_normalization);
+         self.measured_tables = std::mem::take(&mut staged.measured_tables);
+diff --git a/src/document_core/mod.rs b/src/document_core/mod.rs
+index 352d4d0..13eae6e 100644
+--- a/src/document_core/mod.rs
++++ b/src/document_core/mod.rs
+@@ -306,6 +306,10 @@ pub struct DocumentCore {
+     pub(crate) model_stamp_clock: u64,
+     /// `document_mut` 로 표식 없이 모델이 바뀌었다. 다음 전체 재구성까지 구역을 재사용하지 않는다.
+     pub(crate) untracked_model_edit: bool,
++    /// [HwpCraft 0031] 구역별 직전 조판 원본과 그 입력 서명 (입력 문단의 줄 배치가 그대로면 재사용).
++    pub(crate) typeset_reuse: Vec<Option<queries::rendering::TypesetReuse>>,
++    /// [HwpCraft 0031] 구역별 직전 조판 뒤의 변경 집계.
++    pub(crate) typeset_marks: Vec<queries::rendering::TypesetMarks>,
+     /// 모든 구역의 파생 상태를 만든 문서 전체 조판 계약. 증분 조판 중 계약이 바뀌어
+     /// 구역마다 다른 계약으로 만든 상태가 섞이면 `None`.
+     pub(crate) derived_layout_contract: Option<queries::rendering::LayoutContract>,
+@@ -620,6 +624,8 @@ impl DocumentCore {
+             model_stamps: ModelStamps::default(),
+             model_stamp_clock: 0,
+             untracked_model_edit: false,
++            typeset_reuse: Vec::new(),
++            typeset_marks: Vec::new(),
+             derived_layout_contract: None,
+             char_style_inputs: None,
+             batch_recompose_sections: std::collections::BTreeSet::new(),
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 64e2279..ba6f5e7 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -4295,6 +4295,16 @@ impl DocumentCore {
+             compose_paragraph_with_horizontal_shaping(para, &self.styles);
+         self.mark_section_dirty(section_idx);
+         self.mark_paragraph_dirty(section_idx, para_idx);
++        if let Some(marks) = self.typeset_marks.get_mut(section_idx) {
++            marks.recomposed = marks.recomposed.saturating_add(1);
++        }
++    }
++
++    /// [HwpCraft 0031] 문단이 끼거나 빠졌다 — 문단 수가 그대로여도 다음 조판은 전체 조판이다.
++    fn count_typeset_structural_change(&mut self, section_idx: usize) {
++        if let Some(marks) = self.typeset_marks.get_mut(section_idx) {
++            marks.structural = marks.structural.saturating_add(1);
++        }
+     }
+ 
+     /// composed 벡터에 새 문단 항목을 삽입한다 (문단 분할/붙여넣기 후).
+@@ -4304,6 +4314,7 @@ impl DocumentCore {
+         let composed = compose_paragraph_with_horizontal_shaping(para, &self.styles);
+         self.composed[section_idx].insert(para_idx, composed);
+         self.mark_section_dirty(section_idx);
++        self.count_typeset_structural_change(section_idx);
+         // measured_sections: 인덱스 조정으로 기존 측정값 재사용 (전체 재측정 회피)
+         if section_idx < self.measured_sections.len() {
+             self.measured_sections[section_idx].shift_for_insert(para_idx);
+@@ -4338,6 +4349,7 @@ impl DocumentCore {
+             self.composed[section_idx].remove(para_idx);
+         }
+         self.mark_section_dirty(section_idx);
++        self.count_typeset_structural_change(section_idx);
+         // measured_sections: 인덱스 조정으로 기존 측정값 재사용
+         if section_idx < self.measured_sections.len() {
+             self.measured_sections[section_idx].shift_for_remove(para_idx);
+@@ -4546,6 +4558,9 @@ impl DocumentCore {
+ 
+     /// 구역 내용이 바뀌었다 — 이전 스냅샷과 이 구역의 파생 상태를 나누어 쓰지 않는다.
+     pub(crate) fn stamp_section_changed(&mut self, section_idx: usize) {
++        if let Some(marks) = self.typeset_marks.get_mut(section_idx) {
++            marks.stamps = marks.stamps.saturating_add(1);
++        }
+         self.sync_model_stamp_len();
+         if section_idx < self.model_stamps.sections.len() {
+             let stamp = self.next_model_stamp();
+@@ -4554,6 +4569,9 @@ impl DocumentCore {
+     }
+ 
+     pub(crate) fn stamp_all_sections_changed(&mut self) {
++        for marks in &mut self.typeset_marks {
++            marks.untracked = true;
++        }
+         self.sync_model_stamp_len();
+         for idx in 0..self.model_stamps.sections.len() {
+             let stamp = self.next_model_stamp();
+@@ -5023,6 +5041,10 @@ impl DocumentCore {
+                 });
+         }
+         self.pagination[section_index] = result;
++        // [HwpCraft 0031] 이 쪽 목록은 재사용 원본에서 만든 것이 아니다.
++        if let Some(marks) = self.typeset_marks.get_mut(section_index) {
++            marks.generation = 0;
++        }
+         if self.measured_tables.len() <= section_index {
+             self.measured_tables
+                 .resize_with(section_index + 1, Vec::new);
+@@ -5253,6 +5275,11 @@ impl DocumentCore {
+         self.measured_tables.truncate(sec_count);
+         self.dirty_sections.resize(sec_count, true);
+         self.dirty_sections.truncate(sec_count);
++        // [HwpCraft 0031] 구역 수가 바뀌면 구역 번호가 어긋나므로 재사용 정보를 모두 버린다.
++        if self.typeset_reuse.len() != sec_count || self.typeset_marks.len() != sec_count {
++            self.typeset_reuse = (0..sec_count).map(|_| None).collect();
++            self.typeset_marks = vec![TypesetMarks::default(); sec_count];
++        }
+         while self.measured_sections.len() < sec_count {
+             self.measured_sections.push(MeasuredSection {
+                 fallback_paragraphs: Vec::new(),
+@@ -5285,6 +5312,12 @@ impl DocumentCore {
+         let mut issue2424_measure_elapsed = std::time::Duration::ZERO;
+         let mut issue2424_typeset_elapsed = std::time::Duration::ZERO;
+         let mut issue2424_postprocess_elapsed = std::time::Duration::ZERO;
++        // [HwpCraft 0031] 미주는 본문 문단에서만 모은다. 하나도 없으면 미루거나 모을 일이 없다.
++        let doc_has_endnotes = self.document.sections.iter().any(|s| {
++            s.paragraphs
++                .iter()
++                .any(|p| p.controls.iter().any(|c| matches!(c, Control::Endnote(_))))
++        });
+         for (idx, section) in self.document.sections.iter().enumerate() {
+             if !self.dirty_sections[idx] {
+                 // dirty가 아닌 구역에서도 carry를 업데이트
+@@ -5399,7 +5432,59 @@ impl DocumentCore {
+             let use_paginator = std::env::var("RHWP_USE_PAGINATOR")
+                 .map(|v| v == "1")
+                 .unwrap_or(false);
+-            let mut result = if use_paginator {
++            // [HwpCraft 0031] 바뀐 문단들의 줄 배치와 조판이 읽는 분류가 직전 조판 때와
++            // 같으면 그 조판 원본을 다시 쓴다. 의심되면 언제나 전체 조판한다.
++            // RHWP_TYPESET_REUSE=0 은 언제나 전체 조판한다(비교·문제 확인용).
++            let reuse_enabled = std::env::var("RHWP_TYPESET_REUSE").map_or(true, |v| v != "0");
++            let reuse_key = (!use_paginator && reuse_enabled)
++                .then(|| {
++                    typeset_reuse_key(
++                        idx,
++                        self.document.sections.len(),
++                        doc_has_endnotes,
++                        section,
++                        &column_def,
++                        self.document.layout_profile(),
++                        hwp3_origin_flow_spacing_before,
++                        hwp3_origin_page_tolerance,
++                        force_breaks.get(idx),
++                        norm.map(|n| n.source_revision),
++                        para_src.len(),
++                        self.model_stamps.doc_info,
++                        self.styles.para_styles.len(),
++                        self.styles.char_styles.len(),
++                    )
++                })
++                .flatten();
++            let reused = reuse_key.and_then(|key| {
++                let cache = self.typeset_reuse.get(idx)?.as_ref()?;
++                let marks = self.typeset_marks.get(idx)?;
++                let bits = self.dirty_paragraphs.get(idx)?.as_deref()?;
++                let usable = cache.key == key
++                    && marks.recomposed > 0
++                    && marks.stamps == marks.recomposed
++                    && marks.structural == 0
++                    && !marks.untracked
++                    && marks.generation != 0
++                    && cache.produced == marks.generation
++                    && bits.len() == para_src.len()
++                    && composed.len() == para_src.len()
++                    && cache.signatures.len() == para_src.len()
++                    && bits.iter().any(|dirty| *dirty)
++                    && bits
++                        .iter()
++                        .enumerate()
++                        .filter(|(_, dirty)| **dirty)
++                        .all(|(i, _)| {
++                            let now = typeset_paragraph_signature(&para_src[i], composed.get(i));
++                            now.is_some() && now == cache.signatures[i]
++                        });
++                usable.then(|| cache.raw.clone())
++            });
++            let typeset_reused = reused.is_some();
++            let mut result = if let Some(raw) = reused {
++                raw
++            } else if use_paginator {
+                 let profile = self.document.layout_profile();
+                 paginator.paginate_with_measured_profile(
+                     para_src,
+@@ -5499,6 +5584,22 @@ impl DocumentCore {
+                     endnote_deferral,
+                 )
+             };
++            // [HwpCraft 0031] 새로 조판했으면 그 원본과 모든 문단의 서명을 남긴다.
++            if !typeset_reused {
++                let cache = reuse_key.map(|key| TypesetReuse {
++                    key,
++                    signatures: para_src
++                        .iter()
++                        .enumerate()
++                        .map(|(i, para)| typeset_paragraph_signature(para, composed.get(i)))
++                        .collect(),
++                    raw: result.clone(),
++                    produced: 0,
++                });
++                if let Some(slot) = self.typeset_reuse.get_mut(idx) {
++                    *slot = cache;
++                }
++            }
+             if let Some(started) = issue2424_typeset_started {
+                 issue2424_typeset_elapsed += started.elapsed();
+             }
+@@ -5874,6 +5975,17 @@ impl DocumentCore {
+             }
+             self.pagination[idx] = result;
+             self.dirty_sections[idx] = false;
++            // [HwpCraft 0031] 이 원본에서 만든 결과임을 표시하고 변경 집계를 비운다.
++            let generation = next_typeset_generation();
++            if let Some(Some(cache)) = self.typeset_reuse.get_mut(idx) {
++                cache.produced = generation;
++            }
++            if let Some(marks) = self.typeset_marks.get_mut(idx) {
++                *marks = TypesetMarks {
++                    generation,
++                    ..TypesetMarks::default()
++                };
++            }
+             // 문단 dirty 비트맵 초기화 (모든 문단 clean)
+             let para_count = section.paragraphs.len();
+             self.dirty_paragraphs[idx] = Some(vec![false; para_count]);
+@@ -8811,6 +8923,352 @@ fn format_line_seg_brief(para: Option<&Paragraph>) -> String {
+     }
+ }
+ 
++/// [HwpCraft 0031] 구역의 직전 조판 원본(머리말·쪽 번호 이월 같은 후처리 전)과 그 입력 서명.
++pub(crate) struct TypesetReuse {
++    key: u64,
++    /// 문단마다 조판이 읽는 줄 배치·분류의 서명. `None` = 판정하지 않는 문단(개체 등).
++    signatures: Vec<Option<u64>>,
++    raw: PaginationResult,
++    /// 이 원본으로 만든 `pagination[idx]` 의 조판 세대 번호. 쪽 목록을 다른 경로가
++    /// 갈아끼웠으면(준비 코어 교체·지연 조판) 구역의 세대가 0 이라 재사용하지 않는다.
++    produced: u64,
++}
++
++/// [HwpCraft 0031] 조판 세대 번호. 0 은 "재사용 원본에서 만든 쪽 목록이 아님" 이다.
++fn next_typeset_generation() -> u64 {
++    use std::sync::atomic::{AtomicU64, Ordering};
++    static NEXT: AtomicU64 = AtomicU64::new(1);
++    NEXT.fetch_add(1, Ordering::Relaxed)
++}
++
++/// [HwpCraft 0031] 구역이 직전 조판 뒤에 바뀐 횟수(`stamps`)와 그중 문단 하나를 다시
++/// 조판한 횟수(`recomposed`). 둘이 같아야 바뀐 것이 표시된 문단뿐이다. 문단이 끼거나
++/// 빠졌거나(`structural`) `document_mut` 뒤(`untracked`)에는 다음 전체 조판까지 재사용하지
++/// 않는다. `generation` 은 지금 `pagination[idx]` 를 만든 조판의 세대 번호다(0 = 모름).
++/// `pagination` 을 조판 밖에서 갈아끼우는 코드는 `generation` 을 0 으로 만든다.
++#[derive(Debug, Default, Clone, Copy)]
++pub(crate) struct TypesetMarks {
++    stamps: u32,
++    recomposed: u32,
++    structural: u32,
++    pub(crate) untracked: bool,
++    pub(crate) generation: u64,
++}
++
++/// [HwpCraft 0031] 구역 조판의 문단 밖 입력. 문서에 미주가 있을 때 미주를 구역 밖으로
++/// 미루거나 모으는 구역(여러 구역 문서의 마지막 구역, 문서 끝 미주)은 `None` 이라 재사용하지
++/// 않는다. 미주가 없으면 미루거나 모을 것이 없어 그런 구역도 재사용한다.
++#[allow(clippy::too_many_arguments)]
++fn typeset_reuse_key(
++    idx: usize,
++    section_count: usize,
++    endnotes: bool,
++    section: &Section,
++    column_def: &ColumnDef,
++    profile: crate::model::provenance::LayoutCompatibilityProfile,
++    flow_spacing_before: bool,
++    page_tolerance: bool,
++    force_breaks: Option<&std::collections::HashSet<usize>>,
++    normalization: Option<u64>,
++    paragraphs: usize,
++    doc_info_stamp: u64,
++    para_styles: usize,
++    char_styles: usize,
++) -> Option<u64> {
++    use std::hash::{Hash, Hasher};
++    let doc_end_endnotes = matches!(
++        section.section_def.endnote_shape.placement,
++        crate::model::footnote::FootnotePlacement::EachColumn
++    );
++    if endnotes && section_count > 1 && (idx + 1 == section_count || doc_end_endnotes) {
++        return None;
++    }
++    let mut breaks: Vec<usize> = force_breaks.into_iter().flatten().copied().collect();
++    breaks.sort_unstable();
++    let mut h = std::collections::hash_map::DefaultHasher::new();
++    (
++        idx,
++        section_count,
++        endnotes,
++        paragraphs,
++        doc_info_stamp,
++        para_styles,
++        char_styles,
++    )
++        .hash(&mut h);
++    (flow_spacing_before, page_tolerance, normalization, breaks).hash(&mut h);
++    format!(
++        "{:?}|{:?}|{}|{:?}|{:?}|{:?}",
++        section.section_def.page_def,
++        column_def,
++        section.section_def.hide_empty_line,
++        profile,
++        section.section_def.footnote_shape,
++        section.section_def.endnote_shape
++    )
++    .hash(&mut h);
++    Some(h.finish())
++}
++
++/// [HwpCraft 0031] 조판이 문단에서 읽는 것의 서명: 문단 모양·스타일·나누기 종류, 글자
++/// 시작 위치를 뺀 줄 정보, 글이 비었는지·공백뿐인지 같은 분류, 줄마다 글자·탭·줄바꿈
++/// 분류. 크기가 없는 인라인 컨트롤(필드·책갈피·하이퍼링크·색인 표시)과 구역·단 정의(내용까지
++/// 서명)만 있는 문단만 판정하고, 그 밖의 컨트롤(표·그림·도형·각주·미주·머리말 등)이 있으면 `None`.
++fn typeset_paragraph_signature(
++    para: &Paragraph,
++    composed: Option<&ComposedParagraph>,
++) -> Option<u64> {
++    use std::hash::{Hash, Hasher};
++    let composed = composed?;
++    let inline_only = para.controls.iter().all(|c| {
++        matches!(
++            c,
++            Control::Field(_)
++                | Control::Bookmark(_)
++                | Control::Hyperlink(_)
++                | Control::IndexMark(_)
++                | Control::SectionDef(_)
++                | Control::ColumnDef(_)
++        )
++    });
++    if !inline_only || !composed.tac_controls.is_empty() {
++        return None;
++    }
++    let mut h = std::collections::hash_map::DefaultHasher::new();
++    (para.para_shape_id, para.style_id).hash(&mut h);
++    std::mem::discriminant(&para.column_type).hash(&mut h);
++    para.line_segs.len().hash(&mut h);
++    for s in &para.line_segs {
++        (
++            s.vertical_pos,
++            s.line_height,
++            s.text_height,
++            s.baseline_distance,
++            s.line_spacing,
++            s.column_start,
++            s.segment_width,
++            s.tag,
++        )
++            .hash(&mut h);
++    }
++    for c in &para.controls {
++        std::mem::discriminant(c).hash(&mut h);
++        // 단 수·간격 같은 정의 내용이 바뀌면 조판이 달라진다.
++        if matches!(c, Control::SectionDef(_) | Control::ColumnDef(_)) {
++            format!("{c:?}").hash(&mut h);
++        }
++    }
++    let text = &para.text;
++    (
++        text.is_empty(),
++        text.trim().is_empty(),
++        text.chars().all(char::is_whitespace),
++        text.replace(|c: char| c.is_control(), "").trim().is_empty(),
++        text.trim_start().starts_with('문'),
++    )
++        .hash(&mut h);
++    (composed.para_style_id, composed.lines.len()).hash(&mut h);
++    composed
++        .numbering_text
++        .as_ref()
++        .map(|(text, _)| text.as_str())
++        .hash(&mut h);
++    for line in &composed.lines {
++        let chars = || line.runs.iter().flat_map(|run| run.text.chars());
++        (
++            line.has_line_break,
++            chars().any(|c| c == '\t'),
++            line.runs.iter().all(|run| run.text.trim().is_empty()),
++            chars().any(|c| c > '\u{001F}' && c != '\u{FFFC}'),
++            chars().next().is_some() || line.has_line_break,
++            line.line_height,
++            line.baseline_distance,
++            line.segment_width,
++            line.column_start,
++            line.line_spacing,
++        )
++            .hash(&mut h);
++    }
++    Some(h.finish())
++}
++
++#[cfg(test)]
++mod hwpcraft_typeset_reuse_tests {
++    use crate::document_core::DocumentCore;
++
++    /// A paragraph index no section has: a kept result marked with it shows when reused.
++    const MARK: usize = usize::MAX;
++
++    /// One section of `count` paragraphs, 1 to 25 short words long.
++    fn report(count: usize) -> DocumentCore {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        for i in 0..count {
++            let text = "가나다라 마바사 ".repeat(i % 5 * 6 + 1);
++            core.insert_text_native(0, i, 0, &text).unwrap();
++            if i + 1 < count {
++                core.split_paragraph_native(0, i, text.chars().count(), None)
++                    .unwrap();
++            }
++        }
++        core
++    }
++
++    fn mark_kept(core: &mut DocumentCore) {
++        let kept = core.typeset_reuse[0].as_mut().expect("kept typesetting");
++        kept.raw.pre_emitted_host_heights.insert(MARK, 1.0);
++    }
++
++    fn reused(core: &DocumentCore) -> bool {
++        core.pagination[0]
++            .pre_emitted_host_heights
++            .contains_key(&MARK)
++    }
++
++    fn pages(core: &DocumentCore) -> String {
++        format!(
++            "{:?}",
++            core.pagination[0]
++                .pages
++                .iter()
++                .map(|p| &p.column_contents)
++                .collect::<Vec<_>>()
++        )
++    }
++
++    fn fresh_pages(core: &DocumentCore) -> String {
++        let mut fresh = DocumentCore::new_empty();
++        fresh.create_blank_document_native().unwrap();
++        fresh.set_document(core.document().clone());
++        pages(&fresh)
++    }
++
++    /// Like `mark_kept` / `reused`, for section `idx`.
++    fn mark_kept_in(core: &mut DocumentCore, idx: usize) {
++        let kept = core.typeset_reuse[idx].as_mut().expect("kept typesetting");
++        kept.raw.pre_emitted_host_heights.insert(MARK, 1.0);
++    }
++
++    fn reused_in(core: &DocumentCore, idx: usize) -> bool {
++        core.pagination[idx]
++            .pre_emitted_host_heights
++            .contains_key(&MARK)
++    }
++
++    fn all_pages(core: &DocumentCore) -> String {
++        format!(
++            "{:?}",
++            core.pagination
++                .iter()
++                .map(|r| r
++                    .pages
++                    .iter()
++                    .map(|p| &p.column_contents)
++                    .collect::<Vec<_>>())
++                .collect::<Vec<_>>()
++        )
++    }
++
++    #[test]
++    fn sections_of_a_document_without_endnotes_are_reused_until_one_is_added() {
++        // Two sections, endnotes at the end of the document (Hangul's default placement).
++        let mut core = report(20);
++        let mut doc = core.document().clone();
++        let second = doc.sections[0].clone();
++        doc.sections.push(second);
++        for section in &mut doc.sections {
++            section.section_def.endnote_shape.placement =
++                crate::model::footnote::FootnotePlacement::EachColumn;
++        }
++        core.set_document(doc);
++        let fresh = |core: &DocumentCore| {
++            let mut fresh = DocumentCore::new_empty();
++            fresh.create_blank_document_native().unwrap();
++            fresh.set_document(core.document().clone());
++            all_pages(&fresh)
++        };
++        for idx in [0, 1] {
++            mark_kept_in(&mut core, idx);
++            core.insert_text_native(idx, 5, 0, "가").unwrap();
++            assert!(
++                reused_in(&core, idx),
++                "section {idx} without endnotes reuses"
++            );
++            assert_eq!(all_pages(&core), fresh(&core));
++        }
++        // An endnote anywhere: the sections that defer or collect endnotes typeset again.
++        core.insert_endnote_native(0, 3, 0).unwrap();
++        // (A new endnote does not yet reach the last section's collected endnotes in RHWP
++        // itself, with or without reuse: start again from the document as it now is.)
++        let doc = core.document().clone();
++        core.set_document(doc);
++        for idx in [0, 1] {
++            if let Some(Some(kept)) = core.typeset_reuse.get_mut(idx) {
++                kept.raw.pre_emitted_host_heights.insert(MARK, 1.0);
++            }
++            core.insert_text_native(idx, 10, 0, "가").unwrap();
++            assert!(
++                !reused_in(&core, idx),
++                "section {idx} with an endnote typesets again"
++            );
++            assert_eq!(all_pages(&core), fresh(&core));
++        }
++    }
++
++    #[test]
++    fn a_split_and_a_merge_in_one_batch_typeset_the_section_again() {
++        let mut core = report(40);
++        assert!(core.page_count() >= 2, "several pages");
++        // Typing that keeps every line reuses the kept typesetting.
++        mark_kept(&mut core);
++        core.insert_text_native(0, 5, 0, "가").unwrap();
++        assert!(reused(&core), "typing in a one-line paragraph reuses it");
++        assert_eq!(pages(&core), fresh_pages(&core));
++        // The first paragraph holds the section and column definitions: reused as well.
++        mark_kept(&mut core);
++        core.insert_text_native(0, 0, 0, "가").unwrap();
++        assert!(reused(&core), "typing in the first paragraph reuses it");
++        assert_eq!(pages(&core), fresh_pages(&core));
++        // A changed column definition there is typeset again.
++        mark_kept(&mut core);
++        for control in &mut core.document.sections[0].paragraphs[0].controls {
++            if let crate::model::control::Control::ColumnDef(def) = control {
++                def.column_count = 2;
++                def.spacing = 1134;
++            }
++        }
++        core.stamp_section_changed(0);
++        core.recompose_paragraph(0, 0);
++        core.paginate();
++        assert!(
++            !reused(&core),
++            "a new column definition typesets the section again"
++        );
++        assert_eq!(pages(&core), fresh_pages(&core));
++        // A split at one place and a merge at another keep the paragraph count.
++        mark_kept(&mut core);
++        core.begin_batch_native().unwrap();
++        core.split_paragraph_native(0, 5, 4, None).unwrap();
++        core.merge_paragraph_native(0, 20).unwrap();
++        assert_eq!(core.typeset_marks[0].structural, 2);
++        core.end_batch_native().unwrap();
++        assert!(
++            !reused(&core),
++            "a structural change typesets the section again"
++        );
++        assert_eq!(pages(&core), fresh_pages(&core));
++        // Pages put in by another path (generation 0) are not reused either.
++        mark_kept(&mut core);
++        core.typeset_marks[0].generation = 0;
++        core.insert_text_native(0, 11, 0, "가").unwrap();
++        assert!(
++            !reused(&core),
++            "a page list from elsewhere is typeset again"
++        );
++        assert_eq!(pages(&core), fresh_pages(&core));
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/src/renderer/pagination.rs b/src/renderer/pagination.rs
+index b9f0058..5463b73 100644
+--- a/src/renderer/pagination.rs
++++ b/src/renderer/pagination.rs
+@@ -146,7 +146,7 @@ pub struct EndnoteParaSource {
+ }
+ 
+ /// 페이지 분할 결과: 페이지별 콘텐츠 참조
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct PaginationResult {
+     /// 페이지별 콘텐츠 목록
+     pub pages: Vec<PageContent>,

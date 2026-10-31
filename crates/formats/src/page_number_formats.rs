@@ -348,9 +348,8 @@ pub(crate) fn export(core: &DocumentCore, password: Option<&[u8]>) -> Result<Vec
     if identities.is_empty() {
         return crate::auto_number_formats::export(core, password);
     }
-    let mut transient = DocumentCore::new_empty();
-    transient.set_document(doc);
-    let baseline = crate::auto_number_formats::export(&transient, None)?;
+    let baseline =
+        crate::auto_number_formats::export(&crate::export_core(doc, core.source_format()), None)?;
     let mut seen = BTreeSet::new();
     let corrected = crate::auto_number_formats::rewrite_package(&baseline, |xml| {
         restore_xml(xml, &identities, &mut seen)

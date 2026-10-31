@@ -118,7 +118,7 @@ struct Split {
     multi: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct GridLine {
     table: ObjectAddress,
     vertical: bool,
@@ -126,6 +126,9 @@ struct GridLine {
     start: Pos2,
     /// Extent of the line across the table (page px): (from, to).
     span: (f32, f32),
+    /// A table inside a cell: the cell paragraph holding it and its control index
+    /// (`context.table.move_border`). Its layout indices are not a body address.
+    nested: Option<(hwpcraft_engine::DocumentAddress, usize)>,
 }
 
 /// Dialog and tool state owned by this module. Stored in `HwpApp::ext.table`.
@@ -815,7 +818,7 @@ impl HwpApp {
         response: &egui::Response,
         rect: Rect,
     ) -> bool {
-        // Objects (selection, drawing) come first; both modules are owned by 03.
+        // Objects (selection, drawing) come first; both modules belong to the table-object area.
         if self.object_ext_canvas(page, response, rect) {
             self.ext.table.block = None;
             return true;
@@ -887,11 +890,25 @@ impl HwpApp {
     pub(super) fn page_layout(&mut self, page: u32) -> std::sync::Arc<Value> {
         cached_page_layout(&mut self.ext.table.layout, &self.session, page)
     }
-    /// Inner and right/bottom outer grid lines of top-level tables under `p` (page px).
-    fn grid_line_at(&mut self, page: u32, p: Pos2, tol: f32) -> Option<GridLine> {
+    /// Inner and right/bottom outer grid lines of tables under `p` (page px). A table
+    /// lying inside another table's box is nested; with `resolve` its address comes
+    /// from a hit test just inside the cell next to the line (hovering only needs the
+    /// cursor shape, so it skips the hit test).
+    fn grid_line_at(&mut self, page: u32, p: Pos2, tol: f32, resolve: bool) -> Option<GridLine> {
         let layout = self.page_layout(page);
         let n = |v: &Value, k: &str| v[k].as_u64();
         let f = |v: &Value, k: &str| v[k].as_f64().unwrap_or(0.0) as f32;
+        let boxes: Vec<Rect> = layout["controls"]
+            .as_array()?
+            .iter()
+            .filter(|t| t["type"] == "table")
+            .map(|t| {
+                Rect::from_min_size(
+                    Pos2::new(f(t, "x"), f(t, "y")),
+                    Vec2::new(f(t, "w"), f(t, "h")),
+                )
+            })
+            .collect();
         for t in layout["controls"].as_array()?.iter().rev() {
             if t["type"] != "table" {
                 continue;
@@ -907,34 +924,62 @@ impl HwpApp {
                 control: ci as usize,
             };
             let (tx, ty, tw, th) = (f(t, "x"), f(t, "y"), f(t, "w"), f(t, "h"));
-            if !Rect::from_min_size(Pos2::new(tx, ty), Vec2::new(tw, th))
-                .expand(tol)
-                .contains(p)
-            {
+            let own = Rect::from_min_size(Pos2::new(tx, ty), Vec2::new(tw, th));
+            if !own.expand(tol).contains(p) {
                 continue;
             }
+            let is_nested = boxes
+                .iter()
+                .any(|b| *b != own && b.contains_rect(own) && b.area() > own.area());
             for c in t["cells"].as_array()? {
                 let (x, y, w, h) = (f(c, "x"), f(c, "y"), f(c, "w"), f(c, "h"));
                 let col = n(c, "col").unwrap_or(0) + n(c, "colSpan").unwrap_or(1);
                 let row = n(c, "row").unwrap_or(0) + n(c, "rowSpan").unwrap_or(1);
-                if (p.x - (x + w)).abs() <= tol && (y..=y + h).contains(&p.y) {
-                    return Some(GridLine {
-                        table,
-                        vertical: true,
-                        boundary: col as u16,
-                        start: p,
-                        span: (ty, ty + th),
-                    });
-                }
-                if (p.y - (y + h)).abs() <= tol && (x..=x + w).contains(&p.x) {
-                    return Some(GridLine {
-                        table,
-                        vertical: false,
-                        boundary: row as u16,
-                        start: p,
-                        span: (tx, tx + tw),
-                    });
-                }
+                let line = if (p.x - (x + w)).abs() <= tol && (y..=y + h).contains(&p.y) {
+                    Some((
+                        true,
+                        col,
+                        Pos2::new(x + w - 2.0, y + h / 2.0),
+                        (ty, ty + th),
+                    ))
+                } else if (p.y - (y + h)).abs() <= tol && (x..=x + w).contains(&p.x) {
+                    Some((
+                        false,
+                        row,
+                        Pos2::new(x + w / 2.0, y + h - 2.0),
+                        (tx, tx + tw),
+                    ))
+                } else {
+                    None
+                };
+                let Some((vertical, boundary, probe, span)) = line else {
+                    continue;
+                };
+                let nested = if is_nested && resolve {
+                    // The cell next to the line must be this table's cell, or the drag
+                    // would land in another table.
+                    let hit = self
+                        .session
+                        .context_hit_test(page, f64::from(probe.x), f64::from(probe.y))
+                        .ok()?;
+                    let mut address: hwpcraft_engine::DocumentAddress =
+                        serde_json::from_value(hit["address"].clone()).ok()?;
+                    let last = address.path.pop()?;
+                    if address.path.is_empty() || Some(last.cell as u64) != n(c, "cellIdx") {
+                        return None;
+                    }
+                    Some((address, last.control))
+                } else {
+                    None
+                };
+                return Some(GridLine {
+                    table,
+                    vertical,
+                    boundary: boundary as u16,
+                    start: p,
+                    span,
+                    nested,
+                });
             }
         }
         None
@@ -945,7 +990,7 @@ impl HwpApp {
         let tol = 3.0 / self.zoom;
         if self.ext.table.line.is_none()
             && let Some(p) = response.hover_pos().map(|p| to_page(self, p))
-            && let Some(l) = self.grid_line_at(page, p, tol)
+            && let Some(l) = self.grid_line_at(page, p, tol, false)
         {
             response.ctx.set_cursor_icon(if l.vertical {
                 egui::CursorIcon::ResizeHorizontal
@@ -954,9 +999,9 @@ impl HwpApp {
             });
         }
         if let Some(p) = crate::table_drawing::page_press(response).map(|p| to_page(self, p)) {
-            self.ext.table.line = self.grid_line_at(page, p, tol);
+            self.ext.table.line = self.grid_line_at(page, p, tol, true);
         }
-        let Some(l) = self.ext.table.line else {
+        let Some(l) = self.ext.table.line.clone() else {
             return false;
         };
         let Some(p) = response
@@ -989,10 +1034,34 @@ impl HwpApp {
             };
             let mm = f64::from(px) * 25.4 / 96.0;
             if mm.abs() >= 0.2 {
-                let r = self.session.run(
-                    "table.move_border",
-                    json!({"table":l.table,"vertical":l.vertical,"boundary":l.boundary,"delta_mm":mm}),
-                );
+                let mut params = json!({"table":l.table,"vertical":l.vertical,"boundary":l.boundary,"delta_mm":mm});
+                // With a cell block in this table, a border on or inside the block moves
+                // for the block's rows (columns) only, as in Hangul.
+                if let Some(b) = self.ext.table.block
+                    && b.table == l.table
+                    && l.vertical
+                    && l.nested.is_none()
+                {
+                    let range = b.range();
+                    let (from, to) = if l.vertical {
+                        (range["start_col"].as_u64(), range["end_col"].as_u64())
+                    } else {
+                        (range["start_row"].as_u64(), range["end_row"].as_u64())
+                    };
+                    let edge = u64::from(l.boundary);
+                    if let (Some(from), Some(to)) = (from, to)
+                        && (from..=to + 1).contains(&edge)
+                    {
+                        params["range"] = range;
+                    }
+                }
+                let r = match &l.nested {
+                    Some((address, control)) => self.session.run(
+                        "context.table.move_border",
+                        json!({"address":address,"control":control,"vertical":l.vertical,"boundary":l.boundary,"delta_mm":mm}),
+                    ),
+                    None => self.session.run("table.move_border", params),
+                };
                 self.result(r);
                 self.ext.table.layout = None;
             }
@@ -1333,7 +1402,7 @@ impl HwpApp {
                 });
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
-                    let (a, c) = chrome::actions(ui, true, "만들기(D)");
+                    let (a, c) = chrome::actions(ui, None, "만들기(D)");
                     create = a;
                     close |= c;
                     ui.add_enabled(
@@ -1580,7 +1649,7 @@ impl HwpApp {
                 });
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
-                    let (a, c) = chrome::actions(ui, true, "설정(D)");
+                    let (a, c) = chrome::actions(ui, None, "설정(D)");
                     apply = a;
                     close |= c;
                 });
@@ -1666,7 +1735,9 @@ impl HwpApp {
                     );
                 });
                 ui.vertical(|ui| {
-                    let (a, c) = chrome::actions(ui, d.by_rows || d.by_columns, "나누기(D)");
+                    let grey = (!d.by_rows && !d.by_columns)
+                        .then_some("줄 개수나 칸 개수 중 하나 이상을 골라 나누세요.");
+                    let (a, c) = chrome::actions(ui, grey, "나누기(D)");
                     apply = a;
                     close |= c;
                 });
@@ -1724,7 +1795,8 @@ impl HwpApp {
                     }
                 });
                 ui.vertical(|ui| {
-                    let (a, c) = chrome::actions(ui, !formula.trim().is_empty(), "넣기(D)");
+                    let grey = formula.trim().is_empty().then_some("계산식을 넣으세요.");
+                    let (a, c) = chrome::actions(ui, grey, "넣기(D)");
                     apply = a;
                     close |= c;
                 });
@@ -1808,6 +1880,9 @@ const STYLE_OPTIONS: &[(&str, &str, bool)] = &[
     ("borders", "테두리 적용", true),
     ("background", "셀 배경 적용", true),
 ];
+/// egui memory keys of the 표 마당 dialog: 사용자 표 마당 names and the name being typed.
+const USER_STYLES_ID: &str = "user-table-styles";
+const USER_STYLE_NAME_ID: &str = "user-table-style-name";
 const STYLES: &[(&str, &str)] = &[
     ("basic", "기본"),
     ("blue_header", "파란 제목 줄"),
@@ -1880,10 +1955,37 @@ impl HwpApp {
         true
     }
 
+    /// Names of the 사용자 표 마당 in the settings folder, kept in egui memory while the
+    /// 표 마당 dialog is open (dropped after a save or delete).
+    fn user_table_styles(&mut self, ctx: &egui::Context) -> Vec<String> {
+        let id = egui::Id::new(USER_STYLES_ID);
+        if let Some(list) = ctx.data(|d| d.get_temp::<Vec<String>>(id)) {
+            return list;
+        }
+        let list: Vec<String> = self
+            .session
+            .run("table.user_style.list", json!({}))
+            .ok()
+            .and_then(|v| v["styles"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|s| s["name"].as_str().map(str::to_owned))
+            .collect();
+        ctx.data_mut(|d| d.insert_temp(id, list.clone()));
+        list
+    }
+
     fn table_tool_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut tool) = self.ext.table.tool.take() else {
             return;
         };
+        let users = if matches!(tool, TableTool::Style(..)) {
+            self.user_table_styles(ctx)
+        } else {
+            Vec::new()
+        };
+        // (save, name): 현재 표 모양 저장 or 지우기 of a 사용자 표 마당, run after the dialog.
+        let mut user_action: Option<(bool, String)> = None;
         let (mut apply, mut close) = (false, false);
         let title = match &tool {
             TableTool::Convert { to_table: true, .. } => "문자열을 표로",
@@ -2013,7 +2115,58 @@ impl HwpApp {
                                     }
                                 }
                             });
-                            ui.label(STYLES[*selected].1);
+                            chrome::section(ui, "사용자 표 마당");
+                            if users.is_empty() {
+                                ui.label(
+                                    RichText::new("아직 없습니다. 현재 표 모양을 이름 붙여 저장하세요.")
+                                        .small()
+                                        .weak(),
+                                );
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                for (i, name) in users.iter().enumerate() {
+                                    let index = STYLES.len() + i;
+                                    if ui.selectable_label(*selected == index, name).clicked() {
+                                        *selected = index;
+                                    }
+                                }
+                            });
+                            let name_id = egui::Id::new(USER_STYLE_NAME_ID);
+                            let mut name: String =
+                                ui.data(|d| d.get_temp(name_id)).unwrap_or_default();
+                            let chosen = selected
+                                .checked_sub(STYLES.len())
+                                .and_then(|i| users.get(i))
+                                .cloned();
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut name)
+                                        .hint_text("새 이름")
+                                        .desired_width(130.0),
+                                );
+                                if ui
+                                    .add_enabled(
+                                        !name.trim().is_empty(),
+                                        egui::Button::new("현재 표 모양 저장"),
+                                    )
+                                    .clicked()
+                                {
+                                    user_action = Some((true, name.trim().to_owned()));
+                                }
+                                if ui
+                                    .add_enabled(chosen.is_some(), egui::Button::new("지우기"))
+                                    .clicked()
+                                {
+                                    user_action = chosen.clone().map(|n| (false, n));
+                                }
+                            });
+                            ui.data_mut(|d| d.insert_temp(name_id, name));
+                            match &chosen {
+                                Some(n) => ui.label(format!(
+                                    "{n} — 저장한 테두리·배경을 셀 위치(첫/가운데/마지막 줄·칸)에 맞춰 씁니다. 위 옵션은 쓰지 않습니다."
+                                )),
+                                None => ui.label(STYLES.get(*selected).map_or("", |s| s.1)),
+                            };
                             ui.label(
                                 RichText::new("테두리와 배경만 바꿉니다(글자 모양은 그대로).")
                                     .small()
@@ -2023,7 +2176,7 @@ impl HwpApp {
                     }
                 });
                 ui.vertical(|ui| {
-                    let (a, c) = chrome::actions(ui, true, "설정(D)");
+                    let (a, c) = chrome::actions(ui, None, "설정(D)");
                     apply = a;
                     close |= c;
                 });
@@ -2061,6 +2214,12 @@ impl HwpApp {
                 TableTool::Caption(text) => {
                     self.run_table("table.caption_text", json!({"text":text}))
                 }
+                TableTool::Style(i, _) if *i >= STYLES.len() => {
+                    match users.get(*i - STYLES.len()) {
+                        Some(name) => self.run("table.user_style.apply", json!({"name": name})),
+                        None => false,
+                    }
+                }
                 TableTool::Style(i, options) => {
                     let mut p = json!({"preset":STYLES[*i].0});
                     for (k, (key, _, _)) in STYLE_OPTIONS.iter().enumerate() {
@@ -2094,6 +2253,32 @@ impl HwpApp {
                 }
             };
             self.ext.table.layout = None;
+        }
+        if let Some((save, name)) = user_action {
+            let r = if save {
+                self.session.run(
+                    "table.user_style.save",
+                    json!({"name": name, "force": true}),
+                )
+            } else {
+                self.session
+                    .run("table.user_style.delete", json!({"name": name}))
+            };
+            if self.result(r).is_some() {
+                ctx.data_mut(|d| d.remove::<Vec<String>>(egui::Id::new(USER_STYLES_ID)));
+                self.message = if save {
+                    format!("사용자 표 마당 [{name}]을 저장했습니다.")
+                } else {
+                    format!("사용자 표 마당 [{name}]을 지웠습니다.")
+                };
+                if let TableTool::Style(selected, _) = &mut tool {
+                    let names = self.user_table_styles(ctx);
+                    *selected = match names.iter().position(|n| *n == name) {
+                        Some(i) if save => STYLES.len() + i,
+                        _ => 1,
+                    };
+                }
+            }
         }
         if !(close || r.should_close()) {
             self.ext.table.tool = Some(tool);
@@ -2154,6 +2339,61 @@ fn paint_style_preview(ui: &egui::Ui, r: Rect, style: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_nested_table_grid_line_carries_its_cell_path() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        a.session
+            .run("insert.table", json!({"rows": 2, "columns": 2}))?;
+        let created = a.session.run(
+            "context.table.create",
+            json!({"address":{"section":0,"paragraph":0,"path":[{"control":2,"cell":0,"paragraph":0}]},
+                   "rows":2,"columns":2}),
+        )?;
+        let inner = created["address"]["path"][1]["control"].as_u64();
+        let layout = a.page_layout(0);
+        let tables: Vec<&Value> = layout["controls"]
+            .as_array()
+            .map(|c| c.iter().filter(|t| t["type"] == "table").collect())
+            .unwrap_or_default();
+        anyhow::ensure!(tables.len() == 2, "{layout}");
+        // The smaller box is the nested table; its first cell's right edge is a line.
+        let area = |t: &&Value| t["w"].as_f64().unwrap_or(0.0) * t["h"].as_f64().unwrap_or(0.0);
+        let nested = tables
+            .iter()
+            .min_by(|x, y| area(x).total_cmp(&area(y)))
+            .ok_or_else(|| anyhow::anyhow!("nested"))?;
+        let cell = &nested["cells"][0];
+        let f = |v: &Value, k: &str| v[k].as_f64().unwrap_or(0.0) as f32;
+        let edge = Pos2::new(
+            f(cell, "x") + f(cell, "w"),
+            f(cell, "y") + f(cell, "h") / 2.0,
+        );
+        let line = a
+            .grid_line_at(0, edge, 3.0, true)
+            .ok_or_else(|| anyhow::anyhow!("nested line"))?;
+        let (address, control) = line
+            .nested
+            .ok_or_else(|| anyhow::anyhow!("nested address"))?;
+        assert_eq!(address.path.len(), 1);
+        assert_eq!(Some(control as u64), inner);
+        assert!((line.vertical, line.boundary) == (true, 1));
+        // The outer table's own line is a body table line.
+        let outer = tables
+            .iter()
+            .max_by(|x, y| area(x).total_cmp(&area(y)))
+            .ok_or_else(|| anyhow::anyhow!("outer"))?;
+        let last = &outer["cells"][3];
+        let bottom = Pos2::new(
+            f(last, "x") + f(last, "w") / 2.0,
+            f(last, "y") + f(last, "h"),
+        );
+        let line = a
+            .grid_line_at(0, bottom, 3.0, true)
+            .ok_or_else(|| anyhow::anyhow!("outer line"))?;
+        assert!(line.nested.is_none());
+        Ok(())
+    }
 
     #[test]
     fn page_layouts_stay_cached_per_page_until_the_document_changes() {

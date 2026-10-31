@@ -28,37 +28,37 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "tools.autotext.body.source",
-        "No parameters. Returns generation and source {section,start,end}: zero-based body paragraphs [start,end). A whole-paragraph selection is used; without a selection, uses the current body paragraph. Partial selections and cells are refused.",
+        "매개 변수 없음. 결과: generation과 source {section,start,end}(0부터 센 본문 문단 범위 [start,end)). 문단 전체를 고른 선택을 쓰고, 선택이 없으면 지금 본문 문단을 씁니다. 문단 일부 선택과 표 셀은 거절합니다.",
         "{}",
     ),
     (
         "tools.autotext.body.list",
-        "No parameters. Returns the separate formatted snippet store's revision and bounded entry metadata, without binary payloads. Existing plain-text snippets are unchanged.",
+        "매개 변수 없음. 서식 상용구 저장소(일반 글 상용구와 따로)의 revision과 항목 정보(크기 제한, 바이너리 내용 없음)를 돌려줍니다. 기존 일반 글 상용구는 바뀌지 않습니다.",
         "{}",
     ),
     (
         "tools.autotext.body.add",
-        "name: 1–64 characters; description: optional; expected_generation: required. Optional source {section,start,end} uses zero-based paragraphs [start,end); default is the current complete paragraph/selection. overwrite defaults false; expected_store_revision optionally checks the store revision. Unsupported content is refused before saving. Settings operation, not document undo.",
+        "name: 1–64자, description: 선택, expected_generation: 필수. source {section,start,end}(선택, 0부터 센 문단 [start,end))를 생략하면 지금 문단 전체·선택을 씁니다. overwrite 기본 false, expected_store_revision(선택)으로 저장소 revision을 확인합니다. 지원하지 않는 내용은 저장 전에 거절합니다. 설정 작업이라 문서 실행 취소 대상이 아닙니다.",
         r#"{"name":"안내문","description":"서식 있는 본문","expected_generation":0,"source":{"section":0,"start":0,"end":1},"expected_store_revision":0}"#,
     ),
     (
         "tools.autotext.body.get",
-        "id: required; expected_store_revision: optional. Returns entry metadata, not its encoded document payload.",
+        "id: 필수, expected_store_revision: 선택. 항목 정보를 돌려주며 부호화한 문서 내용은 주지 않습니다.",
         r#"{"id":"body-example"}"#,
     ),
     (
         "tools.autotext.body.preview",
-        "id and expected_generation: required; expected_store_revision: optional. Validates the current body-paragraph insertion boundary and returns first-page SVG plus the strict import preview. No document or store changes.",
+        "id와 expected_generation: 필수, expected_store_revision: 선택. 지금 본문 문단의 넣을 자리를 검사하고 첫 쪽 SVG와 엄격 가져오기 미리 보기를 돌려줍니다. 문서와 저장소는 바뀌지 않습니다.",
         r#"{"id":"body-example","expected_generation":0}"#,
     ),
     (
         "tools.autotext.body.delete",
-        "id: required; expected_store_revision: optional. Removes only this formatted snippet from the separate settings store. Not document undo.",
+        "id: 필수, expected_store_revision: 선택. 따로 있는 설정 저장소에서 이 서식 상용구만 지웁니다. 문서 실행 취소 대상이 아닙니다.",
         r#"{"id":"body-example","expected_store_revision":1}"#,
     ),
     (
         "tools.autotext.body.insert",
-        "id and expected_generation: required; expected_store_revision: optional. Inserts at a collapsed body-paragraph start/end in one undo step, preserving existing paragraphs and page settings. Cells, remaining selections and mid-paragraph insertion are refused.",
+        "id와 expected_generation: 필수, expected_store_revision: 선택. 선택 없는 본문 캐럿에 한 번 실행 취소로 넣으며 기존 문단과 쪽 설정은 그대로 둡니다. 문단 안에서는 표 없는 한 문단 상용구는 입력하듯 글에 이어 붙이고, 그보다 긴 것은 캐럿에서 나눈 두 반쪽 사이에 들어갑니다. 표 셀과 남은 선택은 거절합니다.",
         r#"{"id":"body-example","expected_generation":0}"#,
     ),
 ];

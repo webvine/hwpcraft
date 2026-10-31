@@ -11,6 +11,10 @@ pub(crate) struct FindState {
     /// The status line reports a result (gray) rather than a problem (red).
     pub status_ok: bool,
     pub focus: bool,
+    /// Passes left in which a found match hidden under the window is scrolled clear.
+    pub reveal: u8,
+    /// Where the window was drawn last pass.
+    pub window: Option<Rect>,
 }
 
 /// Counting stops here so a very common query stays responsive.
@@ -63,21 +67,62 @@ impl HwpApp {
             }
             self.sync_formatting();
             self.follow_cursor();
+            // The view follows the caret over the next passes; then check the window.
+            self.find_state.reveal = if found { 3 } else { 0 };
         }
         // After a whole-document search continue downwards, as Hangul does.
         if self.find_state.options.direction == FindDirection::All {
             self.find_state.options.direction = FindDirection::Down;
         }
     }
+    /// The caret on screen, if its page is in view.
+    fn caret_on_screen(&self) -> Option<Rect> {
+        let caret = self.session.caret().ok()?;
+        let page = u32::try_from(caret["pageIndex"].as_u64()?).ok()?;
+        let (_, rect) = self.wheel_zoom.pages.iter().find(|(p, _)| *p == page)?;
+        let x = caret["x"].as_f64()? as f32 * self.zoom + rect.min.x;
+        let y = caret["y"].as_f64()? as f32 * self.zoom + rect.min.y;
+        let height = caret["height"].as_f64().unwrap_or(16.0) as f32 * self.zoom;
+        Some(Rect::from_min_size(Pos2::new(x, y), Vec2::new(2.0, height)))
+    }
+
+    /// A match the view scrolled to but that sits under the find window is moved to
+    /// the other half of the view, so the window never hides what was found.
+    fn reveal_found(&mut self) {
+        if self.find_state.reveal == 0 {
+            return;
+        }
+        self.find_state.reveal -= 1;
+        let (Some(window), Some(view), Some(caret)) = (
+            self.find_state.window,
+            self.wheel_zoom.viewport,
+            self.caret_on_screen(),
+        ) else {
+            return;
+        };
+        if !window.expand(8.0).intersects(caret) {
+            return;
+        }
+        let target = if window.center().y < view.center().y {
+            view.top() + view.height() * 0.7
+        } else {
+            view.top() + view.height() * 0.3
+        };
+        let offset = self.document_scroll.offset().y + caret.center().y - target;
+        self.document_scroll.pending[1] = Some(offset.max(0.0));
+        self.find_state.reveal = 0;
+    }
+
     pub(crate) fn find_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_find {
             return;
         }
+        self.reveal_found();
         let replace = self.find_state.replace;
         let mut next = false;
         let mut all = false;
         let mut close = false;
-        egui::Window::new(if replace {
+        let shown = egui::Window::new(if replace {
             "찾아 바꾸기"
         } else {
             "찾기"
@@ -256,6 +301,7 @@ impl HwpApp {
                 close = true;
             }
         });
+        self.find_state.window = shown.map(|r| r.response.rect);
         if next {
             self.find_step();
         }
@@ -280,5 +326,48 @@ impl HwpApp {
             self.show_find = false;
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("document-canvas")));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_match_under_the_find_window_is_scrolled_into_the_other_half() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        a.session.execute(Command::Insert("찾을 낱말".into()))?;
+        let caret = a.session.caret()?;
+        let page = Rect::from_min_size(Pos2::new(100.0, 500.0), Vec2::new(714.0, 1010.0));
+        a.wheel_zoom.pages = vec![(0, page)];
+        a.wheel_zoom.viewport = Some(Rect::from_min_size(
+            Pos2::new(0.0, 0.0),
+            Vec2::new(1400.0, 700.0),
+        ));
+        let y = caret["y"].as_f64().unwrap_or(0.0) as f32 * a.zoom + page.min.y;
+        // A window over the caret in the lower half: the match moves up to 30 % of the view.
+        a.find_state.window = Some(Rect::from_min_size(
+            Pos2::new(0.0, y - 40.0),
+            Vec2::new(1400.0, 120.0),
+        ));
+        a.find_state.reveal = 3;
+        a.reveal_found();
+        assert_eq!(a.find_state.reveal, 0);
+        let offset = a.document_scroll.pending[1].expect("scrolled");
+        let height = caret["height"].as_f64().unwrap_or(16.0) as f32 * a.zoom;
+        assert!(
+            (offset - (y + height / 2.0 - 210.0)).abs() < 0.5,
+            "{offset} {y}"
+        );
+        // A window elsewhere leaves the view alone.
+        a.document_scroll.pending[1] = None;
+        a.find_state.window = Some(Rect::from_min_size(
+            Pos2::new(0.0, 600.0),
+            Vec2::new(10.0, 10.0),
+        ));
+        a.find_state.reveal = 1;
+        a.reveal_found();
+        assert_eq!(a.document_scroll.pending[1], None);
+        Ok(())
     }
 }

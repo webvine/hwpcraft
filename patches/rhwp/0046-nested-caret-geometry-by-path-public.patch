@@ -1,0 +1,33 @@
+diff --git a/src/document_core/queries/cursor_nav.rs b/src/document_core/queries/cursor_nav.rs
+--- a/src/document_core/queries/cursor_nav.rs
++++ b/src/document_core/queries/cursor_nav.rs
+@@ -1781,7 +1781,7 @@
+     }
+ 
+     /// 전체 cellPath를 사용하는 중첩 셀 선택 사각형 조회(#4272).
+-    pub(crate) fn get_selection_rects_in_cell_by_path_native(
++    pub fn get_selection_rects_in_cell_by_path_native(
+         &self,
+         section_idx: usize,
+         parent_para_idx: usize,
+diff --git a/src/document_core/queries/cursor_rect.rs b/src/document_core/queries/cursor_rect.rs
+--- a/src/document_core/queries/cursor_rect.rs
++++ b/src/document_core/queries/cursor_rect.rs
+@@ -3506,7 +3506,7 @@
+     // ─── 경로 기반 중첩 표 Native API ──────────────────────────
+ 
+     /// 경로 기반 커서 좌표 조회 (네이티브).
+-    pub(crate) fn get_cursor_rect_by_path_native(
++    pub fn get_cursor_rect_by_path_native(
+         &self,
+         section_idx: usize,
+         parent_para_idx: usize,
+@@ -4053,7 +4053,7 @@
+     }
+ 
+     /// 경로 기반 수직 커서 이동 (네이티브).
+-    pub(crate) fn move_vertical_by_path_native(
++    pub fn move_vertical_by_path_native(
+         &self,
+         section_idx: usize,
+         parent_para_idx: usize,

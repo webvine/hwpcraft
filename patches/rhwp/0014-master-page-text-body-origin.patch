@@ -1,0 +1,49 @@
+diff --git a/src/renderer/layout.rs b/src/renderer/layout.rs
+index 6391e20..ccc8c66 100644
+--- a/src/renderer/layout.rs
++++ b/src/renderer/layout.rs
+@@ -5957,7 +5957,16 @@ impl LayoutEngine {
+                 mp_node.layer = Some(RenderLayerInfo::new(None, 0, 0).for_master_page());
+                 // 바탕쪽 문단 렌더링: 컨트롤(표/도형/그림)은 compute_object_position으로 배치,
+                 // 텍스트 문단은 layout_paragraph로 배치
+-                let mut mp_y_offset = paper_area.y;
++                // 글 문단의 흐름 원점은 본문 영역이다 — 한/글 2024는 개체 없는 바탕쪽 글을
++                // (왼쪽 여백, 위 여백+머리말)에서 시작해 본문 폭으로 줄을 나눈다. 종전엔 용지
++                // (0, 0)에서 용지 폭으로 흘려 글이 쪽 왼쪽 위 모서리에 붙었다.
++                let text_area = LayoutRect {
++                    x: body_area.x,
++                    y: body_area.y,
++                    width: body_area.width,
++                    height: body_area.height,
++                };
++                let mut mp_y_offset = text_area.y;
+                 for (pi, para) in mp.paragraphs.iter().enumerate() {
+                     let has_controls = !para.controls.is_empty();
+                     if has_controls {
+@@ -6124,7 +6133,7 @@ impl LayoutEngine {
+                         // LINE_SEG vpos로 문단 시작 y 결정 (빈 문단 건너뜀 보상)
+                         if let Some(first_ls) = para.line_segs.first() {
+                             let vpos_y =
+-                                paper_area.y + hwpunit_to_px(first_ls.vertical_pos, self.dpi);
++                                text_area.y + hwpunit_to_px(first_ls.vertical_pos, self.dpi);
+                             if vpos_y > mp_y_offset {
+                                 mp_y_offset = vpos_y;
+                             }
+@@ -6135,7 +6144,7 @@ impl LayoutEngine {
+                             para,
+                             Some(&comp),
+                             styles,
+-                            &paper_area,
++                            &text_area,
+                             mp_y_offset,
+                             0,
+                             usize::MAX - pi,
+@@ -6147,7 +6156,7 @@ impl LayoutEngine {
+                         // 빈 문단: LINE_SEG vpos로 y 위치 갱신
+                         if let Some(first_ls) = para.line_segs.first() {
+                             let vpos_y =
+-                                paper_area.y + hwpunit_to_px(first_ls.vertical_pos, self.dpi);
++                                text_area.y + hwpunit_to_px(first_ls.vertical_pos, self.dpi);
+                             let lh = hwpunit_to_px(first_ls.line_height, self.dpi);
+                             let ls = hwpunit_to_px(first_ls.line_spacing, self.dpi);
+                             mp_y_offset = (vpos_y + lh + ls).max(mp_y_offset);

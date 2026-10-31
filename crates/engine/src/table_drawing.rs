@@ -15,17 +15,17 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "table.move",
-        "Move a top-level table on its current page. page is zero-based; dx_mm/dy_mm are millimetre deltas. Inline tables become floating; split tables are rejected.",
+        "지금 쪽 안에서 최상위 표를 옮깁니다. page는 0부터, dx_mm/dy_mm은 옮길 밀리미터. 글자처럼 취급한 표는 떠 있는 표가 되고, 나뉜 표는 거절합니다.",
         r##"{"table":{"section":0,"paragraph":0,"control":0},"page":0,"dx_mm":10,"dy_mm":5}"##,
     ),
     (
         "table.draw_create",
-        "Draw a floating single-cell table. Dimensions and paper-relative origin are millimetres; no active selection or nested table.",
+        "떠 있는 한 칸 표를 그립니다. 크기와 종이 기준 원점은 밀리미터이며, 선택이 있거나 중첩 표 안이면 안 됩니다.",
         r##"{"width_mm":100,"height_mm":50,"x_mm":30,"y_mm":40}"##,
     ),
     (
         "table.pen",
-        "Start/end are [x,y] millimetres from the table origin. erase merges a shared rectangular edge or hides an outer edge. line uses HWP type/width indices.",
+        "start/end는 table.info의 columnWidths/rowHeights 셀 격자에서 표 원점부터의 [x,y] 밀리미터입니다(셀 간격은 세지 않음: 두 셀 사이 틈의 점은 공유 변). erase는 공유하는 직사각형 변을 합치거나 바깥 변을 숨깁니다. line은 HWP 선 종류·굵기 번호를 씁니다.",
         r##"{"table":{"section":0,"paragraph":0,"control":0},"start":[30,0],"end":[30,50],"erase":false,"line":{"type":1,"width":0,"color":"#000000"}}"##,
     ),
 ];
@@ -82,9 +82,8 @@ fn bounds(t: &Table) -> Result<(Vec<f64>, Vec<f64>)> {
     if t.cells.len() > MAX_CELLS
         || usize::from(t.row_count) > MAX_ROWS
         || usize::from(t.col_count) > MAX_COLUMNS
-        || t.cell_spacing != 0
     {
-        bail!("표 그리기는 셀 간격 0인 200줄·64칸·4096셀 이하 표에서 지원합니다.");
+        bail!("표 그리기는 200줄·64칸·4096셀 이하 표에서 지원합니다.");
     }
     for c in &t.cells {
         if c.row_span == 0
@@ -219,7 +218,7 @@ impl Session {
         }
         self.transaction(|s|{
             let c=s.cursor;
-            let v:Value=serde_json::from_str(&s.core.create_table_native(c.section,c.paragraph,c.offset,1,1).map_err(err)?)?;
+            let at=s.split_offset(c)?;let v:Value=serde_json::from_str(&s.core.create_table_native(c.section,c.paragraph,at,1,1).map_err(err)?)?;
             let a=ObjectAddress{section:c.section,paragraph:v["paraIdx"].as_u64().ok_or_else(||anyhow!("표 주소 오류"))? as usize,control:v["controlIdx"].as_u64().ok_or_else(||anyhow!("표 주소 오류"))? as usize};
             let mut t=s.table_at(a)?.clone();t.cells[0].width=(p.width_mm*HU).round()as u32;t.cells[0].height=(p.height_mm*HU).round()as u32;
             s.install_pen_table(a,t)?;

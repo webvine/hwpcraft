@@ -105,7 +105,7 @@ fn plain_text(text: &str) -> Result<()> {
     }
     Ok(())
 }
-fn equation_size(p: &EquationOptions) -> Result<u32> {
+pub(crate) fn equation_size(p: &EquationOptions) -> Result<u32> {
     plain_text(&p.script)?;
     if p.script.trim().is_empty() || !p.size_pt.is_finite() || !(4.0..=100.0).contains(&p.size_pt) {
         bail!("수식과 4–100 pt 글자 크기를 입력하세요.");
@@ -135,7 +135,7 @@ fn dimension(mm: f64) -> Result<u32> {
     }
     Ok((mm * 7200.0 / 25.4).round() as u32)
 }
-fn inserted_address(section: usize, response: &str) -> Result<ObjectAddress> {
+pub(crate) fn inserted_address(section: usize, response: &str) -> Result<ObjectAddress> {
     let v: Value = serde_json::from_str(response)?;
     let index = |key: &str| {
         v[key]
@@ -321,9 +321,12 @@ impl Session {
         self.body_insert()?;
         plain_text(text)?;
         let mut inserted = None;
+        // The note and its text are two native edits; lay the section out once.
         self.transaction(|s| {
-            inserted = Some(s.insert_note_raw(endnote, text)?);
-            Ok(())
+            s.deferred_layout(|s| {
+                inserted = Some(s.insert_note_raw(endnote, text)?);
+                Ok(())
+            })
         })?;
         inserted.ok_or_else(|| anyhow!("주석을 넣지 못했습니다."))
     }

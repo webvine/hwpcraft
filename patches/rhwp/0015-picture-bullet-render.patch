@@ -1,0 +1,142 @@
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 353701e..64e2279 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -3867,6 +3867,17 @@ impl DocumentCore {
+                     ));
+                     return;
+                 }
++                // 그림 글머리표(문단 머리 표식)는 문서 개체가 아니다: 문단만 가리키고 구역·
++                // 컨트롤 번호가 없다(그림 개체는 구역을 늘 가진다 — #5551 부분 주소와 구별).
++                // 글자 글머리표처럼 선택·히트테스트 대상에서 뺀다.
++                RenderNodeType::Image(image_node)
++                    if image_node.para_index.is_some()
++                        && image_node.section_index.is_none()
++                        && image_node.control_index.is_none()
++                        && image_node.header_footer_ref.is_none() =>
++                {
++                    return;
++                }
+                 RenderNodeType::Image(image_node) => {
+                     let doc_coords = match (
+                         public_section(image_node.section_index),
+diff --git a/src/model/paragraph.rs b/src/model/paragraph.rs
+index 601e696..f4ff892 100644
+--- a/src/model/paragraph.rs
++++ b/src/model/paragraph.rs
+@@ -189,6 +189,9 @@ pub struct MarkerHead {
+     pub text_distance: i16,
+     /// 마커 글자 모양 (`u32::MAX` 는 참조 없음 — 문단 첫 글자 모양을 따른다)
+     pub char_shape_id: u32,
++    /// 그림 글머리표의 BinData 참조(0 = 문자 마커). 그림이 있으면 마커 자리에
++    /// 글자 크기의 정사각형 그림을 그리고, 문자 마커는 그리지 않는다.
++    pub image_bullet: u16,
+ }
+ 
+ /// 줄 구성에서 선택한 공백 측정 규칙. 저장 형식의 bit나 글꼴 대체 규칙이 아니다.
+diff --git a/src/renderer/layout/integration_tests.rs b/src/renderer/layout/integration_tests.rs
+index f50cde5..df0e9ab 100644
+--- a/src/renderer/layout/integration_tests.rs
++++ b/src/renderer/layout/integration_tests.rs
+@@ -2829,6 +2829,13 @@ mod tests {
+                         *with_cell += 1;
+                     }
+                 }
++                // 그림 글머리표(문단만 가리키고 구역·컨트롤 번호가 없는 문단 머리 표식)는
++                // `collect_controls` 가 내보내지 않는 장식이라 세지 않는다.
++                RenderNodeType::Image(i)
++                    if i.para_index.is_some()
++                        && i.section_index.is_none()
++                        && i.control_index.is_none()
++                        && i.header_footer_ref.is_none() => {}
+                 RenderNodeType::Image(i) => {
+                     *total += 1;
+                     if i.para_index.is_none() || i.control_index.is_none() {
+diff --git a/src/renderer/layout/paragraph_layout.rs b/src/renderer/layout/paragraph_layout.rs
+index 144c99a..4c1f572 100644
+--- a/src/renderer/layout/paragraph_layout.rs
++++ b/src/renderer/layout/paragraph_layout.rs
+@@ -588,6 +588,21 @@ fn bullet_marker_text(
+         return None;
+     }
+     let bullet = styles.bullets.get((bullet_id - 1) as usize)?;
++    // 그림 글머리표: 마커 영역은 글자 하나 크기로 잡고 그 자리에 그림을 그린다.
++    // 그림 참조가 없거나 잘못되면 종전처럼 U+FFFF 표시자는 그리지 않는다.
++    let image_bullet = u16::try_from(bullet.image_bullet).unwrap_or(0);
++    if image_bullet > 0 {
++        return Some((
++            "\u{25CF}".to_string(),
++            MarkerHead {
++                attr: bullet.attr,
++                width_adjust: bullet.width_adjust,
++                text_distance: bullet.text_distance,
++                char_shape_id: bullet.char_shape_id,
++                image_bullet,
++            },
++        ));
++    }
+     // U+FFFF는 이미지 글머리표 표시자 — 문자 렌더링 불가, 건너뜀
+     if bullet.bullet_char == '\u{FFFF}' {
+         return None;
+@@ -611,6 +626,7 @@ fn bullet_marker_text(
+             width_adjust: bullet.width_adjust,
+             text_distance: bullet.text_distance,
+             char_shape_id: bullet.char_shape_id,
++            image_bullet: 0,
+         },
+     ))
+ }
+@@ -669,6 +685,7 @@ pub(crate) fn numbering_head_text(
+             width_adjust: head.width_adjust,
+             text_distance: head.text_distance,
+             char_shape_id: head.char_shape_id,
++            image_bullet: 0,
+         },
+     ))
+ }
+@@ -6551,7 +6568,37 @@ impl LayoutEngine {
+                             numbering_marker_text_style(styles, para, comp_line.runs.first())
+                         });
+                     let num_width = estimate_text_width(num_text, &num_style);
++                    let image = (head.image_bullet > 0)
++                        .then(|| {
++                            bin_data_content.and_then(|content| {
++                                crate::renderer::layout::utils::find_bin_data_bytes(
++                                    content,
++                                    head.image_bullet,
++                                )
++                            })
++                        })
++                        .flatten();
+                     let num_id = tree.next_id();
++                    if let Some(data) = image {
++                        // 글자 크기의 정사각형, 글자 기준선에 바닥을 맞춘다.
++                        let side = num_style.font_size.max(1.0);
++                        let image_node = RenderNode::new(
++                            num_id,
++                            // 문단 머리 표식: 문단만 가리키고 구역·컨트롤 번호는 비운다
++                            // (문서 개체가 아니라 `collect_controls` 가 내보내지 않는다).
++                            RenderNodeType::Image(ImageNode {
++                                para_index: Some(para_index),
++                                ..ImageNode::new(head.image_bullet, Some(data))
++                            }),
++                            BoundingBox::new(
++                                x + geometry.marker_dx_px,
++                                y + (baseline - side).max(0.0),
++                                side,
++                                side,
++                            ),
++                        );
++                        line_node.children.push(image_node);
++                    } else {
+                     let num_node = RenderNode::new(
+                         num_id,
+                         RenderNodeType::TextRun(TextRunNode {
+@@ -6577,6 +6624,7 @@ impl LayoutEngine {
+                         BoundingBox::new(x + geometry.marker_dx_px, y, num_width, line_height),
+                     );
+                     line_node.children.push(num_node);
++                    }
+                 }
+             }
+ 

@@ -12,17 +12,17 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "selection.range",
-        "start/end Cursor, required expected_generation. Unicode scalar offsets; same section body or same first-level cell. Preserves selection direction.",
+        "start/end Cursor, expected_generation 필수. 유니코드 스칼라 오프셋이며 같은 구역 본문 또는 같은 1단계 셀 안이어야 합니다. 선택 방향을 유지합니다.",
         r#"{"start":{"section":0,"paragraph":0,"offset":0},"end":{"section":0,"paragraph":1,"offset":2},"expected_generation":0}"#,
     ),
     (
         "page.layout.get",
-        "page:1-based, includeControls optional false. Returns shared presentation pageInfo and optional controlLayout, without changing the caret.",
+        "page: 1부터, includeControls(선택, 기본 false). 화면과 같은 pageInfo와 (선택) controlLayout을 돌려주며 캐럿은 바뀌지 않습니다.",
         r#"{"page":1,"includeControls":true}"#,
     ),
     (
         "caret.get",
-        "Optional cursor (Unicode scalar Cursor); defaults to the current visual caret. Returns generation and geometry in unscaled page pixels with zero-based pageIndex.",
+        "cursor(선택, 유니코드 스칼라 Cursor). 생략하면 지금 보이는 캐럿. 결과: generation과 배율 없는 쪽 픽셀 좌표(pageIndex는 0부터).",
         r#"{}"#,
     ),
 ];

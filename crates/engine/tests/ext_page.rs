@@ -891,3 +891,595 @@ fn background_pdf_jobs_cover_print_ranges_and_blocks() -> anyhow::Result<()> {
 fn at_offset(c: hwpcraft_engine::Cursor, offset: usize) -> hwpcraft_engine::Cursor {
     hwpcraft_engine::Cursor { offset, ..c }
 }
+
+/// Page 1's drawn text: the SVG has one text element per character.
+fn drawn(s: &Session) -> anyhow::Result<String> {
+    let svg = svg(s)?;
+    Ok(svg
+        .split("</text>")
+        .filter_map(|part| part.rsplit('>').next())
+        .collect())
+}
+
+#[test]
+fn master_page_text_is_created_edited_deleted_and_roundtrips() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("본문".into()))?;
+    let none = s.run("page.master.get", json!({}))?;
+    assert_eq!(
+        (none["exists"].as_bool(), none["editable"].as_bool()),
+        (Some(false), Some(true))
+    );
+    let v = s.run("page.master.set", json!({"text": "대외비\n둘째 줄"}))?;
+    assert_eq!(v["text"], "대외비\n둘째 줄");
+    assert!(drawn(&s)?.contains("대외비"), "drawn on the page");
+    // Like Hangul, master-page text starts at the body area, not the paper corner
+    // (RHWP patch 0014).
+    let svg = svg(&s)?;
+    let at = svg.find(">대</text>").expect("master glyph");
+    let tag = &svg[svg[..at].rfind("<text").expect("text element")..at];
+    let number = |key: &str| -> f64 {
+        let start = tag.find(key).expect("attribute") + key.len();
+        tag[start..]
+            .split('"')
+            .next()
+            .unwrap_or("")
+            .parse()
+            .unwrap_or(f64::NAN)
+    };
+    let info = s.page_info(0)?;
+    let body_left = info["bodyLeft"].as_f64().unwrap_or(f64::NAN);
+    let body_top =
+        info["marginTop"].as_f64().unwrap_or(0.0) + info["marginHeader"].as_f64().unwrap_or(0.0);
+    assert!((number(" x=\"") - body_left).abs() < 1.0, "{tag}");
+    assert!(number(" y=\"") > body_top, "{tag}");
+    // One undo step back to no master page.
+    s.execute(Command::Undo)?;
+    assert_eq!(s.run("page.master.get", json!({}))?["exists"], false);
+    s.execute(Command::Redo)?;
+    s.run(
+        "page.master.set",
+        json!({"applyTo": "both", "text": "기밀"}),
+    )?;
+    let temp = tempfile::tempdir()?;
+    for ext in ["hwp", "hwpx"] {
+        let path = temp.path().join(format!("master.{ext}"));
+        s.save(&path)?;
+        let mut r = Session::new()?;
+        r.open(&path)?;
+        let back = r.run("page.master.get", json!({}))?;
+        assert_eq!(back["text"], "기밀", "{ext}");
+        assert!(drawn(&r)?.contains("기밀"), "{ext} drawn after reopening");
+        assert_eq!(texts(&r).first().map(String::as_str), Some("본문"), "{ext}");
+    }
+    s.run("page.master.delete", json!({}))?;
+    assert_eq!(s.run("page.master.get", json!({}))?["exists"], false);
+    assert!(!drawn(&s)?.contains("기밀"));
+    assert!(
+        s.run("page.master.delete", json!({})).is_err(),
+        "nothing left to delete"
+    );
+    Ok(())
+}
+
+#[test]
+fn master_pages_that_would_lose_content_are_refused() -> anyhow::Result<()> {
+    use hwpcraft_doc::model::header_footer::{HeaderFooterApply, MasterPage};
+    let mut s = Session::new()?;
+    assert!(
+        s.run("page.master.set", json!({"applyTo": "last", "text": "x"}))
+            .is_err()
+    );
+    assert!(
+        s.run("page.master.set", json!({"text": "a\u{1}b"}))
+            .is_err()
+    );
+    // A section that already has a last-page master page stays as it is.
+    s.core.document_mut().sections[0]
+        .section_def
+        .master_pages
+        .push(MasterPage {
+            apply_to: HeaderFooterApply::Both,
+            is_extension: true,
+            ..Default::default()
+        });
+    let list = s.run("page.master.list", json!({}))?;
+    assert_eq!(list["editable"], false);
+    assert!(
+        list["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("마지막"))
+    );
+    assert!(s.run("page.master.set", json!({"text": "x"})).is_err());
+    assert_eq!(
+        s.core.document().sections[0].section_def.master_pages.len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn odd_and_even_master_pages_follow_hangul() -> anyhow::Result<()> {
+    use hwpcraft_doc::model::header_footer::HeaderFooterApply::{Both, Even, Odd};
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("일".into()))?;
+    s.run("insert.page_break", json!({}))?;
+    s.execute(Command::Insert("이".into()))?;
+    for (kind, text) in [("odd", "홀"), ("both", "양"), ("even", "짝")] {
+        let v = s.run("page.master.set", json!({"applyTo": kind, "text": text}))?;
+        assert_eq!(
+            (v["applyTo"].as_str(), v["text"].as_str()),
+            (Some(kind), Some(text))
+        );
+    }
+    let glyphs = |s: &Session, page: u32| -> anyhow::Result<Vec<&'static str>> {
+        let svg = s
+            .core
+            .render_page_svg_native(page)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(["양", "홀", "짝"]
+            .into_iter()
+            .filter(|g| svg.contains(&format!(">{g}</text>")))
+            .collect())
+    };
+    // Hangul stores 양쪽, 짝수, 홀수 in that order with one section-flag bit each, and an
+    // odd or even master page takes the place of the both-pages one on its pages.
+    let check = |s: &Session, flags: bool| -> anyhow::Result<()> {
+        let sd = &s.core.document().sections[0].section_def;
+        let kinds: Vec<_> = sd.master_pages.iter().map(|m| m.apply_to).collect();
+        assert_eq!(kinds, [Both, Even, Odd]);
+        if flags {
+            assert_eq!(sd.flags & 0xe000_0000, 0xe000_0000);
+        }
+        assert_eq!(glyphs(s, 0)?, ["홀"], "page 1 is odd");
+        assert_eq!(glyphs(s, 1)?, ["짝"], "page 2 is even");
+        Ok(())
+    };
+    check(&s, true)?;
+    let temp = tempfile::tempdir()?;
+    for ext in ["hwp", "hwpx"] {
+        let path = temp.path().join(format!("masters.{ext}"));
+        s.save(&path)?;
+        let mut r = Session::new()?;
+        r.open(&path)?;
+        check(&r, ext == "hwp")?;
+        let even = r.run("page.master.get", json!({"applyTo": "even"}))?;
+        assert_eq!(even["text"], "짝");
+    }
+    // One undo step per change; deleting the odd one leaves 양쪽 on odd pages.
+    s.execute(Command::Undo)?;
+    let sd = &s.core.document().sections[0].section_def;
+    assert_eq!(sd.master_pages.len(), 2);
+    assert_eq!(sd.flags & 0xe000_0000, 0xa000_0000);
+    s.execute(Command::Redo)?;
+    s.run("page.master.delete", json!({"applyTo": "odd"}))?;
+    assert_eq!(
+        s.core.document().sections[0].section_def.flags & 0xe000_0000,
+        0x6000_0000
+    );
+    assert_eq!(glyphs(&s, 0)?, ["양"]);
+    assert_eq!(glyphs(&s, 1)?, ["짝"]);
+    assert!(
+        s.run("page.master.delete", json!({"applyTo": "odd"}))
+            .is_err_and(|e| e.to_string().contains("홀수 쪽"))
+    );
+    Ok(())
+}
+
+/// PDF page objects (`/Type /Page`, not `/Pages`).
+fn pdf_pages(bytes: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(bytes);
+    text.match_indices("/Type /Page")
+        .filter(|(i, _)| !text[i + 11..].starts_with('s'))
+        .count()
+        + text
+            .match_indices("/Type/Page")
+            .filter(|(i, _)| !text[i + 10..].starts_with('s'))
+            .count()
+}
+
+#[test]
+fn print_details_pick_pages_repeat_them_and_put_several_on_a_sheet() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    for i in 0..5 {
+        if i > 0 {
+            s.execute(Command::PageBreak)?;
+        }
+        s.execute(Command::Insert(format!("{}쪽", i + 1)))?;
+    }
+    let before = hwpx(&s)?;
+    let temp = tempfile::tempdir()?;
+    let print = |s: &mut Session, extra: serde_json::Value| -> anyhow::Result<(usize, usize)> {
+        let path = temp.path().join("print.pdf");
+        let mut params = json!({"path": path, "pages": "all"});
+        for (k, v) in extra.as_object().into_iter().flatten() {
+            params[k] = v.clone();
+        }
+        let v = s.run("file.print_pdf", params)?;
+        let bytes = std::fs::read(&path)?;
+        Ok((
+            v["sheets"].as_u64().unwrap_or(0) as usize,
+            pdf_pages(&bytes),
+        ))
+    };
+    assert_eq!(print(&mut s, json!({}))?, (5, 5));
+    assert_eq!(print(&mut s, json!({"oddEven": "odd"}))?, (3, 3));
+    assert_eq!(
+        print(&mut s, json!({"oddEven": "even", "copies": 3}))?,
+        (6, 6)
+    );
+    assert_eq!(print(&mut s, json!({"nUp": 2}))?, (3, 3));
+    assert_eq!(print(&mut s, json!({"nUp": 4, "copies": 2}))?, (3, 3));
+    assert_eq!(
+        print(
+            &mut s,
+            json!({"watermark": {"text": "대외비"}, "reverse": true})
+        )?,
+        (5, 5)
+    );
+    assert!(print(&mut s, json!({"nUp": 3})).is_err());
+    assert!(print(&mut s, json!({"watermark": {"text": ""}})).is_err());
+    // Printing never changes the document.
+    assert_eq!(hwpx(&s)?, before);
+    Ok(())
+}
+
+#[test]
+fn print_preview_shows_sheets_as_they_print() -> anyhow::Result<()> {
+    use hwpcraft_engine::{PrintLayout, Watermark};
+    let mut s = Session::new()?;
+    for i in 0..5 {
+        if i > 0 {
+            s.execute(Command::PageBreak)?;
+        }
+        s.execute(Command::Insert(format!("{}쪽", i + 1)))?;
+    }
+    let (one, sheets) = s.print_preview_sheet(0, &PrintLayout::default())?;
+    assert_eq!(sheets, 5);
+    assert!(one.contains(">1<"));
+    let four = PrintLayout {
+        n_up: 4,
+        watermark: Some(Watermark {
+            text: "초안".into(),
+            opacity: None,
+        }),
+        ..Default::default()
+    };
+    let (sheet, sheets) = s.print_preview_sheet(1, &four)?;
+    assert_eq!(sheets, 2);
+    assert!(
+        sheet.contains(">5<") && !sheet.contains(">1<"),
+        "second sheet holds page 5"
+    );
+    assert!(sheet.contains("초안"));
+    let even = PrintLayout {
+        odd_even: "even".into(),
+        ..Default::default()
+    };
+    let (sheet, sheets) = s.print_preview_sheet(9, &even)?;
+    assert_eq!(sheets, 2, "pages 2 and 4");
+    assert!(sheet.contains(">4<"), "past the end shows the last sheet");
+    Ok(())
+}
+
+#[test]
+fn a_label_sheet_is_one_borderless_table_on_a_new_a4_page() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("고친 글".into()))?;
+    let params = json!({"rows": 8, "columns": 2, "labelWidthMm": 99.1, "labelHeightMm": 34.0, "gapXMm": 2.5});
+    assert!(
+        s.run("page.label", params.clone()).is_err(),
+        "unsaved changes kept"
+    );
+    let mut force = params.clone();
+    force["force"] = json!(true);
+    let v = s.run("page.label", force)?;
+    assert_eq!(
+        (v["labels"].as_u64(), v["pages"].as_u64()),
+        (Some(16), Some(1))
+    );
+    assert!(!s.dirty() && s.path.is_none());
+    let table = s.core.document().sections[0]
+        .paragraphs
+        .iter()
+        .flat_map(|p| &p.controls)
+        .find_map(|c| match c {
+            Control::Table(t) => Some(t.clone()),
+            _ => None,
+        })
+        .expect("label table");
+    assert_eq!(
+        (table.row_count, table.col_count),
+        (8, 3),
+        "a spacer column between labels"
+    );
+    let setup = s.page_setup()?;
+    assert!((setup.width_mm - 210.0).abs() < 0.1 && (setup.left_mm - 4.65).abs() < 0.1);
+    // Too large for A4.
+    assert!(
+        s.run("page.label", json!({"rows": 9, "columns": 3, "labelWidthMm": 80.0, "labelHeightMm": 40.0, "force": true}))
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_column_definition_break_starts_new_columns_and_roundtrips() -> anyhow::Result<()> {
+    use hwpcraft_doc::model::paragraph::ColumnBreakType;
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("제목 본문".into()))?;
+    // Caret after "제목 ": the rest starts two columns.
+    s.select(
+        hwpcraft_doc::Cursor {
+            offset: 3,
+            ..s.cursor
+        },
+        false,
+    )?;
+    let v = s.run(
+        "page.column_def_break",
+        json!({"count": 2, "spacing_mm": 6.0}),
+    )?;
+    assert_eq!(v["columns"], 2);
+    let check = |s: &Session| {
+        let paras = &s.core.document().sections[0].paragraphs;
+        let second = paras.get(1).expect("split paragraph");
+        assert_eq!(second.column_type, ColumnBreakType::MultiColumn);
+        let columns = second.controls.iter().find_map(|c| match c {
+            Control::ColumnDef(d) => Some(d.column_count),
+            _ => None,
+        });
+        assert_eq!(columns, Some(2));
+        assert!(second.text.starts_with("본문"));
+    };
+    check(&s);
+    s.execute(Command::Undo)?;
+    assert_eq!(
+        s.core.document().sections[0].paragraphs.len(),
+        1,
+        "one undo step"
+    );
+    s.execute(Command::Redo)?;
+    let temp = tempfile::tempdir()?;
+    for ext in ["hwp", "hwpx"] {
+        let path = temp.path().join(format!("columns.{ext}"));
+        s.save(&path)?;
+        let mut r = Session::new()?;
+        r.open(&path)?;
+        check(&r);
+    }
+    assert!(s.run("page.column_def_break", json!({"count": 9})).is_err());
+    Ok(())
+}
+
+#[test]
+fn a_section_break_starts_a_section_with_the_same_page_setup() -> anyhow::Result<()> {
+    use hwpcraft_doc::model::paragraph::ColumnBreakType;
+    let mut s = Session::new()?;
+    s.run("page.setup", json!({"landscape": true}))?;
+    s.run(
+        "page.header_footer",
+        json!({"is_header": true, "text": "머리글"}),
+    )?;
+    s.run("page.master.set", json!({"text": "바탕"}))?;
+    s.execute(Command::Insert("첫째 문단\n둘째 셋째".into()))?;
+    // Caret after "둘째 ": the rest starts section 2.
+    s.select(
+        hwpcraft_doc::Cursor {
+            section: 0,
+            paragraph: 1,
+            offset: 3,
+            ..s.cursor
+        },
+        false,
+    )?;
+    let v = s.run("page.section_break", json!({}))?;
+    assert_eq!(
+        (v["sections"].as_u64(), v["pages"].as_u64()),
+        (Some(2), Some(2))
+    );
+    assert_eq!(
+        (s.cursor.section, s.cursor.paragraph, s.cursor.offset),
+        (1, 0, 0)
+    );
+    let check = |s: &Session| -> anyhow::Result<()> {
+        let doc = s.core.document();
+        let texts: Vec<Vec<&str>> = doc
+            .sections
+            .iter()
+            .map(|sec| sec.paragraphs.iter().map(|p| p.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, [vec!["첫째 문단", "둘째 "], vec!["셋째"]]);
+        let (a, b) = (&doc.sections[0].section_def, &doc.sections[1].section_def);
+        assert_eq!(
+            (b.page_def.width, b.page_def.height, b.page_def.landscape),
+            (a.page_def.width, a.page_def.height, a.page_def.landscape)
+        );
+        assert_eq!(b.master_pages.len(), 1, "master page carried on");
+        let head = &doc.sections[1].paragraphs[0];
+        assert_eq!(head.column_type, ColumnBreakType::Section);
+        assert!(matches!(
+            head.controls.first(),
+            Some(Control::SectionDef(_))
+        ));
+        assert!(matches!(head.controls.get(1), Some(Control::ColumnDef(_))));
+        // Page 2 shows the header (carried on), the master page and the new section.
+        let page2 = s
+            .core
+            .render_page_svg_native(1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for glyph in [">머</text>", ">바</text>", ">셋</text>"] {
+            assert!(page2.contains(glyph), "page 2 shows {glyph}");
+        }
+        Ok(())
+    };
+    check(&s)?;
+    s.execute(Command::Undo)?;
+    assert_eq!(s.core.document().sections.len(), 1, "one undo step");
+    assert_eq!(
+        s.core.document().sections[0].paragraphs[1].text,
+        "둘째 셋째"
+    );
+    s.execute(Command::Redo)?;
+    check(&s)?;
+    let temp = tempfile::tempdir()?;
+    for ext in ["hwp", "hwpx"] {
+        let path = temp.path().join(format!("sections.{ext}"));
+        s.save(&path)?;
+        let mut r = Session::new()?;
+        r.open(&path)?;
+        check(&r)?;
+        if ext == "hwp" {
+            // Hangul reads no further than DocInfo's section count.
+            assert_eq!(r.core.document().doc_properties.section_count, 2);
+        }
+    }
+
+    // At the start of a section's first paragraph an empty paragraph stays behind.
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("본문".into()))?;
+    s.select(hwpcraft_doc::Cursor::default(), false)?;
+    s.run("page.section_break", json!({}))?;
+    let doc = s.core.document();
+    let texts: Vec<Vec<&str>> = doc
+        .sections
+        .iter()
+        .map(|sec| sec.paragraphs.iter().map(|p| p.text.as_str()).collect())
+        .collect();
+    assert_eq!(texts, [vec![""], vec!["본문"]]);
+    assert!(matches!(
+        doc.sections[0].paragraphs[0].controls.first(),
+        Some(Control::SectionDef(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn backspace_at_a_section_start_joins_the_sections() -> anyhow::Result<()> {
+    use hwpcraft_doc::model::paragraph::ColumnBreakType;
+    let mut s = Session::new()?;
+    s.run("page.master.set", json!({"text": "바탕"}))?;
+    s.execute(Command::Insert("앞 문단\n뒤 문단".into()))?;
+    s.select(
+        hwpcraft_doc::Cursor {
+            section: 0,
+            paragraph: 1,
+            offset: 0,
+            ..s.cursor
+        },
+        false,
+    )?;
+    s.run("page.section_break", json!({}))?;
+    s.run("page.setup", json!({"landscape": true}))?;
+    let split = |s: &Session| {
+        let doc = s.core.document();
+        assert_eq!(doc.sections.len(), 2);
+        assert!(doc.sections[1].section_def.page_def.landscape);
+        assert_eq!(doc.sections[1].section_def.master_pages.len(), 1);
+    };
+    split(&s);
+    let joined = |s: &Session| -> anyhow::Result<()> {
+        let doc = s.core.document();
+        assert_eq!(doc.sections.len(), 1);
+        let sec = &doc.sections[0];
+        let texts: Vec<&str> = sec.paragraphs.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, ["앞 문단", "뒤 문단"]);
+        // The first section's definition wins; the copied master page of the second goes.
+        assert!(!sec.section_def.page_def.landscape);
+        assert_eq!(sec.section_def.master_pages.len(), 1);
+        let second = &sec.paragraphs[1];
+        assert_eq!(second.column_type, ColumnBreakType::None);
+        assert!(
+            !second
+                .controls
+                .iter()
+                .any(|c| matches!(c, Control::SectionDef(_) | Control::ColumnDef(_)))
+        );
+        assert_eq!(second.char_offsets.first(), Some(&0));
+        assert_eq!(s.page_count()?, 1);
+        Ok(())
+    };
+    // Backspace at the second section's start; the caret stays before "뒤".
+    s.execute(Command::Backspace)?;
+    joined(&s)?;
+    assert_eq!(
+        (s.cursor.section, s.cursor.paragraph, s.cursor.offset),
+        (0, 1, 0)
+    );
+    s.execute(Command::Undo)?;
+    split(&s);
+    // Delete at the end of the first section does the same and keeps the caret.
+    s.select(
+        hwpcraft_doc::Cursor {
+            section: 0,
+            paragraph: 0,
+            offset: 4,
+            ..s.cursor
+        },
+        false,
+    )?;
+    s.execute(Command::Delete)?;
+    joined(&s)?;
+    assert_eq!(
+        (s.cursor.section, s.cursor.paragraph, s.cursor.offset),
+        (0, 0, 4)
+    );
+    let temp = tempfile::tempdir()?;
+    for ext in ["hwp", "hwpx"] {
+        let path = temp.path().join(format!("joined.{ext}"));
+        s.save(&path)?;
+        let mut r = Session::new()?;
+        r.open(&path)?;
+        joined(&r)?;
+    }
+    // The next Delete joins the paragraphs as usual.
+    s.execute(Command::Delete)?;
+    assert_eq!(
+        s.core.document().sections[0].paragraphs[0].text,
+        "앞 문단뒤 문단"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_page_inside_a_long_paragraph_is_copied_and_deleted_by_its_text() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    let words: String = (0..2400).map(|i| format!("낱말{i} ")).collect();
+    s.execute(Command::Insert(words.clone()))?;
+    assert!(s.page_count()? >= 3, "one paragraph over three pages");
+    let at = |s: &Session, page: usize| s.page_first_position(page).map(|c| c.offset);
+    let (Some(p2), Some(p3)) = (at(&s, 1), at(&s, 2)) else {
+        anyhow::bail!("page starts");
+    };
+    assert!(0 < p2 && p2 < p3);
+    let chars: Vec<char> = words.chars().collect();
+    let page2: String = chars[p2..p3].iter().collect();
+    // 쪽 복사하기 takes the text of page 2 only.
+    let r = s.run("page.copy", json!({"page": 2}))?;
+    assert_eq!(r["paragraphs"], 1);
+    s.select(
+        hwpcraft_doc::Cursor {
+            offset: chars.len(),
+            ..s.cursor
+        },
+        false,
+    )?;
+    let pages = s.page_count()?;
+    s.run("page.paste", json!({}))?;
+    let paras = &s.core.document().sections[0].paragraphs;
+    assert_eq!(paras.last().map(|p| p.text.as_str()), Some(page2.as_str()));
+    assert!(s.page_count()? > pages);
+    s.execute(Command::Undo)?;
+    // 쪽 지우기 removes that text; the paragraph stays one paragraph.
+    let pages = s.page_count()?;
+    let r = s.run("page.delete", json!({"page": 2}))?;
+    assert_eq!(r["pages"].as_u64(), Some(pages as u64 - 1), "{r}");
+    let expected: String = chars[..p2].iter().chain(&chars[p3..]).collect();
+    let paras = &s.core.document().sections[0].paragraphs;
+    assert_eq!(paras.len(), 1);
+    assert_eq!(paras[0].text, expected);
+    assert_eq!((s.cursor.paragraph, s.cursor.offset), (0, p2));
+    s.execute(Command::Undo)?;
+    assert_eq!(s.core.document().sections[0].paragraphs[0].text, words);
+    Ok(())
+}

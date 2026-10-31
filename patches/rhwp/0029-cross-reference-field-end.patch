@@ -1,0 +1,21 @@
+diff --git a/src/document_core/commands/text_editing.rs b/src/document_core/commands/text_editing.rs
+index 7640486..5474174 100644
+--- a/src/document_core/commands/text_editing.rs
++++ b/src/document_core/commands/text_editing.rs
+@@ -939,10 +939,14 @@ pub(super) fn inactive_field_end_insertions(
+         .iter()
+         .filter_map(|fr| {
+             // 메모도 끝 칸이 새 글자 앞에 남는다(스트림이 그렇다). 범위만 늘리면 저장본을
+-            // 다시 열 때 글자가 메모 안으로 들어가 모델이 달라진다.
++            // 다시 열 때 글자가 메모 안으로 들어가 모델이 달라진다. 상호 참조의 글은 갱신이
++            // 통째로 바꾸므로 끝에 이어 쓴 글이 그 안에 들어가면 다음 갱신에 지워진다.
+             match para.controls.get(fr.control_idx) {
+                 Some(Control::Field(field))
+-                    if matches!(field.field_type, FieldType::ClickHere | FieldType::Memo) => {}
++                    if matches!(
++                        field.field_type,
++                        FieldType::ClickHere | FieldType::Memo | FieldType::CrossRef
++                    ) => {}
+                 _ => return None,
+             }
+             // 빈 누름틀은 active 상태가 아직 반영되기 전 첫 입력도 값으로 받아야 한다.

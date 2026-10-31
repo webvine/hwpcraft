@@ -1,0 +1,80 @@
+diff --git a/src/parser/body_text.rs b/src/parser/body_text.rs
+index 599a773..685636a 100644
+--- a/src/parser/body_text.rs
++++ b/src/parser/body_text.rs
+@@ -1016,8 +1016,16 @@ fn parse_master_pages_from_raw(raw_records: &[RawRecord], section_flags: u32) ->
+         HeaderFooterApply::Even,
+     ];
+ 
++    // 기본 바탕쪽의 종류는 secd flags 비트가 정한다 — 한글은 있는 종류를 비트로 적고
++    // 바탕쪽을 늘 양쪽 → 짝수 → 홀수 차례로 저장한다(한글 2024 실측: 양·홀·짝 단독,
++    // 양+홀, 양+짝, 홀+짝, 셋 다를 HWP 로 저장). 종전처럼 [양, 홀, 짝] 차례로 붙이면
++    // 짝수 바탕쪽이 있는 문서에서 짝수 바탕쪽이 양쪽이나 홀수로 읽혀 엉뚱한 쪽에 그려진다.
++    // 비트가 모자라면(확장 바탕쪽 등) 종전 차례를 쓴다.
++    let flagged_kinds = master_page_kinds_from_flags(section_flags);
+     for (mp_idx, &start) in list_header_positions.iter().enumerate() {
+-        let apply_to = master_page_apply_to(section_flags, list_header_positions.len(), mp_idx)
++        let apply_to = flagged_kinds
++            .get(master_pages.len())
++            .copied()
+             .or_else(|| apply_order.get(mp_idx).copied())
+             .unwrap_or(HeaderFooterApply::Both);
+ 
+@@ -1099,18 +1107,17 @@ fn parse_master_pages_from_raw(raw_records: &[RawRecord], section_flags: u32) ->
+     master_pages
+ }
+ 
+-fn master_page_apply_to(
+-    section_flags: u32,
+-    list_header_count: usize,
+-    master_page_index: usize,
+-) -> Option<HeaderFooterApply> {
+-    const MASTER_PAGE_FLAGS_MASK: u32 = 0xe000_0000;
+-    const HANCOM_SINGLE_ODD_MASTER_PAGE_FLAGS: u32 = 0x8000_0000;
+-
+-    (list_header_count == 1
+-        && master_page_index == 0
+-        && section_flags & MASTER_PAGE_FLAGS_MASK == HANCOM_SINGLE_ODD_MASTER_PAGE_FLAGS)
+-        .then_some(HeaderFooterApply::Odd)
++/// secd flags 의 바탕쪽 종류 비트를 저장 차례(양쪽 → 짝수 → 홀수)대로 늘어놓는다.
++fn master_page_kinds_from_flags(section_flags: u32) -> Vec<HeaderFooterApply> {
++    [
++        (0x2000_0000, HeaderFooterApply::Both),
++        (0x4000_0000, HeaderFooterApply::Even),
++        (0x8000_0000, HeaderFooterApply::Odd),
++    ]
++    .into_iter()
++    .filter(|(bit, _)| section_flags & bit != 0)
++    .map(|(_, kind)| kind)
++    .collect()
+ }
+ 
+ /// 단 정의 파싱 ('cold' 컨트롤)
+diff --git a/src/parser/body_text/tests.rs b/src/parser/body_text/tests.rs
+index 7e8c05f..a1304c6 100644
+--- a/src/parser/body_text/tests.rs
++++ b/src/parser/body_text/tests.rs
+@@ -34,13 +34,16 @@ fn make_para_text_data(text: &str) -> Vec<u8> {
+ }
+ 
+ #[test]
+-fn hancom_single_odd_master_flag_is_not_parsed_as_both() {
+-    assert_eq!(
+-        master_page_apply_to(0x8008_0000, 1, 0),
+-        Some(HeaderFooterApply::Odd)
+-    );
+-    assert_eq!(master_page_apply_to(0x2008_0000, 1, 0), None);
+-    assert_eq!(master_page_apply_to(0xc008_0000, 2, 0), None);
++fn master_page_kinds_follow_the_section_flag_bits() {
++    use HeaderFooterApply::{Both, Even, Odd};
++    // 한글 2024 저장본: 양쪽 0x2000_0000, 짝수 0x4000_0000, 홀수 0x8000_0000, 저장 차례 양→짝→홀.
++    assert_eq!(master_page_kinds_from_flags(0x8008_0000), [Odd]);
++    assert_eq!(master_page_kinds_from_flags(0x2008_0000), [Both]);
++    assert_eq!(master_page_kinds_from_flags(0x4000_0000), [Even]);
++    assert_eq!(master_page_kinds_from_flags(0x6000_0000), [Both, Even]);
++    assert_eq!(master_page_kinds_from_flags(0xc008_0000), [Even, Odd]);
++    assert_eq!(master_page_kinds_from_flags(0xe000_0000), [Both, Even, Odd]);
++    assert!(master_page_kinds_from_flags(0x0008_0000).is_empty());
+ }
+ 
+ #[test]

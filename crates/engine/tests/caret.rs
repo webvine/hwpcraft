@@ -279,6 +279,28 @@ fn auto_text_overwrite_and_statistics() -> anyhow::Result<()> {
 }
 
 #[test]
+fn hyperlink_jump_follows_a_link_into_the_document() -> anyhow::Result<()> {
+    // A table of contents links each entry to its heading through a bookmark.
+    let mut s = session("차례 자리\n서론\n본문")?;
+    s.select(at(1, 0), false)?;
+    run(&mut s, "style.apply", json!({"id": 2}))?;
+    s.select(at(0, 0), false)?;
+    run(&mut s, "tools.toc", json!({}))?;
+    let t = texts(&s);
+    let entry = t.iter().position(|p| p.contains("서론\t"));
+    let heading = t.iter().rposition(|p| p == "서론");
+    let (Some(entry), Some(heading)) = (entry, heading) else {
+        anyhow::bail!("{t:?}");
+    };
+    s.select(at(entry, 1), false)?;
+    let r = run(&mut s, "hyperlink.jump", json!({}))?;
+    assert_eq!(r["jumped"], true, "{r}");
+    assert_eq!(s.cursor.paragraph, heading, "{r}");
+    assert_eq!(r["cursor"]["paragraph"], heading);
+    Ok(())
+}
+
+#[test]
 fn goto_find_all_and_hyperlink_navigation() -> anyhow::Result<()> {
     let mut s = session("첫 링크 하나\n둘째 링크 둘\n끝")?;
     s.select(at(0, 2), false)?;
@@ -294,6 +316,9 @@ fn goto_find_all_and_hyperlink_navigation() -> anyhow::Result<()> {
     assert_eq!(s.selected_text(), "링크");
     let r = run(&mut s, "hyperlink.jump", json!({}))?;
     assert_eq!(r["uri"], "https://example.com/1");
+    // An outside address is left for the caller; the caret stays.
+    assert_eq!(r["jumped"], false);
+    assert_eq!(s.cursor.paragraph, 0);
     let r = run(&mut s, "hyperlink.next", json!({}))?;
     assert_eq!(r["uri"], "https://example.com/2");
     assert_eq!(s.cursor.paragraph, 1);

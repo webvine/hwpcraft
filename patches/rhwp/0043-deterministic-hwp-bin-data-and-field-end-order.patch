@@ -1,0 +1,71 @@
+diff --git a/src/parser/hwp3/mod.rs b/src/parser/hwp3/mod.rs
+index 87e5107..daa452e 100644
+--- a/src/parser/hwp3/mod.rs
++++ b/src/parser/hwp3/mod.rs
+@@ -4461,6 +4461,13 @@ fn parse_hwp3_inner(
+             doc_bin_data_list.push(bin_data);
+         }
+     }
++    // An HWP5 picture names its BinData by position (`bin_data_id` is the 1-based
++    // index into the list), as the content above is laid out by id. The links were
++    // pushed in `HashMap` order, which changes from process to process: a document
++    // with several external pictures saved as HWP showed each picture under another
++    // one's file name when read back. Ids are handed out 1, 2, 3, ... in the order
++    // the pictures are met, so id order is that position.
++    doc_bin_data_list.sort_by_key(|bin_data| bin_data.storage_id);
+ 
+     use crate::model::document::{Section, SectionDef};
+     use crate::model::page::PageDef;
+@@ -5590,6 +5597,35 @@ mod tests {
+     use std::fs::File;
+     use std::io::Read;
+ 
++    /// Each parse hashes the picture names with a new `HashMap` seed, so a list in map
++    /// order differs between parses; in id order it is the same every time.
++    #[test]
++    fn external_picture_links_are_listed_in_id_order() {
++        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/samples/hwp3-sample10.hwp");
++        let Ok(data) = std::fs::read(path) else {
++            return;
++        };
++        let lists: Vec<Vec<(u16, Option<String>)>> = (0..8)
++            .map(|_| {
++                parse_hwp3(&data)
++                    .expect("hwp3-sample10 parses")
++                    .doc_info
++                    .bin_data_list
++                    .iter()
++                    .map(|b| (b.storage_id, b.rel_path.clone()))
++                    .collect()
++            })
++            .collect();
++        let links = lists[0].iter().filter(|(_, name)| name.is_some()).count();
++        assert!(links >= 2, "the sample links several pictures: {:?}", lists[0]);
++        for list in &lists {
++            assert_eq!(list, &lists[0]);
++            for (index, (id, _)) in list.iter().enumerate() {
++                assert_eq!(usize::from(*id), index + 1, "{list:?}");
++            }
++        }
++    }
++
+     #[test]
+     fn open_decompression_hwp3_body_rejects_output_past_limit() {
+         use std::io::Write;
+diff --git a/src/serializer/body_text.rs b/src/serializer/body_text.rs
+index e132671..1afa15f 100644
+--- a/src/serializer/body_text.rs
++++ b/src/serializer/body_text.rs
+@@ -1133,7 +1133,11 @@ fn serialize_para_text(para: &Paragraph) -> ParaTextResult {
+     // [#4402] 이 경로의 안내문 잔재는 의도적으로 되살리지 않는다 — 슬롯 위치 추정이
+     // 이미 무너진 mismatch/퇴화 경로라 주입이 개선이라 단정할 수 없다는 #3545 의
+     // HWPX 축 판단(`emit_guide_residue` 는 이 경로를 다루지 않는다)을 그대로 따른다.
+-    for end_markers in trailing_end_after_ctrl.values() {
++    // In control order: `HashMap` order changes from process to process, and with two
++    // orphans the same paragraph was written differently each time.
++    let mut orphans: Vec<_> = trailing_end_after_ctrl.iter().collect();
++    orphans.sort_by_key(|(ctrl_idx, _)| **ctrl_idx);
++    for (_, end_markers) in orphans {
+         for &marker in end_markers {
+             push_field_end_ctrl(&mut code_units, marker);
+         }

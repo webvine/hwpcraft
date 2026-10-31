@@ -1,0 +1,202 @@
+diff --git a/src/model/document.rs b/src/model/document.rs
+index a83677f..78a908f 100644
+--- a/src/model/document.rs
++++ b/src/model/document.rs
+@@ -349,6 +349,15 @@ pub struct SectionDef {
+     /// [#2779] 메모 모양 ID (HWPX `secPr@memoShapeIDRef`, header.xml `hh:memoPr@id` 참조).
+     /// HWP5 SECTION_DEF 고정 필드에는 대응 슬롯이 없어 HWPX 경로 전용 보존 필드다.
+     pub memo_shape_id: u16,
++    /// HWPX `secPr/lineNumberShape` (줄 번호 매기기) 속성을 원문 순서대로 보존한다.
++    /// 줄 번호를 그리지는 않지만, 저장할 때 템플릿 기본값(모두 0)으로 덮어
++    /// 문서의 줄 번호 설정이 사라지지 않게 한다. `None` 이면 템플릿 값을 쓴다.
++    /// HWP5 는 `secd` 확장 tail offset 10..19 에 같은 네 값을 둔다(재시작 u8, 간격 u16,
++    /// 본문과의 거리 u32, 시작 번호 u16 — 한글 2024 저장본 실측).
++    pub line_number_shape: Option<Vec<(String, String)>>,
++    /// HWPX `visibility@showLineNumber` (줄 번호 표시), HWP5 `secd` flags bit 24.
++    /// 위와 같은 이유로 보존한다.
++    pub show_line_number: bool,
+     /// CTRL_HEADER 데이터의 파싱된 필드 이후 추가 바이트 (라운드트립 보존용)
+     pub raw_ctrl_extra: Vec<u8>,
+     /// 추가 쪽 테두리/배경 (2번째, 3번째 등)
+diff --git a/src/parser/body_text.rs b/src/parser/body_text.rs
+index 036e8bf..599a773 100644
+--- a/src/parser/body_text.rs
++++ b/src/parser/body_text.rs
+@@ -896,6 +896,30 @@ fn parse_section_def(ctrl_data: &[u8], child_records: &[Record], ctrl_level: u16
+     sd.hide_empty_line = sd.flags & 0x00080000 != 0; // bit 19: 빈 줄 감추기
+     sd.page_num_type = ((sd.flags >> 20) & 0x03) as u8; // bit 20-21: 쪽 번호 종류 (0=이어서, 1=홀수, 2=짝수)
+ 
++    // 줄 번호 매기기: flags bit 24 가 표시, 확장 tail offset 10..19 가 설정이다
++    // (재시작 u8, 간격 u16, 본문과의 거리 u32, 시작 번호 u16 — 한글 2024 저장본 실측).
++    // 그리지는 않고 HWPX 로 옮겨 저장할 때 잃지 않도록 모델에 올린다.
++    sd.show_line_number = sd.flags & 0x0100_0000 != 0;
++    if let Some(t) = sd.raw_ctrl_extra.get(10..19) {
++        if t.iter().any(|b| *b != 0) {
++            sd.line_number_shape = Some(vec![
++                ("restartType".to_string(), t[0].to_string()),
++                (
++                    "countBy".to_string(),
++                    u16::from_le_bytes([t[1], t[2]]).to_string(),
++                ),
++                (
++                    "distance".to_string(),
++                    u32::from_le_bytes([t[3], t[4], t[5], t[6]]).to_string(),
++                ),
++                (
++                    "startNumber".to_string(),
++                    u16::from_le_bytes([t[7], t[8]]).to_string(),
++                ),
++            ]);
++        }
++    }
++
+     // 자식 레코드에서 PAGE_DEF, FOOTNOTE_SHAPE, PAGE_BORDER_FILL 파싱
+     let mut footnote_count = 0u32;
+     let mut border_fill_count = 0u32;
+diff --git a/src/parser/hwpx/section.rs b/src/parser/hwpx/section.rs
+index 8b490f6..58c1c48 100644
+--- a/src/parser/hwpx/section.rs
++++ b/src/parser/hwpx/section.rs
+@@ -1215,6 +1215,7 @@ fn parse_sec_pr_children(
+                     }
+                     b"startNum" => parse_start_num(e, sec_def),
+                     b"visibility" => parse_visibility(e, sec_def),
++                    b"lineNumberShape" => parse_line_number_shape(e, sec_def),
+                     b"pageBorderFill" => {
+                         let (pbf, apply_type) = parse_page_border_fill(e, reader)?;
+                         push_page_border_fill(
+@@ -1247,6 +1248,7 @@ fn parse_sec_pr_children(
+                     }
+                     b"startNum" => parse_start_num(e, sec_def),
+                     b"visibility" => parse_visibility(e, sec_def),
++                    b"lineNumberShape" => parse_line_number_shape(e, sec_def),
+                     b"pageBorderFill" => {
+                         let (pbf, apply_type) = parse_page_border_fill_empty(e);
+                         push_page_border_fill(
+@@ -1749,9 +1751,27 @@ fn parse_start_num(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef)
+ }
+ 
+ /// <hp:visibility> 요소 파싱
++/// `<hp:lineNumberShape>` — 줄 번호 매기기 설정을 속성 그대로 보존한다(표시는 하지 않음).
++fn parse_line_number_shape(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef) {
++    let attrs = e
++        .attributes()
++        .flatten()
++        .map(|attr| {
++            (
++                attr.key.as_ref().to_string(),
++                attr_str(&attr),
++            )
++        })
++        .collect();
++    sec_def.line_number_shape = Some(attrs);
++}
++
+ fn parse_visibility(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef) {
+     for attr in e.attributes().flatten() {
+         match attr.key.as_ref().as_bytes() {
++            b"showLineNumber" => {
++                sec_def.show_line_number = attr_str(&attr) == "1";
++            }
+             b"hideFirstHeader" => {
+                 sec_def.hide_header = attr_str(&attr) == "1";
+                 if sec_def.hide_header {
+diff --git a/src/serializer/hwpx/section.rs b/src/serializer/hwpx/section.rs
+index 8829aec..b71bbaa 100644
+--- a/src/serializer/hwpx/section.rs
++++ b/src/serializer/hwpx/section.rs
+@@ -98,19 +98,40 @@ fn render_visibility(sd: &SectionDef) -> String {
+         }
+     };
+     format!(
+-        r#"<hp:visibility hideFirstHeader="{}" hideFirstFooter="{}" hideFirstMasterPage="{}" border="{}" fill="{}" hideFirstPageNum="0" hideFirstEmptyLine="{}" showLineNumber="0"/>"#,
++        r#"<hp:visibility hideFirstHeader="{}" hideFirstFooter="{}" hideFirstMasterPage="{}" border="{}" fill="{}" hideFirstPageNum="0" hideFirstEmptyLine="{}" showLineNumber="{}"/>"#,
+         b(sd.hide_header),
+         b(sd.hide_footer),
+         b(sd.hide_master_page),
+         bf(sd.hide_border, sd.first_page_border),
+         bf(sd.hide_fill, sd.first_page_fill),
+         b(sd.hide_empty_line),
++        b(sd.show_line_number),
+     )
+ }
+ 
+-/// 템플릿의 visibility 고정 문자열을 IR 기반 값으로 1회 치환.
++/// 템플릿의 줄 번호 매기기 기본값(모두 0). 원본 HWPX 에 값이 있으면 그대로 다시 쓴다.
++const TEMPLATE_LINE_NUMBER_SHAPE: &str =
++    r#"<hp:lineNumberShape restartType="0" countBy="0" distance="0" startNumber="0"/>"#;
++
++/// 템플릿의 visibility 고정 문자열을 IR 기반 값으로 1회 치환하고, 줄 번호 매기기
++/// 설정(`lineNumberShape`)이 있으면 원본 속성 그대로 되살린다.
+ fn replace_visibility(xml: &str, sd: &SectionDef) -> String {
+-    xml.replacen(TEMPLATE_VISIBILITY, &render_visibility(sd), 1)
++    let out = xml.replacen(TEMPLATE_VISIBILITY, &render_visibility(sd), 1);
++    match &sd.line_number_shape {
++        Some(attrs) => {
++            let mut element = String::from("<hp:lineNumberShape");
++            for (key, value) in attrs {
++                element.push_str(&format!(
++                    r#" {}="{}""#,
++                    super::utils::xml_escape(key),
++                    super::utils::xml_escape(value)
++                ));
++            }
++            element.push_str("/>");
++            out.replacen(TEMPLATE_LINE_NUMBER_SHAPE, &element, 1)
++        }
++        None => out,
++    }
+ }
+ 
+ /// [#1987] 템플릿 secPr 의 하드코딩 스칼라(spaceColumns, outlineShapeIDRef, memoShapeIDRef 등)를
+diff --git a/src/document_core/converters/hwpx_to_hwp.rs b/src/document_core/converters/hwpx_to_hwp.rs
+index 26bbee5..1d23ef5 100644
+--- a/src/document_core/converters/hwpx_to_hwp.rs
++++ b/src/document_core/converters/hwpx_to_hwp.rs
+@@ -1828,6 +1828,7 @@ fn adapt_section_def(
+     materialize_single_master_page_flags(section_def, report);
+     materialize_multi_master_page_flags(section_def, report);
+     materialize_section_def_ctrl_tail(section_def, file_version, report);
++    materialize_section_def_line_numbers(section_def);
+ 
+     for master_page in &mut section_def.master_pages {
+         adapt_paragraphs_with_context(
+@@ -1838,6 +1839,38 @@ fn adapt_section_def(
+     }
+ }
+ 
++/// 줄 번호 매기기를 HWP5 자리로 옮긴다 — flags bit 24(표시)와 확장 tail offset 10..19
++/// (재시작 u8, 간격 u16, 본문과의 거리 u32, 시작 번호 u16 — 한글 2024 저장본 실측).
++///
++/// HWP5 원본은 파서가 같은 자리에서 읽어 온 값이므로 같은 바이트가 다시 적힌다.
++/// 구 계약(10 byte tail)에는 자리가 없어 표시 비트만 옮긴다.
++fn materialize_section_def_line_numbers(section_def: &mut SectionDef) {
++    const SHOW_LINE_NUMBER_FLAG: u32 = 0x0100_0000;
++
++    if section_def.show_line_number {
++        section_def.flags |= SHOW_LINE_NUMBER_FLAG;
++    } else {
++        section_def.flags &= !SHOW_LINE_NUMBER_FLAG;
++    }
++    let Some(attrs) = &section_def.line_number_shape else {
++        return;
++    };
++    let Some(tail) = section_def.raw_ctrl_extra.get_mut(10..19) else {
++        return;
++    };
++    let value = |key: &str| {
++        attrs
++            .iter()
++            .find(|(k, _)| k == key)
++            .and_then(|(_, v)| v.parse::<u32>().ok())
++            .unwrap_or(0)
++    };
++    tail[0] = value("restartType") as u8;
++    tail[1..3].copy_from_slice(&(value("countBy") as u16).to_le_bytes());
++    tail[3..7].copy_from_slice(&value("distance").to_le_bytes());
++    tail[7..9].copy_from_slice(&(value("startNumber") as u16).to_le_bytes());
++}
++
+ fn materialize_section_def_hide_empty_line_flag(
+     section_def: &mut SectionDef,
+     report: &mut AdapterReport,

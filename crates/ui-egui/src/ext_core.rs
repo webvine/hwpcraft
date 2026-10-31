@@ -148,6 +148,7 @@ impl HwpApp {
                             ui.label("번호");
                             let edit = ui
                                 .add(egui::TextEdit::singleline(&mut g.value).desired_width(80.0));
+                            chrome::first_focus(&edit);
                             if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                                 apply = true;
                             }
@@ -157,7 +158,8 @@ impl HwpApp {
                 ui.vertical(|ui| {
                     let valid = g.kind == GotoKind::Bookmark
                         || g.value.trim().parse::<usize>().is_ok_and(|n| n >= 1);
-                    let (a, c) = chrome::actions(ui, valid, "이동");
+                    let grey = (!valid).then_some("이동할 번호를 1 이상의 수로 넣으세요.");
+                    let (a, c) = chrome::actions(ui, grey, "이동(D)");
                     apply |= a;
                     cancel |= c;
                 });
@@ -221,7 +223,7 @@ impl HwpApp {
                     );
                 });
                 ui.vertical(|ui| {
-                    let (a, c) = chrome::actions(ui, true, "실행");
+                    let (a, c) = chrome::actions(ui, None, "실행(D)");
                     apply = a;
                     cancel |= c;
                 });
@@ -282,7 +284,9 @@ impl HwpApp {
                 });
                 ui.vertical(|ui| {
                     let valid = marks.iter().any(|m| m.2 && m.1 > 0);
-                    let (a, c) = chrome::actions(ui, valid, "지우기");
+                    let grey = (!valid)
+                        .then_some("지울 조판 부호를 하나 이상 고르세요. 문서에 없는 종류(0개)는 지울 것이 없습니다.");
+                    let (a, c) = chrome::actions(ui, grey, "지우기(D)");
                     apply = a;
                     cancel |= c;
                 });

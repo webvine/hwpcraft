@@ -1,0 +1,367 @@
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index e88f9e8..30a15c5 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -8132,9 +8132,122 @@ impl DocumentCore {
+         // 두 그림의 미세한 세로 스케일 차이로 인한 잔상(이중 라인) 제거.
+         // build 직후 1회만 적용 — 모든 렌더러(SVG/Canvas/Skia/HTML/Layer) 공통.
+         tree.clip_overlapping_same_bin_images();
++        // [HwpCraft 0037] 줄 번호 — 구역에서 켜 있을 때만 그린다(끈 문서의 쪽은 그대로).
++        if let Some((numbers, count_by, distance)) = self.page_line_numbers(sec_idx, page_content) {
++            crate::renderer::layout::draw_line_numbers(
++                &mut tree,
++                &page_content.layout,
++                &numbers,
++                count_by,
++                distance,
++                &self.styles,
++            );
++        }
+         Ok(tree)
+     }
+ 
++    /// [HwpCraft 0037] 한 쪽의 본문 줄 (문단, 줄) 순서. 쪽 항목 순서대로, 빈 줄 감추기로
++    /// 감춘 문단과 미주 문단은 뺀다. 줄 수는 그 문단의 조판 줄 수다.
++    fn page_body_lines(&self, sec_idx: usize, page: &PageContent) -> Vec<(usize, usize)> {
++        use crate::renderer::pagination::PageItem;
++        let paragraph_count = self
++            .document
++            .sections
++            .get(sec_idx)
++            .map_or(0, |s| s.paragraphs.len());
++        let hidden = self.pagination.get(sec_idx).map(|p| &p.hidden_empty_paras);
++        let lines_of = |pi: usize| {
++            self.composed
++                .get(sec_idx)
++                .and_then(|c| c.get(pi))
++                .map(|c| c.lines.len())
++                .filter(|n| *n > 0)
++                .unwrap_or(1)
++        };
++        let mut out = Vec::new();
++        for column in &page.column_contents {
++            for item in &column.items {
++                let (pi, range) = match item {
++                    PageItem::FullParagraph { para_index } => {
++                        (*para_index, 0..lines_of(*para_index))
++                    }
++                    PageItem::PartialParagraph {
++                        para_index,
++                        start_line,
++                        end_line,
++                    } => (*para_index, *start_line..*end_line),
++                    _ => continue,
++                };
++                if pi >= paragraph_count || hidden.is_some_and(|h| h.contains(&pi)) {
++                    continue;
++                }
++                out.extend(range.map(|li| (pi, li)));
++            }
++        }
++        out
++    }
++
++    /// [HwpCraft 0037] 이 쪽의 줄 번호: (문단, 줄) → 번호, 번호 간격, 본문과의 거리(px).
++    /// restartType 은 한글 자동화 표(LineNumberRestart)의 뜻으로 읽는다: 1 쪽마다,
++    /// 2 구역마다, 그 밖(0 기본, 3 이어서)은 앞 구역의 번호에 이어 매긴다.
++    fn page_line_numbers(
++        &self,
++        sec_idx: usize,
++        page: &PageContent,
++    ) -> Option<(std::collections::HashMap<(usize, usize), u32>, u32, f64)> {
++        let setting = |def: &crate::model::document::SectionDef, key: &str| -> u32 {
++            def.line_number_shape
++                .as_ref()
++                .and_then(|attrs| attrs.iter().find(|(k, _)| k == key))
++                .and_then(|(_, v)| v.parse().ok())
++                .unwrap_or(0)
++        };
++        let def = &self.document.sections.get(sec_idx)?.section_def;
++        if !def.show_line_number {
++            return None;
++        }
++        // The number of this page's first line: walk the numbered sections and pages before.
++        let mut next: Option<u32> = None;
++        let mut first = None;
++        'sections: for (si, section) in self.document.sections.iter().enumerate().take(sec_idx + 1)
++        {
++            let sd = &section.section_def;
++            if !sd.show_line_number {
++                continue;
++            }
++            let start = setting(sd, "startNumber").max(1);
++            let restart = setting(sd, "restartType");
++            if restart == 2 || next.is_none() {
++                next = Some(start);
++            }
++            for p in self
++                .pagination
++                .get(si)
++                .map(|r| r.pages.as_slice())
++                .unwrap_or(&[])
++            {
++                if restart == 1 {
++                    next = Some(start);
++                }
++                if si == sec_idx && p.page_index == page.page_index {
++                    first = next;
++                    break 'sections;
++                }
++                let lines = self.page_body_lines(si, p).len() as u32;
++                next = next.map(|n| n.saturating_add(lines));
++            }
++        }
++        let mut number = first.or(next)?;
++        let mut numbers = std::collections::HashMap::new();
++        for key in self.page_body_lines(sec_idx, page) {
++            numbers.insert(key, number);
++            number = number.saturating_add(1);
++        }
++        let count_by = setting(def, "countBy").max(1);
++        let distance = crate::renderer::hwpunit_to_px(setting(def, "distance") as i32, self.dpi);
++        Some((numbers, count_by, distance))
++    }
++
+     /// 한 페이지의 번호 문단을 replay하여 카운터를 전진시킨다.
+     fn replay_numbering_page(
+         &self,
+@@ -10534,3 +10647,121 @@ mod footnote_page_numbering_tests {
+         assert_eq!(numbers, [vec![1, 2, 3], vec![3, 1], vec![1]]);
+     }
+ }
++
++#[cfg(test)]
++mod hwpcraft_line_number_tests {
++    use crate::document_core::DocumentCore;
++
++    /// A blank document with `lines` one-line paragraphs and the given line numbering.
++    fn numbered(lines: usize, show: bool, restart: u32, count_by: u32) -> DocumentCore {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        for i in 0..lines {
++            if i > 0 {
++                core.split_paragraph_native(0, i - 1, 1, None).unwrap();
++            }
++            core.insert_text_native(0, i, 0, "가").unwrap();
++        }
++        let mut doc = core.document().clone();
++        let def = &mut doc.sections[0].section_def;
++        def.show_line_number = show;
++        def.line_number_shape = Some(vec![
++            ("restartType".into(), restart.to_string()),
++            ("countBy".into(), count_by.to_string()),
++            ("distance".into(), "1417".into()),
++            ("startNumber".into(), "1".into()),
++        ]);
++        core.set_document(doc);
++        core
++    }
++
++    /// The line numbers drawn on `page` (text runs outside any paragraph), top to bottom,
++    /// with their x.
++    fn drawn(core: &DocumentCore, page: u32) -> Vec<(u32, f64)> {
++        drawn_from(core, page, false)
++    }
++
++    fn drawn_from(core: &DocumentCore, page: u32, cached: bool) -> Vec<(u32, f64)> {
++        use crate::renderer::render_tree::{RenderNode, RenderNodeType};
++        fn walk(node: &RenderNode, out: &mut Vec<(u32, f64, f64)>) {
++            if let RenderNodeType::TextRun(run) = &node.node_type {
++                if run.para_index.is_none() {
++                    if let Ok(n) = run.text.parse() {
++                        out.push((n, node.bbox.y, node.bbox.x));
++                    }
++                }
++            }
++            for child in &node.children {
++                walk(child, out);
++            }
++        }
++        let tree = if cached {
++            core.build_page_tree_cached(page).unwrap()
++        } else {
++            core.build_page_render_tree(page).unwrap()
++        };
++        let mut out = Vec::new();
++        walk(&tree.root, &mut out);
++        out.sort_by(|a, b| a.1.total_cmp(&b.1));
++        out.into_iter().map(|(n, _, x)| (n, x)).collect()
++    }
++
++    fn numbers(core: &DocumentCore, page: u32) -> Vec<u32> {
++        drawn(core, page).into_iter().map(|(n, _)| n).collect()
++    }
++
++    #[test]
++    fn a_later_section_follows_a_line_added_before_it() {
++        // Two one-page sections numbered on: section 2 continues section 1.
++        let mut core = numbered(3, true, 3, 1);
++        let mut doc = core.document().clone();
++        let second = doc.sections[0].clone();
++        doc.sections.push(second);
++        core.set_document(doc);
++        assert_eq!(core.page_count(), 2);
++        let cached = |core: &DocumentCore| -> Vec<u32> {
++            drawn_from(core, 1, true)
++                .into_iter()
++                .map(|(n, _)| n)
++                .collect()
++        };
++        assert_eq!(cached(&core), vec![4, 5, 6]);
++        // A line added in section 1 renumbers section 2's kept page.
++        core.split_paragraph_native(0, 0, 1, None).unwrap();
++        assert_eq!(cached(&core), vec![5, 6, 7]);
++    }
++
++    #[test]
++    fn line_numbers_are_drawn_only_when_shown_and_follow_count_and_restart() {
++        // Off: the page is drawn exactly as without the setting.
++        let off = numbered(60, false, 0, 1);
++        let plain = numbered(60, false, 0, 1);
++        assert_eq!(
++            off.render_page_svg_native(0).unwrap(),
++            plain.render_page_svg_native(0).unwrap()
++        );
++        assert!(numbers(&off, 0).is_empty());
++        // On, every line, numbered on: page 2 continues page 1.
++        let on = numbered(60, true, 3, 1);
++        assert!(on.pagination[0].pages.len() >= 2, "two pages");
++        let first = numbers(&on, 0);
++        assert_eq!(first[0], 1);
++        assert_eq!(first, (1..=first.len() as u32).collect::<Vec<_>>());
++        let second = numbers(&on, 1);
++        assert_eq!(second[0], first.len() as u32 + 1);
++        // Restart per page (1): page 2 starts at 1 again.
++        let per_page = numbered(60, true, 1, 1);
++        assert_eq!(numbers(&per_page, 1)[0], 1);
++        // Every fifth line only.
++        let fifth = numbered(60, true, 3, 5);
++        let shown = numbers(&fifth, 0);
++        assert!(
++            !shown.is_empty() && shown.iter().all(|n| n % 5 == 0),
++            "{shown:?}"
++        );
++        // The numbers end 5 mm (`distance` 1417) left of the body.
++        let body_left = on.pagination[0].pages[0].layout.body_area.x;
++        let (_, x) = drawn(&on, 0)[0];
++        assert!(x < body_left - 15.0, "{x} vs {body_left}");
++    }
++}
+diff --git a/src/renderer/layout.rs b/src/renderer/layout.rs
+index 453bb7f..803dbfb 100644
+--- a/src/renderer/layout.rs
++++ b/src/renderer/layout.rs
+@@ -16903,3 +16903,113 @@ fn compute_tac_leading_width(
+     }
+     width
+ }
++
++/// [HwpCraft 0037] 줄 번호: 본문 단의 줄(표·글상자·묶음·각주·머리말/꼬리말 밖)마다
++/// `numbers` 의 (문단, 줄) 번호가 `count_by` 의 배수이면 그 줄이 놓인 단의 왼쪽에서
++/// `distance` 만큼 띄워 오른쪽 맞춤으로, 줄의 기준선에 맞춰 그린다. 글꼴은 첫 글자
++/// 모양(바탕글)이다. 한글 화면과 대조하지 못한 배치다.
++pub(crate) fn draw_line_numbers(
++    tree: &mut PageRenderTree,
++    layout: &PageLayoutInfo,
++    numbers: &std::collections::HashMap<(usize, usize), u32>,
++    count_by: u32,
++    distance: f64,
++    styles: &ResolvedStyleSet,
++) {
++    type Line = (Option<u16>, BoundingBox, f64, usize, usize);
++    fn walk(node: &RenderNode, column: Option<u16>, inside_body: bool, out: &mut Vec<Line>) {
++        match &node.node_type {
++            RenderNodeType::Table(_)
++            | RenderNodeType::TableCell(_)
++            | RenderNodeType::TextBox
++            | RenderNodeType::Group(_)
++            | RenderNodeType::FootnoteArea
++            | RenderNodeType::Header
++            | RenderNodeType::Footer
++            | RenderNodeType::MasterPage => return,
++            RenderNodeType::TextLine(line) => {
++                if inside_body {
++                    if let (Some(para), Some(index)) = (line.para_index, line.line_index) {
++                        out.push((column, node.bbox, line.baseline, para, index as usize));
++                    }
++                }
++                return;
++            }
++            _ => {}
++        }
++        let column = match node.node_type {
++            RenderNodeType::Column(c) => Some(c),
++            _ => column,
++        };
++        let inside = inside_body || matches!(node.node_type, RenderNodeType::Body { .. });
++        for child in &node.children {
++            walk(child, column, inside, out);
++        }
++    }
++    let mut lines = Vec::new();
++    walk(&tree.root, None, false, &mut lines);
++    let count_by = count_by.max(1);
++    let base = styles.char_styles.first();
++    let font_size = base
++        .map(|style| style.font_size)
++        .filter(|size| *size > 0.0)
++        .unwrap_or(10.0 * layout.dpi / 72.0);
++    let style = TextStyle {
++        font_family: base
++            .and_then(|style| style.font_families.first())
++            .filter(|family| !family.is_empty())
++            .cloned()
++            .unwrap_or_else(|| "바탕".to_string()),
++        font_size,
++        color: base.map(|style| style.text_color).unwrap_or(0x000000),
++        ..Default::default()
++    };
++    let mut drawn = std::collections::HashSet::new();
++    for (column, bbox, baseline, para, index) in lines {
++        let Some(&number) = numbers.get(&(para, index)) else {
++            continue;
++        };
++        if number % count_by != 0 || !drawn.insert((para, index)) {
++            continue;
++        }
++        let text = number.to_string();
++        let width = estimate_text_width(&text, &style);
++        let left = column
++            .and_then(|c| layout.column_areas.get(c as usize))
++            .map_or(layout.body_area.x, |area| area.x);
++        let x = left - distance - width;
++        let y = bbox.y + baseline;
++        let line_id = tree.next_id();
++        let mut line_node = RenderNode::new(
++            line_id,
++            RenderNodeType::TextLine(TextLineNode::new(font_size * 1.2, font_size)),
++            BoundingBox::new(x, y - font_size, width, font_size * 1.2),
++        );
++        let run_id = tree.next_id();
++        line_node.children.push(RenderNode::new(
++            run_id,
++            RenderNodeType::TextRun(TextRunNode {
++                text,
++                style: style.clone(),
++                char_shape_id: None,
++                para_shape_id: None,
++                section_index: None,
++                para_index: None,
++                char_start: None,
++                cell_context: None,
++                is_para_end: true,
++                is_line_break_end: false,
++                rotation: 0.0,
++                is_vertical: false,
++                char_overlap: None,
++                border_fill_id: 0,
++                baseline: font_size,
++                field_marker: FieldMarkerType::None,
++                layout_positions: None,
++                display_text: None,
++            }),
++            BoundingBox::new(x, y - font_size, width, font_size),
++        ));
++        tree.root.children.push(line_node);
++    }
++}

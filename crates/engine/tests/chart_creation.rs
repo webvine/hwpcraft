@@ -400,13 +400,13 @@ fn discovery_and_definition_are_live_readonly_and_legacy_shapes_remain_compatibl
     let mut s = Session::new()?;
     let before = state(&s);
     let types = s.run("chart.types", json!({}))?;
-    assert_eq!(types["types"].as_array().context("types")?.len(), 11);
+    assert_eq!(types["types"].as_array().context("types")?.len(), 15);
     assert!(
         types["unsupported"]
             .as_array()
             .context("unsupported")?
             .iter()
-            .any(|v| v["kind"] == "area")
+            .any(|v| v["kind"] == "surface")
     );
     assert_eq!(state(&s), before);
     for kind in ["column", "bar", "line", "pie", "doughnut"] {
@@ -456,8 +456,7 @@ fn extended_invalid_data_and_unknown_xml_settings_preserve_everything() -> Resul
     let mut stock = extended_spec("stock_ohlc");
     stock["series"][0]["values"][0] = json!(1);
     bad.push(stock);
-    bad.push(spec("area"));
-    bad.push(spec("radar"));
+    bad.push(spec("surface"));
     bad.push(spec("line_3d"));
     for value in bad {
         let before = state(&s);

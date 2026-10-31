@@ -15,33 +15,39 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("memo.get", "메모 조회", ""),
     ("memo.create", "메모 만들기", ""),
     ("memo.update", "메모 내용·작성자 고치기", ""),
+    ("memo.reply", "메모에 댓글 달기", ""),
     ("memo.delete", "메모 지우기 (본문 유지)", ""),
 ];
 
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "memo.list",
-        "No parameters. Native memo fields with id, author, content and anchor. Existing table comments are listed but editing currently requires a body anchor.",
+        "매개 변수 없음. 메모 필드마다 id, author, content, anchor. 표 셀 메모도 나열합니다.",
         "{}",
     ),
     (
         "memo.get",
-        "id: the unique field id returned by memo.create/list. Does not change selection.",
+        "id: memo.create/list가 돌려준 필드 id. 선택은 바뀌지 않습니다.",
         r#"{"id":1}"#,
     ),
     (
         "memo.create",
-        "text (up to 1 MiB), author? (default 사용자), expected_generation?. Anchors the current single body-paragraph selection, or an empty caret range. Does not replace anchor text. A stale expected_generation fails before mutation.",
+        "text(1 MiB까지), author?(기본 사용자; 데스크톱의 개인 정보 이름은 여기 쓰이지 않음), expected_generation?. 지금 본문 한 문단 안의 선택, 또는 빈 캐럿 범위에 메모를 답니다. 범위 글은 바꾸지 않습니다. expected_generation이 낡았으면 바꾸기 전에 실패합니다.",
         r#"{"text":"내용을 확인해 주세요.","author":"검토자"}"#,
     ),
     (
         "memo.update",
-        "id; text? and author? replace the native comment content/author. At least one is required. expected_generation? is the generation returned by memo.get/list; stale drafts fail without mutation. Reply threads/resolved status are not implemented by this command.",
+        "id; text?와 author?로 메모 내용·작성자를 바꿉니다(하나는 있어야 함). expected_generation?은 memo.get/list가 준 값이며 낡은 초안은 바꾸지 않고 실패합니다. 한글 메모에는 해결 상태가 없어 제공하지 않습니다.",
         r#"{"id":1,"text":"수정한 메모"}"#,
     ),
     (
+        "memo.reply",
+        "id(메모 또는 그 스레드의 아무 댓글), text, author?(기본 사용자), expected_generation?. 한글이 저장하는 방식대로 댓글을 답니다: 같은 글에 단 또 하나의 메모를 스레드 안쪽에 중첩. memo.list의 댓글에는 replyTo(스레드 첫 메모)와 바깥에서 안쪽 순서의 thread가 있습니다. 빈 캐럿 범위의 메모에는 댓글을 달 수 없습니다. 한 번 실행 취소.",
+        r#"{"id":1,"text":"반영했습니다.","author":"작성자"}"#,
+    ),
+    (
         "memo.delete",
-        "id, expected_generation?; removes only the memo field and content. Anchor text and formatting are preserved. One undo step. Stale generations fail before mutation.",
+        "id, expected_generation?. 메모 필드와 내용을 지우며, 스레드 첫 메모면 댓글도 모두 지웁니다(결과: removedIds). 범위 글과 서식은 그대로입니다. 한 번 실행 취소. 낡은 generation은 바꾸기 전에 실패합니다.",
         r#"{"id":1}"#,
     ),
 ];
@@ -62,6 +68,17 @@ struct Id {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Create {
+    text: String,
+    #[serde(default = "default_author")]
+    author: String,
+    #[serde(default)]
+    expected_generation: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Reply {
+    id: u32,
     text: String,
     #[serde(default = "default_author")]
     author: String,
@@ -94,6 +111,16 @@ fn check_generation(session: &Session, expected: Option<u64>) -> Result<()> {
         bail!("문서가 메모를 불러온 뒤 변경되었습니다. 메모를 다시 불러오세요.");
     }
     Ok(())
+}
+
+/// The creation-time tokens of a new memo's command (`MEMO/shape/n/<low>/<high>/…`),
+/// as Hangul 2024 writes them: the FILETIME of now. Existing values are kept as read.
+fn filetime_tokens() -> (u32, u32) {
+    let since_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() / 100);
+    let filetime = (since_unix + 116_444_736_000_000_000) as u64;
+    (filetime as u32, (filetime >> 32) as u32)
 }
 
 fn default_author() -> String {
@@ -244,17 +271,17 @@ fn update_field(field: &mut Field, text: Option<Vec<Paragraph>>, by: Option<&str
 /// Re-lay out the memo's anchor paragraph and rebuild only its section after a
 /// field-metadata edit. Rebuilding the whole document here (clone + set_document)
 /// recomposed and repaginated every section: ~2 s per memo edit on a 381-page file.
-fn relayout_paragraph(s: &mut Session, section: usize, paragraph: usize) -> Result<()> {
-    let shape = s
-        .core
+/// Lay out the memo's body paragraph again after its field was edited in the
+/// model. Only that paragraph changed, so RHWP's undo keeps the other sections.
+fn relayout_paragraph(s: &mut Session, at: Cursor) -> Result<()> {
+    s.core
         .document()
         .sections
-        .get(section)
-        .and_then(|x| x.paragraphs.get(paragraph))
-        .map(|p| p.para_shape_id)
+        .get(at.section)
+        .and_then(|x| x.paragraphs.get(at.paragraph))
         .ok_or_else(|| anyhow!("메모 문단을 찾지 못했습니다."))?;
     s.core
-        .set_para_shape_id_native(section, paragraph, shape)
+        .relayout_paragraph_native(at.section, at.paragraph, at.cell.map(|c| c.control))
         .map_err(err)?;
     Ok(())
 }
@@ -273,38 +300,84 @@ struct Location {
     cursor: Cursor,
     control: usize,
 }
+/// The memo with this id in a body paragraph or a paragraph of a table cell
+/// (one table level, as the caret addresses cells).
 fn find_body(doc: &Document, id: u32) -> Result<Location> {
     let mut found = None;
+    let mut visit = |paragraph: &Paragraph, cursor: Cursor| -> Result<()> {
+        for (control, c) in paragraph.controls.iter().enumerate() {
+            if matches!(c, Control::Field(f) if is_memo(f) && f.field_id == id) {
+                if found.is_some() {
+                    bail!("중복 메모 ID는 편집할 수 없습니다: {id}");
+                }
+                found = Some(Location { cursor, control });
+            }
+        }
+        Ok(())
+    };
     for (section, s) in doc.sections.iter().enumerate() {
         for (paragraph, p) in s.paragraphs.iter().enumerate() {
+            let body = Cursor {
+                section,
+                paragraph,
+                ..Default::default()
+            };
+            visit(p, body)?;
             for (control, c) in p.controls.iter().enumerate() {
-                if matches!(c, Control::Field(f) if is_memo(f) && f.field_id == id) {
-                    if found.is_some() {
-                        bail!("중복 메모 ID는 편집할 수 없습니다: {id}");
+                let Control::Table(table) = c else { continue };
+                for (index, value) in table.cells.iter().enumerate() {
+                    for (cell_paragraph, cp) in value.paragraphs.iter().enumerate() {
+                        let cell = Some(Cell {
+                            control,
+                            index,
+                            paragraph: cell_paragraph,
+                        });
+                        visit(cp, Cursor { cell, ..body })?;
                     }
-                    found = Some(Location {
-                        cursor: Cursor {
-                            section,
-                            paragraph,
-                            ..Default::default()
-                        },
-                        control,
-                    });
                 }
             }
         }
     }
-    found.ok_or_else(|| anyhow!("본문 메모 ID를 찾을 수 없습니다: {id}. 셀/중첩 문맥의 메모 편집은 아직 지원하지 않습니다."))
+    found.ok_or_else(|| {
+        anyhow!(
+            "메모 ID를 찾을 수 없습니다: {id}. 본문과 표 셀(한 단계)의 메모만 편집할 수 있습니다."
+        )
+    })
+}
+/// The paragraph a cursor addresses: a body paragraph or a cell paragraph.
+fn paragraph_mut(doc: &mut Document, at: Cursor) -> Option<&mut Paragraph> {
+    let body = doc
+        .sections
+        .get_mut(at.section)?
+        .paragraphs
+        .get_mut(at.paragraph)?;
+    match at.cell {
+        None => Some(body),
+        Some(cell) => match body.controls.get_mut(cell.control)? {
+            Control::Table(table) => table
+                .cells
+                .get_mut(cell.index)?
+                .paragraphs
+                .get_mut(cell.paragraph),
+            _ => None,
+        },
+    }
 }
 fn field_mut<'a>(doc: &'a mut Document, at: &Location) -> Result<&'a mut Field> {
-    match doc
-        .sections
-        .get_mut(at.cursor.section)
-        .and_then(|s| s.paragraphs.get_mut(at.cursor.paragraph))
-        .and_then(|p| p.controls.get_mut(at.control))
-    {
+    match paragraph_mut(doc, at.cursor).and_then(|p| p.controls.get_mut(at.control)) {
         Some(Control::Field(field)) if is_memo(field) => Ok(field),
         _ => bail!("메모 주소가 더 이상 유효하지 않습니다."),
+    }
+}
+/// RHWP's range-field target for a body or cell paragraph.
+fn field_target(at: Cursor) -> HyperlinkTarget {
+    HyperlinkTarget {
+        section: at.section,
+        para: at.paragraph,
+        cell_path: at
+            .cell
+            .map(|c| vec![(c.control, c.index, c.paragraph)])
+            .unwrap_or_default(),
     }
 }
 fn collect_fields<'a>(paragraphs: &'a [Paragraph], fields: &mut Vec<&'a Field>) {
@@ -429,6 +502,9 @@ impl Session {
             "memo.create" => serde_json::from_value::<Create>(params.clone())
                 .map_err(anyhow::Error::from)
                 .and_then(|p| self.create_memo(p)),
+            "memo.reply" => serde_json::from_value::<Reply>(params.clone())
+                .map_err(anyhow::Error::from)
+                .and_then(|p| self.reply_memo(p)),
             "memo.update" => serde_json::from_value::<Update>(params.clone())
                 .map_err(anyhow::Error::from)
                 .and_then(|p| self.update_memo(p)),
@@ -464,7 +540,7 @@ impl Session {
                             .iter()
                             .map(|p| p.text.as_str())
                             .collect();
-                        out.push(json!({"id":field.field_id,"index":memo_number(field),"at":at,"author":author(field),"anchor":anchor,"start":range.map(|r|r.start_char_idx),"end":range.map(|r|r.end_char_idx),"paragraphs":paragraphs,"text":paragraphs.join("\n"),"contentAvailable":!field.memo_paragraphs.is_empty(),"editable":address.get("cell").is_none(),"threadingSupported":false,"resolvedStateSupported":false}));
+                        out.push(json!({"id":field.field_id,"index":memo_number(field),"at":at,"author":author(field),"anchor":anchor,"start":range.map(|r|r.start_char_idx),"end":range.map(|r|r.end_char_idx),"paragraphs":paragraphs,"text":paragraphs.join("\n"),"contentAvailable":!field.memo_paragraphs.is_empty(),"editable":true,"threadingSupported":true,"resolvedStateSupported":false}));
                     }
                     Control::Table(table) => {
                         for (cell, value) in table.cells.iter().enumerate() {
@@ -489,8 +565,27 @@ impl Session {
                 );
             }
         }
+        // Memos on the same text in one paragraph form a thread (Hangul's 댓글), first
+        // memo outermost; later ones reply to it, numbered from outside in.
+        let mut first: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         for item in &mut out {
             item["generation"] = json!(self.generation);
+            let mut at = item["at"].clone();
+            at.as_object_mut().map(|o| o.remove("control"));
+            let key = format!("{at}:{}:{}", item["start"], item["end"]);
+            let empty = item["start"] == item["end"];
+            match first.get_mut(&key) {
+                Some((root, count)) if !empty => {
+                    *count += 1;
+                    item["replyTo"] = json!(root);
+                    item["thread"] = json!(*count);
+                }
+                _ => {
+                    first.insert(key, (item["id"].as_u64().unwrap_or(0), 0));
+                    item["replyTo"] = Value::Null;
+                    item["thread"] = json!(0);
+                }
+            }
         }
         json!(out)
     }
@@ -513,9 +608,6 @@ impl Session {
         let content = body_paragraphs(&request.text)?;
         self.guard_protected()?;
         let cursor = self.cursor;
-        if cursor.cell.is_some() {
-            bail!("새 메모는 본문의 한 문단 안에서만 만들 수 있습니다.");
-        }
         if self.span_anchor.is_some() {
             bail!("여러 문단에 걸친 메모는 아직 지원하지 않습니다.");
         }
@@ -540,19 +632,54 @@ impl Session {
             .ok_or_else(|| anyhow!("메모 번호 공간이 소진되었습니다."))?;
         let mut created_id = 0;
         self.transaction(|s| {
+            created_id = s.place_memo(cursor, start, end, index, &request.author, content)?;
+            Ok(())
+        })?;
+        self.memo_get(created_id)
+    }
+
+    /// The next memo number in the document.
+    fn next_memo_number(&self) -> Result<u32> {
+        let mut fields = Vec::new();
+        for section in &self.core.document().sections {
+            collect_fields(&section.paragraphs, &mut fields);
+        }
+        fields
+            .iter()
+            .filter(|f| is_memo(f))
+            .map(|f| memo_number(f))
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .filter(|x| *x <= u32::from(u16::MAX))
+            .ok_or_else(|| anyhow!("메모 번호 공간이 소진되었습니다."))
+    }
+
+    /// A memo field over `start..end` of the paragraph at `cursor` (a caret slot when
+    /// empty), inside the caller's transaction. Returns its field id.
+    fn place_memo(
+        &mut self,
+        cursor: Cursor,
+        start: usize,
+        end: usize,
+        index: u32,
+        author: &str,
+        content: Vec<Paragraph>,
+    ) -> Result<u32> {
+        let s = self;
+        {
             let id = if start < end {
                 s.core
                     .insert_hyperlink_native(
-                        &HyperlinkTarget::body(cursor.section, cursor.paragraph),
+                        &field_target(cursor),
                         start,
                         end,
                         "https://invalid.invalid/field-anchor",
                     )
                     .map_err(err)?
             } else {
-                let raw = s
-                    .core
-                    .insert_click_here_field_at(
+                let raw = match cursor.cell {
+                    None => s.core.insert_click_here_field_at(
                         cursor.section,
                         cursor.paragraph,
                         start,
@@ -560,8 +687,22 @@ impl Session {
                         "",
                         "",
                         true,
-                    )
-                    .map_err(err)?;
+                    ),
+                    Some(cell) => s.core.insert_click_here_field_at_in_cell(
+                        cursor.section,
+                        cursor.paragraph,
+                        cell.control,
+                        cell.index,
+                        cell.paragraph,
+                        start,
+                        false,
+                        "",
+                        "",
+                        "",
+                        true,
+                    ),
+                }
+                .map_err(err)?;
                 let result: Value = serde_json::from_str(&raw)?;
                 result["fieldId"]
                     .as_u64()
@@ -569,8 +710,8 @@ impl Session {
                     .ok_or_else(|| anyhow!("메모 필드 생성 응답에 ID가 없습니다."))?
             };
             let shape = memo_shape(s.core.document(), cursor.section);
-            let paragraph =
-                &mut s.core.document_mut().sections[cursor.section].paragraphs[cursor.paragraph];
+            let paragraph = paragraph_mut(s.core.document_mut(), cursor)
+                .ok_or_else(|| anyhow!("메모 문단을 찾지 못했습니다."))?;
             let field = paragraph
                 .controls
                 .iter_mut()
@@ -579,12 +720,36 @@ impl Session {
                     _ => None,
                 })
                 .ok_or_else(|| anyhow!("생성한 메모 필드를 찾지 못했습니다."))?;
+            let (low, high) = filetime_tokens();
             field.memo_index = index;
-            field.command = format!("MEMO/{shape}/{index}/{id}/{id}/{}/\\;;", request.author);
-            update_field(field, Some(content), Some(&request.author));
+            field.command = format!("MEMO/{shape}/{index}/{low}/{high}/{author}/\\;;");
+            update_field(field, Some(content), Some(author));
             s.core.document_mut().sections[cursor.section].raw_stream = None;
-            relayout_paragraph(s, cursor.section, cursor.paragraph)?;
-            created_id = id;
+            relayout_paragraph(s, cursor)?;
+            Ok(id)
+        }
+    }
+
+    fn reply_memo(&mut self, request: Reply) -> Result<Value> {
+        check_generation(self, request.expected_generation)?;
+        validate_author(&request.author)?;
+        let content = body_paragraphs(&request.text)?;
+        self.guard_protected()?;
+        let at = find_body(self.core.document(), request.id)?;
+        let (start, end) = self
+            .paragraph(at.cursor)?
+            .field_ranges
+            .iter()
+            .find(|r| r.control_idx == at.control)
+            .map(|r| (r.start_char_idx, r.end_char_idx))
+            .ok_or_else(|| anyhow!("메모 범위를 찾지 못했습니다."))?;
+        if start >= end {
+            bail!("글자 범위 없이 캐럿 자리에 단 메모에는 댓글을 달 수 없습니다.");
+        }
+        let index = self.next_memo_number()?;
+        let mut created_id = 0;
+        self.transaction(|s| {
+            created_id = s.place_memo(at.cursor, start, end, index, &request.author, content)?;
             Ok(())
         })?;
         self.memo_get(created_id)
@@ -607,7 +772,7 @@ impl Session {
                 request.author.as_deref(),
             );
             s.core.document_mut().sections[at.cursor.section].raw_stream = None;
-            relayout_paragraph(s, at.cursor.section, at.cursor.paragraph)?;
+            relayout_paragraph(s, at.cursor)?;
             Ok(())
         })?;
         self.memo_get(request.id)
@@ -615,20 +780,31 @@ impl Session {
     fn delete_memo(&mut self, id: u32, expected_generation: Option<u64>) -> Result<Value> {
         check_generation(self, expected_generation)?;
         self.guard_protected()?;
-        let at = find_body(self.core.document(), id)?;
+        find_body(self.core.document(), id)?;
+        // Deleting a thread's first memo takes its replies along, innermost first.
+        let details = self.memo_details();
+        let mut ids: Vec<u32> = details
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["replyTo"] == id)
+            .filter_map(|m| m["id"].as_u64().and_then(|v| u32::try_from(v).ok()))
+            .collect();
+        ids.reverse();
+        ids.push(id);
         self.transaction(|s| {
-            // Removing a range field uses the same native marker-axis primitive
-            // as hyperlinks; keep all body text and its character formatting.
-            field_mut(s.core.document_mut(), &at)?.field_type = FieldType::Hyperlink;
-            s.core
-                .remove_hyperlink_native(
-                    &HyperlinkTarget::body(at.cursor.section, at.cursor.paragraph),
-                    id,
-                )
-                .map_err(err)?;
+            for id in &ids {
+                let at = find_body(s.core.document(), *id)?;
+                // Removing a range field uses the same native marker-axis primitive
+                // as hyperlinks; keep all body text and its character formatting.
+                field_mut(s.core.document_mut(), &at)?.field_type = FieldType::Hyperlink;
+                s.core
+                    .remove_hyperlink_native(&field_target(at.cursor), *id)
+                    .map_err(err)?;
+            }
             Ok(())
         })?;
-        Ok(json!({"id":id,"removed":true,"generation":self.generation}))
+        Ok(json!({"id":id,"removed":true,"removedIds":ids,"generation":self.generation}))
     }
 }
 
@@ -692,19 +868,35 @@ pub fn restore_memo_content(core: &mut DocumentCore) -> Result<()> {
                 }
             }
         }
-        for paragraph in &mut section.paragraphs {
-            for control in &mut paragraph.controls {
-                if let Control::Field(field) = control
-                    && is_memo(field)
-                    && field.memo_paragraphs.is_empty()
-                    && let Some(paragraphs) = contents.get(&memo_number(field))
-                {
-                    let author = author(field);
-                    update_field(field, Some(paragraphs.clone()), Some(&author));
-                    changed = true;
+        // Memos sit in body paragraphs and in table cells (any depth).
+        fn fill(
+            paragraphs: &mut [Paragraph],
+            contents: &BTreeMap<u32, Vec<Paragraph>>,
+            changed: &mut bool,
+        ) {
+            for paragraph in paragraphs {
+                for control in &mut paragraph.controls {
+                    match control {
+                        Control::Field(field)
+                            if is_memo(field) && field.memo_paragraphs.is_empty() =>
+                        {
+                            if let Some(body) = contents.get(&memo_number(field)) {
+                                let author = author(field);
+                                update_field(field, Some(body.clone()), Some(&author));
+                                *changed = true;
+                            }
+                        }
+                        Control::Table(table) => {
+                            for cell in &mut table.cells {
+                                fill(&mut cell.paragraphs, contents, changed);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
+        fill(&mut section.paragraphs, &contents, &mut changed);
         // A memo-tail metadata root is not an extra editable body paragraph.
         if let Some(first) = first_memo {
             let headers: Vec<_> = records[..first]

@@ -83,3 +83,46 @@ fn deferred_edits_match_an_undeferred_run_live_and_after_reopen() -> anyhow::Res
     }
     Ok(())
 }
+
+/// `replace_all` paginates once at the end (it used to repaginate after every
+/// replacement); the live layout must equal the saved and reopened document.
+#[test]
+fn replace_all_paginates_once_and_matches_a_reopened_document() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    for i in 0..60 {
+        s.execute(Command::Insert(format!(
+            "항목 {i}: 바꿀 말 그리고 바꿀 말. "
+        )))?;
+        s.execute(Command::Split)?;
+    }
+    s.run("table.create", json!({"rows":12,"columns":2}))?;
+    let before = s.page_count()?;
+    let count = s.replace_all("바꿀 말", &"훨씬 길게 늘어나는 새 문장 ".repeat(8))?;
+    assert_eq!(count, 120);
+    assert!(!s.layout_deferred());
+    let pages = s.page_count()?;
+    assert!(pages > before, "{before} -> {pages}");
+    let live = (s.caret_at(at(59, 3))?, s.caret_at(at(30, 0))?);
+    // HWP keeps the rows; HWPX from a new document leaves them to the reader
+    // (engine `layout_cache`), so the reopened file is laid out afresh. Both match
+    // the live layout: every page full (41 lines), 10 pages. Before, the live
+    // rows were taken for Hangul's and got the stored-layout rules (11 pages,
+    // every other page 10 lines short), and the fresh layout stacked its rows.
+    assert_eq!(pages, 10);
+    for ext in ["hwp", "hwpx"] {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(format!("replaced.{ext}"));
+        s.save(&path)?;
+        let mut r = Session::new()?;
+        r.open(&path)?;
+        assert_eq!(r.page_count()?, pages, "{ext}");
+        assert_eq!(
+            (r.caret_at(at(59, 3))?, r.caret_at(at(30, 0))?),
+            live,
+            "{ext}"
+        );
+    }
+    s.execute(Command::Undo)?;
+    assert_eq!(s.page_count()?, before);
+    Ok(())
+}

@@ -105,7 +105,10 @@ async fn require_token(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
+        // The auth scheme is case-insensitive (RFC 9110 11.1); the token is not.
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+        .map(|(_, token)| token);
     if presented.is_some_and(|value| token.accepts(value.as_bytes())) {
         return next.run(request).await;
     }
@@ -212,13 +215,16 @@ where
     // Restrict both the hostname and port. DNS-rebinding domains and authorities
     // for unrelated local services must not pass merely because we bind locally.
     let allowed_hosts = [address.to_string(), format!("localhost:{}", address.port())];
+    // Native MCP clients omit Origin. A browser Origin passes only when it is
+    // this server's own origin, which no other site can claim and which serves
+    // no pages; every other origin, including other local ports, gets 403.
+    let allowed_origins = allowed_hosts.clone().map(|host| format!("http://{host}"));
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_stateless_protocol_metadata_required(true)
         .with_json_response(true)
         .with_allowed_hosts(allowed_hosts)
-        // An empty SDK allowlist otherwise disables Origin validation.
-        // Native MCP clients omit Origin; all browser origins are denied here.
+        .with_allowed_origins(allowed_origins)
         .enforce_origin_validation()
         // SDK enforcement consumes a bounded streaming body; Content-Length
         // and chunked transfer cannot bypass this limit.
@@ -510,6 +516,12 @@ mod tests {
             .request("POST", "/mcp", &headers("server/discover"), &bytes)
             .await?;
         assert_eq!(reply.status, 200);
+        // The scheme name is case-insensitive; the token itself is not.
+        let lower = format!("bearer {TOKEN}");
+        let mut extra = headers("server/discover").to_vec();
+        extra.push(("Authorization", lower.as_str()));
+        let reply = server.request_raw("POST", "/mcp", &extra, &bytes).await?;
+        assert_eq!(reply.status, 200);
         server.finish().await
     }
 
@@ -677,6 +689,15 @@ mod tests {
                 .status,
             403
         );
+        // The server's own origin is not cross-site; another local port is.
+        let own = format!("http://{}", server.address);
+        let other = format!("http://127.0.0.1:{}", server.address.port().wrapping_add(1));
+        for (value, status) in [(own.as_str(), 200), (other.as_str(), 403)] {
+            let mut origin = headers("server/discover").to_vec();
+            origin.push(("Origin", value));
+            let reply = server.request("POST", "/mcp", &origin, &bytes).await?;
+            assert_eq!(reply.status, status, "{value}");
+        }
         let mut host = headers("server/discover").to_vec();
         host.push(("Host", "attacker.invalid"));
         let rejected = server.request("POST", "/mcp", &host, &bytes).await?;

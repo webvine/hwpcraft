@@ -1,0 +1,35 @@
+diff --git a/src/model/paragraph.rs b/src/model/paragraph.rs
+index 601e696..669a7d8 100644
+--- a/src/model/paragraph.rs
++++ b/src/model/paragraph.rs
+@@ -1146,7 +1146,29 @@ impl Paragraph {
+                 0
+             } else if !self.char_offsets.is_empty() {
+                 let prev_idx = effective_char_offset - 1;
+-                self.char_offsets[prev_idx] + Self::char_stream_len(text_chars[prev_idx])
++                // 앞 글자가 자동 번호 placeholder 면 그 번호의 8 유닛 칸 전체가 앞 글자다
++                // (`control_text_positions` 의 #3466 판별과 같다: 공백, stride 8 이상,
++                // 그 자리에 놓인 번호 컨트롤). 글자 폭 1 만 건너뛰면 새 글자가 번호 칸
++                // 안에 들어가, 뒤 번호가 한 자리 밀리고 저장 시 자리표가 어긋난다.
++                let prev_is_number_placeholder = text_chars[prev_idx] == ' '
++                    && self
++                        .char_offsets
++                        .get(prev_idx + 1)
++                        .is_some_and(|&next| next >= self.char_offsets[prev_idx] + 8)
++                    && self
++                        .controls
++                        .iter()
++                        .zip(control_positions.iter())
++                        .any(|(ctrl, &pos)| {
++                            pos == prev_idx
++                                && matches!(ctrl, Control::AutoNumber(_) | Control::NewNumber(_))
++                        });
++                let prev_len = if prev_is_number_placeholder {
++                    8
++                } else {
++                    Self::char_stream_len(text_chars[prev_idx])
++                };
++                self.char_offsets[prev_idx] + prev_len
+             } else {
+                 0
+             }

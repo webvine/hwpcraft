@@ -8,6 +8,7 @@ use super::*;
 use hwpcraft_engine::{EquationOptions, ObjectAddress};
 use serde_json::{Map, Value};
 mod chart_creation;
+mod equation_visual;
 
 const HU_PER_MM: f64 = 7200.0 / 25.4;
 /// RHWP page coordinates are 96 dpi pixels.
@@ -32,6 +33,102 @@ struct FieldInsert {
     guide: String,
     name: String,
     memo: String,
+}
+/// 양식 개체 넣기 draft: one kind, the fields that kind takes.
+struct FormInsert {
+    /// form.insert kind: check_box | edit | combo_box | radio_button | push_button
+    kind: &'static str,
+    caption: String,
+    checked: bool,
+    text: String,
+    /// Combo box items, one per line.
+    items: String,
+    group: String,
+    name: String,
+}
+impl FormInsert {
+    fn new(kind: &'static str) -> Self {
+        let caption = match kind {
+            "check_box" => "선택 상자",
+            "radio_button" => "라디오 단추",
+            "push_button" => "명령 단추",
+            _ => "",
+        };
+        Self {
+            kind,
+            caption: caption.into(),
+            checked: false,
+            text: String::new(),
+            items: String::new(),
+            group: String::new(),
+            name: String::new(),
+        }
+    }
+    fn title(&self) -> &'static str {
+        match self.kind {
+            "check_box" => "양식 개체 넣기 - 선택 상자",
+            "edit" => "양식 개체 넣기 - 입력 상자",
+            "combo_box" => "양식 개체 넣기 - 콤보 상자",
+            "radio_button" => "양식 개체 넣기 - 라디오 단추",
+            _ => "양식 개체 넣기 - 명령 단추",
+        }
+    }
+    /// The engine's automatic name for this kind ("ComboBox1" …).
+    fn name_hint(&self) -> String {
+        let label = match self.kind {
+            "check_box" => "CheckBox",
+            "edit" => "Edit",
+            "combo_box" => "ComboBox",
+            "radio_button" => "RadioButton",
+            _ => "PushButton",
+        };
+        format!("비우면 {label}1처럼 자동")
+    }
+    fn item_list(&self) -> Vec<String> {
+        self.items
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+    /// Why 넣기 is grey, if it is.
+    fn grey(&self) -> Option<&'static str> {
+        if self.kind == "combo_box"
+            && !self.text.trim().is_empty()
+            && !self.item_list().iter().any(|i| i == self.text.trim())
+        {
+            return Some("선택 값은 목록 항목 중 하나여야 합니다.");
+        }
+        None
+    }
+    /// form.insert parameters for this draft.
+    fn params(&self) -> Value {
+        let mut p = json!({"kind": self.kind});
+        match self.kind {
+            "check_box" | "radio_button" | "push_button" => {
+                p["caption"] = json!(self.caption);
+            }
+            _ => {
+                if !self.text.trim().is_empty() {
+                    p["text"] = json!(self.text.trim());
+                }
+            }
+        }
+        if matches!(self.kind, "check_box" | "radio_button") && self.checked {
+            p["checked"] = json!(true);
+        }
+        if self.kind == "combo_box" {
+            p["items"] = json!(self.item_list());
+        }
+        if self.kind == "radio_button" && !self.group.trim().is_empty() {
+            p["group"] = json!(self.group.trim());
+        }
+        if !self.name.trim().is_empty() {
+            p["name"] = json!(self.name.trim());
+        }
+        p
+    }
 }
 #[derive(Clone)]
 struct FormDraft {
@@ -125,6 +222,7 @@ pub(crate) struct State {
     /// Connector tool: the shape under the drag start and its connection point.
     connector_start: Option<(ObjectAddress, u32)>,
     field: Option<FieldInsert>,
+    form_insert: Option<FormInsert>,
     forms: Option<Vec<FormDraft>>,
     picture: Option<PictureInsert>,
     properties: Option<Box<Properties>>,
@@ -372,6 +470,8 @@ const SHAPES: &[(&str, &str)] = &[
     ("arc", "호"),
     ("polygon", "다각형"),
     ("curve", "곡선"),
+    // Drawn only by dragging; inserted as a curve of short segments.
+    ("freeline", "자유선"),
 ];
 
 impl HwpApp {
@@ -492,7 +592,12 @@ impl HwpApp {
             | "memo.list"
             | "object.unlock_all"
             | "insert.field"
-            | "insert.form_object" => Some(true),
+            | "insert.form_object"
+            | "insert.form.check_box"
+            | "insert.form.edit"
+            | "insert.form.combo_box"
+            | "insert.form.radio_button"
+            | "insert.form.push_button" => Some(true),
             "object.group" => Some(selected && !self.ext.object.multi.is_empty()),
             "object.ungroup" => Some(
                 self.ext
@@ -539,8 +644,15 @@ impl HwpApp {
             if let Some((k, label)) = SHAPES.iter().find(|(k, _)| *k == kind) {
                 self.ext.object.draw = Some(k);
                 self.clear_object_selection();
-                self.message =
-                    format!("{label}: 쪽에서 끌어 그리세요. 클릭만 하면 기본 크기, Esc 취소.");
+                self.message = if *k == "freeline" {
+                    format!("{label}: 쪽에서 끄는 대로 선을 그립니다. Esc 취소.")
+                } else if matches!(*k, "polygon" | "curve") {
+                    format!(
+                        "{label}: 클릭해 점을 찍고, 두 번 클릭하거나 Enter로 끝냅니다. Esc 취소."
+                    )
+                } else {
+                    format!("{label}: 쪽에서 끌어 그리세요. 클릭만 하면 기본 크기, Esc 취소.")
+                };
                 return true;
             }
             return false;
@@ -642,6 +754,19 @@ impl HwpApp {
                 });
             }
             "insert.form_object" => self.open_form_editor(),
+            "insert.form.check_box" => {
+                self.ext.object.form_insert = Some(FormInsert::new("check_box"))
+            }
+            "insert.form.edit" => self.ext.object.form_insert = Some(FormInsert::new("edit")),
+            "insert.form.combo_box" => {
+                self.ext.object.form_insert = Some(FormInsert::new("combo_box"))
+            }
+            "insert.form.radio_button" => {
+                self.ext.object.form_insert = Some(FormInsert::new("radio_button"))
+            }
+            "insert.form.push_button" => {
+                self.ext.object.form_insert = Some(FormInsert::new("push_button"))
+            }
             "chart.edit" => self.open_chart_editor(0),
             "insert.chart" => self.open_chart_creation(None),
             "memo.list" => self.ext.object.memos = true,
@@ -925,10 +1050,10 @@ impl HwpApp {
         let to_page = |s: &Self, p: Pos2| ((p - rect.min) / s.zoom).to_pos2();
         let painter = response.ctx.layer_painter(response.layer_id);
         if let Some(kind) = self.ext.object.draw {
-            if kind == "polygon" {
-                return self.draw_polygon(page, response, rect);
+            if kind == "polygon" || kind == "curve" {
+                return self.draw_polygon(page, response, rect, kind == "curve");
             }
-            if kind == "curve" && (response.drag_started() || !self.ext.object.points.is_empty()) {
+            if kind == "freeline" {
                 return self.draw_freehand(page, response, rect);
             }
             if response.drag_started()
@@ -1037,6 +1162,14 @@ impl HwpApp {
         let hit = response
             .interact_pointer_pos()
             .and_then(|p| self.object_at(page, to_page(self, p)));
+        // As in Hangul, a press on a text box's text puts the caret there (nested_edit.rs);
+        // near its frame, or dragging the selected box, it is the object.
+        let hit = match (hit, response.interact_pointer_pos()) {
+            (Some(h), Some(p)) if self.on_text_box_text(page, &h, to_page(self, p), response) => {
+                None
+            }
+            (hit, _) => hit,
+        };
         let pointer = response.interact_pointer_pos().map(|p| to_page(self, p));
         let hover = response.hover_pos().map(|p| to_page(self, p));
         let selected = self.ext.object.selected.filter(|s| s.page == page);
@@ -1081,7 +1214,13 @@ impl HwpApp {
                 {
                     self.ext.object.resizing = Some((h, p));
                     consumed = true;
-                } else if hit.is_some_and(|h| h.address == s.address) && !s.inline {
+                } else if hit.is_some_and(|h| {
+                    h.address == s.address
+                        || self.ext.object.multi.iter().any(|m| m.address == h.address)
+                }) && (!s.inline || self.ext.object.multi.is_empty())
+                {
+                    // An object treated as a character drops at a text position instead.
+                    // With several objects selected, dragging any of them moves them all.
                     self.ext.object.moving = Some(Vec2::ZERO);
                     consumed = true;
                 }
@@ -1115,6 +1254,48 @@ impl HwpApp {
                 self.ext.object.moving = None;
                 if let Some(s) = self.ext.object.selected
                     && d.length() > 1.0
+                    && s.inline
+                {
+                    // Hangul moves an inline object to the text position it is dropped on.
+                    if let Some(p) = pointer
+                        && let Ok(to) = self.session.hit_test(page, f64::from(p.x), f64::from(p.y))
+                        && to.cell.is_none()
+                    {
+                        let r = self
+                            .session
+                            .run("object.move_inline", json!({"address":s.address,"to":to}));
+                        if let Some(v) = self.result(r) {
+                            self.ext.object.layout = None;
+                            self.ext.object.selected = serde_json::from_value(v["address"].clone())
+                                .ok()
+                                .and_then(|a| self.selected_from_address(page, a));
+                        }
+                    } else {
+                        self.message =
+                            "글자처럼 취급한 개체는 본문 글자 자리에 놓아야 옮겨집니다.".into();
+                    }
+                } else if let Some(s) = self.ext.object.selected
+                    && d.length() > 1.0
+                    && !self.ext.object.multi.is_empty()
+                {
+                    let mut addresses: Vec<ObjectAddress> =
+                        self.ext.object.multi.iter().map(|m| m.address).collect();
+                    addresses.push(s.address);
+                    let mm = |px: f32| f64::from(px * MM_PER_PX);
+                    if self.run(
+                        "object.move_by",
+                        json!({"addresses":addresses,"dx_mm":mm(d.x),"dy_mm":mm(d.y)}),
+                    ) {
+                        self.ext.object.layout = None;
+                        let multi = std::mem::take(&mut self.ext.object.multi);
+                        self.ext.object.multi = multi
+                            .iter()
+                            .filter_map(|m| self.selected_from_address(m.page, m.address))
+                            .collect();
+                        self.ext.object.selected = self.selected_from_address(page, s.address);
+                    }
+                } else if let Some(s) = self.ext.object.selected
+                    && d.length() > 1.0
                 {
                     let r = self.session.object_properties(s.address);
                     if let Some(v) = self.result(r) {
@@ -1122,7 +1303,8 @@ impl HwpApp {
                         let x = p["horzOffset"].as_i64().unwrap_or(0) + (d.x * 75.0) as i64;
                         let y = p["vertOffset"].as_i64().unwrap_or(0) + (d.y * 75.0) as i64;
                         self.quick_props(json!({"horzOffset":x,"vertOffset":y}));
-                        self.ext.object.selected = None;
+                        // Hangul keeps the moved object selected.
+                        self.ext.object.selected = self.selected_from_address(page, s.address);
                     }
                 }
             }
@@ -1162,7 +1344,8 @@ impl HwpApp {
                     }
                     self.quick_props(props);
                 }
-                self.ext.object.selected = None;
+                // Hangul keeps the resized or rotated object selected.
+                self.ext.object.selected = self.selected_from_address(page, s.address);
             }
         }
         if !consumed && (response.clicked() || response.double_clicked()) {
@@ -1208,7 +1391,10 @@ impl HwpApp {
         let to_screen_pos = |p: Pos2| rect.min + p.to_vec2() * self.zoom;
         let stroke = Stroke::new(1.0, chrome::Tokens::ACCENT);
         for m in self.ext.object.multi.iter().filter(|m| m.page == page) {
-            let r = to_screen(m.bbox);
+            let mut r = to_screen(m.bbox);
+            if let Some(d) = self.ext.object.moving {
+                r = r.translate(d * self.zoom);
+            }
             painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Outside);
             for p in [
                 r.left_top(),
@@ -1284,8 +1470,15 @@ impl HwpApp {
         }
         consumed
     }
-    /// Polygon tool: each click adds a vertex; double click or Enter finishes.
-    fn draw_polygon(&mut self, page: u32, response: &egui::Response, rect: Rect) -> bool {
+    /// Polygon and curve tools: each click adds a point; double click or Enter
+    /// finishes. A curve (Hangul's 곡선) passes smoothly through its points.
+    fn draw_polygon(
+        &mut self,
+        page: u32,
+        response: &egui::Response,
+        rect: Rect,
+        curve: bool,
+    ) -> bool {
         let to_page = |s: &Self, p: Pos2| ((p - rect.min) / s.zoom).to_pos2();
         if !self.ext.object.points.is_empty() && self.ext.object.points_page != page {
             return true;
@@ -1315,7 +1508,12 @@ impl HwpApp {
             .iter()
             .map(|q| to_screen(*q))
             .collect();
-        for w in pts.windows(2) {
+        let path = if curve {
+            smooth_curve(&pts)
+        } else {
+            pts.clone()
+        };
+        for w in path.windows(2) {
             painter.line_segment([w[0], w[1]], stroke);
         }
         if let (Some(last), Some(h)) = (pts.last(), response.hover_pos()) {
@@ -1330,16 +1528,23 @@ impl HwpApp {
                 .input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
         if finish {
             let points = std::mem::take(&mut self.ext.object.points);
-            if points.len() < 3 {
-                self.message = "다각형은 꼭짓점 3개 이상이 필요합니다. 계속 클릭하세요.".into();
-                self.ext.object.points = points;
-            } else {
+            if curve && points.len() >= 2 {
+                self.insert_drawn(page, "curve", &smooth_curve(&points));
+            } else if !curve && points.len() >= 3 {
                 self.insert_drawn(page, "polygon", &points);
+            } else {
+                self.message = if curve {
+                    "곡선은 점 2개 이상이 필요합니다. 계속 클릭하세요."
+                } else {
+                    "다각형은 꼭짓점 3개 이상이 필요합니다. 계속 클릭하세요."
+                }
+                .into();
+                self.ext.object.points = points;
             }
         }
         true
     }
-    /// Curve tool: drag draws a freehand line, sampled every 2 px.
+    /// 자유선 tool: drag draws a freehand line, sampled every 2 px.
     fn draw_freehand(&mut self, page: u32, response: &egui::Response, rect: Rect) -> bool {
         let to_page = |s: &Self, p: Pos2| ((p - rect.min) / s.zoom).to_pos2();
         if response.drag_started() {
@@ -1384,6 +1589,8 @@ impl HwpApp {
         true
     }
     /// Insert a polygon/curve from page-pixel points, positioned on the paper.
+    /// (A curve is stored as short line segments: HWPX CURVE segments are not the
+    /// HWP5 Bézier ones, RHWP #4676.)
     fn insert_drawn(&mut self, page: u32, kind: &str, points: &[Pos2]) {
         let mut bbox = Rect::from_points(points);
         // Keep a non-zero frame for straight horizontal/vertical strokes.
@@ -1459,6 +1666,38 @@ impl HwpApp {
     fn layout_bbox(c: &Value) -> Rect {
         let f = |k: &str| c[k].as_f64().unwrap_or(0.0) as f32;
         Rect::from_min_size(Pos2::new(f("x"), f("y")), Vec2::new(f("w"), f("h")))
+    }
+    /// Whether page point `p` on object `h` is on the text of a text box rather than on
+    /// the box: more than 4 px inside its frame, where the nested caret can stand. Dragging
+    /// the selected box still moves it.
+    fn on_text_box_text(
+        &self,
+        page: u32,
+        h: &Selected,
+        p: Pos2,
+        response: &egui::Response,
+    ) -> bool {
+        if !h.bbox.shrink(4.0 / self.zoom).contains(p) {
+            return false;
+        }
+        let selected = self
+            .ext
+            .object
+            .selected
+            .is_some_and(|s| s.address == h.address);
+        if selected && (response.drag_started() || response.dragged()) {
+            return false;
+        }
+        matches!(
+            self.session.hit_nested(page, f64::from(p.x), f64::from(p.y)),
+            Ok(Some(c)) if c.address.section == h.address.section
+                && c.address.paragraph == h.address.paragraph
+                && matches!(
+                    c.address.path.first(),
+                    Some(hwpcraft_engine::ContextStep::TextBox { control, .. })
+                        if *control == h.address.control
+                )
+        )
     }
     fn object_at(&mut self, page: u32, p: Pos2) -> Option<Selected> {
         let layout = self.object_page_layout(page)?;
@@ -1753,6 +1992,7 @@ impl HwpApp {
                 self.object_ext_dispatch("insert.field", ctx);
             }
             "form-edit" => self.open_form_editor(),
+            "form-insert" => self.ext.object.form_insert = Some(FormInsert::new("combo_box")),
             "note-shape" => self.open_note_shape(false),
             "object-align" => {
                 // Two floating drawing objects on page 1 selected, then 왼쪽 맞춤 applied.
@@ -1801,6 +2041,7 @@ impl HwpApp {
         self.chart_creation_dialog(ctx);
         self.memo_list_dialog(ctx);
         self.field_insert_dialog(ctx);
+        self.form_insert_dialog(ctx);
         self.note_shape_dialog(ctx);
         self.form_editor_dialog(ctx);
     }
@@ -1836,7 +2077,7 @@ impl HwpApp {
                     );
                 });
                 ui.vertical(|ui| {
-                    let (a, c) = chrome::actions(ui, true, "넣기(D)");
+                    let (a, c) = chrome::actions(ui, None, "넣기(D)");
                     apply = a;
                     close |= c;
                 });
@@ -1854,6 +2095,98 @@ impl HwpApp {
         if !(close || r.should_close()) {
             self.ext.object.field = Some(d);
         }
+    }
+    /// 양식 개체 넣기: the fields of the chosen kind; inserts at the caret as a character.
+    fn form_insert_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.ext.object.form_insert.take() else {
+            return;
+        };
+        let (mut apply, mut close) = (false, false);
+        let r = chrome::modal("ext-form-insert").show(ctx, |ui| {
+            ui.set_width(460.0);
+            close = chrome::title(ui, d.title());
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(350.0);
+                    let first = match d.kind {
+                        "check_box" | "radio_button" | "push_button" => {
+                            chrome::section(ui, "글(C)");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.caption)
+                                    .desired_width(f32::INFINITY),
+                            )
+                        }
+                        "combo_box" => {
+                            chrome::section(ui, "목록 항목 (한 줄에 하나)(L)");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut d.items)
+                                    .desired_rows(4)
+                                    .desired_width(f32::INFINITY),
+                            )
+                        }
+                        _ => {
+                            chrome::section(ui, "처음 내용(T)");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.text)
+                                    .desired_width(f32::INFINITY),
+                            )
+                        }
+                    };
+                    chrome::first_focus(&first);
+                    if d.kind == "combo_box" {
+                        chrome::section(ui, "선택 값(V)");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.text)
+                                .hint_text("목록 항목 중 하나 (비우면 선택 없음)")
+                                .desired_width(f32::INFINITY),
+                        );
+                    }
+                    if matches!(d.kind, "check_box" | "radio_button") {
+                        ui.checkbox(&mut d.checked, "선택한 상태로 넣기(S)");
+                    }
+                    if d.kind == "radio_button" {
+                        chrome::section(ui, "묶음 이름(G)");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.group)
+                                .hint_text("같은 이름의 라디오 단추끼리 하나만 선택")
+                                .desired_width(f32::INFINITY),
+                        );
+                    }
+                    let name_hint = d.name_hint();
+                    chrome::section(ui, "개체 이름(N)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.name)
+                            .hint_text(name_hint)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "커서 위치(본문 또는 표 셀)에 글자처럼 넣습니다. 값은 [입력 > 양식 개체 > 양식 개체 값 고치기]에서 바꿀 수 있습니다.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                });
+                ui.vertical(|ui| {
+                    let (a, c) = chrome::actions(ui, d.grey(), "넣기(D)");
+                    apply = a;
+                    close |= c;
+                });
+            });
+        });
+        if apply {
+            close = self.submit_form_insert(&d);
+        }
+        if !(close || r.should_close()) {
+            self.ext.object.form_insert = Some(d);
+        }
+    }
+    fn submit_form_insert(&mut self, d: &FormInsert) -> bool {
+        let done = self.run("form.insert", d.params());
+        if done {
+            self.message = "양식 개체를 넣었습니다.".into();
+        }
+        done
     }
     /// 양식 개체: value editor for the document's existing form objects.
     pub(super) fn open_form_editor(&mut self) {
@@ -2049,7 +2382,7 @@ impl HwpApp {
                     );
                 });
                 ui.vertical(|ui| {
-                    let (a, c) = chrome::actions(ui, true, "넣기(D)");
+                    let (a, c) = chrome::actions(ui, None, "넣기(D)");
                     apply = a;
                     close |= c;
                 });
@@ -2219,7 +2552,7 @@ impl HwpApp {
                 });
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
-                    let (a, c) = chrome::actions(ui, true, "설정(D)");
+                    let (a, c) = chrome::actions(ui, None, "설정(D)");
                     apply = a;
                     close |= c;
                 });
@@ -2599,6 +2932,14 @@ pub(crate) struct EquationEditor {
     font: String,
     original: Option<Value>,
     error: Option<String>,
+    /// Script caret (Unicode scalars) shared by the preview and the script box.
+    caret: usize,
+    /// The preview took the last click: palette inserts go to `caret`.
+    preview_focus: bool,
+    preedit: String,
+    layout: Option<(String, hwpcraft_engine::EquationLayout)>,
+    macro_name: String,
+    macro_note: Option<String>,
 }
 
 /// (button label, tooltip, items: (menu label, script inserted at the caret)).
@@ -2900,6 +3241,12 @@ impl HwpApp {
             font: "HancomEQN".into(),
             original: None,
             error: None,
+            caret: 0,
+            preview_focus: false,
+            preedit: String::new(),
+            layout: None,
+            macro_name: String::new(),
+            macro_note: None,
         };
         if let Some(a) = address {
             let r = self.session.object_properties(a);
@@ -2916,6 +3263,7 @@ impl HwpApp {
             }
             editor.original = Some(p);
         }
+        editor.caret = editor.script.chars().count();
         self.ext.object.equation = Some(Box::new(editor));
     }
 
@@ -2926,6 +3274,7 @@ impl HwpApp {
         let (mut apply, mut close) = (false, false);
         let script_id = egui::Id::new("equation-script");
         let mut insert: Option<&'static str> = None;
+        let mut macro_insert: Option<String> = None;
         let r = chrome::modal("ext-equation-editor").show(ctx, |ui| {
             ui.set_width(760.0);
             close = chrome::title(
@@ -2993,6 +3342,13 @@ impl HwpApp {
                         .on_hover_text("글자 크기");
                         egui::color_picker::color_edit_button_srgb(ui, &mut d.color)
                             .on_hover_text("글자 색");
+                        ui.separator();
+                        macro_insert = equation_visual::macro_menu(
+                            ui,
+                            &d.script,
+                            &mut d.macro_name,
+                            &mut d.macro_note,
+                        );
                     }
                 });
             }
@@ -3021,7 +3377,7 @@ impl HwpApp {
                             egui::TextureOptions::LINEAR,
                         );
                         self.equation_preview =
-                            Some((key, texture, Vec2::new(p.width as f32, p.height as f32)));
+                            Some((key.clone(), texture, Vec2::new(p.width as f32, p.height as f32)));
                         d.error = None;
                     }
                     Err(e) => {
@@ -3030,21 +3386,117 @@ impl HwpApp {
                     }
                 }
             }
+            // Pieces tied to script ranges, for clicking and typing in the preview.
+            if d.layout.as_ref().is_none_or(|l| l.0 != key) {
+                let options = EquationOptions {
+                    script: d.script.clone(),
+                    size_pt: d.size_pt,
+                };
+                d.layout = self
+                    .session
+                    .equation_layout(&options)
+                    .ok()
+                    .map(|l| (key.clone(), l));
+            }
+            let mut preview_edit = false;
+            let mut preview_id = None;
             egui::Frame::new()
                 .fill(Color32::WHITE)
                 .stroke(Stroke::new(1.0, chrome::Tokens::BORDER))
                 .show(ui, |ui| {
                     let (rect, _) =
                         ui.allocate_exact_size(Vec2::new(740.0, 190.0), egui::Sense::hover());
+                    let response =
+                        ui.interact(rect, egui::Id::new("equation-preview"), egui::Sense::click());
+                    let response = response.on_hover_text(
+                        "수식을 누르면 그 자리에서 입력합니다. Tab: 다음 빈 칸, Shift+Tab: 이전 빈 칸",
+                    );
+                    let mut dest = None;
                     if let Some((_, texture, size)) = &self.equation_preview {
                         let scale = (rect.width() / size.x).min(rect.height() / size.y).min(1.0);
-                        let dest = Rect::from_center_size(rect.center(), *size * scale);
+                        let place = Rect::from_center_size(rect.center(), *size * scale);
                         ui.painter().image(
                             texture.id(),
-                            dest,
+                            place,
                             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                             Color32::WHITE,
                         );
+                        dest = Some(place);
+                    }
+                    if response.clicked() {
+                        response.request_focus();
+                        d.preview_focus = true;
+                        if let (Some(place), Some((_, layout)), Some(p)) =
+                            (dest, &d.layout, response.interact_pointer_pos())
+                        {
+                            let x = f64::from((p.x - place.min.x) / place.width()) * layout.width;
+                            let y =
+                                f64::from((p.y - place.min.y) / place.height()) * layout.height;
+                            if let Some(c) = equation_visual::hit(layout, x, y) {
+                                d.caret = c;
+                                preview_edit = true;
+                            }
+                        }
+                    }
+                    preview_id = Some(response.id);
+                    let focused = response.has_focus();
+                    if focused {
+                        ui.memory_mut(|m| {
+                            m.set_focus_lock_filter(
+                                response.id,
+                                egui::EventFilter {
+                                    tab: true,
+                                    horizontal_arrows: true,
+                                    ..Default::default()
+                                },
+                            )
+                        });
+                        let slots = d.layout.as_ref().map(|l| l.1.slots.clone()).unwrap_or_default();
+                        for event in ui.input(|i| i.events.clone()) {
+                            if let egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) = &event {
+                                d.preedit.clone_from(text);
+                            } else if equation_visual::apply_event(
+                                &mut d.script,
+                                &mut d.caret,
+                                &slots,
+                                &event,
+                            ) {
+                                d.preedit.clear();
+                                preview_edit = true;
+                            }
+                        }
+                    } else {
+                        d.preedit.clear();
+                    }
+                    if let (Some(place), Some((_, layout))) = (dest, &d.layout) {
+                        equation_visual::paint(ui.painter(), place, layout, d.caret, focused);
+                        if focused {
+                            let (x, y, h) = equation_visual::caret_line(layout, d.caret)
+                                .unwrap_or((0.0, 0.0, layout.height));
+                            let sx = place.width() / layout.width.max(1.0) as f32;
+                            let sy = place.height() / layout.height.max(1.0) as f32;
+                            let caret_rect = Rect::from_min_size(
+                                place.min + Vec2::new(x as f32 * sx, y as f32 * sy),
+                                Vec2::new(2.0, h as f32 * sy),
+                            );
+                            ui.ctx().output_mut(|o| {
+                                o.ime = Some(egui::output::IMEOutput {
+                                    purpose: egui::IMEPurpose::Normal,
+                                    rect,
+                                    cursor_rect: caret_rect,
+                                    should_interrupt_composition: false,
+                                })
+                            });
+                            if !d.preedit.is_empty() {
+                                ui.painter().text(
+                                    caret_rect.right_bottom() + Vec2::new(2.0, 2.0),
+                                    egui::Align2::LEFT_TOP,
+                                    &d.preedit,
+                                    egui::FontId::proportional(14.0),
+                                    chrome::Tokens::ACCENT,
+                                );
+                            }
+                        }
                     }
                 });
             ui.add_space(6.0);
@@ -3062,30 +3514,53 @@ impl HwpApp {
                 .desired_rows(4)
                 .desired_width(740.0)
                 .show(ui);
-            if let Some(snippet) = insert {
-                let at = output
-                    .cursor_range
-                    .map(|r| r.primary.index.0)
-                    .or_else(|| {
-                        egui::TextEdit::load_state(ctx, script_id)
-                            .and_then(|s| s.cursor.char_range())
-                            .map(|r| r.primary.index.0)
-                    })
-                    .unwrap_or_else(|| d.script.chars().count());
+            if output.response.has_focus() {
+                d.preview_focus = false;
+                if let Some(r) = output.cursor_range {
+                    d.caret = r.primary.index.0;
+                }
+            }
+            if preview_edit && let Some(mut state) = egui::TextEdit::load_state(ctx, script_id) {
+                let caret = egui::text::CCursor::new(d.caret);
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(caret)));
+                state.store(ctx, script_id);
+            }
+            if let Some(snippet) = insert.map(str::to_owned).or(macro_insert) {
+                let at = if d.preview_focus {
+                    d.caret.min(d.script.chars().count())
+                } else {
+                    output
+                        .cursor_range
+                        .map(|r| r.primary.index.0)
+                        .or_else(|| {
+                            egui::TextEdit::load_state(ctx, script_id)
+                                .and_then(|s| s.cursor.char_range())
+                                .map(|r| r.primary.index.0)
+                        })
+                        .unwrap_or_else(|| d.script.chars().count())
+                };
                 let byte = d
                     .script
                     .char_indices()
                     .nth(at)
                     .map_or(d.script.len(), |(i, _)| i);
-                d.script.insert_str(byte, snippet);
+                d.script.insert_str(byte, &snippet);
+                // A template puts the caret in its first empty slot.
+                d.caret = at
+                    + equation_visual::first_slot(&snippet).unwrap_or_else(|| snippet.chars().count());
                 if let Some(mut state) = egui::TextEdit::load_state(ctx, script_id) {
-                    let caret = egui::text::CCursor::new(at + snippet.chars().count());
+                    let caret = egui::text::CCursor::new(d.caret);
                     state
                         .cursor
                         .set_char_range(Some(egui::text::CCursorRange::one(caret)));
                     state.store(ctx, script_id);
                 }
-                ctx.memory_mut(|m| m.request_focus(script_id));
+                let focus = if d.preview_focus { preview_id } else { Some(script_id) };
+                if let Some(id) = focus {
+                    ctx.memory_mut(|m| m.request_focus(id));
+                }
             }
             ui.horizontal(|ui| {
                 ui.label("기준선");
@@ -3281,7 +3756,7 @@ impl HwpApp {
                     }
                 });
                 ui.vertical(|ui| {
-                    let (a, c) = chrome::actions(ui, true, "설정(D)");
+                    let (a, c) = chrome::actions(ui, None, "설정(D)");
                     apply = a;
                     close |= c;
                 });
@@ -3944,19 +4419,31 @@ impl HwpApp {
                     if d.draft["separatorEnabled"] == true {
                         egui::Grid::new("note-separator").num_columns(4).show(ui, |ui| {
                             ui.label("길이");
-                            let mut len = d.draft["separatorLength"].as_i64().unwrap_or(0);
-                            let mut column_width = len < 0;
-                            if ui.checkbox(&mut column_width, "단 너비").changed() {
-                                len = if column_width { -1 } else { (50.0 * HU_PER_MM) as i64 };
-                                d.draft["separatorLength"] = json!(len);
-                            }
-                            if !column_width {
+                            // Hangul's presets: -1 = 5 cm (default), -4 = column width (endnotes).
+                            let len = d.draft["separatorLength"].as_i64().unwrap_or(0);
+                            ui.horizontal(|ui| {
+                                let mut presets = vec![(-1, "5 cm(기본)")];
+                                if d.endnote {
+                                    presets.push((-4, "단 너비"));
+                                }
+                                for (value, label) in presets {
+                                    if ui.radio(len == value, label).clicked() {
+                                        d.draft["separatorLength"] = json!(value);
+                                    }
+                                }
+                                if ui.radio(len >= 0, "직접 지정").clicked() && len < 0 {
+                                    d.draft["separatorLength"] = json!((50.0 * HU_PER_MM).round() as i64);
+                                }
+                            });
+                            if len >= 0 {
+                                // HWP stores the length in 16 bits (at most 32767 HWPUNIT).
                                 let mut mm = len as f64 / HU_PER_MM;
                                 if ui
-                                    .add(egui::DragValue::new(&mut mm).range(0.0..=600.0).speed(0.5).fixed_decimals(1).suffix(" mm"))
+                                    .add(egui::DragValue::new(&mut mm).range(0.0..=115.0).speed(0.5).fixed_decimals(1).suffix(" mm"))
                                     .changed()
                                 {
-                                    d.draft["separatorLength"] = json!((mm * HU_PER_MM).round() as i64);
+                                    let hu = (mm * HU_PER_MM).round().min(f64::from(i16::MAX));
+                                    d.draft["separatorLength"] = json!(hu as i64);
                                 }
                             } else {
                                 ui.label("");
@@ -3975,14 +4462,14 @@ impl HwpApp {
                         RichText::new(if d.endnote {
                             "현재 구역의 미주 번호와 구분선에 적용됩니다."
                         } else {
-                            "현재 구역의 각주 번호와 구분선에 적용됩니다. 구분선 길이 -1(단 너비)은 화면에 짧게 표시될 수 있습니다."
+                            "현재 구역의 각주 번호와 구분선에 적용됩니다. 쪽마다 새로 매기면 각주가 있는 쪽마다 시작 번호부터 다시 셉니다."
                         })
                         .small()
                         .weak(),
                     );
                 });
                 ui.vertical(|ui| {
-                    let (a, c) = chrome::actions(ui, true, "설정(D)");
+                    let (a, c) = chrome::actions(ui, None, "설정(D)");
                     apply = a;
                     close |= c;
                 });
@@ -4019,6 +4506,37 @@ impl HwpApp {
     }
 }
 
+/// A smooth path through `points` (Catmull-Rom), sampled into short segments that
+/// the curve shape stores; at most 1,024 points as `shape.insert` allows.
+fn smooth_curve(points: &[Pos2]) -> Vec<Pos2> {
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+    let spans = points.len() - 1;
+    let steps = (1023 / spans).clamp(1, 12);
+    let at = |i: isize| points[i.clamp(0, points.len() as isize - 1) as usize];
+    let mut out = Vec::with_capacity(spans * steps + 1);
+    for i in 0..spans as isize {
+        let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+        for k in 0..steps {
+            let t = k as f32 / steps as f32;
+            let (t2, t3) = (t * t, t * t * t);
+            let f = |a: f32, b: f32, c: f32, d: f32| {
+                0.5 * (2.0 * b
+                    + (c - a) * t
+                    + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2
+                    + (3.0 * b - a - 3.0 * c + d) * t3)
+            };
+            out.push(Pos2::new(
+                f(p0.x, p1.x, p2.x, p3.x),
+                f(p0.y, p1.y, p2.y, p3.y),
+            ));
+        }
+    }
+    out.push(points[points.len() - 1]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4043,6 +4561,180 @@ mod tests {
         assert_eq!(a.object_ext_enabled("insert.shape.vtextbox"), Some(false));
         // Unknown shape kinds still belong to no module.
         assert_eq!(a.object_ext_enabled("insert.shape.zigzag"), None);
+    }
+
+    /// One frame of the page canvas at (50, 50), as the document view draws it.
+    fn canvas_frame(a: &mut HwpApp, events: Vec<egui::Event>) {
+        canvas_frame_after(a, events, 1.0 / 60.0);
+    }
+    /// A canvas frame `seconds` after the previous one.
+    fn canvas_frame_after(a: &mut HwpApp, events: Vec<egui::Event>, seconds: f64) {
+        let ctx = a.ctx.clone();
+        let time = ctx.input(|i| i.time) + seconds;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1100.0, 1400.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let rect =
+                    Rect::from_min_size(Pos2::new(50.0, 50.0), Vec2::new(794.0, 1123.0) * a.zoom);
+                let response = ui.interact(
+                    rect,
+                    egui::Id::new("page-test"),
+                    egui::Sense::click_and_drag(),
+                );
+                a.ext_canvas(0, &response, rect);
+            },
+        );
+        out.textures_delta.clear();
+    }
+    fn press(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+    fn key(key: Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+    /// Points of every curve shape in the body.
+    fn curves(a: &HwpApp) -> Vec<Vec<hwpcraft_doc::model::Point>> {
+        a.session.core.document().sections[0]
+            .paragraphs
+            .iter()
+            .flat_map(|p| &p.controls)
+            .filter_map(|c| match c {
+                hwpcraft_doc::model::control::Control::Shape(s) => match s.as_ref() {
+                    hwpcraft_doc::model::shape::ShapeObject::Curve(c) => Some(c.points.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn freeline_draws_the_dragged_path_as_a_curve() {
+        let ctx = egui::Context::default();
+        let mut a = HwpApp::with_context(ctx.clone(), None, None, false).unwrap();
+        assert_eq!(a.object_ext_enabled("insert.shape.freeline"), Some(true));
+        assert!(a.object_ext_dispatch("insert.shape.freeline", &ctx));
+        assert_eq!(a.ext.object.draw, Some("freeline"));
+        // A wavy stroke from (250, 300) over 160 px.
+        let path: Vec<Pos2> = (0..=40)
+            .map(|i| {
+                let t = i as f32 / 40.0;
+                Pos2::new(250.0 + 160.0 * t, 300.0 + 30.0 * (t * 6.0).sin())
+            })
+            .collect();
+        canvas_frame(&mut a, vec![]);
+        canvas_frame(
+            &mut a,
+            vec![egui::Event::PointerMoved(path[0]), press(path[0], true)],
+        );
+        for p in &path[1..] {
+            canvas_frame(&mut a, vec![egui::Event::PointerMoved(*p)]);
+        }
+        canvas_frame(&mut a, vec![press(path[40], false)]);
+        assert!(a.error.is_none(), "{:?}", a.error);
+        assert_eq!(a.ext.object.draw, None, "one stroke, then the tool ends");
+        let got = curves(&a);
+        assert_eq!(got.len(), 1, "{}", a.message);
+        assert!(got[0].len() > 10, "the curve follows the stroke: {got:?}");
+    }
+
+    /// 곡선 places points by clicking, as in Hangul: Enter or a double click ends it,
+    /// the curve passes through the clicked points, and Esc draws nothing.
+    #[test]
+    fn the_curve_tool_places_points_by_clicking() {
+        let ctx = egui::Context::default();
+        let mut a = HwpApp::with_context(ctx.clone(), None, None, false).unwrap();
+        // Separate clicks: a second apart, outside the double-click window.
+        let click = |a: &mut HwpApp, p: Pos2| {
+            canvas_frame_after(a, vec![egui::Event::PointerMoved(p), press(p, true)], 1.0);
+            canvas_frame(a, vec![press(p, false)]);
+        };
+        let clicked = [
+            Pos2::new(250.0, 300.0),
+            Pos2::new(320.0, 240.0),
+            Pos2::new(390.0, 320.0),
+            Pos2::new(460.0, 260.0),
+        ];
+        // Esc cancels a curve in progress.
+        assert!(a.object_ext_dispatch("insert.shape.curve", &ctx));
+        assert!(a.message.contains("클릭"), "{}", a.message);
+        canvas_frame(&mut a, vec![]);
+        click(&mut a, clicked[0]);
+        click(&mut a, clicked[1]);
+        let keys_ctx = a.ctx.clone();
+        let _ = keys_ctx.run_ui(
+            egui::RawInput {
+                events: vec![key(Key::Escape)],
+                ..Default::default()
+            },
+            |ui| {
+                a.object_ext_keys(ui.ctx());
+            },
+        );
+        assert_eq!(a.ext.object.draw, None);
+        assert!(a.ext.object.points.is_empty());
+        assert!(curves(&a).is_empty());
+        // One point and Enter is not a curve yet; more clicks and Enter end it.
+        assert!(a.object_ext_dispatch("insert.shape.curve", &ctx));
+        canvas_frame(&mut a, vec![]);
+        click(&mut a, clicked[0]);
+        canvas_frame(&mut a, vec![key(Key::Enter)]);
+        assert!(curves(&a).is_empty(), "{}", a.message);
+        assert_eq!(a.ext.object.draw, Some("curve"));
+        for p in &clicked[1..] {
+            click(&mut a, *p);
+        }
+        assert!(curves(&a).is_empty(), "nothing until the curve is ended");
+        canvas_frame(&mut a, vec![key(Key::Enter)]);
+        assert!(a.error.is_none(), "{:?}", a.error);
+        let got = curves(&a);
+        assert_eq!(got.len(), 1, "{}", a.message);
+        assert!(got[0].len() > clicked.len(), "smoothed between the points");
+        assert_eq!(a.ext.object.draw, None);
+        // The curve passes through the clicked points (page px to paper HWPUNIT).
+        let address = a.ext.object.selected.map(|s| s.address).unwrap();
+        let props = a.session.object_properties(address).unwrap()["props"].clone();
+        let (x0, y0) = (
+            props["horzOffset"].as_f64().unwrap(),
+            props["vertOffset"].as_f64().unwrap(),
+        );
+        for p in clicked {
+            let z = a.zoom;
+            let (px, py) = (
+                f64::from((p.x - 50.0) / z) * 75.0,
+                f64::from((p.y - 50.0) / z) * 75.0,
+            );
+            let near = got[0].iter().any(|q| {
+                (x0 + f64::from(q.x) - px).abs() < 60.0 && (y0 + f64::from(q.y) - py).abs() < 60.0
+            });
+            assert!(near, "passes through {p:?}");
+        }
+        // A double click also ends a curve.
+        assert!(a.object_ext_dispatch("insert.shape.curve", &ctx));
+        canvas_frame(&mut a, vec![]);
+        click(&mut a, Pos2::new(250.0, 500.0));
+        click(&mut a, Pos2::new(350.0, 450.0));
+        let end = Pos2::new(450.0, 520.0);
+        click(&mut a, end);
+        canvas_frame(&mut a, vec![press(end, true)]);
+        canvas_frame(&mut a, vec![press(end, false)]);
+        assert_eq!(curves(&a).len(), 2, "{}", a.message);
     }
 
     #[test]
@@ -4134,5 +4826,60 @@ mod tests {
         assert_eq!(handle_at(b, Pos2::new(150.0, 125.0), 1.0), None);
         // At 200 % zoom the screen tolerance halves in page pixels.
         assert_eq!(handle_at(b, Pos2::new(104.5, 104.5), 2.0), None);
+    }
+
+    #[test]
+    fn form_insert_dialog_inserts_each_kind_with_its_fields() -> anyhow::Result<()> {
+        let mut app = crate::HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = app.ctx.clone();
+        for kind in [
+            "check_box",
+            "edit",
+            "combo_box",
+            "radio_button",
+            "push_button",
+        ] {
+            app.object_ext_dispatch(&format!("insert.form.{kind}"), &ctx);
+            assert!(app.ext.object.form_insert.is_some(), "{kind}: dialog opens");
+            let mut d = app
+                .ext
+                .object
+                .form_insert
+                .take()
+                .unwrap_or_else(|| FormInsert::new(kind));
+            match kind {
+                "edit" => d.text = "홍길동".into(),
+                "combo_box" => {
+                    d.items = "1분기\n2분기\n".into();
+                    d.text = "3분기".into();
+                    assert!(d.grey().is_some(), "a value outside the list greys 넣기");
+                    d.text = "2분기".into();
+                }
+                "radio_button" => {
+                    d.group = "성별".into();
+                    d.checked = true;
+                }
+                _ => {}
+            }
+            assert!(d.grey().is_none());
+            assert!(app.submit_form_insert(&d), "{kind}: {:?}", app.error);
+        }
+        let forms = app.session.run("form.list", json!({}))?;
+        let kinds: Vec<_> = forms
+            .as_array()
+            .map(|l| {
+                l.iter()
+                    .map(|f| f["type"].as_str().unwrap_or("").to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            kinds,
+            ["CheckBox", "Edit", "ComboBox", "RadioButton", "PushButton"]
+        );
+        assert_eq!(forms[1]["text"], "홍길동");
+        assert_eq!(forms[2]["text"], "2분기");
+        assert_eq!(forms[3]["value"], 1);
+        Ok(())
     }
 }

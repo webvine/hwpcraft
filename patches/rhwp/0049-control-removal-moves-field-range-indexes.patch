@@ -1,0 +1,321 @@
+diff --git a/src/document_core/commands/footnote_ops.rs b/src/document_core/commands/footnote_ops.rs
+index 90f802e3..c72deb60 100644
+--- a/src/document_core/commands/footnote_ops.rs
++++ b/src/document_core/commands/footnote_ops.rs
+@@ -199,6 +199,7 @@ impl DocumentCore {
+             if control_idx < para.ctrl_data_records.len() {
+                 para.ctrl_data_records.remove(control_idx);
+             }
++            para.shift_field_ranges_for_control_removal(control_idx);
+             if para.char_count >= 8 {
+                 para.char_count -= 8;
+             }
+@@ -214,6 +215,7 @@ impl DocumentCore {
+             section.raw_stream = None;
+         }
+ 
++        self.shift_active_field_for_control_removal(section_idx, para_idx, control_idx);
+         self.renumber_footnotes_in_section(section_idx);
+         self.mark_section_dirty(section_idx);
+         self.recompose_section(section_idx);
+diff --git a/src/document_core/commands/object_ops/common.rs b/src/document_core/commands/object_ops/common.rs
+index 9d15d48c..a2ddfe0a 100644
+--- a/src/document_core/commands/object_ops/common.rs
++++ b/src/document_core/commands/object_ops/common.rs
+@@ -79,6 +79,24 @@ impl DocumentCore {
+             }
+         }
+     }
++    /// [HwpCraft 0049] 본문 문단 `controls[control_idx]` 를 뺐을 때 같은 문단의 활성 누름틀 번호를
++    /// 당긴다. `shift_active_field_for_control_insert` 의 역연산이다.
++    pub(crate) fn shift_active_field_for_control_removal(
++        &mut self,
++        section_idx: usize,
++        para_idx: usize,
++        control_idx: usize,
++    ) {
++        if let Some(active) = self.active_field.as_mut() {
++            if active.section_idx == section_idx
++                && active.para_idx == para_idx
++                && active.cell_path.is_none()
++                && active.control_idx > control_idx
++            {
++                active.control_idx -= 1;
++            }
++        }
++    }
+     /// 컨트롤 삭제 후 문단의 line_segs를 재계산한다.
+     ///
+     /// 그림/도형 삭제 시 문단의 line_segs에 컨트롤 높이가 그대로 남아,
+diff --git a/src/document_core/commands/object_ops/equation.rs b/src/document_core/commands/object_ops/equation.rs
+index bf54bdfa..02dc44e2 100644
+--- a/src/document_core/commands/object_ops/equation.rs
++++ b/src/document_core/commands/object_ops/equation.rs
+@@ -491,12 +491,14 @@ impl DocumentCore {
+         if control_idx < para.ctrl_data_records.len() {
+             para.ctrl_data_records.remove(control_idx);
+         }
++        para.shift_field_ranges_for_control_removal(control_idx);
+         if para.char_count >= 8 {
+             para.char_count -= 8;
+         }
+ 
+         Self::reflow_paragraph_line_segs_after_control_delete(para, &self.styles, self.dpi);
+         section.raw_stream = None;
++        self.shift_active_field_for_control_removal(section_idx, parent_para_idx, control_idx);
+         self.recompose_section(section_idx);
+         self.paginate_if_needed();
+ 
+diff --git a/src/document_core/commands/object_ops/shape.rs b/src/document_core/commands/object_ops/shape.rs
+index 32e5922b..e784eb01 100644
+--- a/src/document_core/commands/object_ops/shape.rs
++++ b/src/document_core/commands/object_ops/shape.rs
+@@ -2175,9 +2175,11 @@ impl DocumentCore {
+             if ci < para.ctrl_data_records.len() {
+                 para.ctrl_data_records.remove(ci);
+             }
++            para.shift_field_ranges_for_control_removal(ci);
+             if para.char_count >= 8 {
+                 para.char_count -= 8;
+             }
++            self.shift_active_field_for_control_removal(section_idx, pi, ci);
+         }
+ 
+         // 5) 삽입 위치 인덱스 재계산 (제거 후 인덱스가 변했을 수 있음)
+@@ -2211,6 +2213,7 @@ impl DocumentCore {
+                 .insert(ctrl_insert, Control::Shape(Box::new(group_obj)));
+             let cdr_insert = ctrl_insert.min(para.ctrl_data_records.len());
+             para.ctrl_data_records.insert(cdr_insert, None);
++            para.shift_field_ranges_for_control_insert(ctrl_insert);
+ 
+             // char_offsets: 텍스트 문자 매핑이므로 컨트롤 인덱스와 무관 — 삽입 지점(safe_offset)
+             // 이후 char_offsets 만 +8 시프트한다.
+@@ -2225,6 +2228,14 @@ impl DocumentCore {
+             para.has_para_text = true;
+         }
+ 
++        let ctrl_insert = insert_ci.min(
++            self.document.sections[section_idx].paragraphs[insert_pi]
++                .controls
++                .len()
++                - 1,
++        );
++        self.shift_active_field_for_control_insert(section_idx, insert_pi, ctrl_insert);
++
+         // 7) 리플로우 + 페이지네이션
+         self.document.sections[section_idx].raw_stream = None;
+         self.recompose_section(section_idx);
+@@ -2292,6 +2303,7 @@ impl DocumentCore {
+         if control_idx < para.ctrl_data_records.len() {
+             para.ctrl_data_records.remove(control_idx);
+         }
++        para.shift_field_ranges_for_control_removal(control_idx);
+         if para.char_count >= 8 {
+             para.char_count -= 8;
+         }
+@@ -2401,6 +2413,7 @@ impl DocumentCore {
+             para.controls
+                 .insert(insert_idx, Control::Shape(Box::new(child)));
+             para.ctrl_data_records.insert(insert_idx, None);
++            para.shift_field_ranges_for_control_insert(insert_idx);
+             para.char_count += 8;
+             para.control_mask |= 0x00000800;
+             para.has_para_text = true;
+@@ -2428,6 +2441,11 @@ impl DocumentCore {
+             }
+         }
+ 
++        self.shift_active_field_for_control_removal(section_idx, para_idx, control_idx);
++        for idx in control_idx..control_idx + children_count {
++            self.shift_active_field_for_control_insert(section_idx, para_idx, idx);
++        }
++
+         // 리플로우 + 페이지네이션
+         self.document.sections[section_idx].raw_stream = None;
+         self.recompose_section(section_idx);
+@@ -3051,6 +3069,49 @@ mod resize_clamp_tests {
+             "언그룹이 삽입 지점 이전 텍스트(char 'A')의 char_offsets 를 밀면 안 된다"
+         );
+     }
++
++    /// [HwpCraft 0049] 묶기·풀기로 컨트롤 수가 바뀌어도 뒤 누름틀 범위는 같은 필드를 가리킨다.
++    #[test]
++    fn grouping_and_ungrouping_keep_a_later_field_range() {
++        use crate::model::control::{Control, Field};
++        use crate::model::paragraph::FieldRange;
++        let mut core = make_test_core();
++        let (_, a) = create_rectangle(&mut core);
++        let (_, b) = create_rectangle(&mut core);
++        {
++            let para = &mut core.document.sections[0].paragraphs[0];
++            para.controls.push(Control::Field(Field {
++                field_id: 7,
++                ..Default::default()
++            }));
++            para.align_ctrl_data_records();
++            para.field_ranges.push(FieldRange {
++                control_idx: para.controls.len() - 1,
++                ..Default::default()
++            });
++        }
++        let field = |core: &DocumentCore| {
++            let para = &core.document.sections[0].paragraphs[0];
++            match para.controls.get(para.field_ranges[0].control_idx) {
++                Some(Control::Field(f)) => f.field_id,
++                _ => 0,
++            }
++        };
++        assert_eq!(field(&core), 7);
++        let res = core
++            .group_shapes_native(0, &[(0, a), (0, b)])
++            .expect("group");
++        assert_eq!(field(&core), 7, "after grouping: {res}");
++        let group = core.document.sections[0].paragraphs[0]
++            .controls
++            .iter()
++            .position(
++                |c| matches!(c, Control::Shape(s) if matches!(s.as_ref(), ShapeObject::Group(_))),
++            )
++            .expect("group shape");
++        core.ungroup_shape_native(0, 0, group).expect("ungroup");
++        assert_eq!(field(&core), 7, "after ungrouping");
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/document_core/commands/object_ops/table.rs b/src/document_core/commands/object_ops/table.rs
+index 3413ce73..9c0b24d8 100644
+--- a/src/document_core/commands/object_ops/table.rs
++++ b/src/document_core/commands/object_ops/table.rs
+@@ -1564,6 +1564,7 @@ impl DocumentCore {
+             if inner_control_idx < para.ctrl_data_records.len() {
+                 para.ctrl_data_records.remove(inner_control_idx);
+             }
++            para.shift_field_ranges_for_control_removal(inner_control_idx);
+             if para.char_count >= 8 {
+                 para.char_count -= 8;
+             }
+diff --git a/src/document_core/commands/table_ops.rs b/src/document_core/commands/table_ops.rs
+index 7c31daa4..65dfb9d1 100644
+--- a/src/document_core/commands/table_ops.rs
++++ b/src/document_core/commands/table_ops.rs
+@@ -3498,6 +3498,7 @@ impl DocumentCore {
+             if control_idx < para.ctrl_data_records.len() {
+                 para.ctrl_data_records.remove(control_idx);
+             }
++            para.shift_field_ranges_for_control_removal(control_idx);
+ 
+             // char_count 갱신 (확장 컨트롤 = 8 code unit)
+             if para.char_count >= 8 {
+@@ -3513,6 +3514,7 @@ impl DocumentCore {
+         if let Some(key) = removed_table_key {
+             self.render_normalization.text_reflowed_tables.remove(&key);
+         }
++        self.shift_active_field_for_control_removal(section_idx, parent_para_idx, control_idx);
+ 
+         // [Task #2299] 리셋 판별용 — reflow 이전 저장 흐름 end 캡처.
+         let stored_end_for_reset = crate::renderer::composer::paragraph_flow_end(
+diff --git a/src/document_core/commands/text_editing.rs b/src/document_core/commands/text_editing.rs
+index 1c52c56e..7b1df9b9 100644
+--- a/src/document_core/commands/text_editing.rs
++++ b/src/document_core/commands/text_editing.rs
+@@ -7763,6 +7763,67 @@ mod tests {
+         assert!(partition_is_current(&core));
+     }
+ 
++    /// [HwpCraft 0049] 셀 문단에서 그림을 지워도 뒤 누름틀 범위는 같은 필드를 가리킨다.
++    #[test]
++    fn cell_picture_delete_keeps_a_later_field_range() {
++        use crate::model::control::{Control, Field};
++        use crate::model::image::Picture;
++        use crate::model::paragraph::FieldRange;
++        use crate::model::table::{Cell, Table};
++
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++
++        // [그림] [누름틀 시작] 가나 [누름틀 끝] 다
++        let mut cell_para = Paragraph::default();
++        cell_para.text = "가나다".to_string();
++        cell_para.char_offsets = vec![16, 17, 26];
++        cell_para.char_count = 28;
++        let mut pic = Picture::default();
++        pic.common.width = 1000;
++        pic.common.height = 1000;
++        pic.common.treat_as_char = true;
++        cell_para.controls.push(Control::Picture(Box::new(pic)));
++        cell_para.controls.push(Control::Field(Field {
++            field_id: 7,
++            ..Default::default()
++        }));
++        cell_para.ctrl_data_records = vec![None, None];
++        cell_para.field_ranges.push(FieldRange {
++            start_char_idx: 0,
++            end_char_idx: 2,
++            control_idx: 1,
++            ..Default::default()
++        });
++        let table = Table {
++            cells: vec![Cell {
++                width: 8000,
++                paragraphs: vec![cell_para],
++                ..Default::default()
++            }],
++            ..Default::default()
++        };
++        core.document.sections[0].paragraphs[0]
++            .controls
++            .push(Control::Table(Box::new(table)));
++        let ctrl_idx = core.document.sections[0].paragraphs[0].controls.len() - 1;
++        let path_json = format!(
++            r#"[{{"controlIdx":{},"cellIdx":0,"cellParaIdx":0}}]"#,
++            ctrl_idx
++        );
++        core.delete_cell_picture_control_by_path_native(0, 0, &path_json, 0)
++            .expect("셀 그림 삭제");
++
++        let Control::Table(t) = &core.document.sections[0].paragraphs[0].controls[ctrl_idx] else {
++            panic!("expected table");
++        };
++        let para = &t.cells[0].paragraphs[0];
++        assert!(matches!(
++            para.controls.get(para.field_ranges[0].control_idx),
++            Some(Control::Field(f)) if f.field_id == 7
++        ));
++    }
++
+     /// 셀 그림 삭제 뒤 renderer verdict는 새 composition에만 만들어진다.
+     #[test]
+     fn cell_picture_delete_updates_source_without_cache_state() {
+diff --git a/src/model/paragraph.rs b/src/model/paragraph.rs
+index 2ab19ac4..b776c0f2 100644
+--- a/src/model/paragraph.rs
++++ b/src/model/paragraph.rs
+@@ -934,6 +934,27 @@ impl Paragraph {
+         self.shift_for_control_slot_insert(char_offset);
+     }
+ 
++    /// [HwpCraft 0049] `controls[control_idx]` 를 뺀 뒤 그보다 뒤 컨트롤을 가리키는 누름틀
++    /// 범위 번호를 당긴다. 범위가 옛 번호에 남으면 한 칸 뒤 컨트롤(또는 배열 밖)을 가리켜
++    /// 누름틀·링크가 조회와 저장에서 사라진다.
++    pub(crate) fn shift_field_ranges_for_control_removal(&mut self, control_idx: usize) {
++        for range in &mut self.field_ranges {
++            if range.control_idx > control_idx {
++                range.control_idx -= 1;
++            }
++        }
++    }
++
++    /// [HwpCraft 0049] `controls[control_idx]` 에 컨트롤을 넣을 때 누름틀 범위 번호만 민다.
++    /// 슬롯(char_offsets 등)은 호출자가 따로 연다.
++    pub(crate) fn shift_field_ranges_for_control_insert(&mut self, control_idx: usize) {
++        for range in &mut self.field_ranges {
++            if range.control_idx >= control_idx {
++                range.control_idx += 1;
++            }
++        }
++    }
++
+     /// BEGIN/END 슬롯처럼 컨트롤 번호가 늘지 않는 8유닛 삽입에도 사용한다.
+     pub(crate) fn shift_for_control_slot_insert(&mut self, char_offset: usize) {
+         if self.char_offsets.is_empty() {

@@ -1,0 +1,131 @@
+diff --git a/src/renderer/composer/line_breaking.rs b/src/renderer/composer/line_breaking.rs
+index 59231bb..98d7544 100644
+--- a/src/renderer/composer/line_breaking.rs
++++ b/src/renderer/composer/line_breaking.rs
+@@ -4139,6 +4139,7 @@ pub(crate) fn layout_picture_band(
+     let exclusion_end = exclusion.vertical.end;
+     let mut frame = host_box.frame_with(0, vec![exclusion]);
+     frame.side_flow_band = true;
++    let mut previous_spacing_after: i32 = 0;
+     let mut line_segs = Vec::new();
+     let mut space_metrics = Vec::new();
+ 
+@@ -4150,12 +4151,9 @@ pub(crate) fn layout_picture_band(
+         let paragraph_style = styles.para_styles.get(paragraph.para_shape_id as usize);
+         // [0010] host 앞의 나누기(구역 첫 문단의 `Section`, 쪽·단 나누기)는 띠보다 앞에서
+         // 일어난다 — 띠는 host 의 위쪽에서 시작하므로 host 에는 막지 않는다.
+-        if (paragraph_index != host_index && paragraph.column_type != ColumnBreakType::None)
+-            || paragraph_style.is_some_and(|style| {
+-                style.spacing_before.abs() > f64::EPSILON
+-                    || style.spacing_after.abs() > f64::EPSILON
+-                    || style.page_break_before
+-            })
++        if (paragraph_index != host_index
++            && (paragraph.column_type != ColumnBreakType::None
++                || paragraph_style.is_some_and(|style| style.page_break_before)))
+             || box_for(paragraph)?.effective() != host_horizontal
+             || (paragraph_index != host_index
+                 && paragraph.controls.iter().any(|control| {
+@@ -4165,6 +4163,20 @@ pub(crate) fn layout_picture_band(
+             return None;
+         }
+ 
++        // [0026] 문단 위·아래 간격은 띠 안의 흐름 거리다: 앞 문단의 아래 간격과 이 문단의 위
++        // 간격만큼 프레임을 내린다. host 의 위 간격은 띠가 시작하기 전이라 세지 않는다 —
++        // 프레임 원점은 host 의 첫 줄이고, 배제 띠도 그 줄을 기준으로 잰다.
++        if paragraph_index != host_index {
++            let before = paragraph_style.map_or(0.0, |style| style.spacing_before.max(0.0));
++            let gap = previous_spacing_after.saturating_add(px_to_hwpunit(before, dpi));
++            frame.top = frame.top.saturating_add(gap);
++            if frame.top >= exclusion_end {
++                break;
++            }
++        }
++        previous_spacing_after = paragraph_style
++            .map_or(0, |style| px_to_hwpunit(style.spacing_after.max(0.0), dpi));
++
+         let mut input = paragraph.clone();
+         // A picture-band projection is freshly computed implementation state,
+         // even when the source paragraph had authentic cached rows. Clearing
+@@ -6228,6 +6240,67 @@ mod frame_reflow_tests {
+         assert!(band(host_with(TextWrap::TopAndBottom)).is_none());
+     }
+ 
++    /// [0026] 문단 위·아래 간격이 있어도 띠가 선다: 다음 문단은 앞 문단의 아래 간격과 자기 위
++    /// 간격만큼 내려가 배제 띠를 지난다(간격 있는 문단의 문단 첫 글자 장식).
++    #[test]
++    fn side_flow_band_spans_paragraph_spacing() {
++        use crate::model::shape::{
++            CommonObjAttr, HorzAlign, HorzRelTo, RectangleShape, ShapeObject, TextFlow, TextWrap,
++            VertAlign, VertRelTo,
++        };
++
++        const DPI: f64 = 96.0;
++        const COLUMN_WIDTH: i32 = 15_000;
++        const AFTER: i32 = 600;
++        let mut styles = styles(&[12.0]);
++        styles.para_styles[0].spacing_after = crate::renderer::hwpunit_to_px(AFTER, DPI);
++        styles.para_styles[0].spacing_before = crate::renderer::hwpunit_to_px(300, DPI);
++        let rect = RectangleShape {
++            common: CommonObjAttr {
++                width: 3_000,
++                // Taller than one row plus the spacing, so the band reaches paragraph 2.
++                height: 3_000,
++                text_wrap: TextWrap::Square,
++                text_flow: TextFlow::BothSides,
++                vert_rel_to: VertRelTo::Para,
++                vert_align: VertAlign::Top,
++                horz_rel_to: HorzRelTo::Para,
++                horz_align: HorzAlign::Left,
++                ..Default::default()
++            },
++            ..Default::default()
++        };
++        let char_shapes = || {
++            vec![CharShapeRef {
++                start_pos: 0,
++                char_shape_id: 0,
++            }]
++        };
++        let mut host = paragraph("x", char_shapes());
++        host.controls
++            .push(Control::Shape(Box::new(ShapeObject::Rectangle(rect))));
++        let next = paragraph("y", char_shapes());
++
++        let band = layout_picture_band(
++            &[host, next],
++            0,
++            crate::renderer::hwpunit_to_px(COLUMN_WIDTH, DPI),
++            &styles,
++            DPI,
++            (0.0, 0.0),
++        )
++        .expect("a band across two spaced paragraphs");
++        assert_eq!(band.paragraph_range, 0..2);
++        let host_row = &band.line_segs[0][0];
++        let next_row = &band.line_segs[1][0];
++        assert_eq!(host_row.vertical_pos, 0, "the host's own spacing before is outside the band");
++        let host_bottom = host_row.vertical_pos + host_row.line_height + host_row.line_spacing;
++        let gap = next_row.vertical_pos - host_bottom;
++        let expected = AFTER + crate::renderer::px_to_hwpunit(styles.para_styles[0].spacing_before, DPI);
++        assert!((gap - expected).abs() <= 1, "gap {gap}, expected {expected}");
++        assert_eq!(next_row.column_start, 3_000);
++    }
++
+     #[test]
+     fn real_p325_picture_band_matches_the_stored_seven_paragraph_geometry() {
+         use crate::model::page::ColumnDef;
+diff --git a/src/renderer/typeset/controls/host_wrap.rs b/src/renderer/typeset/controls/host_wrap.rs
+index 7e62647..f6464af 100644
+--- a/src/renderer/typeset/controls/host_wrap.rs
++++ b/src/renderer/typeset/controls/host_wrap.rs
+@@ -20,8 +20,7 @@ pub(super) fn stored_candidate(para: &Paragraph) -> Option<StoredHostBand> {
+                 if let crate::model::shape::ShapeObject::Picture(p) = s.as_ref() {
+                     Some(&p.common)
+                 } else {
+-                    // [0010] 띠가 줄을 새로 계산한 그리기 개체 host(글상자 등).
+-                    crate::renderer::float_placement::computed_band_drawing_common(para, c)
++                    None
+                 }
+             }
+             _ => None,

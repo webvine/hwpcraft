@@ -15,6 +15,10 @@ pub(crate) struct State {
 }
 
 impl State {
+    /// Current scroll position of the document view.
+    pub fn offset(&self) -> Vec2 {
+        self.offset
+    }
     pub fn update<T>(
         &mut self,
         ctx: &egui::Context,

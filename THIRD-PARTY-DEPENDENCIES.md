@@ -1,6 +1,6 @@
 # Third-party Rust dependencies
 
-Generated from Cargo.lock with cargo metadata (HwpCraft 0.17, RHWP 0.8.7).
+Generated from Cargo.lock with cargo metadata (HwpCraft 0.19, RHWP 0.8.7).
 Crates offered under a choice of licenses are used under MIT where available, otherwise Apache-2.0.
 
 | Crate | Version | License | Repository |

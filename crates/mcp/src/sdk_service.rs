@@ -46,6 +46,9 @@ impl HwpService {
         definitions.push(json!({"name":"close_document","description":"Close the explicitly identified document worker. Unsaved changes require force=true. Other documents are preserved.",
             "inputSchema":{"type":"object","properties":{"force":{"type":"boolean"}},"additionalProperties":false},
             "annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":false}}));
+        definitions.push(json!({"name":"list_documents","description":"List the documents a desktop HwpCraft user has shared with MCP (title, path, unsaved state) and their document_id. Documents created through MCP are not listed: their document_id is held only by the client that created it.",
+            "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
         let mut typed = Vec::new();
         let mut validators = HashMap::new();
         for mut definition in definitions {
@@ -57,7 +60,7 @@ impl HwpService {
                 .as_object_mut()
                 .context("tool input schema missing")?;
             schema.insert("$schema".into(), json!(DIALECT));
-            let independent = name == "list_commands";
+            let independent = matches!(name.as_str(), "list_commands" | "list_documents");
             if !independent {
                 let properties = schema
                     .get_mut("properties")
@@ -186,6 +189,18 @@ impl HwpService {
                 ),
             ));
         }
+        if name == "list_documents" {
+            let documents: Vec<Value> = self
+                .workers
+                .list()
+                .into_iter()
+                .map(|entry| {
+                    json!({DOCUMENT:entry.id,"title":entry.info.title,"path":entry.info.path,
+                        "source":entry.source,"dirty":entry.info.dirty})
+                })
+                .collect();
+            return Ok((None, tools::result(json!({"documents":documents}), false)));
+        }
         if name == "hwp_action" && args.get("id").is_none() {
             return Ok((
                 None,
@@ -268,14 +283,24 @@ fn tool_result(
     id: Option<&str>,
 ) -> std::result::Result<CallToolResponse, McpError> {
     let is_error = value["isError"].as_bool().unwrap_or(false);
-    let text = value["content"].as_array().and_then(|blocks| {
-        blocks
-            .iter()
-            .find_map(|block| block.get("text").and_then(Value::as_str))
-    });
-    let data = match text {
-        Some(text) => serde_json::from_str(text).unwrap_or_else(|_| json!({"message":text})),
-        None => value.clone(),
+    let parsed = value
+        .as_object_mut()
+        .and_then(|map| map.remove(tools::PARSED));
+    let data = match parsed {
+        Some(data) => data,
+        None => {
+            let text = value["content"].as_array().and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find_map(|block| block.get("text").and_then(Value::as_str))
+            });
+            match text {
+                Some(text) => {
+                    serde_json::from_str(text).unwrap_or_else(|_| json!({"message":text}))
+                }
+                None => value.clone(),
+            }
+        }
     };
     let mut structured = match data {
         Value::Object(map) => Value::Object(map),
@@ -392,7 +417,10 @@ impl ServerHandler for HwpService {
         let client_tasks = context
             .client_capabilities()
             .is_some_and(|capabilities| capabilities.supports_tasks());
-        if client_tasks && tasks::eligible(name, &args) {
+        if client_tasks
+            && tasks::eligible(name, &args)
+            && self.tasks.running_task_count() < tasks::MAX_RUNNING
+        {
             return Ok(CallToolResponse::Task(
                 self.spawn_task(name.to_owned(), args),
             ));
@@ -569,6 +597,49 @@ impl ServerHandler for HwpService {
 mod tests {
     use super::*;
 
+    /// Only documents a desktop user shared are listed; MCP-created handles stay private.
+    #[tokio::test]
+    async fn list_documents_shows_shared_desktop_documents_only() -> Result<()> {
+        let workers = Arc::new(DocumentWorkers::new(None));
+        let service = HwpService::new(workers.clone())?;
+        let list = |service: HwpService| async move {
+            let (_, value) = service
+                .dispatch("list_documents", json!({}), CancellationToken::new())
+                .await?;
+            let response = tool_result(value, None).map_err(anyhow::Error::msg)?;
+            let result = serde_json::to_value(ServerResult::from(response))?;
+            let structured = result["structuredContent"].clone();
+            assert!(service.validators.contains_key("list_documents"));
+            let schema = output_schemas::declared("list_documents", DIALECT).context("schema")?;
+            assert!(
+                schema_validator(&schema)?.is_valid(&structured),
+                "{structured}"
+            );
+            anyhow::Ok(structured["documents"].clone())
+        };
+        let (created, _) = service
+            .dispatch("new_document", json!({}), CancellationToken::new())
+            .await?;
+        assert!(created.is_some());
+        assert_eq!(list(service.clone()).await?, json!([]));
+        let shared = workers.attach_external(
+            Arc::new(|| {}),
+            crate::document_workers::ExternalInfo {
+                title: "보고서.hwpx".into(),
+                path: Some("C:/docs/보고서.hwpx".into()),
+                dirty: true,
+            },
+        )?;
+        let listed = list(service.clone()).await?;
+        assert_eq!(
+            listed,
+            json!([{"document_id":shared.id(),"title":"보고서.hwpx","path":"C:/docs/보고서.hwpx","source":"desktop","dirty":true}])
+        );
+        drop(shared);
+        assert_eq!(list(service).await?, json!([]));
+        Ok(())
+    }
+
     #[test]
     fn schemas_require_explicit_document_context_and_preserve_pure_discovery() -> Result<()> {
         let service = HwpService::new(Arc::new(DocumentWorkers::new(None)))?;
@@ -586,6 +657,8 @@ mod tests {
         }
         assert!(service.validators["new_document"].is_valid(&json!({})));
         assert!(service.validators["list_commands"].is_valid(&json!({"query":"표"})));
+        assert!(service.validators["list_documents"].is_valid(&json!({})));
+        assert!(!service.validators["list_documents"].is_valid(&json!({"document_id":"x"})));
         assert!(service.validators["hwp_action"].is_valid(&json!({"query":"Bold"})));
         assert!(!service.validators["hwp_action"].is_valid(&json!({"id":"CharShapeBold"})));
         assert!(
@@ -641,6 +714,18 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(text)?,
             value["structuredContent"]
+        );
+        // The value carried beside the text for the response stays internal.
+        assert!(!value.to_string().contains(tools::PARSED), "{value}");
+        // A result built without it (render_page) is still read from its text.
+        let response = tool_result(
+            json!({"content":[{"type":"text","text":"{\"page\":1}"}],"isError":false}),
+            None,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            serde_json::to_value(ServerResult::from(response))?["structuredContent"]["page"],
+            1
         );
         let response = tool_result(tools::result(json!(["one", "two"]), false), None)
             .map_err(anyhow::Error::msg)?;
@@ -730,6 +815,7 @@ mod tests {
         let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
         let cases = [
             ("list_commands", json!({"query":"표"}), false),
+            ("list_documents", json!({}), false),
             (
                 "type_text",
                 doc(json!({"text":"첫째 문단 😀\n둘째 문단"})),
@@ -769,7 +855,7 @@ mod tests {
             ("save_document", doc(json!({"path":path(&saved)})), false),
             (
                 "save_document",
-                doc(json!({"path":path(&dir.path().join("x.docx"))})),
+                doc(json!({"path":path(&dir.path().join("x.odt"))})),
                 true,
             ),
             ("open_document", json!({"path":path(&saved)}), false),

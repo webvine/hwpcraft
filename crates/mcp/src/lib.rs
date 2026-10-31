@@ -4,6 +4,7 @@
 
 mod atomic_batch;
 mod catalog;
+pub mod desktop_bridge;
 mod document_subscriptions;
 mod document_workers;
 mod output_schemas;
@@ -52,6 +53,13 @@ struct New {
 #[serde(deny_unknown_fields)]
 struct Save {
     path: Option<PathBuf>,
+    /// Save a change-tracked document as HWP/HWPX anyway, merging its changes
+    /// into the shown text and dropping the tracking records.
+    #[serde(default, rename = "acceptTrackChanges")]
+    accept_track_changes: bool,
+    /// Save as .hwp anyway, removing the picture effects HWP cannot hold yet.
+    #[serde(default, rename = "dropPictureEffects")]
+    drop_picture_effects: bool,
 }
 
 impl Headless {
@@ -116,7 +124,29 @@ impl Headless {
                     {
                         bail!("file.pdf의 path는 .pdf여야 합니다.");
                     }
-                    self.session.save(&path)?;
+                    // DOCX reports what it could not carry instead of dropping it silently.
+                    if path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("docx"))
+                    {
+                        let omitted = self.session.export_docx(&path, p.accept_track_changes)?;
+                        let mut info = self.session.info();
+                        info["omitted"] = json!(omitted);
+                        return Ok(info);
+                    }
+                    if p.drop_picture_effects {
+                        let dropped = self
+                            .session
+                            .save_dropping_picture_effects(&path, p.accept_track_changes)?;
+                        let mut info = self.session.info();
+                        info["droppedPictureEffects"] = json!(dropped);
+                        return Ok(info);
+                    }
+                    if p.accept_track_changes {
+                        self.session.save_accepting_track_changes(&path)?;
+                    } else {
+                        self.session.save(&path)?;
+                    }
                 }
                 _ => return self.session.run(command, params),
             }

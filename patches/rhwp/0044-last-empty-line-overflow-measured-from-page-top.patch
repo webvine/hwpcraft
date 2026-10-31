@@ -1,0 +1,129 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 96f6a9f..8ee35f0 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -4221,6 +4221,37 @@ mod fresh_flow_tests {
+         core.reflow_linesegs_on_demand();
+         assert_eq!(rows(&core), live);
+     }
++
++    /// A last empty line that fits the body stays on its page on later pages too.
++    /// The fresh layout of a section without rows does not rewind vpos at page
++    /// boundaries, so measured from 0 that line read as past the body and the
++    /// layout added a blank page.
++    #[test]
++    fn a_fresh_layout_keeps_a_last_empty_line_that_fits_on_a_later_page() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        // Landscape A4 holds 25 rows of 10 pt at 160% (1,600 HU) in its 41,104 HU
++        // body. The 26th, empty row ends at 41,000 HU: inside the body, but within
++        // the 4 px layout safety margin.
++        let mut doc = core.document().clone();
++        doc.sections[0].section_def.page_def.landscape = true;
++        core.set_document(doc);
++        for i in 0..50 {
++            let text = format!("줄 {i}");
++            core.insert_text_native(0, i, 0, &text).unwrap();
++            core.split_paragraph_native(0, i, text.chars().count(), None)
++                .unwrap();
++        }
++        assert_eq!(core.page_count(), 2);
++        let mut doc = core.document().clone();
++        for p in &mut doc.sections[0].paragraphs {
++            p.line_segs.clear();
++        }
++        core.set_document(doc);
++        core.validation_report = DocumentCore::validate_linesegs(&core.document, true);
++        core.reflow_linesegs_on_demand();
++        assert_eq!(core.page_count(), 2);
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/renderer/typeset/paragraph.rs b/src/renderer/typeset/paragraph.rs
+index 6735063..235b2f7 100644
+--- a/src/renderer/typeset/paragraph.rs
++++ b/src/renderer/typeset/paragraph.rs
+@@ -651,11 +651,31 @@ pub(super) fn try_absorb_rowbreak_guide(
+ 
+ /// 저장 줄 상자가 본문 높이를 넘으면 빈 꼬리 흡수와 끝 쪽 제거 모두에서 보존한다.
+ /// Enter 재조판은 쪽 경계에서 vpos를 되감지 않으므로 이 줄은 실제 흐름을 점유한다.
+-pub(super) fn stored_line_overflows_body(para: &Paragraph, body_height: f64, dpi: f64) -> bool {
++///
++/// `page_vpos_base` 는 줄이 놓일 쪽의 시작 vpos 다. 되감지 않는 사다리는 둘째 쪽부터
++/// vpos 가 본문 높이보다 커서, 0 을 기준으로 재면 본문 안의 줄도 넘친 것으로 읽힌다.
++pub(super) fn stored_line_overflows_body(
++    para: &Paragraph,
++    page_vpos_base: i32,
++    body_height: f64,
++    dpi: f64,
++) -> bool {
+     let body_height_hu = crate::renderer::px_to_hwpunit(body_height, dpi);
+-    para.line_segs
+-        .first()
+-        .is_some_and(|ls| ls.vertical_pos.saturating_add(ls.line_height) > body_height_hu)
++    para.line_segs.first().is_some_and(|ls| {
++        ls.vertical_pos
++            .saturating_add(ls.line_height)
++            .saturating_sub(page_vpos_base)
++            > body_height_hu
++    })
++}
++
++/// 현재 쪽의 vpos 기준점. 흐름 스냅이 확정한 기준이 없으면 쪽 첫 항목의 줄에서 읽는다.
++fn current_page_vpos_base(st: &TypesetState, paragraphs: &[Paragraph]) -> Option<i32> {
++    st.vpos_page_base.or(st.vpos_lazy_base).or_else(|| {
++        st.current_items
++            .first()
++            .and_then(|item| page_item_vpos_base(item, paragraphs))
++    })
+ }
+ 
+ /// 다단 조판의 조기 반환 뒤에서만 실행한다. 숨김 옵션의 페이지 수명과 구역 끝 처리를 구분한다.
+@@ -690,7 +710,20 @@ pub(super) fn try_absorb_empty_paragraph(
+     }
+     // 마지막 빈 문단도 유효한 줄 상자를 소유한다. 저장 줄이 이미 본문 밖에
+     // 있으면 미세 drift용 Hidden/Unadvanced 처리로 그 소유를 없애지 않는다.
+-    if stored_line_overflows_body(para, st.layout.body_area.height, st.layout.dpi) {
++    // 합성 줄(재조판·저장 행 없는 구역의 새 조판이 만든 줄)은 vpos 가 쪽에서 되감기지
++    // 않으므로 현재 쪽 기준으로 잰다. 한/글 저장 줄은 쪽마다 되감기므로 0 기준 그대로다.
++    let page_vpos_base = para
++        .line_segs
++        .first()
++        .filter(|seg| is_synthetic_line_seg(seg))
++        .map(|seg| current_page_vpos_base(st, paragraphs).unwrap_or(seg.vertical_pos))
++        .unwrap_or(0);
++    if stored_line_overflows_body(
++        para,
++        page_vpos_base,
++        st.layout.body_area.height,
++        st.layout.dpi,
++    ) {
+         return false;
+     }
+     match empty::trailing_disposition(
+@@ -821,11 +854,7 @@ pub(super) fn prepare_forced_page_boundary(
+         native_hwp5_existing_footnote_reset_overlap_break_line(st, para, fmt, paragraphs, dpi);
+     // 흐름 스냅이 이미 확정한 지연 기준은 마지막 줄·내부 쪽 경계도 함께 소비한다.
+     // 첫 빈 개체 호스트의 저장 위치는 표 밴드 뒤의 줄일 수 있어 쪽 원점으로 다시 쓰지 않는다.
+-    let current_page_vpos_base = st.vpos_page_base.or(st.vpos_lazy_base).or_else(|| {
+-        st.current_items
+-            .first()
+-            .and_then(|item| page_item_vpos_base(item, paragraphs))
+-    });
++    let current_page_vpos_base = current_page_vpos_base(st, paragraphs);
+     // 쪽 소유가 저장 앵커와 현재 흐름으로 입증된 일반 본문은 시작 높이의
+     // 비율로 다시 거절하지 않는다. 기존 세션 편집 플래그와 구성 줄 수,
+     // 유효 저장 앵커를 확인하고 실제 재조판으로 사라진 reset은 재사용하지 않는다.
+diff --git a/src/renderer/typeset/state/finalize.rs b/src/renderer/typeset/state/finalize.rs
+index f68f801..644c5c7 100644
+--- a/src/renderer/typeset/state/finalize.rs
++++ b/src/renderer/typeset/state/finalize.rs
+@@ -54,6 +54,7 @@ pub(super) fn discard_terminal_blank_only_page(
+                     .is_some_and(|prev| stored_vpos_top_collision(prev, para));
+             let stored_line_overflows_body = stored_line_overflows_body(
+                 para,
++                0,
+                 last_page.layout.body_area.height,
+                 last_page.layout.dpi,
+             );

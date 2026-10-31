@@ -94,11 +94,15 @@ pub(crate) fn success(tool: &str) -> Option<Value> {
             )},"rolledBack":{"type":"boolean"}}),
             &["results", "rolledBack"],
         )),
-        "new_document"
-        | "open_document"
-        | "open_protected_document"
-        | "save_document"
-        | "type_text" => summary_result(),
+        "new_document" | "open_document" | "open_protected_document" | "type_text" => {
+            summary_result()
+        }
+        "save_document" => {
+            let mut schema = summary_result();
+            schema["properties"]["droppedPictureEffects"] = integer();
+            schema["properties"]["omitted"] = json!({"type":"array","items":{"type":"string"}});
+            schema
+        }
         "select_text" => with_document(object(
             json!({"cursor":cursor(),"anchor":nullable(integer())}),
             &["cursor", "anchor"],
@@ -156,6 +160,15 @@ pub(crate) fn success(tool: &str) -> Option<Value> {
                 "width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1}}),
             &["page", "pages", "width", "height"],
         )),
+        "list_documents" => object(
+            json!({"documents":{"type":"array","items":object(
+                json!({"document_id":{"type":"string","minLength":1},"title":{"type":"string"},
+                    "path":nullable(json!({"type":"string"})),"source":{"enum":["desktop"]},
+                    "dirty":{"type":"boolean"}}),
+                &["document_id", "title", "path", "source", "dirty"],
+            )}}),
+            &["documents"],
+        ),
         "close_document" => with_document(object(json!({"closed":{"const":true}}), &["closed"])),
         _ => return None,
     };

@@ -1,0 +1,94 @@
+diff --git a/src/document_core/commands/text_editing.rs b/src/document_core/commands/text_editing.rs
+index 139c0c4..65ec825 100644
+--- a/src/document_core/commands/text_editing.rs
++++ b/src/document_core/commands/text_editing.rs
+@@ -941,11 +941,15 @@ pub(super) fn inactive_field_end_insertions(
+             // 메모도 끝 칸이 새 글자 앞에 남는다(스트림이 그렇다). 범위만 늘리면 저장본을
+             // 다시 열 때 글자가 메모 안으로 들어가 모델이 달라진다. 상호 참조의 글은 갱신이
+             // 통째로 바꾸므로 끝에 이어 쓴 글이 그 안에 들어가면 다음 갱신에 지워진다.
++            // 문서 요약 필드(날짜 코드 등)도 같은 이유로 끝에 이어 쓴 글을 밖에 둔다.
+             match para.controls.get(fr.control_idx) {
+                 Some(Control::Field(field))
+                     if matches!(
+                         field.field_type,
+-                        FieldType::ClickHere | FieldType::Memo | FieldType::CrossRef
++                        FieldType::ClickHere
++                            | FieldType::Memo
++                            | FieldType::CrossRef
++                            | FieldType::Summary
+                     ) => {}
+                 _ => return None,
+             }
+diff --git a/src/document_core/hyperlink.rs b/src/document_core/hyperlink.rs
+index 4d54677..71a01d4 100644
+--- a/src/document_core/hyperlink.rs
++++ b/src/document_core/hyperlink.rs
+@@ -86,11 +86,21 @@ impl DocumentCore {
+                 "하이퍼링크는 문단 안의 비어 있지 않은 범위가 필요합니다",
+             ));
+         }
++        // 메모와 같은 범위는 겹침이 아니라 그 메모의 댓글 자리다(한글은 댓글을 같은 범위의
++        // 메모로, 부모 시작 표식 뒤·글 앞에 중첩해 저장한다). 새 시작 표식은 부모 시작 뒤에
++        // 들어가고 끝 표식은 같은 글 경계에 붙는다.
++        let reply_slot = |r: &FieldRange| {
++            r.start_char_idx == start
++                && r.end_char_idx == end
++                && matches!(candidate.controls.get(r.control_idx),
++                    Some(Control::Field(f)) if f.field_type == FieldType::Memo)
++        };
+         if candidate.field_ranges.iter().any(|r| {
+-            start < r.end_char_idx && r.start_char_idx < end
+-                || (r.start_char_idx == r.end_char_idx
+-                    && start <= r.start_char_idx
+-                    && r.start_char_idx < end)
++            !reply_slot(r)
++                && (start < r.end_char_idx && r.start_char_idx < end
++                    || (r.start_char_idx == r.end_char_idx
++                        && start <= r.start_char_idx
++                        && r.start_char_idx < end))
+         }) {
+             return Err(invalid("기존 필드와 겹치는 하이퍼링크는 지원하지 않습니다"));
+         }
+diff --git a/src/serializer/body_text.rs b/src/serializer/body_text.rs
+index 0e94a08..e132671 100644
+--- a/src/serializer/body_text.rs
++++ b/src/serializer/body_text.rs
+@@ -168,18 +168,30 @@ fn serialize_master_page_tail(section: &Section, records: &mut Vec<Record>) {
+ }
+ 
+ fn collect_memo_lists(section: &Section) -> Vec<(u32, Vec<Paragraph>)> {
+-    let mut memo_lists = Vec::new();
+-    for para in &section.paragraphs {
+-        for ctrl in &para.controls {
+-            if let Control::Field(field) = ctrl {
+-                if field.field_type == crate::model::control::FieldType::Memo
+-                    && !field.memo_paragraphs.is_empty()
+-                {
+-                    memo_lists.push((field.memo_index, field.memo_paragraphs.clone()));
++    // 메모는 본문 문단뿐 아니라 표 셀 문단에도 달린다. 본문은 구역 끝 MEMO_LIST 하나에
++    // 모이므로 셀(중첩 표 포함) 안의 메모도 문서 순서대로 함께 모은다.
++    fn collect(paragraphs: &[Paragraph], memo_lists: &mut Vec<(u32, Vec<Paragraph>)>) {
++        for para in paragraphs {
++            for ctrl in &para.controls {
++                match ctrl {
++                    Control::Field(field)
++                        if field.field_type == crate::model::control::FieldType::Memo
++                            && !field.memo_paragraphs.is_empty() =>
++                    {
++                        memo_lists.push((field.memo_index, field.memo_paragraphs.clone()));
++                    }
++                    Control::Table(table) => {
++                        for cell in &table.cells {
++                            collect(&cell.paragraphs, memo_lists);
++                        }
++                    }
++                    _ => {}
+                 }
+             }
+         }
+     }
++    let mut memo_lists = Vec::new();
++    collect(&section.paragraphs, &mut memo_lists);
+     memo_lists
+ }
+ 

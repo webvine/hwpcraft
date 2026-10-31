@@ -1,0 +1,204 @@
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 30a15c5..39c3658 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -8181,6 +8181,22 @@ impl DocumentCore {
+                 if pi >= paragraph_count || hidden.is_some_and(|h| h.contains(&pi)) {
+                     continue;
+                 }
++                // [HwpCraft 0042] 줄 번호 건너뜀 문단은 번호를 매기지도 세지도 않는다.
++                let suppressed = self
++                    .document
++                    .sections
++                    .get(sec_idx)
++                    .and_then(|s| s.paragraphs.get(pi))
++                    .and_then(|para| {
++                        self.document
++                            .doc_info
++                            .para_shapes
++                            .get(para.para_shape_id as usize)
++                    })
++                    .is_some_and(|shape| shape.suppress_line_numbers);
++                if suppressed {
++                    continue;
++                }
+                 out.extend(range.map(|li| (pi, li)));
+             }
+         }
+@@ -10731,6 +10747,30 @@ mod hwpcraft_line_number_tests {
+         assert_eq!(cached(&core), vec![5, 6, 7]);
+     }
+ 
++    #[test]
++    fn a_skipped_paragraph_keeps_skipping_when_its_alignment_changes() {
++        // [HwpCraft 0042] ParaShape equality includes the skip, so a centred paragraph's
++        // shape is not handed to a skipped paragraph centred after it.
++        let mut core = numbered(3, true, 3, 1);
++        let mut doc = core.document().clone();
++        let mut shape =
++            doc.doc_info.para_shapes[doc.sections[0].paragraphs[1].para_shape_id as usize].clone();
++        shape.suppress_line_numbers = true;
++        shape.raw_data = None;
++        doc.doc_info.para_shapes.push(shape);
++        doc.sections[0].paragraphs[1].para_shape_id = (doc.doc_info.para_shapes.len() - 1) as u16;
++        core.set_document(doc);
++        core.apply_para_format_native(0, 0, r#"{"alignment":"center"}"#)
++            .unwrap();
++        core.apply_para_format_native(0, 1, r#"{"alignment":"center"}"#)
++            .unwrap();
++        let doc = core.document();
++        let [a, b] = [0, 1].map(|i| doc.sections[0].paragraphs[i].para_shape_id);
++        assert_ne!(a, b);
++        assert!(doc.doc_info.para_shapes[b as usize].suppress_line_numbers);
++        assert_eq!(numbers(&core, 0), vec![1, 2]);
++    }
++
+     #[test]
+     fn line_numbers_are_drawn_only_when_shown_and_follow_count_and_restart() {
+         // Off: the page is drawn exactly as without the setting.
+@@ -10759,6 +10799,19 @@ mod hwpcraft_line_number_tests {
+             !shown.is_empty() && shown.iter().all(|n| n % 5 == 0),
+             "{shown:?}"
+         );
++        // [HwpCraft 0042] A paragraph that skips line numbering gets none and is not counted.
++        let mut skip = numbered(60, true, 3, 1);
++        let mut doc = skip.document().clone();
++        let mut shape =
++            doc.doc_info.para_shapes[doc.sections[0].paragraphs[1].para_shape_id as usize].clone();
++        shape.suppress_line_numbers = true;
++        shape.raw_data = None;
++        doc.doc_info.para_shapes.push(shape);
++        doc.sections[0].paragraphs[1].para_shape_id = (doc.doc_info.para_shapes.len() - 1) as u16;
++        skip.set_document(doc);
++        let shown = numbers(&skip, 0);
++        assert_eq!(&shown[..3], &[1, 2, 3], "{shown:?}");
++        assert_eq!(shown.len(), first.len() - 1);
+         // The numbers end 5 mm (`distance` 1417) left of the body.
+         let body_left = on.pagination[0].pages[0].layout.body_area.x;
+         let (_, x) = drawn(&on, 0)[0];
+diff --git a/src/model/style.rs b/src/model/style.rs
+index cf7344f..9c7bf4d 100644
+--- a/src/model/style.rs
++++ b/src/model/style.rs
+@@ -357,6 +357,9 @@ pub struct ParaShape {
+     pub head_type: HeadType,
+     /// 문단 수준 (0~6 → 1~7수준, attr1 bit 25~27)
+     pub para_level: u8,
++    /// [HwpCraft 0042] HWPX `paraPr@suppressLineNumbers` (줄 번호 건너뜀). HWP5 의 자리는
++    /// 공개 형식 문서에 없어 HWPX 에서만 읽고 쓴다.
++    pub suppress_line_numbers: bool,
+     /// [#4898] HWPX 원본이 `hp:switch` 없이 여백·줄간격을 평문으로 적었는지 보존한다.
+     /// 평문 고정 줄간격은 switch와 다른 저장 계약이므로 원본 표기를 유지한다.
+     /// 평문 여백의 패키지 버전별 단위는 아래 출처와 함께 보존한다.
+@@ -418,6 +421,7 @@ impl PartialEq for ParaShape {
+             && self.head_type == other.head_type
+             && self.para_level == other.para_level
+             && self.break_latin_word == other.break_latin_word
++            && self.suppress_line_numbers == other.suppress_line_numbers
+     }
+ }
+ 
+diff --git a/src/parser/doc_info.rs b/src/parser/doc_info.rs
+index 8cd7697..b22fec3 100644
+--- a/src/parser/doc_info.rs
++++ b/src/parser/doc_info.rs
+@@ -815,6 +815,8 @@ fn parse_para_shape(data: &[u8]) -> Result<ParaShape, DocInfoError> {
+         line_spacing_v2,
+         head_type,
+         para_level,
++        // HWP5 의 줄 번호 건너뜀 자리는 공개 형식 문서에 없다(HWPX 만 읽음).
++        suppress_line_numbers: false,
+         // HWP5 는 breakLatinWord 를 attr1 비트로 갖지만 HWPX 원문 보존 필드는 미사용
+         // (None → 직렬화 KEEP_WORD 기본, 기존 동작 유지). (#1986)
+         break_latin_word: None,
+diff --git a/src/parser/hwpx/header.rs b/src/parser/hwpx/header.rs
+index 3b82bee..65bef1c 100644
+--- a/src/parser/hwpx/header.rs
++++ b/src/parser/hwpx/header.rs
+@@ -929,6 +929,7 @@ fn parse_para_shape(
+                     ps.attr1 &= !(1 << 8);
+                 }
+             }
++            b"suppressLineNumbers" => ps.suppress_line_numbers = parse_bool(&attr),
+             _ => {}
+         }
+     }
+diff --git a/src/serializer/doc_info/tests.rs b/src/serializer/doc_info/tests.rs
+index 43f6fa7..a56a72d 100644
+--- a/src/serializer/doc_info/tests.rs
++++ b/src/serializer/doc_info/tests.rs
+@@ -287,6 +287,7 @@ fn test_serialize_para_shape_roundtrip() {
+         line_spacing_v2: 0,
+         head_type: crate::model::style::HeadType::None,
+         para_level: 0,
++        suppress_line_numbers: false,
+         break_latin_word: None,
+         hwpx_plain_para_margin: false,
+         hwpx_plain_para_margin_physical: false,
+@@ -316,6 +317,7 @@ fn serialize_para_shape_writes_outline_level_into_tail() {
+     for lvl in 0u8..=9 {
+         let ps = ParaShape {
+             para_level: lvl,
++            suppress_line_numbers: false,
+             ..Default::default()
+         };
+         let data = serialize_para_shape(&ps);
+@@ -677,6 +679,7 @@ fn test_serialize_doc_info_roundtrip() {
+         line_spacing_v2: 0,
+         head_type: crate::model::style::HeadType::None,
+         para_level: 0,
++        suppress_line_numbers: false,
+         break_latin_word: None,
+         hwpx_plain_para_margin: false,
+         hwpx_plain_para_margin_physical: false,
+diff --git a/src/serializer/hwpx/header.rs b/src/serializer/hwpx/header.rs
+index 2f0b5ae..d9997e2 100644
+--- a/src/serializer/hwpx/header.rs
++++ b/src/serializer/hwpx/header.rs
+@@ -1020,7 +1020,10 @@ fn write_para_pr<W: Write>(
+             ("condense", &condense),
+             ("fontLineHeight", &font_line_height),
+             ("snapToGrid", &snap_to_grid),
+-            ("suppressLineNumbers", "0"),
++            (
++                "suppressLineNumbers",
++                if ps.suppress_line_numbers { "1" } else { "0" },
++            ),
+             ("checked", "0"),
+         ],
+     )?;
+@@ -2557,3 +2560,34 @@ mod tests {
+         assert_eq!(tab_leader_str(8), "DOUBLE_SLIM");
+     }
+ }
++
++#[cfg(test)]
++mod hwpcraft_suppress_line_numbers_tests {
++    use crate::document_core::DocumentCore;
++
++    /// [HwpCraft 0042] 문단의 줄 번호 건너뜀은 HWPX 로 저장하고 다시 열어도 남는다.
++    #[test]
++    fn suppressed_line_numbers_survive_an_hwpx_round_trip() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        let mut doc = core.document().clone();
++        let id = doc.sections[0].paragraphs[0].para_shape_id as usize;
++        doc.doc_info.para_shapes[id].suppress_line_numbers = true;
++        doc.doc_info.para_shapes[id].raw_data = None;
++        core.set_document(doc);
++        let bytes = core.export_hwpx_native().unwrap();
++        let back = DocumentCore::from_bytes(&bytes).unwrap();
++        let id = back.document().sections[0].paragraphs[0].para_shape_id as usize;
++        assert!(back.document().doc_info.para_shapes[id].suppress_line_numbers);
++        // Others stay off.
++        let others = back
++            .document()
++            .doc_info
++            .para_shapes
++            .iter()
++            .enumerate()
++            .filter(|(i, ps)| *i != id && ps.suppress_line_numbers)
++            .count();
++        assert_eq!(others, 0);
++    }
++}

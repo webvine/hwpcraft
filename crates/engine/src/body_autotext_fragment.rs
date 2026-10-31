@@ -128,10 +128,28 @@ fn guard_document(session: &Session) -> Result<()> {
     session.guard_protected()
 }
 
-fn destination(session: &Session) -> Result<usize> {
+/// Where a body snippet goes: before a paragraph, or into the middle of one (the
+/// paragraph is split there first).
+#[derive(Clone, Copy)]
+enum Spot {
+    Before(usize),
+    Middle { paragraph: usize, offset: usize },
+}
+
+impl Spot {
+    /// The paragraph the snippet's first paragraph takes the place of.
+    fn before(self) -> usize {
+        match self {
+            Spot::Before(before) => before,
+            Spot::Middle { paragraph, .. } => paragraph + 1,
+        }
+    }
+}
+
+fn destination(session: &Session) -> Result<Spot> {
     guard_document(session)?;
     if session.cursor.cell.is_some() || session.has_selection() {
-        bail!("본문 상용구는 선택 없이 표 밖 본문의 문단 경계에 넣으세요.");
+        bail!("본문 상용구는 선택 없이 표 밖 본문의 캐럿 자리에 넣으세요.");
     }
     let paragraph = session.paragraph(session.cursor)?;
     if session.cursor.offset == 0 {
@@ -157,15 +175,20 @@ fn destination(session: &Session) -> Result<usize> {
                 bail!("대상 첫 문단의 구역/단 정의 배치는 본문 상용구에서 지원하지 않습니다.");
             }
         }
-        Ok(session.cursor.paragraph)
+        Ok(Spot::Before(session.cursor.paragraph))
     } else if session.cursor.offset == paragraph.text.chars().count() {
         session
             .cursor
             .paragraph
             .checked_add(1)
+            .map(Spot::Before)
             .ok_or_else(|| anyhow!("상용구 삽입 위치 초과"))
     } else {
-        bail!("문단 중간에는 본문 상용구를 넣을 수 없습니다.")
+        // The split takes RHWP's logical offset (an inline object counts once).
+        Ok(Spot::Middle {
+            paragraph: session.cursor.paragraph,
+            offset: session.split_offset(session.cursor)?,
+        })
     }
 }
 
@@ -177,7 +200,7 @@ fn request(range: SourceRange, section: usize, before: usize) -> Value {
             "maxDocumentNodes":100_000},"maxResourceMetadataBytes":8*1024*1024,"maxBinaryBytes":MAX_BINARY}})
 }
 
-fn import(
+pub(crate) fn import(
     core: &mut DocumentCore,
     source: &Document,
     range: SourceRange,
@@ -304,7 +327,7 @@ pub(crate) fn preview(
     expected_generation: u64,
 ) -> Result<Value> {
     generation(session, expected_generation)?;
-    let before = destination(session)?;
+    let before = destination(session)?.before();
     let core = decode(payload)?;
     let paragraphs = core.document().sections[0].paragraphs.len();
     let options = serde_json::from_value(request(
@@ -335,12 +358,25 @@ pub(crate) fn insert(
     expected_generation: u64,
 ) -> Result<Value> {
     generation(session, expected_generation)?;
-    let before = destination(session)?;
+    let spot = destination(session)?;
+    let before = spot.before();
     let source = decode(payload)?;
     let paragraphs = source.document().sections[0].paragraphs.len();
+    // A one-paragraph snippet without a table goes into the text like typing; a
+    // longer one stands between the two halves of the split paragraph.
+    let inline = paragraphs == 1
+        && !source.document().sections[0].paragraphs[0]
+            .controls
+            .iter()
+            .any(|c| matches!(c, Control::Table(_)));
     let section = session.cursor.section;
     let mut report = Value::Null;
     session.transaction(|s| {
+        if let Spot::Middle { paragraph, offset } = spot {
+            s.core
+                .split_paragraph_native(section, paragraph, offset, None)
+                .map_err(err)?;
+        }
         report = import(
             &mut s.core,
             source.document(),
@@ -359,19 +395,36 @@ pub(crate) fn insert(
         let last = (before + paragraphs)
             .checked_sub(1)
             .ok_or_else(|| anyhow!("본문 상용구에 넣을 문단이 없습니다."))?;
-        let offset = s
-            .core
-            .document()
-            .sections
-            .get(section)
-            .and_then(|sec| sec.paragraphs.get(last))
-            .ok_or_else(|| anyhow!("본문 상용구를 넣은 뒤 문단 위치를 찾지 못했습니다."))?
-            .text
-            .chars()
-            .count();
+        let length = |s: &Session, paragraph: usize| -> Result<usize> {
+            Ok(s.core
+                .document()
+                .sections
+                .get(section)
+                .and_then(|sec| sec.paragraphs.get(paragraph))
+                .ok_or_else(|| anyhow!("본문 상용구를 넣은 뒤 문단 위치를 찾지 못했습니다."))?
+                .text
+                .chars()
+                .count())
+        };
+        let mut paragraph = last;
+        let mut offset = length(s, last)?;
+        if let Spot::Middle {
+            paragraph: head, ..
+        } = spot
+            && inline
+        {
+            // Join the text after the caret, then the snippet, back into one paragraph.
+            let head_length = length(s, head)?;
+            s.core
+                .merge_paragraph_native(section, last + 1)
+                .map_err(err)?;
+            s.core.merge_paragraph_native(section, last).map_err(err)?;
+            paragraph = head;
+            offset += head_length;
+        }
         s.cursor = Cursor {
             section,
-            paragraph: last,
+            paragraph,
             offset,
             cell: None,
         };
@@ -387,7 +440,11 @@ pub(crate) fn insert(
 /// move the target's original definitions rather than letting serialization add
 /// a second definition before the displaced one. This is a same-document move:
 /// resource IDs, document settings and all original body text stay unchanged.
-fn move_target_prologue(core: &mut DocumentCore, section: usize, displaced: usize) -> Result<()> {
+pub(crate) fn move_target_prologue(
+    core: &mut DocumentCore,
+    section: usize,
+    displaced: usize,
+) -> Result<()> {
     use hwpcraft_doc::model::paragraph::ColumnBreakType;
     let paragraphs = &mut core
         .document_mut()
@@ -612,7 +669,7 @@ fn bounded_source_copy(document: &Document) -> Result<Document> {
     })
 }
 
-fn normalize_prefix(paragraph: &mut Paragraph, allow: bool) -> Result<()> {
+pub(crate) fn normalize_prefix(paragraph: &mut Paragraph, allow: bool) -> Result<()> {
     let count = paragraph
         .controls
         .iter()
@@ -1549,16 +1606,15 @@ mod tests {
     }
 
     #[test]
-    fn destination_mid_selection_and_stale_requests_preserve_history() -> Result<()> {
+    fn destination_selection_and_stale_requests_preserve_history_and_mid_caret_inserts()
+    -> Result<()> {
         let mut source = Session::new()?;
         source.execute(Command::Insert("상용구".into()))?;
         let payload = captured(&source, 0, 1)?.payload;
         let mut target = Session::new()?;
         target.execute(Command::Insert("기존 본문".into()))?;
-        target.select(at(0, 1), false)?;
         let before = text(&target);
         let generation = target.generation;
-        assert!(insert(&mut target, &payload, generation).is_err());
         target.select(at(0, 0), false)?;
         target.select(at(0, 2), true)?;
         assert!(insert(&mut target, &payload, generation).is_err());
@@ -1566,6 +1622,12 @@ mod tests {
         assert!(insert(&mut target, &payload, generation + 1).is_err());
         assert_eq!(text(&target), before);
         assert_eq!(target.generation, generation);
+        // Inside a paragraph the snippet joins the text; one undo takes it out.
+        target.select(at(0, 1), false)?;
+        insert(&mut target, &payload, generation)?;
+        assert_eq!(text(&target), vec!["기상용구존 본문"]);
+        target.execute(Command::Undo)?;
+        assert_eq!(text(&target), before);
         target.execute(Command::Undo)?;
         assert_eq!(text(&target), vec![""]);
         Ok(())

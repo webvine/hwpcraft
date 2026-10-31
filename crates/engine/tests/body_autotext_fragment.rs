@@ -128,3 +128,79 @@ fn source_query_and_failed_capture_leave_settings_and_document_unchanged() -> an
     assert_eq!(session.text(), "부분 선택 시험");
     Ok(())
 }
+
+fn texts(s: &Session) -> Vec<String> {
+    s.core.document().sections[0]
+        .paragraphs
+        .iter()
+        .map(|p| p.text.clone())
+        .collect()
+}
+
+/// A body snippet goes in at the caret inside a paragraph too: a one-paragraph snippet
+/// joins the text like typing, a longer one stands between the two halves. One undo.
+#[test]
+fn body_snippets_go_into_the_middle_of_a_paragraph() -> anyhow::Result<()> {
+    let _settings = settings();
+    let mut source = Session::new()?;
+    source.execute(Command::Insert("굵은 회사명\n첫 줄\n둘째 줄".into()))?;
+    source.select(at(0, 0), false)?;
+    source.select(at(0, 6), true)?;
+    source.execute(Command::Character(json!({"bold":true})))?;
+    let current = source.run("tools.autotext.body.source", json!({}))?;
+    let one = source.run(
+        "tools.autotext.body.add",
+        json!({"name":"회사명","source":{"section":0,"start":0,"end":1},"expected_generation":current["generation"]}),
+    )?["entry"]["id"]
+        .clone();
+    let current = source.run("tools.autotext.body.source", json!({}))?;
+    let two = source.run(
+        "tools.autotext.body.add",
+        json!({"name":"두 줄","source":{"section":0,"start":1,"end":3},"expected_generation":current["generation"]}),
+    )?["entry"]["id"]
+        .clone();
+
+    let mut report = Session::new()?;
+    report.execute(Command::Insert("앞글뒤글".into()))?;
+    report.select(at(0, 2), false)?;
+    let head = report.run("tools.autotext.body.source", json!({}))?;
+    let shown = report.run(
+        "tools.autotext.body.preview",
+        json!({"id":one,"expected_generation":head["generation"]}),
+    )?;
+    assert!(shown["svg"].as_str().unwrap_or_default().contains("<svg"));
+    let done = report.run(
+        "tools.autotext.body.insert",
+        json!({"id":one,"expected_generation":head["generation"]}),
+    )?;
+    assert_eq!(texts(&report), ["앞글굵은 회사명뒤글"]);
+    assert_eq!(done["cursor"]["offset"], 8, "{done}");
+    report.select(at(0, 2), false)?;
+    report.select(at(0, 4), true)?;
+    assert_eq!(report.run("format.character.get", json!({}))?["bold"], true);
+    report.select(at(0, 8), false)?;
+    report.select(at(0, 10), true)?;
+    assert_ne!(report.run("format.character.get", json!({}))?["bold"], true);
+    let files = tempfile::tempdir()?;
+    for extension in ["hwp", "hwpx"] {
+        let path = files.path().join(format!("inline.{extension}"));
+        report.save(&path)?;
+        let mut reopened = Session::new()?;
+        reopened.open(&path)?;
+        assert_eq!(texts(&reopened), ["앞글굵은 회사명뒤글"], "{extension}");
+    }
+    report.execute(Command::Undo)?;
+    assert_eq!(texts(&report), ["앞글뒤글"]);
+
+    // Two paragraphs stand between the halves.
+    report.select(at(0, 2), false)?;
+    let head = report.run("tools.autotext.body.source", json!({}))?;
+    report.run(
+        "tools.autotext.body.insert",
+        json!({"id":two,"expected_generation":head["generation"]}),
+    )?;
+    assert_eq!(texts(&report), ["앞글", "첫 줄", "둘째 줄", "뒤글"]);
+    report.execute(Command::Undo)?;
+    assert_eq!(texts(&report), ["앞글뒤글"]);
+    Ok(())
+}

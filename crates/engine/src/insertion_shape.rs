@@ -504,7 +504,7 @@ fn format_selection(
         }
         .map_err(err)?;
         if range.start == 0 {
-            align_selected_leading(formatter.core.document_mut(), at)?;
+            align_selected_leading(&mut formatter.core, at)?;
         }
         validate_resources(formatter.core.document())?;
     }
@@ -537,12 +537,20 @@ fn register_live(core: &mut DocumentCore, style: &NativeInsertionShape) -> Resul
 
 /// Native selection formatting starting at the first text character also sets
 /// the preceding section/column definition run. RHWP formats only text units.
-pub(crate) fn align_selected_leading(doc: &mut Document, mut at: Cursor) -> Result<()> {
+/// Only a section's first paragraph has such a run; others are left untouched,
+/// so RHWP's layout caches stay trusted for undo.
+pub(crate) fn align_selected_leading(core: &mut DocumentCore, mut at: Cursor) -> Result<()> {
     at.offset = 0;
-    if let Boundary::Leading(first) = boundary(doc, at)? {
-        let id = paragraph(doc, at)?.char_shape_id_at(0).unwrap_or(0);
-        apply_boundary(doc, at, Boundary::Leading(first), id)?;
-    }
+    let Boundary::Leading(first) = boundary(core.document(), at)? else {
+        return Ok(());
+    };
+    let id = paragraph(core.document(), at)?
+        .char_shape_id_at(0)
+        .unwrap_or(0);
+    apply_boundary(core.document_mut(), at, Boundary::Leading(first), id)?;
+    // Tells RHWP only this paragraph changed, so undo keeps the other sections.
+    core.relayout_paragraph_native(at.section, at.paragraph, at.cell.map(|c| c.control))
+        .map_err(err)?;
     Ok(())
 }
 

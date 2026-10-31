@@ -100,13 +100,19 @@ impl HwpApp {
             .copied()?;
         let logical = (pointer - page.min) / old;
         let page_size = *sizes.get(index as usize)? * self.zoom;
+        // With 쪽 윤곽 off only each page's body band is stacked, with no gap.
+        let outline = self.ext.shell.page_outline;
+        let band = |i: usize| match self.ext.shell.page_bodies.get(i) {
+            Some(&(top, bottom)) if !outline => (top, bottom),
+            _ => (0.0, sizes.get(i).map_or(0.0, |s| s.y)),
+        };
+        let gap = if outline { PAGE_GAP } else { 0.0 };
         let top = 15.0
-            + sizes
-                .iter()
-                .take(index as usize)
-                .map(|s| s.y * self.zoom + PAGE_GAP)
+            + (0..index as usize)
+                .map(|i| (band(i).1 - band(i).0) * self.zoom + gap)
                 .sum::<f32>();
         let left = ((viewport.width() - page_size.x) / 2.0).max(0.0);
+        let logical = logical - Vec2::new(0.0, band(index as usize).0);
         let content = Vec2::new(left, top) + logical * self.zoom;
         Some((content - (pointer - viewport.min)).max(Vec2::ZERO))
     }

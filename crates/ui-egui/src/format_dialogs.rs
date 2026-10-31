@@ -237,12 +237,13 @@ impl HwpApp {
                             &without_head(draft.patch()),
                             character,
                         );
-                        let (a, c) = chrome::actions(ui, validation.is_ok(), "설정(D)");
+                        let grey = validation.err().map(|e| e.to_string());
+                        let (a, c) = chrome::actions(ui, grey.as_deref(), "설정(D)");
                         apply = a;
                         cancel |= c;
-                        if let Err(e) = validation {
+                        if let Some(e) = grey {
                             ui.add_space(8.0);
-                            ui.colored_label(Color32::DARK_RED, e.to_string());
+                            ui.colored_label(Color32::DARK_RED, e);
                         }
                     });
                 });

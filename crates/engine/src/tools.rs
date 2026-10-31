@@ -1,5 +1,6 @@
 //! Owner: core area. 편집 도구: 정렬 (edit.sort), 조판 부호 지우기 (edit.delete_ctrl_marks).
 use super::*;
+use hwpcraft_doc::model::control::FieldType;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -73,7 +74,14 @@ impl MarkKind {
             Control::Bookmark(_) => Self::Bookmark,
             Control::Hyperlink(_) => Self::Hyperlink,
             Control::HiddenComment(_) => Self::HiddenComment,
-            Control::Field(_) => Self::Field,
+            // HwpCraft's (and Hangul's HWPX) hyperlinks are fields. Memos are fields
+            // too, but not 조판 부호 here: `memo.delete` removes them.
+            Control::Field(f) => match f.field_type {
+                FieldType::Hyperlink => Self::Hyperlink,
+                FieldType::Memo => return None,
+                _ if f.command.starts_with("MEMO/") => return None,
+                _ => Self::Field,
+            },
             _ => return None,
         })
     }
@@ -234,11 +242,16 @@ impl Session {
         self.transaction(|s| {
             // Last first, so earlier paragraph/control indexes stay valid.
             for (p, c, k) in targets.into_iter().rev() {
+                let field = matches!(
+                    s.core.document().sections[section].paragraphs[p].controls[c],
+                    Control::Field(_)
+                );
                 match k {
+                    _ if field => s.remove_field_control(section, p, c)?,
                     MarkKind::Footnote | MarkKind::Endnote => {
-                        s.core.delete_footnote_native(section, p, c).map_err(err)?
+                        s.delete_control_keeping_fields(section, p, c, true)?
                     }
-                    _ => s.core.delete_control_native(section, p, c).map_err(err)?,
+                    _ => s.delete_control_keeping_fields(section, p, c, false)?,
                 };
             }
             s.clear_selection();
@@ -251,5 +264,134 @@ impl Session {
             Ok(())
         })?;
         Ok(count)
+    }
+    /// Delete control `control` of a body paragraph through RHWP, then point the
+    /// paragraph's field ranges at their fields again: RHWP removes the control and its
+    /// CTRL_DATA record but leaves the ranges' control indices, so a 누름틀 after the
+    /// control would name the one after it (`field.list` loses it, an HWP save drops
+    /// its value). Ranges follow their field by id, so this stays right if RHWP moves
+    /// them itself.
+    pub(crate) fn delete_control_keeping_fields(
+        &mut self,
+        section: usize,
+        paragraph: usize,
+        control: usize,
+        note: bool,
+    ) -> Result<()> {
+        let field_id = |p: &Paragraph, i: usize| match p.controls.get(i) {
+            Some(Control::Field(f)) => Some(f.field_id),
+            _ => None,
+        };
+        let para = &self.core.document().sections[section].paragraphs[paragraph];
+        let ids: Vec<Option<u32>> = para
+            .field_ranges
+            .iter()
+            .map(|r| field_id(para, r.control_idx))
+            .collect();
+        if note {
+            self.core
+                .delete_footnote_native(section, paragraph, control)
+                .map_err(err)?;
+        } else {
+            self.core
+                .delete_control_native(section, paragraph, control)
+                .map_err(err)?;
+        }
+        let para = &mut self.core.document_mut().sections[section].paragraphs[paragraph];
+        for (k, id) in ids.into_iter().enumerate() {
+            let Some(range) = para.field_ranges.get(k) else {
+                break;
+            };
+            let (at, Some(id)) = (range.control_idx, id) else {
+                continue;
+            };
+            if field_id(para, at) == Some(id) {
+                continue;
+            }
+            let found = para
+                .controls
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| matches!(c, Control::Field(f) if f.field_id == id))
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            let to = match found.as_slice() {
+                [only] => *only,
+                // The same id twice: the shift RHWP left out.
+                _ if at > control => at - 1,
+                _ => continue,
+            };
+            para.field_ranges[k].control_idx = to;
+        }
+        Ok(())
+    }
+    /// Remove a field control with its start and end marks and its range record, so
+    /// no range is left naming a control that is gone. A 누름틀 goes with its value,
+    /// as `field.delete` does; any other field (link, date, cross reference) keeps
+    /// its text.
+    fn remove_field_control(
+        &mut self,
+        section: usize,
+        paragraph: usize,
+        control: usize,
+    ) -> Result<()> {
+        let para = &self.core.document().sections[section].paragraphs[paragraph];
+        let Some(Control::Field(field)) = para.controls.get(control) else {
+            bail!("누름틀·필드가 아닙니다.");
+        };
+        let range = para
+            .field_ranges
+            .iter()
+            .find(|r| r.control_idx == control)
+            .cloned()
+            .ok_or_else(|| anyhow!("필드 범위를 찾지 못했습니다."))?;
+        let ids: std::collections::HashSet<u32> = para
+            .controls
+            .iter()
+            .filter_map(|c| match c {
+                Control::Field(f) => Some(f.field_id),
+                _ => None,
+            })
+            .collect();
+        if field.field_type == FieldType::ClickHere {
+            let id = field.field_id;
+            // RHWP finds the 누름틀 by a position in it; inside its value, so a
+            // neighbour ending where this one starts is not taken instead.
+            let at = if range.end_char_idx > range.start_char_idx {
+                range.start_char_idx + 1
+            } else {
+                range.start_char_idx
+            };
+            let before = ids.len();
+            self.core
+                .remove_field_at(section, paragraph, at)
+                .map_err(err)?;
+            let para = &self.core.document().sections[section].paragraphs[paragraph];
+            let left = para
+                .controls
+                .iter()
+                .filter(|c| matches!(c, Control::Field(f) if f.field_id == id))
+                .count();
+            if left != 0 || para.field_ranges.len() + 1 != before {
+                bail!("누름틀을 지우지 못했습니다(겹친 누름틀).");
+            }
+            return Ok(());
+        }
+        // The field's text stays; its end mark (a slot without a control, counted
+        // through its range) and its start control go. RHWP does this only for a link
+        // in a paragraph without other objects.
+        let doc = self.core.document_mut();
+        doc.sections[section].raw_stream = None;
+        let para = &mut doc.sections[section].paragraphs[paragraph];
+        let k = para
+            .field_ranges
+            .iter()
+            .position(|r| r.control_idx == control)
+            .ok_or_else(|| anyhow!("필드 범위를 찾지 못했습니다."))?;
+        crate::control_slots::remove_field(para, k);
+        self.core
+            .relayout_paragraph_native(section, paragraph, None)
+            .map_err(err)?;
+        Ok(())
     }
 }

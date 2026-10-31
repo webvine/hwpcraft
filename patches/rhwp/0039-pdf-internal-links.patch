@@ -1,0 +1,243 @@
+diff --git a/src/document_core/queries/hyperlink_geometry.rs b/src/document_core/queries/hyperlink_geometry.rs
+index 27939fd..f98b7fa 100644
+--- a/src/document_core/queries/hyperlink_geometry.rs
++++ b/src/document_core/queries/hyperlink_geometry.rs
+@@ -28,6 +28,7 @@ impl PageHyperlink {
+         PdfLink {
+             uri: self.uri.clone(),
+             rect: self.rect,
++            dest: None,
+         }
+     }
+ }
+@@ -42,6 +43,25 @@ impl DocumentCore {
+         self.hyperlinks_in_layer_tree(&self.build_page_layer_tree_with_profile(page, profile)?)
+     }
+ 
++    /// 0-based 페이지의 문서 안 링크 영역: 책갈피로 가는 하이퍼링크(`?`로 시작)와
++    /// 상호 참조 필드. `uri`는 필드 명령 원문이며 목적지 해석은 호출자가 한다.
++    pub fn page_internal_link_areas_native(
++        &self,
++        page: u32,
++        profile: RenderProfile,
++    ) -> Result<Vec<PageHyperlink>, HwpError> {
++        let tree = self.build_page_layer_tree_with_profile(page, profile)?;
++        let mut links = Vec::new();
++        let clip = BoundingBox {
++            x: 0.0,
++            y: 0.0,
++            width: tree.page_width,
++            height: tree.page_height,
++        };
++        self.collect_layer_links(&tree.root, clip, &mut links, internal_uri)?;
++        Ok(links)
++    }
++
+     /// 이미 생성한 출력 트리를 재사용한다. glyph sidecar와 fallback을 이중으로 세지 않는다.
+     pub fn hyperlinks_in_layer_tree(
+         &self,
+@@ -54,15 +74,16 @@ impl DocumentCore {
+             width: tree.page_width,
+             height: tree.page_height,
+         };
+-        self.collect_layer_hyperlinks(&tree.root, page, &mut links)?;
++        self.collect_layer_links(&tree.root, page, &mut links, external_uri)?;
+         Ok(links)
+     }
+ 
+-    fn collect_layer_hyperlinks(
++    fn collect_layer_links(
+         &self,
+         node: &LayerNode,
+         clip: BoundingBox,
+         links: &mut Vec<PageHyperlink>,
++        select: fn(&crate::model::control::Field) -> Option<String>,
+     ) -> Result<(), HwpError> {
+         match &node.kind {
+             LayerNodeKind::Group {
+@@ -81,7 +102,7 @@ impl DocumentCore {
+                     return Ok(());
+                 }
+                 for child in children {
+-                    self.collect_layer_hyperlinks(child, clip, links)?;
++                    self.collect_layer_links(child, clip, links, select)?;
+                 }
+             }
+             LayerNodeKind::ClipRect {
+@@ -90,7 +111,7 @@ impl DocumentCore {
+                 ..
+             } => {
+                 if let Some(intersection) = clipped_rect(*child_clip, clip) {
+-                    self.collect_layer_hyperlinks(child, intersection, links)?;
++                    self.collect_layer_links(child, intersection, links, select)?;
+                 }
+             }
+             LayerNodeKind::Leaf { ops } => {
+@@ -131,15 +152,12 @@ impl DocumentCore {
+                         else {
+                             continue;
+                         };
+-                        if field.field_type != FieldType::Hyperlink {
+-                            continue;
+-                        }
+                         let start = char_start.max(range.start_char_idx);
+                         let end = run_end.min(range.end_char_idx);
+                         if start >= end {
+                             continue;
+                         }
+-                        let Some(uri) = export_uri(&command_uri(&field.command)) else {
++                        let Some(uri) = select(field) else {
+                             continue;
+                         };
+                         // 보이지 않는 반복 셀 조각에는 클릭 영역을 만들지 않는다.
+@@ -184,3 +202,22 @@ impl DocumentCore {
+         Ok(())
+     }
+ }
++
++/// 실행 가능한 외부 링크(웹·메일)만.
++fn external_uri(field: &crate::model::control::Field) -> Option<String> {
++    (field.field_type == FieldType::Hyperlink)
++        .then(|| export_uri(&command_uri(&field.command)))
++        .flatten()
++}
++
++/// 문서 안 링크: 책갈피 하이퍼링크와 상호 참조 필드의 명령 원문.
++fn internal_uri(field: &crate::model::control::Field) -> Option<String> {
++    match field.field_type {
++        FieldType::Hyperlink => {
++            let uri = command_uri(&field.command);
++            uri.starts_with('?').then_some(uri)
++        }
++        FieldType::CrossRef => Some(field.command.clone()),
++        _ => None,
++    }
++}
+diff --git a/src/renderer/hyperlinks.rs b/src/renderer/hyperlinks.rs
+index e0293fe..6524705 100644
+--- a/src/renderer/hyperlinks.rs
++++ b/src/renderer/hyperlinks.rs
+@@ -2,10 +2,27 @@
+ use super::render_tree::BoundingBox;
+ 
+ /// 페이지 좌상단 기준 CSS px. PDF writer에서만 72/96 배율과 y축 반전을 적용한다.
+-#[derive(Debug, Clone, serde::Serialize)]
++#[derive(Debug, Clone, Default, serde::Serialize)]
+ pub struct PdfLink {
+     pub uri: String,
+     pub rect: BoundingBox,
++    /// 문서 안 목적지. 있으면 `uri` 대신 같은 PDF의 쪽으로 가는 GoTo 링크가 된다.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub dest: Option<PdfDest>,
++}
++
++/// 문서 안 링크 목적지: 이번 출력의 쪽 순번(0부터, 호출자가 넘긴 쪽 목록 기준)과
++/// 그 쪽 좌상단 기준 CSS px 위치. PDF 좌표(pt, 왼쪽 아래 원점) 변환은 writer가 한다.
++#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
++pub struct PdfDest {
++    pub page: usize,
++    pub x: f64,
++    pub y: f64,
++}
++
++/// CSS px 위치를 높이 `page_height_pt`인 PDF 쪽의 (left, top) pt로 바꾼다.
++pub fn pdf_point(x: f64, y: f64, page_height_pt: f32) -> (f32, f32) {
++    ((x * 0.75) as f32, page_height_pt - (y * 0.75) as f32)
+ }
+ 
+ /// 웹/메일 링크만 실행 URI로 내보낸다. 내부 목적지는 별도 GoTo 구현이 필요하다.
+@@ -74,10 +91,19 @@ pub(crate) fn page_links(links: &[PdfLink], width: f64, height: f64) -> Vec<PdfL
+     links
+         .iter()
+         .filter_map(|link| {
+-            Some(PdfLink {
+-                uri: export_uri(&link.uri)?,
+-                rect: clipped_rect(link.rect, page)?,
+-            })
++            let rect = clipped_rect(link.rect, page)?;
++            match link.dest {
++                Some(dest) => (dest.x.is_finite() && dest.y.is_finite()).then(|| PdfLink {
++                    uri: String::new(),
++                    rect,
++                    dest: Some(dest),
++                }),
++                None => Some(PdfLink {
++                    uri: export_uri(&link.uri)?,
++                    rect,
++                    dest: None,
++                }),
++            }
+         })
+         .collect()
+ }
+diff --git a/src/renderer/pdf.rs b/src/renderer/pdf.rs
+index 1c2715e..636c2a1 100644
+--- a/src/renderer/pdf.rs
++++ b/src/renderer/pdf.rs
+@@ -1688,6 +1688,13 @@ fn assemble_pdf(
+         .count(page_refs.len() as i32)
+         .kids(page_refs.iter().copied());
+ 
++    // 문서 안 링크 목적지: 호출자 쪽 순번 → (쪽 객체, 높이 pt). 건너뛴 쪽은 없다.
++    let targets: HashMap<usize, (Ref, f32)> = page_datas
++        .iter()
++        .zip(&page_refs)
++        .map(|(pd, page_ref)| (pd.source_index, (*page_ref, pd.height)))
++        .collect();
++
+     // 각 페이지 생성
+     let svg_name = pdf_writer::Name(b"S1");
+ 
+@@ -1696,11 +1703,12 @@ fn assemble_pdf(
+         let content_ref = alloc.bump();
+         let svg_ref = svg_refs_remapped[i];
+ 
+-        let page_links = super::hyperlinks::page_links(
++        let mut page_links = super::hyperlinks::page_links(
+             &links[pd.source_index],
+             f64::from(pd.width) / 0.75,
+             f64::from(pd.height) / 0.75,
+         );
++        page_links.retain(|link| link.dest.is_none_or(|d| targets.contains_key(&d.page)));
+         let annotation_refs: Vec<_> = page_links.iter().map(|_| alloc.bump()).collect();
+         let mut page = pdf.page(page_ref);
+         page.media_box(pdf_writer::Rect::new(0.0, 0.0, pd.width, pd.height));
+@@ -1727,10 +1735,23 @@ fn assemble_pdf(
+                 ))
+                 .page(page_ref)
+                 .border(0.0, 0.0, 0.0, None);
+-            annotation
+-                .action()
+-                .action_type(pdf_writer::types::ActionType::Uri)
+-                .uri(pdf_writer::Str(link.uri.as_bytes()));
++            if let Some((dest, &(target, height))) = link
++                .dest
++                .and_then(|d| targets.get(&d.page).map(|t| (d, t)))
++            {
++                let (left, top) = super::hyperlinks::pdf_point(dest.x, dest.y, height);
++                annotation
++                    .action()
++                    .action_type(pdf_writer::types::ActionType::GoTo)
++                    .destination()
++                    .page(target)
++                    .xyz(left, top, None);
++            } else {
++                annotation
++                    .action()
++                    .action_type(pdf_writer::types::ActionType::Uri)
++                    .uri(pdf_writer::Str(link.uri.as_bytes()));
++            }
+             annotation.finish();
+         }
+ 
+@@ -1856,6 +1877,10 @@ pub fn layer_trees_to_pdf_with_links(
+                 .render_page_to_canvas_strict(canvas, tree, options.raster_dpi / 96.0)
+                 .map_err(|error| format!("direct PDF page replay failed: {error}"))?;
+             for link in super::hyperlinks::page_links(links, tree.page_width, tree.page_height) {
++                // 이 writer는 URL 주석만 쓴다. 문서 안 목적지는 svg2pdf 경로가 맡는다.
++                if link.dest.is_some() {
++                    continue;
++                }
+                 let r = link.rect;
+                 let mut uri = link.uri.into_bytes();
+                 uri.push(0); // Skia URL annotation payload는 NUL 종료 문자열이다.

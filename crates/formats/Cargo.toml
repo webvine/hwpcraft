@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 [dependencies]
 hwpcraft-doc.workspace = true
+hwpcraft-render.workspace = true
+image.workspace = true
+serde_json.workspace = true
 anyhow.workspace = true
 tempfile.workspace = true
 quick-xml.workspace = true

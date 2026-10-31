@@ -9,10 +9,11 @@ pub use rhwp::document_core::queries::{hidden_text, pii_scan};
 pub use rhwp::model;
 pub use rhwp::paint::RenderProfile;
 pub use rhwp::paint::{LayerNode, LayerNodeKind, PaintOp};
+pub use rhwp::parser::FileFormat;
 pub use rhwp::parser::body_text::parse_paragraph_list as parse_hwp_paragraph_list;
 pub use rhwp::parser::record::Record as HwpRecord;
 pub use rhwp::password_crypto;
-pub use rhwp::renderer::hyperlinks::PdfLink;
+pub use rhwp::renderer::hyperlinks::{PdfDest, PdfLink};
 pub use rhwp::renderer::layout::set_layout_diagnostics;
 pub use rhwp::renderer::pdf::PdfExportOptions;
 pub use rhwp::renderer::pdf::svgs_to_pdf_with_links;
@@ -26,10 +27,16 @@ pub use rhwp::serializer::record_writer::write_records as write_hwp_records;
 /// live on this wrapper; it derefs to `DocumentCore` and compiles natively.
 pub use rhwp::wasm_api::HwpDocument;
 
+/// RHWP's equation pipeline (tokens → AST → layout boxes), for visual equation editing.
+pub mod equation {
+    pub use rhwp::renderer::equation::{layout, parser, symbols, tokenizer};
+    pub use rhwp::renderer::{DEFAULT_DPI, hwpunit_to_px};
+}
+
 /// Public chart/compound-file primitives used by HwpCraft's own chart authoring.
 pub mod chart_io {
     pub use rhwp::ooxml_chart::{
-        OoxmlChart, OoxmlChartType, ScatterStyle, data::scan_chart_values,
+        OoxmlChart, OoxmlChartType, RadarStyle, ScatterStyle, data::scan_chart_values,
     };
     pub use rhwp::parser::ole_container::{all_ole_streams, ole_root_clsid};
     pub use rhwp::serializer::mini_cfb::build_cfb_with_root_clsid;

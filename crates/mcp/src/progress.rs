@@ -4,7 +4,7 @@
 //! elapsed-time heartbeat: progress is seconds since the call started, without
 //! `total`, and every value is strictly greater than the previous one as MCP
 //! requires. Clients that extend their request timeout on progress keep long
-//! saves (a 383-page PDF takes about a minute) alive.
+//! saves (a 381-page PDF takes 11–22 s) alive.
 use std::{future::Future, time::Duration};
 use tokio::time::Instant;
 

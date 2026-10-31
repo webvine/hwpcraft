@@ -110,6 +110,11 @@ impl HwpApp {
         };
         let x = f64::from((point.x - rect.left()) / self.zoom);
         let y = f64::from((point.y - rect.top()) / self.zoom);
+        // Where the page edits a nested cell or text box directly, a double click selects
+        // a word there (nested_edit.rs); the region editor stays for the other places.
+        if matches!(self.session.hit_nested(page, x, y), Ok(Some(_))) {
+            return false;
+        }
         let Ok(value) = self.session.context_hit_test(page, x, y) else {
             return false;
         };

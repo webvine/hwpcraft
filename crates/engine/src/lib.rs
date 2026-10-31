@@ -12,10 +12,12 @@ mod ext_table;
 mod extensions;
 mod table_drawing;
 pub use autotext::{config_dir, set_config_dir};
+pub use date_fields::fixed_clock;
 pub use ext_format::COLOR_PRESETS;
 pub use extensions::{command_help, command_help_entries, extension_commands};
 mod atomic_history;
 pub use atomic_history::FullCheckpoint;
+pub use macros::{MacroStep, SavedMacro, delete_macro, save_macro, saved_macros};
 mod automation_context;
 mod autotext;
 mod body_autotext;
@@ -33,6 +35,7 @@ mod review;
 pub use editing::Motion;
 mod hwp_action_defaults;
 mod hwp_actions;
+pub use hanja::primary_reading;
 pub use hwp_actions::{HWP_ACTIONS, hwp_action};
 mod hwp_parameters;
 pub use hwp_parameters::{PreparedHwpAction, hwp_parameter_schema};
@@ -45,12 +48,18 @@ mod features;
 mod find;
 pub use find::{FindDirection, FindOptions};
 mod links;
+mod macros;
+mod nested_caret;
 pub use links::HyperlinkEdit;
+pub use nested_caret::NestedCaret;
+mod distribution;
 mod highlights;
 mod nested_presentation;
 mod page_fields;
 pub mod presentation_geometry;
 mod rendering;
+pub use distribution::DISTRIBUTION_READ_ONLY;
+pub use ext_page::{PrintLayout, Watermark};
 pub use highlights::{HighlightRect, markpen_ranges};
 pub use rendering::{PdfJob, PdfPrep};
 mod symbols;
@@ -62,10 +71,50 @@ mod formatting;
 pub use formatting::validate_format;
 mod objects;
 pub use objects::{EquationOptions, ObjectAddress, ShapeKind, ShapeOptions};
+mod equation_layout;
+pub use equation_layout::{EquationLayout, EquationLayoutItem};
+mod equation_macros;
+pub use equation_macros::{
+    EquationMacro, delete_equation_macro, equation_macro, equation_macros, save_equation_macro,
+};
 mod automation;
+mod control_slots;
+mod cross_ref;
+mod date_fields;
+mod doc_merge;
+mod docx;
+mod drop_cap;
+mod index;
+mod inline_moves;
+mod master_objects;
+mod nested_tables;
+mod object_moves;
 mod page;
+mod picture_bullet;
+mod picture_effects;
+mod ruby;
+mod style_sets;
+mod table_border;
+mod table_styles;
+mod track_changes;
+
+fn hwpx_track_marks_of(path: &Path) -> usize {
+    let hwpx = path
+        .extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| x.eq_ignore_ascii_case("hwpx"));
+    if hwpx {
+        track_changes::hwpx_track_marks(path)
+    } else {
+        0
+    }
+}
+mod captions;
+mod form_insert;
+mod layout_cache;
 mod protocol;
 mod tabs;
+mod toc;
 mod tools;
 pub use features::TableEdit;
 pub use page::PageSetup;
@@ -211,6 +260,13 @@ pub struct Session {
     pub core: DocumentCore,
     /// Nesting depth of `defer_layout`; RHWP batch mode is on while it is > 0.
     deferred_depth: u32,
+    /// Nesting of `transaction`; only the outermost one records an undo step and
+    /// rolls back on failure, so a command built from other commands stays one step.
+    transaction_depth: u32,
+    /// The table the last `Command::Table` created, for the command's result.
+    created_table: Option<ObjectAddress>,
+    /// Caret in a nested table cell or a text box (see `nested_caret`).
+    nested: Option<NestedCaret>,
     pub cursor: Cursor,
     /// Selection is confined to the current paragraph, including table cells.
     pub anchor: Option<usize>,
@@ -219,6 +275,9 @@ pub struct Session {
     /// Overwrite (수정) mode replaces following characters while typing.
     pub overwrite: bool,
     pub path: Option<PathBuf>,
+    /// Written in HwpCraft (a new document, or an HWPX HwpCraft wrote): no stored
+    /// row is the file author's layout, so an HWPX save leaves them all out.
+    authored: bool,
     /// Document password applied to HWP/HWPX saves; set when a protected file was
     /// opened or by `set_password`. Never written to logs or command results.
     password: Option<String>,
@@ -250,15 +309,31 @@ pub struct Session {
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     history_scopes: atomic_history::HistoryScopes,
+    /// Key macro recording; kept when another document replaces this one.
+    macros: macros::MacroRecorder,
+    /// HWPX insert/delete marks found when the file opened (RHWP drops them).
+    track_marks: usize,
 }
 impl Session {
     pub fn new() -> Result<Self> {
-        Ok(Self::with_core(blank()?, None))
+        // A new document holds no row Hangul laid out. Its template rows are marked
+        // RHWP's own, so the rows edits derive from them are too, and RHWP lays it out
+        // as it lays out a reopened copy (rows it takes as Hangul's get the stored-
+        // layout rules, which left every other page part empty; see `layout_cache`).
+        let mut core = blank()?;
+        let mut doc = core.document().clone();
+        layout_cache::hide(&mut doc);
+        core.set_document(doc);
+        Ok(Self::with_core(core, None))
     }
     fn with_core(core: DocumentCore, path: Option<PathBuf>) -> Self {
         Self {
             core,
             deferred_depth: 0,
+            transaction_depth: 0,
+            created_table: None,
+            nested: None,
+            authored: path.is_none(),
             path,
             password: None,
             cursor: Cursor::default(),
@@ -287,6 +362,8 @@ impl Session {
             undo: vec![],
             redo: vec![],
             history_scopes: atomic_history::HistoryScopes::default(),
+            macros: Default::default(),
+            track_marks: 0,
         }
     }
     pub fn open(&mut self, path: &Path) -> Result<()> {
@@ -296,7 +373,13 @@ impl Session {
         let generation = self.generation + 1;
         let mut opened = Self::with_core(core, Some(path.to_owned()));
         opened.generation = generation;
+        opened.authored = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("hwpx"))
+            && !layout_cache::has_authored_rows(opened.core.document());
         opened.page_count()?;
+        opened.macros = self.take_macro_recorder();
+        opened.track_marks = hwpx_track_marks_of(path);
         *self = opened;
         Ok(())
     }
@@ -310,6 +393,8 @@ impl Session {
         opened.generation = generation;
         opened.password = Some(password.to_owned());
         opened.page_count()?;
+        opened.macros = self.take_macro_recorder();
+        opened.track_marks = hwpx_track_marks_of(path);
         *self = opened;
         Ok(())
     }
@@ -337,7 +422,9 @@ impl Session {
     pub fn reset(&mut self) -> Result<()> {
         self.ensure_history_replacement_allowed()?;
         let generation = self.generation + 1;
-        *self = Self::new()?;
+        let mut fresh = Self::new()?;
+        fresh.macros = self.take_macro_recorder();
+        *self = fresh;
         self.generation = generation;
         Ok(())
     }
@@ -351,7 +438,9 @@ impl Session {
         !self.redo.is_empty()
     }
     pub fn save(&mut self, path: &Path) -> Result<()> {
-        self.save_with_tab_widths(path)?;
+        // Change tracking cannot be kept; see `track_changes`.
+        self.refuse_tracked_save(path)?;
+        self.with_save_times(path, |s| s.save_with_tab_widths(path))?;
         if matches!(
             path.extension()
                 .and_then(|x| x.to_str())
@@ -383,6 +472,11 @@ impl Session {
             bail!("이 개체의 편집은 아직 지원하지 않습니다.");
         }
         Ok(p)
+    }
+    /// Steps the undo history holds (at most 40); for measurements (`--view bench-ime`).
+    #[doc(hidden)]
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
     }
     pub fn text(&self) -> &str {
         self.paragraph(self.cursor)
@@ -862,6 +956,20 @@ impl Session {
         Ok(value)
     }
     fn transaction(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        if self.transaction_depth > 0 {
+            // Part of an enclosing transaction: it records the one undo step and
+            // restores everything if any part fails.
+            self.transaction_depth += 1;
+            let result = f(self);
+            self.transaction_depth -= 1;
+            return result;
+        }
+        self.transaction_depth = 1;
+        let result = self.outer_transaction(f);
+        self.transaction_depth = 0;
+        result
+    }
+    fn outer_transaction(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
         let snapshot = self.snapshot();
         self.typing = None;
         self.clear_geometry();
@@ -1090,6 +1198,17 @@ impl Session {
         if !back && c.offset < length {
             return self.delete_range(c.offset..c.offset + 1);
         }
+        // Backspace at a section's start or Delete at its end removes the section break.
+        if c.cell.is_none() {
+            let doc = self.core.document();
+            let last = doc.sections[c.section].paragraphs.len().saturating_sub(1);
+            if back && c.section > 0 && c.paragraph == 0 {
+                return self.join_sections(c.section, true);
+            }
+            if !back && c.section + 1 < doc.sections.len() && c.paragraph == last {
+                return self.join_sections(c.section + 1, false);
+            }
+        }
         let n = if back {
             c.cell
                 .map(|t| t.paragraph)
@@ -1154,6 +1273,11 @@ impl Session {
         Ok(())
     }
     pub fn execute(&mut self, command: Command) -> Result<()> {
+        self.guard_distribution()?;
+        let step = self.record_command(&command);
+        self.recorded(|| step, |s| s.execute_unrecorded(command))
+    }
+    fn execute_unrecorded(&mut self, command: Command) -> Result<()> {
         if let Command::Character(value) = command {
             let plan = self.insertion_shape.prepare(self, value)?;
             self.typing = None;
@@ -1248,22 +1372,27 @@ impl Session {
                     Command::Character(_) => bail!("글자 모양 명령 경로가 잘못되었습니다."),
                     Command::Paragraph(v) => {
                         let props = s.paragraph_parameters(v)?.to_string();
-                        for (c, _) in s.selected_paragraphs()? {
-                            let result = if let Some(t) = c.cell {
-                                s.core.apply_para_format_in_cell_native(
-                                    c.section,
-                                    c.paragraph,
-                                    t.control,
-                                    t.index,
-                                    t.paragraph,
-                                    &props,
-                                )
-                            } else {
-                                s.core
-                                    .apply_para_format_native(c.section, c.paragraph, &props)
-                            };
-                            result.map_err(err)?;
-                        }
+                        let paragraphs = s.selected_paragraphs()?;
+                        // One layout pass for the selection, not a section re-layout per paragraph.
+                        s.deferred_layout(|s| {
+                            for (c, _) in paragraphs {
+                                let result = if let Some(t) = c.cell {
+                                    s.core.apply_para_format_in_cell_native(
+                                        c.section,
+                                        c.paragraph,
+                                        t.control,
+                                        t.index,
+                                        t.paragraph,
+                                        &props,
+                                    )
+                                } else {
+                                    s.core
+                                        .apply_para_format_native(c.section, c.paragraph, &props)
+                                };
+                                result.map_err(err)?;
+                            }
+                            Ok(())
+                        })?;
                     }
                     Command::Table { rows, columns } => {
                         if c.cell.is_some() {
@@ -1272,9 +1401,13 @@ impl Session {
                         if rows == 0 || columns == 0 || rows > 30 || columns > 12 {
                             bail!("표는 1–30행, 1–12열로 만들 수 있습니다.");
                         }
-                        s.core
-                            .create_table_native(c.section, c.paragraph, c.offset, rows, columns)
+                        // RHWP counts an inline object as one position (`split_offset`).
+                        let at = s.split_offset(c)?;
+                        let created = s
+                            .core
+                            .create_table_native(c.section, c.paragraph, at, rows, columns)
                             .map_err(err)?;
+                        s.created_table = Some(objects::inserted_address(c.section, &created)?);
                     }
                     Command::Undo | Command::Redo => {}
                 }
@@ -1456,16 +1589,20 @@ impl Session {
             return Ok(0);
         }
         self.transaction(|s| {
-            for (cursor, offset) in matches.into_iter().rev() {
-                s.clear_selection();
-                s.cursor = Cursor {
-                    offset: offset + length,
-                    ..cursor
-                };
-                s.anchor = Some(offset);
-                s.insert(replacement)?;
-            }
-            Ok(())
+            // One pagination at the end, as in `replace_all_with`: 1,445 replacements
+            // in a 381-page document took 81-90 s when RHWP repaginated after each.
+            s.deferred_layout(|s| {
+                for (cursor, offset) in matches.into_iter().rev() {
+                    s.clear_selection();
+                    s.cursor = Cursor {
+                        offset: offset + length,
+                        ..cursor
+                    };
+                    s.anchor = Some(offset);
+                    s.insert(replacement)?;
+                }
+                Ok(())
+            })
         })?;
         Ok(count)
     }

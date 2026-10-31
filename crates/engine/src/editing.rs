@@ -68,7 +68,7 @@ fn with_index(c: Cursor, i: usize, offset: usize) -> Cursor {
         },
     }
 }
-fn class(ch: char) -> u8 {
+pub(crate) fn class(ch: char) -> u8 {
     if ch.is_whitespace() {
         0
     } else if ch.is_alphanumeric() {
@@ -587,6 +587,17 @@ impl Session {
         })
     }
     pub fn move_caret(&mut self, motion: Motion, extend: bool) -> Result<()> {
+        self.recorded(
+            || {
+                Some(crate::MacroStep {
+                    command: "caret.move".into(),
+                    params: json!({ "motion": motion, "extend": extend }),
+                })
+            },
+            |s| s.move_caret_unrecorded(motion, extend),
+        )
+    }
+    fn move_caret_unrecorded(&mut self, motion: Motion, extend: bool) -> Result<()> {
         self.hit_hint.set(None);
         if !extend && self.has_selection() && matches!(motion, Motion::Left | Motion::Right) {
             // Like Hangul, an arrow collapses a selection to its matching edge.
@@ -639,6 +650,7 @@ impl Session {
     }
     /// Copy to RHWP's internal clipboard (formats, tables and objects) and return plain text.
     pub fn copy(&mut self) -> Result<String> {
+        self.guard_distribution()?;
         if !self.has_selection() {
             return Ok(String::new());
         }
@@ -664,6 +676,7 @@ impl Session {
     /// HTML for the system clipboard (body selections only), so other programs
     /// receive formatting. `None` inside cells or without a selection.
     pub fn copy_html(&self) -> Result<Option<String>> {
+        self.guard_distribution()?;
         if !self.has_selection() {
             return Ok(None);
         }

@@ -6,7 +6,6 @@
 //! like a Hangul F5 cell block.
 use super::*;
 use hwpcraft_doc::model::{
-    paragraph::Paragraph,
     shape::{HorzAlign, HorzRelTo, TextWrap, VertAlign, VertRelTo},
     table::{Table, TablePageBreak},
 };
@@ -42,6 +41,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("table.to_text", "표를 문자열로", ""),
     ("table.sort", "표 정렬 (줄 단위)", ""),
     ("table.auto_fill", "자동 채우기", ""),
+    ("table.cells.set", "여러 셀 글 한 번에 채우기", ""),
     ("table.caption_text.get", "캡션 내용 조회", ""),
     ("table.caption_text", "캡션 내용 고치기", ""),
     (
@@ -148,7 +148,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "table.move_border",
-        "table, vertical(true: 세로 경계선), boundary(경계선 번호), delta_mm",
+        "table, vertical(true: 세로 경계선), boundary(경계선 번호), delta_mm, range?(셀 블록: 세로 안쪽 선을 그 블록의 줄에서만 옮김, 한글처럼 경계가 어긋난 표가 됨; 가로 선은 거부)",
         r##"{"vertical":true,"boundary":1,"delta_mm":5.0}"##,
     ),
     (
@@ -170,6 +170,11 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
         "table.auto_fill",
         "table, range(2셀 이상), values[](사용자 목록; 없으면 숫자·요일·월·분기·간지 등 자동 인식)",
         r##"{"values":["상","중","하"]}"##,
+    ),
+    (
+        "table.cells.set",
+        "table?(없으면 캐럿 표), row?,col?(시작 셀, 0부터, 기본 0), cells[[글|null]](행마다 배열; 셀 글을 통째로 바꿈, 줄바꿈은 문단 나누기, null은 그대로 둠·병합으로 가려진 칸) → cells(바꾼 셀 수). 표 밖으로 넘치거나 개체·필드가 든 셀이면 아무것도 바꾸지 않고 거절. 실행 취소 한 번",
+        r##"{"table":{"section":0,"paragraph":0,"control":0},"row":1,"col":0,"cells":[["1분기","120"],["2분기","135"]]}"##,
     ),
     (
         "table.caption_text.get",
@@ -753,6 +758,22 @@ impl Session {
                 self.sort_rows(a, p.range, p.column, p.descending)?;
                 Ok(self.info())
             }
+            "table.cells.set" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct CellsSet {
+                    #[serde(default)]
+                    table: Option<ObjectAddress>,
+                    #[serde(default)]
+                    row: u16,
+                    #[serde(default)]
+                    col: u16,
+                    cells: Vec<Vec<Option<String>>>,
+                }
+                let p: CellsSet = serde_json::from_value(params)?;
+                let a = self.table_target(p.table)?;
+                Ok(json!({"cells": self.set_cells(a, p.row, p.col, &p.cells)?}))
+            }
             "table.auto_fill" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -839,10 +860,15 @@ impl Session {
                     vertical: bool,
                     boundary: u16,
                     delta_mm: f64,
+                    #[serde(default)]
+                    range: Option<CellRange>,
                 }
                 let p: Border = serde_json::from_value(params)?;
                 let a = self.table_target(p.table)?;
-                self.move_border(a, p.vertical, p.boundary, p.delta_mm)?;
+                match p.range {
+                    Some(r) => self.move_border_in(a, p.vertical, p.boundary, p.delta_mm, r)?,
+                    None => self.move_border(a, p.vertical, p.boundary, p.delta_mm)?,
+                }
                 Ok(self.info())
             }
             "table.resize" => {
@@ -921,6 +947,35 @@ impl Session {
         };
         self.table_at(a)?;
         Ok(a)
+    }
+    /// Put the caret at the start of the cell covering `row`, `col` (0-based) of a
+    /// table (the one holding the caret when `table` is absent), for commands that
+    /// act on the caret cell.
+    pub(crate) fn caret_to_table_cell(
+        &mut self,
+        table: Option<ObjectAddress>,
+        row: u16,
+        col: u16,
+    ) -> Result<()> {
+        let a = self.table_target(table)?;
+        let t = self.table_at(a)?;
+        let index = (row < t.row_count && col < t.col_count)
+            .then(|| t.cell_index_at(row, col))
+            .flatten()
+            .ok_or_else(|| anyhow!("{row}행 {col}열 셀이 없습니다(0부터 셉니다)."))?;
+        self.select(
+            Cursor {
+                section: a.section,
+                paragraph: a.paragraph,
+                offset: 0,
+                cell: Some(Cell {
+                    control: a.control,
+                    index,
+                    paragraph: 0,
+                }),
+            },
+            false,
+        )
     }
     fn cursor_in(&self, a: ObjectAddress) -> Option<usize> {
         let c = self.cursor;
@@ -1223,8 +1278,9 @@ impl Session {
                     )
                     .map_err(err)?
             } else {
+                let at = s.split_offset(c)?;
                 s.core
-                    .create_table_native(c.section, c.paragraph, c.offset, p.rows, p.columns)
+                    .create_table_native(c.section, c.paragraph, at, p.rows, p.columns)
                     .map_err(err)?
             };
             let v: Value = serde_json::from_str(&response)?;
@@ -2520,6 +2576,149 @@ impl Session {
             s.reseat_if_inside(a, r)
         })
     }
+    /// Replace the text of a block of cells from `row`, `col` in one undo step. A
+    /// `None` entry leaves its cell alone (and must be used for a grid position a
+    /// merged cell covers); a line break starts a new cell paragraph. Nothing changes
+    /// unless every target is inside the table and holds only plain text.
+    pub fn set_cells(
+        &mut self,
+        a: ObjectAddress,
+        row: u16,
+        col: u16,
+        cells: &[Vec<Option<String>>],
+    ) -> Result<usize> {
+        if cells.is_empty() || cells.len() > MAX_ROWS || cells.iter().all(Vec::is_empty) {
+            bail!("cells에는 채울 행을 1–{MAX_ROWS}개 넣으세요.");
+        }
+        let total: usize = cells.iter().flatten().flatten().map(String::len).sum();
+        if total > 1_000_000 {
+            bail!("채울 글은 모두 1 MB 이하로 넣으세요.");
+        }
+        let t = self.table_at(a)?;
+        let mut edits = Vec::new();
+        for (i, line) in cells.iter().enumerate() {
+            if line.len() > MAX_COLUMNS {
+                bail!("한 행에는 {MAX_COLUMNS}칸까지 넣을 수 있습니다.");
+            }
+            for (j, text) in line.iter().enumerate() {
+                let Some(text) = text else { continue };
+                let (r, c) = (usize::from(row) + i, usize::from(col) + j);
+                if r >= usize::from(t.row_count) || c >= usize::from(t.col_count) {
+                    bail!(
+                        "{r}행 {c}열은 표 밖입니다(표는 {}행 {}열, 0부터 셉니다).",
+                        t.row_count,
+                        t.col_count
+                    );
+                }
+                let (r, c) = (r as u16, c as u16);
+                let index = t
+                    .cell_index_at(r, c)
+                    .ok_or_else(|| anyhow!("{r}행 {c}열 셀이 없습니다."))?;
+                let cell = &t.cells[index];
+                if (cell.row, cell.col) != (r, c) {
+                    bail!("{r}행 {c}열은 병합된 셀에 가려진 칸입니다. null로 두세요.");
+                }
+                let plain = cell.paragraphs.iter().all(|p| {
+                    p.controls.is_empty()
+                        && p.field_ranges.is_empty()
+                        && !p.text.chars().any(char::is_control)
+                });
+                if !plain {
+                    bail!("{r}행 {c}열 셀에 개체나 필드가 있어 글을 통째로 바꿀 수 없습니다.");
+                }
+                let paragraphs: Vec<String> = text
+                    .replace("\r\n", "\n")
+                    .split('\n')
+                    .map(str::to_owned)
+                    .collect();
+                if paragraphs.len() > 200
+                    || paragraphs.iter().any(|p| p.chars().any(char::is_control))
+                {
+                    bail!(
+                        "{r}행 {c}열 글에는 줄바꿈 말고 제어 문자를 넣을 수 없습니다(문단 200개까지)."
+                    );
+                }
+                let now: Vec<&str> = cell.paragraphs.iter().map(|p| p.text.as_str()).collect();
+                if now != paragraphs {
+                    edits.push((index, paragraphs));
+                }
+            }
+        }
+        let count = edits.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        let width = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let block = CellRange {
+            start_row: row,
+            start_col: col,
+            end_row: (usize::from(row) + cells.len() - 1) as u16,
+            end_col: (usize::from(col) + width - 1) as u16,
+        };
+        self.deferred_transaction(|s| {
+            for (cell, paragraphs) in &edits {
+                s.write_cell_paragraphs(a, *cell, paragraphs)?;
+            }
+            s.reseat_if_inside(a, block)
+        })?;
+        Ok(count)
+    }
+    /// Collapse a plain-text cell to one empty paragraph, then rebuild it with splits.
+    fn write_cell_paragraphs(
+        &mut self,
+        a: ObjectAddress,
+        cell: usize,
+        paragraphs: &[String],
+    ) -> Result<()> {
+        let count = self.table_at(a)?.cells[cell].paragraphs.len();
+        for i in (1..count).rev() {
+            self.core
+                .merge_paragraph_in_cell_native(a.section, a.paragraph, a.control, cell, i)
+                .map_err(err)?;
+        }
+        let old = self.table_at(a)?.cells[cell].paragraphs[0]
+            .text
+            .chars()
+            .count();
+        if old > 0 {
+            self.core
+                .delete_text_in_cell_native(a.section, a.paragraph, a.control, cell, 0, 0, old)
+                .map_err(err)?;
+        }
+        for (i, text) in paragraphs.iter().enumerate() {
+            if i > 0 {
+                let end = self.table_at(a)?.cells[cell].paragraphs[i - 1]
+                    .text
+                    .chars()
+                    .count();
+                self.core
+                    .split_paragraph_in_cell_native(
+                        a.section,
+                        a.paragraph,
+                        a.control,
+                        cell,
+                        i - 1,
+                        end,
+                        None,
+                    )
+                    .map_err(err)?;
+            }
+            if !text.is_empty() {
+                self.core
+                    .insert_text_in_cell_native(a.section, a.paragraph, a.control, cell, i, 0, text)
+                    .map_err(err)?;
+            }
+        }
+        let now: Vec<String> = self.table_at(a)?.cells[cell]
+            .paragraphs
+            .iter()
+            .map(|p| p.text.clone())
+            .collect();
+        if now != paragraphs {
+            bail!("셀 글을 쓰지 못했습니다.");
+        }
+        Ok(())
+    }
     fn replace_cell_text(
         &mut self,
         a: ObjectAddress,
@@ -2609,63 +2808,18 @@ impl Session {
 
     /// Text after the automatic "표 N" number of the table caption.
     pub fn table_caption_text(&self, a: ObjectAddress) -> Result<String> {
-        let (p, number) = self.caption_paragraph(a)?;
-        let after: String = p.text.chars().skip(number).collect();
-        // Readers place the number before or after the label's space; skip spaces.
-        Ok(after.trim_start_matches(' ').to_owned())
+        crate::captions::text_after_number(self.table_caption(a)?)
     }
-    /// The single caption paragraph and the character index of its number control.
-    fn caption_paragraph(&self, a: ObjectAddress) -> Result<(&Paragraph, usize)> {
-        let cap = self
-            .table_at(a)?
+    fn table_caption(&self, a: ObjectAddress) -> Result<&hwpcraft_doc::model::shape::Caption> {
+        self.table_at(a)?
             .caption
             .as_ref()
-            .ok_or_else(|| anyhow!("캡션이 없는 표입니다. 먼저 캡션을 넣으세요."))?;
-        let [p] = cap.paragraphs.as_slice() else {
-            bail!("여러 문단 캡션은 아직 고칠 수 없습니다.");
-        };
-        if p.controls.len() != 1
-            || !matches!(p.controls[0], Control::AutoNumber(_))
-            || !p.field_ranges.is_empty()
-            || p.text.chars().any(char::is_control)
-        {
-            bail!("번호 외 개체가 있는 캡션은 고칠 수 없습니다.");
-        }
-        let number = p
-            .control_text_positions()
-            .first()
-            .copied()
-            .unwrap_or(0)
-            .min(p.text.chars().count());
-        Ok((p, number))
+            .ok_or_else(|| anyhow!("캡션이 없는 표입니다. 먼저 캡션을 넣으세요."))
     }
-    /// Rebuild the caption paragraph as `prefix` + number control (8 code units) +
-    /// " " + text, with consistent offsets. RHWP has no caption text API.
+    /// Replace the words after the caption number (see `captions::rewrite`).
     pub fn set_table_caption_text(&mut self, a: ObjectAddress, text: &str) -> Result<()> {
-        if text.chars().count() > 1000 || text.chars().any(char::is_control) {
-            bail!("캡션은 제어 문자 없이 1,000자 이하로 입력하세요.");
-        }
-        let (p, number) = self.caption_paragraph(a)?;
-        // The label before the number ("표"), whatever spacing the source used.
-        let before: String = p.text.chars().take(number).collect();
-        let label = before.split(' ').next().unwrap_or("").to_owned();
-        // Hangul's own caption (read by RHWP): "표 " + a placeholder space that stands
-        // for the number control (8 code units) + " " + text; char_count = units + 1.
-        let prefix = format!("{label} ");
-        let suffix = format!(" {text}");
-        let mut offsets = Vec::new();
-        let mut at = 0u32;
-        for ch in prefix.chars() {
-            offsets.push(at);
-            at += ch.len_utf16() as u32;
-        }
-        offsets.push(at);
-        at += 8;
-        for ch in suffix.chars() {
-            offsets.push(at);
-            at += ch.len_utf16() as u32;
-        }
-        let full = format!("{prefix} {suffix}");
+        let mut caption = self.table_caption(a)?.clone();
+        crate::captions::rewrite(&mut caption, text)?;
         self.transaction(|s| {
             {
                 let Some(Control::Table(t)) = s
@@ -2678,15 +2832,7 @@ impl Session {
                 else {
                     bail!("표를 찾지 못했습니다.");
                 };
-                let p = t
-                    .caption
-                    .as_mut()
-                    .and_then(|c| c.paragraphs.first_mut())
-                    .ok_or_else(|| anyhow!("캡션 문단이 없습니다."))?;
-                p.text = full.clone();
-                p.char_offsets = offsets.clone();
-                // Characters, the number control and the paragraph end.
-                p.char_count = at + 1;
+                t.caption = Some(caption);
             }
             // Re-run table layout and pagination through the property path.
             s.core

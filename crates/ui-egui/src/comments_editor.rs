@@ -15,7 +15,7 @@ const TEXT_FIELD: &str = "memo-text";
 pub(crate) struct State {
     pub open: bool,
     selected: Option<u32>,
-    author: String,
+    pub(crate) author: String,
     text: String,
     items: Vec<Value>,
     generation: Option<u64>,
@@ -127,6 +127,11 @@ impl HwpApp {
         self.ext.comments.open = true;
         if matches!(id, "insert.memo" | "memo.create") {
             self.ext.comments.new_memo();
+            // 개인 정보 바꾸기 names the author of memos made here.
+            let name = &self.ext.shell.settings.user_name;
+            if !name.is_empty() {
+                self.ext.comments.author = name.clone();
+            }
         } else {
             let c = self.session.cursor;
             let item = self

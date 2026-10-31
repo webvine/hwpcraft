@@ -26,22 +26,22 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
 pub(crate) const PARAMS: &[(&str, &str, &str)] = &[
     (
         "chart.create",
-        "chart: {kind:column|bar|line|pie|doughnut|scatter|stock_hlc|stock_ohlc|column_3d|bar_3d|pie_3d,title?,categories:[text],series:[{name,values:[finite numbers],color?:#RRGGBB,x_values?:[finite numbers]}],scatter_style?:marker|line|line_marker|smooth_marker,width_mm?,height_mm?,legend?}; expected_generation?; chart.types describes kind constraints. Scatter requires shared numeric x_values and no categories. Stock series roles/order: high,low,close or open,high,low,close. Body caret only. Hancom native interoperability requires a separate oracle.",
+        "chart: {kind:column|bar|line|pie|doughnut|scatter|stock_hlc|stock_ohlc|column_3d|bar_3d|pie_3d|combo|area|radar|bubble,title?,categories:[text],series:[{name,values:[유한한 수],color?:#RRGGBB,x_values?:[유한한 수],bubble_sizes?:[0 이상 크기],plot?:column|line,secondary_axis?}],scatter_style?:marker|line|line_marker|smooth_marker,grouping?:clustered|stacked|percent_stacked,radar_style?:standard|marker|filled,width_mm?,height_mm?,legend?}. grouping은 2D 세로·가로 막대·꺾은선·영역형에만 씁니다. 거품형은 분산형처럼 공통 x_values와 bubble_sizes가 필요합니다. 혼합형 계열은 plot이 필요하며 막대, 꺾은선, secondary_axis 꺾은선 순서로 둡니다. expected_generation?. chart.types가 종류별 제약을 알려 줍니다. 분산형은 공통 숫자 x_values가 필요하고 categories는 없습니다. 주가형 계열 순서: 고가·저가·종가 또는 시가·고가·저가·종가. 본문 캐럿에만 넣습니다. 한컴 네이티브 호환은 따로 확인해야 합니다.",
         r##"{"chart":{"kind":"column","title":"분기 실적","categories":["1분기","2분기"],"series":[{"name":"매출","values":[12,19]}]}}"##,
     ),
     (
         "chart.configure",
-        "index: 0-based chart.list index; chart: complete replacement definition in chart.create shape; required expected_generation. Only HwpCraft-authored charts are accepted. Preserves object placement and all other CFB streams. Existing chart.data remains the value-edit API for other supported charts.",
+        "index: chart.list의 0부터 센 번호, chart: chart.create 모양의 전체 새 정의, expected_generation: 필수. HwpCraft가 만든 차트만 받습니다. 개체 배치와 다른 CFB 스트림은 모두 그대로 둡니다. 다른 지원 차트의 값 고치기는 계속 chart.data를 씁니다.",
         r##"{"index":0,"expected_generation":0,"chart":{"kind":"line","categories":["1분기","2분기"],"series":[{"name":"매출","values":[15,21]}]}}"##,
     ),
     (
         "chart.types",
-        "No parameters. Actual authoring profiles, required fields, constraints, unsupported kinds and native interoperability limits.",
+        "매개 변수 없음. 실제 만들기 모양, 필수 필드, 제약, 지원하지 않는 종류와 네이티브 호환 한계.",
         "{}",
     ),
     (
         "chart.definition.get",
-        "index: 0-based chart.list index. Read actual current OOXML, dimensions, generation/address/instance_id. Only direct, unshared, unlocked HwpCraft canonical authoring profiles; unknown settings are rejected to prevent configure data loss.",
+        "index: chart.list의 0부터 센 번호. 지금 OOXML, 크기, generation/address/instance_id를 읽습니다. 직접·공유 안 함·잠기지 않은 HwpCraft 기본 만들기 모양만 받으며, 모르는 설정은 chart.configure에서 잃지 않도록 거절합니다.",
         r#"{"index":0}"#,
     ),
 ];
@@ -76,6 +76,12 @@ enum Kind {
     Bar3d,
     #[serde(rename = "pie_3d")]
     Pie3d,
+    /// Columns and lines in one plot, lines optionally on a secondary axis.
+    Combo,
+    Area,
+    Radar,
+    /// Shared X values, Y values and bubble sizes per series.
+    Bubble,
 }
 
 impl Kind {
@@ -94,9 +100,63 @@ impl Kind {
     fn horizontal(self) -> bool {
         matches!(self, Self::Bar | Self::Bar3d)
     }
+    /// Numeric X axis and shared `x_values` instead of categories.
+    fn xy(self) -> bool {
+        matches!(self, Self::Scatter | Self::Bubble)
+    }
     fn three_d(self) -> bool {
         matches!(self, Self::Column3d | Self::Bar3d | Self::Pie3d)
     }
+}
+
+/// `c:grouping` of 2D column, bar and line plots. For lines `clustered` is
+/// OOXML's `standard` (series drawn independently).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Grouping {
+    #[default]
+    Clustered,
+    Stacked,
+    PercentStacked,
+}
+
+impl Grouping {
+    fn xml(self, line: bool) -> &'static str {
+        match self {
+            Self::Clustered if line => "standard",
+            Self::Clustered => "clustered",
+            Self::Stacked => "stacked",
+            Self::PercentStacked => "percentStacked",
+        }
+    }
+}
+
+/// `c:radarStyle`: lines, lines with markers, or filled polygons.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RadarMode {
+    #[default]
+    Standard,
+    Marker,
+    Filled,
+}
+
+impl RadarMode {
+    fn xml(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Marker => "marker",
+            Self::Filled => "filled",
+        }
+    }
+}
+
+/// Plot of one combo series.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Plot {
+    Column,
+    Line,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -459,6 +519,15 @@ struct Series {
     color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     x_values: Option<Vec<f64>>,
+    /// Combo only: column or line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plot: Option<Plot>,
+    /// Combo only: a line series on the secondary (right) value axis.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    secondary_axis: bool,
+    /// Bubble only: bubble sizes (bubble area is proportional to the size).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bubble_sizes: Option<Vec<f64>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -478,6 +547,12 @@ struct Spec {
     legend: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scatter_style: Option<ScatterMode>,
+    /// 2D column, bar, line and area: clustered (default), stacked or percent stacked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grouping: Option<Grouping>,
+    /// Radar only: standard (default), marker or filled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    radar_style: Option<RadarMode>,
 }
 fn width() -> f64 {
     120.0
@@ -573,19 +648,19 @@ fn chart_types() -> Value {
         (Kind::Column3d, "입체 세로 막대형"),
         (Kind::Bar3d, "입체 가로 막대형"),
         (Kind::Pie3d, "입체 원형"),
+        (Kind::Combo, "혼합형 (막대+꺾은선)"),
+        (Kind::Area, "영역형"),
+        (Kind::Radar, "방사형"),
+        (Kind::Bubble, "거품형"),
     ];
     json!({"types":kinds.into_iter().map(|(kind,label)|json!({
-        "kind":kind,"label":label,"requiredFields":if kind==Kind::Scatter {vec!["series[].name","series[].values","series[].x_values"]}else{vec!["categories","series[].name","series[].values"]},
-        "constraints":{"pointsMin":1,"pointsMax":1000,"seriesMin":if kind==Kind::StockHlc {3}else if kind==Kind::StockOhlc{4}else{1},"seriesMax":if kind.pie(){1}else if kind==Kind::StockHlc{3}else if kind==Kind::StockOhlc{4}else{64},"totalValuesMax":16000,"absoluteValueMax":1e12,"widthMm":[10,300],"heightMm":[10,300],"sharedX":kind==Kind::Scatter,"scatterStyles":if kind==Kind::Scatter {vec!["marker","line","line_marker","smooth_marker"]}else{vec![]},"seriesRoles":if kind==Kind::StockHlc{vec!["high","low","close"]}else if kind==Kind::StockOhlc{vec!["open","high","low","close"]}else{vec![]},"priceBoundsCheckedOn":"create/configure/chart.data for canonical authored direct, unshared stock profiles; foreign/unknown profiles retain native validation","nonNegative":kind.pie(),"positiveSum":kind.pie(),"camera":if kind.three_d(){json!({"rotX":15,"rotY":20,"perspective":30,"rightAngleAxes":true})}else{Value::Null}},
+        "kind":kind,"label":label,"requiredFields":if kind==Kind::Bubble {vec!["series[].name","series[].values","series[].x_values","series[].bubble_sizes"]}else if kind==Kind::Scatter {vec!["series[].name","series[].values","series[].x_values"]}else{vec!["categories","series[].name","series[].values"]},
+        "constraints":{"pointsMin":1,"pointsMax":1000,"seriesMin":if kind==Kind::StockHlc {3}else if kind==Kind::StockOhlc{4}else if kind==Kind::Combo{2}else{1},"seriesMax":if kind.pie(){1}else if kind==Kind::StockHlc{3}else if kind==Kind::StockOhlc{4}else{64},"totalValuesMax":16000,"absoluteValueMax":1e12,"widthMm":[10,300],"heightMm":[10,300],"sharedX":kind.xy(),"scatterStyles":if kind==Kind::Scatter {vec!["marker","line","line_marker","smooth_marker"]}else{vec![]},"seriesRoles":if kind==Kind::StockHlc{vec!["high","low","close"]}else if kind==Kind::StockOhlc{vec!["open","high","low","close"]}else{vec![]},"priceBoundsCheckedOn":"create/configure/chart.data for canonical authored direct, unshared stock profiles; foreign/unknown profiles retain native validation","nonNegative":kind.pie(),"positiveSum":kind.pie(),"camera":if kind.three_d(){json!({"rotX":15,"rotY":20,"perspective":30,"rightAngleAxes":true})}else{Value::Null},"radarStyles":if kind==Kind::Radar{vec!["standard","marker","filled"]}else{vec![]},"groupings":if matches!(kind,Kind::Column|Kind::Bar|Kind::Line|Kind::Area){vec!["clustered","stacked","percent_stacked"]}else{vec![]},"comboSeries":if kind==Kind::Combo{json!({"plot":["column","line"],"secondaryAxis":"line series only","order":"columns, then lines, then secondary-axis lines; at least one column and one line"})}else{Value::Null}},
         "nativeInterop":"unverified"
     })).collect::<Vec<_>>(),"unsupported":[
-        {"kind":"area","reason":"The current public parser/renderer has no area plot implementation."},
-        {"kind":"radar","reason":"The current public parser/renderer has no radar plot implementation."},
         {"kind":"line_3d","reason":"The current renderer uses a flat line approximation; genuine 3D authoring is not offered."},
-        {"kind":"bubble","reason":"Bubble-size data and rendering are not implemented."},
-        {"kind":"surface","reason":"Surface data and rendering are not implemented."},
-        {"kind":"combo","reason":"Per-series plot/axis authoring is not part of this profile."}
-    ],"limitations":["Scatter authoring uses the same X coordinates and point count for every series so the existing chart.data labels contract remains exact.","3D projection is an implementation-specific DrawingML rendering; native Hancom display/editing parity is unverified.","Canonical HwpCraft body profiles hide legends and decode XML strings in screen/PDF output; foreign, shared, nested or extended profiles retain their native rendering. Hidden-legend space is not fully reclaimed."]})
+        {"kind":"surface","reason":"Surface data and rendering are not implemented."}
+    ],"limitations":["Scatter and bubble authoring use the same X coordinates and point count for every series so the existing chart.data labels contract remains exact; chart.data edits bubble X/Y values, not sizes (use chart.configure).","3D projection is an implementation-specific DrawingML rendering; native Hancom display/editing parity is unverified.","Canonical HwpCraft body profiles hide legends and decode XML strings in screen/PDF output; foreign, shared, nested or extended profiles retain their native rendering. Hidden-legend space is not fully reclaimed."]})
 }
 
 /// A strict XML profile comparison prevents the lossy public render model
@@ -706,7 +781,7 @@ impl Spec {
         {
             bail!("차트 크기는 유한한 10–300 mm입니다.");
         }
-        let points = if self.kind == Kind::Scatter {
+        let points = if self.kind.xy() {
             self.series.first().map_or(0, |s| s.values.len())
         } else {
             self.categories.len()
@@ -736,22 +811,36 @@ impl Spec {
             {
                 bail!("계열 값 개수는 범주 개수와 같아야 하며 각 값은 유한한 ±1e12 범위입니다.");
             }
-            if self.kind == Kind::Scatter {
+            if self.kind.xy() {
                 let x = series
                     .x_values
                     .as_ref()
-                    .context("분산형에는 각 계열의 x_values가 필요합니다.")?;
+                    .context("분산형·거품형에는 각 계열의 x_values가 필요합니다.")?;
                 if !self.categories.is_empty()
                     || x.len() != points
                     || x.iter().any(|v| !v.is_finite() || v.abs() > 1.0e12)
                     || self.series[0].x_values.as_ref() != Some(x)
                 {
                     bail!(
-                        "분산형은 범주 없이 동일한 유한한 X 좌표를 모든 계열에 사용합니다(각 ±1e12, Y와 같은 개수)."
+                        "분산형·거품형은 범주 없이 동일한 유한한 X 좌표를 모든 계열에 사용합니다(각 ±1e12, Y와 같은 개수)."
                     );
                 }
-            } else if series.x_values.is_some() || self.scatter_style.is_some() {
-                bail!("x_values와 scatter_style은 분산형 전용입니다.");
+            } else if series.x_values.is_some() {
+                bail!("x_values는 분산형·거품형 전용입니다.");
+            }
+            match (&series.bubble_sizes, self.kind == Kind::Bubble) {
+                (Some(sizes), true) => {
+                    if sizes.len() != points
+                        || sizes
+                            .iter()
+                            .any(|v| !v.is_finite() || *v < 0.0 || *v > 1.0e12)
+                    {
+                        bail!("거품 크기는 값과 같은 개수의 0–1e12 유한한 수입니다.");
+                    }
+                }
+                (None, true) => bail!("거품형에는 각 계열의 bubble_sizes가 필요합니다."),
+                (Some(_), false) => bail!("bubble_sizes는 거품형 전용입니다."),
+                (None, false) => {}
             }
             if let Some(color) = &series.color
                 && (color.len() != 7
@@ -760,6 +849,45 @@ impl Spec {
             {
                 bail!("차트 색상은 #RRGGBB입니다.");
             }
+        }
+        if self.grouping.is_some()
+            && !matches!(
+                self.kind,
+                Kind::Column | Kind::Bar | Kind::Line | Kind::Area
+            )
+        {
+            bail!("grouping(누적·100% 누적)은 2D 세로·가로 막대, 꺾은선, 영역형 전용입니다.");
+        }
+        if self.scatter_style.is_some() && self.kind != Kind::Scatter {
+            bail!("scatter_style은 분산형 전용입니다.");
+        }
+        if self.radar_style.is_some() && self.kind != Kind::Radar {
+            bail!("radar_style은 방사형 전용입니다.");
+        }
+        if self.kind == Kind::Combo {
+            // Stored grouped: columns, then lines, then lines on the secondary axis.
+            let rank = |s: &Series| match (s.plot, s.secondary_axis) {
+                (Some(Plot::Column), false) => Ok(0),
+                (Some(Plot::Line), false) => Ok(1),
+                (Some(Plot::Line), true) => Ok(2),
+                (Some(Plot::Column), true) => {
+                    bail!("혼합형의 보조 축은 꺾은선 계열만 쓸 수 있습니다.")
+                }
+                (None, _) => bail!("혼합형의 모든 계열에 plot(column|line)이 필요합니다."),
+            };
+            let ranks = self.series.iter().map(rank).collect::<Result<Vec<_>>>()?;
+            if !ranks.is_sorted() {
+                bail!("혼합형 계열은 막대, 꺾은선, 보조 축 꺾은선 순서로 주세요.");
+            }
+            if !ranks.contains(&0) || ranks.iter().all(|r| *r == 0) {
+                bail!("혼합형에는 막대 계열과 꺾은선 계열이 하나 이상씩 필요합니다.");
+            }
+        } else if self
+            .series
+            .iter()
+            .any(|s| s.plot.is_some() || s.secondary_axis)
+        {
+            bail!("plot과 secondary_axis는 혼합형(combo) 전용입니다.");
         }
         if self.kind.pie()
             && (self.series.len() != 1
@@ -792,6 +920,113 @@ impl Spec {
         Ok(())
     }
 
+    /// One `c:ser`, written as a series of `kind`.
+    fn write_series(
+        &self,
+        xml: &mut String,
+        index: usize,
+        series: &Series,
+        kind: Kind,
+    ) -> Result<()> {
+        let color = series
+            .color
+            .as_deref()
+            .map(|c| &c[1..])
+            .unwrap_or(COLORS[index % COLORS.len()]);
+        xml.push_str(&format!("<c:ser><c:idx val=\"{index}\"/><c:order val=\"{index}\"/><c:tx><c:v>{}</c:v></c:tx><c:spPr><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill><a:ln w=\"25400\">",escape(&series.name)));
+        if kind.stock() {
+            xml.push_str("<a:noFill/>");
+        } else {
+            xml.push_str(&format!(
+                "<a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill>"
+            ));
+        }
+        xml.push_str("</a:ln></c:spPr>");
+        if kind.stock() {
+            xml.push_str(&format!(
+                "<c:marker><c:symbol val=\"{}\"/></c:marker>",
+                if index == self.series.len() - 1 {
+                    "auto"
+                } else {
+                    "none"
+                }
+            ));
+        }
+        if kind.xy() {
+            numeric_block(
+                xml,
+                "xVal",
+                series.x_values.as_deref().context("분산형 X 값 없음")?,
+            );
+            numeric_block(xml, "yVal", &series.values);
+            if kind == Kind::Bubble {
+                numeric_block(
+                    xml,
+                    "bubbleSize",
+                    series.bubble_sizes.as_deref().context("거품 크기 없음")?,
+                );
+                xml.push_str("<c:bubble3D val=\"0\"/>");
+            }
+            xml.push_str("</c:ser>");
+            return Ok(());
+        }
+        xml.push_str(&format!(
+            "<c:cat><c:strLit><c:ptCount val=\"{}\"/>",
+            self.categories.len()
+        ));
+        for (i, label) in self.categories.iter().enumerate() {
+            xml.push_str(&format!(
+                "<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>",
+                escape(label)
+            ));
+        }
+        xml.push_str(&format!("</c:strLit></c:cat><c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{}\"/>",series.values.len()));
+        for (i, value) in series.values.iter().enumerate() {
+            xml.push_str(&format!(
+                "<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>",
+                number_text(*value)
+            ));
+        }
+        xml.push_str("</c:numLit></c:val>");
+        if kind == Kind::Line {
+            xml.push_str("<c:smooth val=\"0\"/>");
+        }
+        xml.push_str("</c:ser>");
+        Ok(())
+    }
+
+    /// Combo plot groups: columns, lines, and lines on the secondary axis, each
+    /// in its own chart group with the axes it plots against.
+    fn combo_plots(&self, xml: &mut String) -> Result<()> {
+        let group = |plot: Plot, secondary: bool| {
+            self.series
+                .iter()
+                .enumerate()
+                .filter(move |(_, s)| s.plot == Some(plot) && s.secondary_axis == secondary)
+        };
+        xml.push_str("<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>");
+        for (index, series) in group(Plot::Column, false) {
+            self.write_series(xml, index, series, Kind::Column)?;
+        }
+        xml.push_str(
+            "<c:gapWidth val=\"150\"/><c:axId val=\"100\"/><c:axId val=\"200\"/></c:barChart>",
+        );
+        for (secondary, axes) in [(false, (100, 200)), (true, (300, 400))] {
+            if group(Plot::Line, secondary).next().is_none() {
+                continue;
+            }
+            xml.push_str("<c:lineChart><c:grouping val=\"standard\"/><c:varyColors val=\"0\"/>");
+            for (index, series) in group(Plot::Line, secondary) {
+                self.write_series(xml, index, series, Kind::Line)?;
+            }
+            xml.push_str(&format!(
+                "<c:marker val=\"1\"/><c:axId val=\"{}\"/><c:axId val=\"{}\"/></c:lineChart>",
+                axes.0, axes.1
+            ));
+        }
+        Ok(())
+    }
+
     fn xml(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let mut xml = String::from(
@@ -808,6 +1043,7 @@ impl Spec {
         }
         xml.push_str("<c:plotArea><c:layout/>");
         let plot = match self.kind {
+            Kind::Combo => "",
             Kind::Column | Kind::Bar => "barChart",
             Kind::Line => "lineChart",
             Kind::Pie => "pieChart",
@@ -816,14 +1052,34 @@ impl Spec {
             Kind::StockHlc | Kind::StockOhlc => "stockChart",
             Kind::Column3d | Kind::Bar3d => "bar3DChart",
             Kind::Pie3d => "pie3DChart",
+            Kind::Area => "areaChart",
+            Kind::Radar => "radarChart",
+            Kind::Bubble => "bubbleChart",
         };
-        xml.push_str(&format!("<c:{plot}>"));
+        if self.kind != Kind::Combo {
+            xml.push_str(&format!("<c:{plot}>"));
+        }
+        let grouping = self.grouping.unwrap_or_default();
         match self.kind {
             Kind::Column | Kind::Bar | Kind::Column3d | Kind::Bar3d => xml.push_str(&format!(
-                "<c:barDir val=\"{}\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>",
-                if self.kind.horizontal() { "bar" } else { "col" }
+                "<c:barDir val=\"{}\"/><c:grouping val=\"{}\"/><c:varyColors val=\"0\"/>",
+                if self.kind.horizontal() { "bar" } else { "col" },
+                grouping.xml(false)
             )),
-            Kind::Line => xml.push_str("<c:grouping val=\"standard\"/><c:varyColors val=\"0\"/>"),
+            Kind::Line => xml.push_str(&format!(
+                "<c:grouping val=\"{}\"/><c:varyColors val=\"0\"/>",
+                grouping.xml(true)
+            )),
+            Kind::Combo => {}
+            Kind::Area => xml.push_str(&format!(
+                "<c:grouping val=\"{}\"/><c:varyColors val=\"0\"/>",
+                grouping.xml(true)
+            )),
+            Kind::Radar => xml.push_str(&format!(
+                "<c:radarStyle val=\"{}\"/><c:varyColors val=\"0\"/>",
+                self.radar_style.unwrap_or_default().xml()
+            )),
+            Kind::Bubble => xml.push_str("<c:varyColors val=\"0\"/>"),
             Kind::Scatter => xml.push_str(&format!(
                 "<c:scatterStyle val=\"{}\"/><c:varyColors val=\"0\"/>",
                 self.scatter_style.unwrap_or_default().xml()
@@ -831,66 +1087,19 @@ impl Spec {
             Kind::StockHlc | Kind::StockOhlc => {}
             _ => xml.push_str("<c:varyColors val=\"1\"/>"),
         }
-        for (index, series) in self.series.iter().enumerate() {
-            let color = series
-                .color
-                .as_deref()
-                .map(|c| &c[1..])
-                .unwrap_or(COLORS[index % COLORS.len()]);
-            xml.push_str(&format!("<c:ser><c:idx val=\"{index}\"/><c:order val=\"{index}\"/><c:tx><c:v>{}</c:v></c:tx><c:spPr><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill><a:ln w=\"25400\">",escape(&series.name)));
-            if self.kind.stock() {
-                xml.push_str("<a:noFill/>");
-            } else {
-                xml.push_str(&format!(
-                    "<a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill>"
-                ));
+        if self.kind == Kind::Combo {
+            self.combo_plots(&mut xml)?;
+        } else {
+            for (index, series) in self.series.iter().enumerate() {
+                self.write_series(&mut xml, index, series, self.kind)?;
             }
-            xml.push_str("</a:ln></c:spPr>");
-            if self.kind.stock() {
-                xml.push_str(&format!(
-                    "<c:marker><c:symbol val=\"{}\"/></c:marker>",
-                    if index == self.series.len() - 1 {
-                        "auto"
-                    } else {
-                        "none"
-                    }
-                ));
-            }
-            if self.kind == Kind::Scatter {
-                numeric_block(
-                    &mut xml,
-                    "xVal",
-                    series.x_values.as_deref().context("분산형 X 값 없음")?,
-                );
-                numeric_block(&mut xml, "yVal", &series.values);
-                xml.push_str("</c:ser>");
-                continue;
-            }
-            xml.push_str(&format!(
-                "<c:cat><c:strLit><c:ptCount val=\"{}\"/>",
-                self.categories.len()
-            ));
-            for (i, label) in self.categories.iter().enumerate() {
-                xml.push_str(&format!(
-                    "<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>",
-                    escape(label)
-                ));
-            }
-            xml.push_str(&format!("</c:strLit></c:cat><c:val><c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{}\"/>",series.values.len()));
-            for (i, value) in series.values.iter().enumerate() {
-                xml.push_str(&format!(
-                    "<c:pt idx=\"{i}\"><c:v>{}</c:v></c:pt>",
-                    number_text(*value)
-                ));
-            }
-            xml.push_str("</c:numLit></c:val>");
-            if self.kind == Kind::Line {
-                xml.push_str("<c:smooth val=\"0\"/>");
-            }
-            xml.push_str("</c:ser>");
         }
         if self.kind.bars() {
             xml.push_str("<c:gapWidth val=\"150\"/>");
+            if grouping != Grouping::Clustered {
+                // Stacked bars sit on one another (OOXML convention).
+                xml.push_str("<c:overlap val=\"100\"/>");
+            }
             if self.kind.three_d() {
                 xml.push_str("<c:gapDepth val=\"150\"/><c:shape val=\"box\"/>");
             }
@@ -901,6 +1110,9 @@ impl Spec {
                     xml.push_str("<c:firstSliceAng val=\"0\"/><c:holeSize val=\"50\"/>")
                 }
                 Kind::Pie => xml.push_str("<c:firstSliceAng val=\"0\"/>"),
+                Kind::Bubble => {
+                    xml.push_str("<c:bubbleScale val=\"100\"/><c:showNegBubbles val=\"0\"/>")
+                }
                 Kind::StockHlc | Kind::StockOhlc => {
                     xml.push_str("<c:hiLowLines/>");
                     if self.kind == Kind::StockOhlc {
@@ -910,11 +1122,13 @@ impl Spec {
                 _ => {}
             }
         }
-        if !self.kind.pie() {
-            xml.push_str("<c:axId val=\"100\"/><c:axId val=\"200\"/>");
+        if self.kind != Kind::Combo {
+            if !self.kind.pie() {
+                xml.push_str("<c:axId val=\"100\"/><c:axId val=\"200\"/>");
+            }
+            xml.push_str(&format!("</c:{plot}>"));
         }
-        xml.push_str(&format!("</c:{plot}>"));
-        if self.kind == Kind::Scatter {
+        if self.kind.xy() {
             for (id, cross, pos) in [(100, 200, "b"), (200, 100, "l")] {
                 xml.push_str(&format!("<c:valAx><c:axId val=\"{id}\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"{pos}\"/><c:majorGridlines/><c:numFmt formatCode=\"General\" sourceLinked=\"0\"/><c:majorTickMark val=\"none\"/><c:minorTickMark val=\"none\"/><c:tickLblPos val=\"nextTo\"/><c:crossAx val=\"{cross}\"/><c:crosses val=\"autoZero\"/><c:crossBetween val=\"midCat\"/></c:valAx>"));
             }
@@ -925,6 +1139,9 @@ impl Spec {
                 ("b", "l")
             };
             xml.push_str(&format!("<c:catAx><c:axId val=\"100\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"{catpos}\"/><c:majorTickMark val=\"none\"/><c:minorTickMark val=\"none\"/><c:tickLblPos val=\"nextTo\"/><c:crossAx val=\"200\"/><c:crosses val=\"autoZero\"/><c:auto val=\"1\"/><c:lblAlgn val=\"ctr\"/><c:lblOffset val=\"100\"/></c:catAx><c:valAx><c:axId val=\"200\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"{valpos}\"/><c:majorGridlines/><c:numFmt formatCode=\"General\" sourceLinked=\"0\"/><c:majorTickMark val=\"none\"/><c:minorTickMark val=\"none\"/><c:tickLblPos val=\"nextTo\"/><c:crossAx val=\"100\"/><c:crosses val=\"autoZero\"/><c:crossBetween val=\"between\"/></c:valAx>"));
+            if self.series.iter().any(|s| s.secondary_axis) {
+                xml.push_str("<c:catAx><c:axId val=\"300\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"1\"/><c:axPos val=\"b\"/><c:majorTickMark val=\"none\"/><c:minorTickMark val=\"none\"/><c:tickLblPos val=\"nextTo\"/><c:crossAx val=\"400\"/><c:crosses val=\"autoZero\"/><c:auto val=\"1\"/><c:lblAlgn val=\"ctr\"/><c:lblOffset val=\"100\"/></c:catAx><c:valAx><c:axId val=\"400\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"r\"/><c:numFmt formatCode=\"General\" sourceLinked=\"0\"/><c:majorTickMark val=\"none\"/><c:minorTickMark val=\"none\"/><c:tickLblPos val=\"nextTo\"/><c:crossAx val=\"300\"/><c:crosses val=\"max\"/><c:crossBetween val=\"between\"/></c:valAx>");
+            }
         }
         xml.push_str("</c:plotArea>");
         if self.legend {
@@ -1012,6 +1229,8 @@ impl Spec {
         let parsed = chart_io::OoxmlChart::parse(xml).context("차트 구성 모델 없음")?;
         let kind = if text.contains("<c:doughnutChart>") {
             Kind::Doughnut
+        } else if parsed.is_combo() {
+            Kind::Combo
         } else {
             match (parsed.chart_type, parsed.is_3d) {
                 (T::Column, false) => Kind::Column,
@@ -1022,6 +1241,9 @@ impl Spec {
                 (T::Pie, false) => Kind::Pie,
                 (T::Pie, true) => Kind::Pie3d,
                 (T::Scatter, false) => Kind::Scatter,
+                (T::Area, false) => Kind::Area,
+                (T::Radar, false) => Kind::Radar,
+                (T::Bubble, false) => Kind::Bubble,
                 (T::Stock, false) => {
                     if parsed.has_up_down_bars {
                         Kind::StockOhlc
@@ -1042,7 +1264,7 @@ impl Spec {
         let spec = Self {
             kind,
             title: actual_title(xml)?,
-            categories: if kind == Kind::Scatter {
+            categories: if kind.xy() {
                 Vec::new()
             } else {
                 data.series
@@ -1066,7 +1288,14 @@ impl Spec {
                             .map(|p| Ok(decode(&p.text)?.parse::<f64>()?))
                             .collect::<Result<_>>()?,
                         color: s.color.map(|c| format!("#{c:06X}")),
-                        x_values: if kind == Kind::Scatter {
+                        plot: (kind == Kind::Combo).then_some(if s.series_type == T::Line {
+                            Plot::Line
+                        } else {
+                            Plot::Column
+                        }),
+                        secondary_axis: kind == Kind::Combo && s.axis_group == 1,
+                        bubble_sizes: (kind == Kind::Bubble).then(|| s.bubble_sizes.clone()),
+                        x_values: if kind.xy() {
                             Some(
                                 d.labels
                                     .iter()
@@ -1088,6 +1317,18 @@ impl Spec {
                 S::LineMarker => ScatterMode::LineMarker,
                 S::SmoothMarker => ScatterMode::SmoothMarker,
             }),
+            radar_style: (kind == Kind::Radar).then_some(match parsed.radar_style {
+                chart_io::RadarStyle::Standard => RadarMode::Standard,
+                chart_io::RadarStyle::Marker => RadarMode::Marker,
+                chart_io::RadarStyle::Filled => RadarMode::Filled,
+            }),
+            grouping: if text.contains("<c:grouping val=\"percentStacked\"/>") {
+                Some(Grouping::PercentStacked)
+            } else if text.contains("<c:grouping val=\"stacked\"/>") {
+                Some(Grouping::Stacked)
+            } else {
+                None
+            },
         };
         spec.validate()?;
         if xml_profile(xml)? != xml_profile(&spec.xml()?)? {
