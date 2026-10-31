@@ -18,6 +18,9 @@ fn at(paragraph: usize, offset: usize) -> Cursor {
 
 /// A saved and reopened file, so the layout starts from an opened document.
 fn document(dir: &tempfile::TempDir) -> anyhow::Result<Session> {
+    // Saving stamps the document's times; the byte comparisons need one instant. The
+    // clock is process-wide, so every test fixes it before its first save.
+    hwpcraft_engine::fixed_clock(Some(1_767_225_600));
     let path = dir.path().join("base.hwpx");
     if !path.exists() {
         let mut s = Session::new()?;
@@ -64,8 +67,6 @@ fn patch() -> Value {
 
 #[test]
 fn selection_matches_paragraph_by_paragraph_and_the_reopened_file() -> anyhow::Result<()> {
-    // Saving stamps the document's times; the byte comparison needs one instant.
-    hwpcraft_engine::fixed_clock(Some(1_767_225_600));
     let dir = tempfile::tempdir()?;
     let mut whole = document(&dir)?;
     let original = saved(&mut whole, &dir, "original.hwpx")?;

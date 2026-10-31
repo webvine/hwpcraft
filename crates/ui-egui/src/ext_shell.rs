@@ -6260,7 +6260,7 @@ impl HwpApp {
         scale: f32,
         image: egui::ColorImage,
     ) -> egui::TextureHandle {
-        if cfg!(debug_assertions) {
+        if cfg!(any(test, debug_assertions)) {
             self.ext.shell.page_images.insert(index, image.clone());
         }
         let size = Vec2::new(image.size[0] as f32 / scale, image.size[1] as f32 / scale);
@@ -6374,7 +6374,7 @@ impl HwpApp {
         if band.size[0] != width || y0 + band.size[1] > height {
             return false;
         }
-        if cfg!(debug_assertions) {
+        if cfg!(any(test, debug_assertions)) {
             // Patch the stored copy and require it to equal a full render everywhere.
             let Some(mut patched) = self.ext.shell.page_images.get(&page).cloned() else {
                 return false;
