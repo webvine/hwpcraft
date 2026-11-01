@@ -173,6 +173,38 @@ async fn limit_legacy_sessions(
     next.run(request).await
 }
 
+/// The SDK refuses a request from another browser origin before it reads the
+/// body. Closing a socket with unread request bytes makes some systems (macOS)
+/// reset the connection, so the client would see a reset instead of the 403:
+/// read a small body first and hand the request on unchanged.
+async fn read_foreign_origin_body(
+    State(allowed): State<Arc<Vec<String>>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let foreign = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|origin| !allowed.iter().any(|own| own == origin));
+    if !foreign {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    match tokio::time::timeout(
+        REJECTED_BODY_DRAIN_TIME,
+        axum::body::to_bytes(body, REJECTED_BODY_DRAIN_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => {
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        _ => StatusCode::FORBIDDEN.into_response(),
+    }
+}
+
 /// The SDK answers a JSON body it cannot decode with 415 Unsupported Media Type.
 /// The media type was right; the body was not. Answer as JSON-RPC (and stdio) do:
 /// 400 with -32700 Parse error, or -32600 for valid JSON that is no message (a
@@ -266,7 +298,7 @@ where
         .with_stateless_protocol_metadata_required(true)
         .with_json_response(true)
         .with_allowed_hosts(allowed_hosts)
-        .with_allowed_origins(allowed_origins)
+        .with_allowed_origins(allowed_origins.clone())
         .enforce_origin_validation()
         // SDK enforcement consumes a bounded streaming body; Content-Length
         // and chunked transfer cannot bypass this limit.
@@ -280,6 +312,10 @@ where
     let router = axum::Router::new()
         .nest_service("/mcp", transport)
         .layer(middleware::from_fn(json_rpc_body_errors))
+        .layer(middleware::from_fn_with_state(
+            Arc::new(allowed_origins.to_vec()),
+            read_foreign_origin_body,
+        ))
         .layer(middleware::from_fn_with_state(
             sessions,
             limit_legacy_sessions,

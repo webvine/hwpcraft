@@ -4677,8 +4677,8 @@ mod tests {
 
     #[test]
     fn two_key_shortcuts_are_shown_with_a_space_after_the_comma() {
-        assert_eq!(shown_keys("Ctrl+Q,I"), "Ctrl+Q, I");
-        assert_eq!(shown_keys("Ctrl+B"), "Ctrl+B");
+        assert_eq!(shown_keys("Ctrl+Q,I"), platform_keys("Ctrl+Q, I"));
+        assert_eq!(shown_keys("Ctrl+B"), platform_keys("Ctrl+B"));
         // macOS writes the COMMAND key as ⌘; Alt and Shift stay as they are.
         assert_eq!(keys_for(true, "되돌리기 (Ctrl+Z)"), "되돌리기 (⌘Z)");
         assert_eq!(keys_for(true, "Ctrl+Q, I · Alt+P"), "⌘Q, I · Alt+P");
@@ -4991,7 +4991,7 @@ mod tests {
         let has = |t: &str| texts.iter().any(|x| x == t);
         assert_eq!(texts.iter().filter(|t| *t == "가").count(), 3, "{texts:?}");
         assert!(
-            has("붙이기") && has("Ctrl+V"),
+            has("붙이기") && has(&platform_keys("Ctrl+V")),
             "shortcut beside 붙이기: {texts:?}"
         );
         assert!(has("줄/칸 추가하기") && has("줄/칸 지우기"), "{texts:?}");
@@ -5228,14 +5228,17 @@ mod tests {
         assert_eq!(table.disabled_reason(A::Ext("table.merge")), CELL_BLOCK);
         assert_eq!(blank.disabled_reason(A::Ext("object.lock")), SELECT_OBJECT);
         // Shortcuts from the command list, once, after the name.
-        assert_eq!(blank.tip("오려\n두기", A::Cut, true), "오려 두기 (Ctrl+X)");
+        assert_eq!(
+            blank.tip("오려\n두기", A::Cut, true),
+            platform_keys("오려 두기 (Ctrl+X)")
+        );
         assert_eq!(
             blank.tip("하이퍼링크", A::Link, true),
-            "하이퍼링크 (Ctrl+K, H)"
+            platform_keys("하이퍼링크 (Ctrl+K, H)")
         );
         assert_eq!(
             blank.tip("진하게 (Ctrl+B)", A::Char("bold"), true),
-            "진하게 (Ctrl+B)"
+            platform_keys("진하게 (Ctrl+B)")
         );
         assert_eq!(blank.tip("바탕쪽", A::Ext("page.master"), true), "바탕쪽");
     }
