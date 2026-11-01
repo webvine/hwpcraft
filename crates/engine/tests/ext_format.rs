@@ -1225,3 +1225,30 @@ fn copy_shape_apply_sets_character_and_paragraph_in_one_undo_step() -> anyhow::R
     }
     Ok(())
 }
+
+/// Hangul's 문단 번호 / 글머리표 keep the paragraph's own left margin (0 before,
+/// with and after the head). HwpCraft gives a head without a margin room to hang
+/// in; taking the head off takes that margin back, and leaves a margin of the
+/// paragraph's own.
+#[test]
+fn removing_a_head_takes_back_the_margin_it_was_given() -> anyhow::Result<()> {
+    let mut s = doc("번호를 붙였다가 없앤 문단")?;
+    for kind in ["number", "bullet"] {
+        s.run("format.numbering.apply", json!({"kind": kind, "level": 1}))?;
+        assert_ne!(para(&mut s)?["marginLeft"], 0, "{kind}: room for the head");
+        s.run("format.numbering.apply", json!({"kind": "none"}))?;
+        let p = para(&mut s)?;
+        assert_eq!(p["headType"], "None", "{kind}");
+        assert_eq!(p["marginLeft"], 0, "{kind}: {p}");
+    }
+    // The toggle takes it back too.
+    s.run("format.numbering.toggle", json!({}))?;
+    s.run("format.numbering.toggle", json!({}))?;
+    assert_eq!(para(&mut s)?["marginLeft"], 0);
+    // A margin the paragraph had of its own stays.
+    s.run("format.paragraph", json!({"marginLeft": 3000}))?;
+    s.run("format.numbering.toggle", json!({}))?;
+    s.run("format.numbering.toggle", json!({}))?;
+    assert_eq!(para(&mut s)?["marginLeft"], 3000);
+    Ok(())
+}

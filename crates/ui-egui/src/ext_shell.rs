@@ -605,7 +605,8 @@ impl HwpApp {
             | "tools.autocorrect"
             | "tools.customize"
             | "page.label"
-            | "page.manuscript" => true,
+            | "page.manuscript"
+            | "view.ai_panel" => true,
             "review.accept" | "review.accept_all" | "review.reject" | "review.reject_all"
             | "review.prev" | "review.next" => self.session.has_unkept_track_changes(),
             "review.track_changes" => true,
@@ -684,6 +685,7 @@ impl HwpApp {
             "page.line_numbers.skip_paragraph" => self.line_number_skipped(),
             "view.page_outline" => self.ext.shell.page_outline,
             "view.guides" => self.ext.shell.show_guides,
+            "view.ai_panel" => self.ext.shell.settings.ai_panel_open,
             "review.track_changes" => self.session.track_recording(),
             "view.guides.object" => self.ext.shell.object_guides,
             "view.split" => self.split.as_ref().is_some_and(|s| !s.side_by_side),
@@ -726,6 +728,10 @@ impl HwpApp {
             "view.zoom_out" => self.set_zoom(self.zoom - 0.1),
             "view.status_bar" => self.ext.shell.show_status_bar ^= true,
             "view.guides" => self.ext.shell.show_guides ^= true,
+            "view.ai_panel" => {
+                let open = !self.ext.shell.settings.ai_panel_open;
+                self.set_ai_panel_open(open);
+            }
             "view.guides.object" => {
                 self.ext.shell.object_guides ^= true;
                 self.message = if self.ext.shell.object_guides {
@@ -3459,16 +3465,45 @@ const CHORDS: &[(char, egui::Key, &str)] = {
     ]
 };
 
+/// Why a command waits while an AI question runs (AI 편집 패널).
+pub(crate) const AI_LOCKED: &str = "AI가 편집 중입니다. 패널의 [중지]로 멈출 수 있습니다.";
+
 /// Settings folder shared with the engine (`hwpcraft_engine::config_dir`: Windows
 /// `%APPDATA%`, macOS `~/Library/Application Support`, Linux `$XDG_CONFIG_HOME`).
 /// `None` means settings are not persisted. Tests get a folder of their own so they
 /// never write the user's recent documents, view settings, symbols or window state.
 pub(crate) fn config_dir() -> Option<PathBuf> {
     if cfg!(test) {
-        let name = format!("hwpcraft-ui-test-config-{}", std::process::id());
-        return Some(std::env::temp_dir().join(name));
+        static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let dir = DIR.get_or_init(|| {
+            let temp = std::env::temp_dir();
+            // Earlier runs' folders go once they are an hour old (a run takes minutes),
+            // so at most the last runs' are left.
+            for entry in std::fs::read_dir(&temp).into_iter().flatten().flatten() {
+                let age = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok());
+                if age
+                    .is_some_and(|age| stale_test_config(&entry.file_name().to_string_lossy(), age))
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+            temp.join(format!("{TEST_CONFIG}{}", std::process::id()))
+        });
+        return Some(dir.clone());
     }
     hwpcraft_engine::config_dir()
+}
+/// Name start of the settings folder each test run uses (`config_dir`).
+const TEST_CONFIG: &str = "hwpcraft-ui-test-config-";
+/// An earlier test run's settings folder, old enough to remove.
+fn stale_test_config(name: &str, age: std::time::Duration) -> bool {
+    name.strip_prefix(TEST_CONFIG)
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+        && age > std::time::Duration::from_secs(3600)
 }
 fn recent_file() -> Option<PathBuf> {
     config_dir().map(|d| d.join("recent.txt"))
@@ -3597,6 +3632,7 @@ pub(crate) const ALT_KEYS: &[(usize, char, &str)] = &[
     (2, 'D', "view.guides"),
     (2, 'P', "view.hanja_pronounce"),
     (2, 'W', "view.task_pane"),
+    (2, 'Q', "view.ai_panel"),
     (2, 'B', "view.split"),
     (2, 'O', "menu:창 배열"),
     (2, 'K', "view.switch_window"),
@@ -3878,9 +3914,7 @@ impl HwpApp {
             self.ext.shell.last_path = self.session.path.clone();
             if let Some(path) = self.session.path.clone() {
                 push_recent(&mut self.ext.shell.recent, &path);
-                // Captures and benchmarks stay out of the user's recent documents.
-                let measured = self.screenshot.is_some() || self.ext.shell.bench.is_some();
-                if let Some(file) = recent_file().filter(|_| !measured) {
+                if let Some(file) = recent_file().filter(|_| self.persists_settings()) {
                     if let Some(dir) = file.parent() {
                         let _ = std::fs::create_dir_all(dir);
                     }
@@ -3997,15 +4031,89 @@ impl HwpApp {
     /// The document's tracked changes (`document.track_changes`), kept for the current
     /// document generation: the status bar asks every frame.
     pub(crate) fn track_state(&mut self) -> serde_json::Value {
+        self.track_state_ref().clone()
+    }
+
+    /// The cached change-tracking state, without copying its list (the status bar reads
+    /// it every frame).
+    fn track_state_ref(&mut self) -> &serde_json::Value {
         let generation = self.session.generation;
-        if let Some((g, v)) = &self.ext.shell.track_state
-            && *g == generation
+        if self
+            .ext
+            .shell
+            .track_state
+            .as_ref()
+            .is_none_or(|(g, _)| *g != generation)
         {
-            return v.clone();
+            let v = self.session.track_changes();
+            self.ext.shell.track_state = Some((generation, v));
         }
-        let v = self.session.track_changes();
-        self.ext.shell.track_state = Some((generation, v.clone()));
-        v
+        &self.ext.shell.track_state.as_ref().expect("filled above").1
+    }
+
+    /// AI 편집 패널 shown or hidden, remembered in the settings. Hiding it does not stop
+    /// a running question.
+    pub(crate) fn set_ai_panel_open(&mut self, open: bool) {
+        self.ext.shell.settings.ai_panel_open = open;
+        self.save_shell_settings();
+    }
+
+    /// Write the settings, with the 지원하지 않는 명령 switch that lives beside them.
+    fn save_shell_settings(&mut self) {
+        self.ext.shell.settings.show_unsupported = self.ext.shell.show_unsupported;
+        if self.persists_settings() {
+            self.ext.shell.settings.save();
+        }
+    }
+
+    /// Screen captures and benchmarks run commands to show them; they leave the user's
+    /// recent documents and settings as they were (the AI panel's history too).
+    pub(crate) fn persists_settings(&self) -> bool {
+        self.screenshot.is_none() && self.ext.shell.bench.is_none()
+    }
+
+    /// True while an AI question runs: the document is the AI's until it ends, so the
+    /// user's editing, opening and saving wait (scrolling, zoom and panes still work).
+    pub(crate) fn ai_locked(&self) -> bool {
+        self.ai_busy()
+    }
+
+    /// AI 편집 패널 dock: the window's right edge, outside the memo pane and the
+    /// scroll rail, above the status bar. Its width is remembered once a drag ends.
+    pub(crate) fn ai_panel_dock(&mut self, ui: &mut egui::Ui) {
+        if self.ai_panel_take_close() {
+            self.set_ai_panel_open(false);
+        }
+        if !self.ext.shell.settings.ai_panel_open {
+            return;
+        }
+        let range = settings::AI_PANEL_WIDTHS;
+        let (least, most) = (*range.start() as f32, *range.end() as f32);
+        // A narrow window keeps at least half of itself for the document; the remembered
+        // width comes back in a wider one.
+        let room = (ui.ctx().content_rect().width() * 0.5).clamp(least, most);
+        let saved = self.ext.shell.settings.ai_panel_width;
+        // Held back by a narrower window: back to the remembered width once there is room.
+        let id = egui::Id::new("ai-panel");
+        let ctx = ui.ctx().clone();
+        if egui::containers::panel::PanelState::load(&ctx, id)
+            .is_some_and(|p| p.size().x < (saved as f32).min(room) - 1.0)
+            && !ctx.input(|i| i.pointer.any_down())
+        {
+            ctx.data_mut(|d| d.remove::<egui::containers::panel::PanelState>(id));
+        }
+        let shown = egui::Panel::right(id)
+            .default_size((saved as f32).min(room))
+            .size_range(least..=room)
+            .resizable(true)
+            .show(ui, |ui| self.ai_panel_ui(ui));
+        let width =
+            (shown.response.rect.width().round() as u32).clamp(*range.start(), *range.end());
+        let held_back = saved as f32 > room && width as f32 >= room - 1.0;
+        if width != saved && !held_back && !ui.ctx().input(|i| i.pointer.any_down()) {
+            self.ext.shell.settings.ai_panel_width = width;
+            self.save_shell_settings();
+        }
     }
 
     /// The status bar's change-tracking cell (label, tooltip). Turning recording on
@@ -4013,9 +4121,11 @@ impl HwpApp {
     /// "기록 중" until the first change is in the list.
     pub(crate) fn track_status(&mut self) -> Option<(&'static str, &'static str)> {
         let recording = self.session.track_recording();
-        let tracked = self.session.has_unkept_track_changes();
-        let state = self.track_state();
+        // From the state cached for this generation: reading it fresh walks the document.
+        let state = self.track_state_ref();
+        let tracked = state["tracked"] == true;
         let listed = state["list"].as_array().is_some_and(|l| !l.is_empty());
+        let kept = state["keptOnHwpSave"] == true;
         if recording && !listed {
             return Some((
                 "변경 추적 기록 중",
@@ -4033,7 +4143,7 @@ impl HwpApp {
                  HWP·HWPX로 저장하면 기록이 그대로 남습니다. [검토 → 변경 \
                  추적]으로 끕니다.",
             )
-        } else if state["keptOnHwpSave"] == true {
+        } else if kept {
             (
                 "변경 추적 기록 있음",
                 "이 문서에는 한글의 변경 추적 기록이 있습니다. HWP·HWPX로 \
@@ -8256,6 +8366,84 @@ mod dialog_tests {
         Ok(())
     }
 
+    /// 좁은 창에서는 AI 패널이 창 폭의 절반까지만 차지해 문서 화면을 남기고, 기억한
+    /// 폭(560)은 그대로 두었다가 넓은 창에서 다시 씁니다.
+    #[test]
+    fn ai_panel_keeps_half_of_a_narrow_window_for_the_document() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        let remaining = |a: &mut HwpApp, w: f32| {
+            let mut width = 0.0;
+            for i in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, 700.0))),
+                    time: Some(f64::from(i)),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    a.status_bar(ui);
+                    width = ui.available_rect_before_wrap().width();
+                });
+                output.textures_delta.clear();
+            }
+            width
+        };
+        a.tab = 1;
+        a.ext.shell.settings.ai_panel_open = true;
+        a.ext.shell.settings.ai_panel_width = 560;
+        // Half of 800, less the rulers and the scroll rail (195 without the limit).
+        let narrow = remaining(&mut a, 800.0);
+        assert!(narrow >= 340.0, "{narrow}");
+        assert_eq!(
+            a.ext.shell.settings.ai_panel_width, 560,
+            "the width is kept"
+        );
+        let wide = remaining(&mut a, 1600.0);
+        assert!(wide <= 1600.0 - 560.0, "{wide}");
+        Ok(())
+    }
+
+    /// 보기 ▸ AI 편집 패널 (✦ AI): 누를 때마다 열고 닫으며, 열림은 설정에 남고, 패널의 ✕도
+    /// 닫습니다. 열린 패널은 문서 화면 오른쪽 끝에 서고 문서 화면은 그만큼 좁아집니다.
+    #[test]
+    fn ai_panel_command_opens_and_closes_the_dock() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        let run = |a: &mut HwpApp| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1500.0, 916.0))),
+                ..Default::default()
+            };
+            let mut width = 0.0;
+            let mut output = ctx.run_ui(input, |ui| {
+                a.status_bar(ui);
+                a.page_view(ui);
+                width = ui.available_rect_before_wrap().width();
+            });
+            output.textures_delta.clear();
+            width
+        };
+        a.tab = 1;
+        let full = run(&mut a);
+        assert!(!a.shell_ext_checked("view.ai_panel"));
+        a.shell_ext_dispatch("view.ai_panel", &ctx.clone());
+        assert!(a.shell_ext_checked("view.ai_panel"));
+        assert!(a.ext.shell.settings.serialize().contains("ai_panel_open=1"));
+        run(&mut a);
+        let narrowed = run(&mut a);
+        assert!(
+            full - narrowed >= settings::AI_PANEL_DEFAULT_WIDTH as f32 - 1.0,
+            "{full} {narrowed}"
+        );
+        a.shell_ext_dispatch("view.ai_panel", &ctx.clone());
+        assert!(!a.shell_ext_checked("view.ai_panel"));
+        // A screen capture that opens the panel keeps it out of the settings file.
+        assert!(a.persists_settings());
+        a.screenshot = Some(std::env::temp_dir().join("hwpcraft-ai-panel-shot.png"));
+        assert!(!a.persists_settings());
+        Ok(())
+    }
+
     /// 상태 표시줄: 변경 추적을 켜기만 하면 "기록 중", 첫 변경이 기록되면 "기록 있음 · 기록 중".
     #[test]
     fn track_status_reads_recording_until_a_change_is_listed() -> anyhow::Result<()> {
@@ -8270,7 +8458,43 @@ mod dialog_tests {
             a.track_status().map(|s| s.0),
             Some("변경 추적 기록 있음 · 기록 중")
         );
+        // The status reads the state cached for the generation (a fresh read walks the
+        // document every frame); it agrees with a fresh read when recording stops.
+        a.shell_ext_dispatch("review.track_changes", &ctx.clone());
+        assert_eq!(
+            a.track_status().is_some(),
+            a.session.has_unkept_track_changes()
+        );
+        assert!(
+            a.ext
+                .shell
+                .track_state
+                .as_ref()
+                .is_some_and(|(g, _)| *g == a.session.generation)
+        );
+        // Recording turned on and off again with nothing typed.
+        let mut b = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        assert_eq!(b.track_status(), None);
+        b.shell_ext_dispatch("review.track_changes", &ctx.clone());
+        b.track_status();
+        b.shell_ext_dispatch("review.track_changes", &ctx.clone());
+        assert_eq!(
+            b.track_status().is_some(),
+            b.session.has_unkept_track_changes()
+        );
         Ok(())
+    }
+
+    /// 지난 시험 실행의 설정 폴더는 한 시간이 지나면 지웁니다(이름이 꼭 맞을 때만).
+    #[test]
+    fn old_test_settings_folders_are_cleared() {
+        let hour = std::time::Duration::from_secs(3600);
+        let old = hour + std::time::Duration::from_secs(1);
+        assert!(stale_test_config("hwpcraft-ui-test-config-1234", old));
+        assert!(!stale_test_config("hwpcraft-ui-test-config-1234", hour));
+        assert!(!stale_test_config("hwpcraft-ui-test-config-", old));
+        assert!(!stale_test_config("hwpcraft-ui-test-config-12a", old));
+        assert!(!stale_test_config("hwpcraft-recent-1234", old));
     }
 
     /// 시험은 사용자 설정 폴더(최근 문서·보기 설정 등)를 건드리지 않고 자기 폴더에 씁니다.
@@ -8282,18 +8506,24 @@ mod dialog_tests {
         let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
         let dir = std::env::temp_dir().join(format!("hwpcraft-recent-{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
+        // The recent list is written into that folder. Tests running at the same time
+        // share the file, so this looks at the path and the list, not at its contents.
+        assert_eq!(recent_file(), Some(own.join("recent.txt")));
         let path = dir.join("recent.hwpx");
         a.session.save(&path)?;
         a.shell_ext_frame();
-        let recent = std::fs::read_to_string(own.join("recent.txt"))?;
-        assert!(recent.contains("recent.hwpx"), "{recent}");
-        // A screen capture run does not add its document.
+        assert!(
+            a.ext
+                .shell
+                .recent
+                .iter()
+                .any(|p| p.ends_with("recent.hwpx"))
+        );
+        assert!(a.persists_settings());
+        // A screen capture run does not write it.
         let mut b = HwpApp::with_context(egui::Context::default(), None, None, false)?;
         b.screenshot = Some(dir.join("shot.png"));
-        b.session.save(&dir.join("captured.hwpx"))?;
-        b.shell_ext_frame();
-        let recent = std::fs::read_to_string(own.join("recent.txt"))?;
-        assert!(!recent.contains("captured.hwpx"), "{recent}");
+        assert!(!b.persists_settings());
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

@@ -68,14 +68,19 @@ A detailed, area-by-area list of what HwpCraft does. The project overview and bu
 
 ```text
 hwpcraft-cli --help
-hwpcraft-cli commands                       # list editing commands
+hwpcraft-cli commands [query] [--json]        # editing commands (--json: parameter help and examples)
+hwpcraft-cli actions  [query]                 # Hangul action names and their commands
 hwpcraft-cli info  input.hwp
 hwpcraft-cli convert input.hwp output.hwpx
-hwpcraft-cli render input.hwpx page.png 1
+hwpcraft-cli render input.hwpx page.png 1     # `all` renders every page, --scale 0.25–2
+hwpcraft-cli run input.hwpx document.text '{"limit":20}'          # one command, result only
+hwpcraft-cli run input.hwpx text.insert '{"text":"Hello"}' -o out.hwpx
 hwpcraft-cli edit --new commands.json output.hwpx
-hwpcraft-cli mcp --help                     # local stdio MCP server
+hwpcraft-cli mcp --help                     # local stdio / HTTP MCP server
 ```
 
-The `edit` command file is a JSON array such as `[{"command":"text.insert","params":{"text":"Hello"}},{"command":"page.setup","params":{"landscape":true}}]`, limited to 1 MB / 1,000 commands. The output file is written only when every command succeeds. Text offsets count Unicode scalar values.
+The `edit` command file is a JSON array such as `[{"command":"text.insert","params":{"text":"Hello"}},{"hwpAction":"MoveDocEnd"}]` (`-` reads it from stdin), limited to 1 MB / 1,000 commands. By default the output file is written only when every command succeeds; with `--keep-going` failed commands are skipped, the file is saved and the exit code is 1. `run` executes one command (or one Hangul action name) and prints its result as JSON, saving only with `-o`. Exit codes: 0 success, 1 failure, 2 usage error. `--password` opens a protected document; `--new-password` / `--remove-password` change or clear the password on save. Text offsets count Unicode scalar values.
+
+**AI edit panel (0.21)**: in the panel on the right of the window, ask Claude Code or Codex (installed and signed in on this PC) in plain words and it edits the open document at once through the desktop MCP connection. The selection or the caret's paragraph goes along as context, and one Ctrl+Z (⌘Z on macOS) takes a whole question back. The AI works with a one-time token on this window's document only; saving, opening, exporting, reading local files, writing the settings folder, passwords and undo/redo are refused, and other MCP clients may only read that document meanwhile. See [docs/mcp.md](mcp.md) (Korean) for the rules.
 
 `hwpcraft-cli mcp` is a headless MCP server for `2026-07-28` and 2025-era clients (stdio by default; `--transport http --listen 127.0.0.1:7082` serves loopback HTTP, where every request needs `Authorization: Bearer <token>` with the token read from `mcp-http-token` in the settings folder or `--auth-token-file`, created readable only by you if missing): create Korean documents, edit text / formatting / tables / objects, save HWP / HWPX, export PDF / TXT, render PNG for checking, and restrict read / write roots. 0.14 adds `hwp_action`, which accepts Hangul automation action names (`MoveLineEnd`, `CharShapeBold`, `DeleteWord`, about 300 of them) and runs the matching command, `batch {atomic:true}` that rolls every document change back when any command fails, and `get_selection`. Every tool declares an `outputSchema` for its structured result; for `execute` and `batch`, whose result depends on the command, only the common envelope is fixed. With **MCP 연결** (Tools tab) the desktop app serves the same protocol from its window on `127.0.0.1:7083` (same token); clients find the window's document with `list_documents` and edit it by that `document_id`, the window shows each edit at once and undo reverts it, and MCP cannot close it. It does not control Hancom software. See [docs/mcp.md](mcp.md) and [docs/mcp-commands.md](mcp-commands.md) (Korean).

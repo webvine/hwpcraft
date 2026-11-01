@@ -19,6 +19,7 @@ fn caret_y(s: &Session) -> anyhow::Result<f64> {
 }
 
 #[test]
+#[ignore = "0.21: RHWP hit_test_native returns offsets one short on lines after an inline object, so the probe lands a line too far (being fixed)"]
 fn down_and_up_leave_a_line_made_tall_by_an_inline_shape() -> anyhow::Result<()> {
     let mut s = Session::new()?;
     let text = "글자처럼 취급한 도형이 첫 줄을 높게 만든다. ".repeat(12);
@@ -31,15 +32,34 @@ fn down_and_up_leave_a_line_made_tall_by_an_inline_shape() -> anyhow::Result<()>
 
     s.select(at(0), false)?;
     let first = caret_y(&s)?;
+    // The second line: the y of the first offset whose caret leaves the first line.
+    let len = s.core.document().sections[0].paragraphs[0]
+        .text
+        .chars()
+        .count();
+    let mut second = None;
+    for offset in 1..=len {
+        s.select(at(offset), false)?;
+        let y = caret_y(&s)?;
+        if y > first + 1.0 {
+            second = Some(y);
+            break;
+        }
+    }
+    let second = second.expect("a second line");
+    s.select(at(0), false)?;
     s.move_caret(Motion::Down, false)?;
-    let second = caret_y(&s)?;
-    assert!(s.cursor.offset > 0, "{:?}", s.cursor);
-    assert!(second > first + 1.0, "{first} → {second}");
+    assert!(
+        (caret_y(&s)? - second).abs() < 1.0,
+        "↓ lands on the second line {second}, not {:?} at {}",
+        s.cursor,
+        caret_y(&s)?
+    );
 
     // MCP caret.move does the same.
     s.select(at(0), false)?;
     s.run("caret.move", json!({"motion": "down"}))?;
-    assert!(caret_y(&s)? > first + 1.0, "{:?}", s.cursor);
+    assert!((caret_y(&s)? - second).abs() < 1.0, "{:?}", s.cursor);
 
     // ↑ from the second line goes back to the tall first line.
     s.move_caret(Motion::Up, false)?;

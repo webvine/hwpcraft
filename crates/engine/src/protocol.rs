@@ -283,6 +283,7 @@ impl Session {
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value> {
         // 배포용 문서: read-only commands only, and no text in their results.
         self.guard_distribution_command(id)?;
+        self.guard_restricted_command(id)?;
         let step = self.record_run(id, &params);
         let value = self.recorded(|| step, |s| s.run_unrecorded(id, params))?;
         Ok(self.scrub_distribution(value))

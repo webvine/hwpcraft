@@ -550,6 +550,12 @@ const VIEW: &[Item] = &[
     ),
     Sep,
     Big(Icon::Windows, "작업\n창", A::Navigation, true),
+    Big(
+        Icon::Sparkle,
+        "AI 편집\n패널",
+        A::Ext("view.ai_panel"),
+        false,
+    ),
     Sep,
     Item::Menu(Icon::SplitView, "편집 화면\n나누기", SPLIT_MENU),
     Item::Menu(Icon::Windows, "새\n창", WINDOW_MENU),
@@ -2098,7 +2104,26 @@ impl HwpApp {
             ui.close();
         }
     }
+    /// While an AI question runs (AI 편집 패널) only viewing commands work: zoom, panes,
+    /// screen marks and help. Everything that edits, opens or saves waits.
+    fn allowed_while_ai(action: Action) -> bool {
+        matches!(
+            action,
+            A::Search
+                | A::ShowUnsupported
+                | A::Help
+                | A::Rulers
+                | A::Navigation
+                | A::ZoomIn
+                | A::ZoomOut
+                | A::Fit
+        ) || Self::action_id(action)
+            .is_some_and(|id| id.starts_with("view.") || id.starts_with("help."))
+    }
     fn enabled(&self, action: Action) -> bool {
+        if self.ai_locked() && !Self::allowed_while_ai(action) {
+            return false;
+        }
         let free_text = self.session.cursor.cell.is_none();
         match action {
             A::Equation | A::Note(_) | A::Shape(_) => free_text && !self.session.has_selection(),
@@ -2143,6 +2168,10 @@ impl HwpApp {
     fn dispatch(&mut self, action: Action, ctx: &egui::Context) {
         use super::feature_dialogs::FeatureDialog;
         use super::object_dialogs::ObjectDialog;
+        if self.ai_locked() && !Self::allowed_while_ai(action) {
+            self.message = super::ext_shell::AI_LOCKED.into();
+            return;
+        }
         match action {
             A::Or(id, base) => {
                 if self.ext_enabled(id) {
@@ -2330,6 +2359,9 @@ impl HwpApp {
     fn disabled_reason(&self, action: Action) -> &'static str {
         if let Some(why) = unsupported_reason(action) {
             return why;
+        }
+        if self.ai_locked() && !Self::allowed_while_ai(action) {
+            return super::ext_shell::AI_LOCKED;
         }
         let in_table = self.session.cursor.cell.is_some();
         match action {
@@ -3033,6 +3065,36 @@ impl HwpApp {
                         .clicked()
                     {
                         self.show_ribbon = !self.show_ribbon;
+                    }
+                    // ✦ AI: shows or hides the AI 편집 패널 (view.ai_panel).
+                    let open = self.ext.shell.settings.ai_panel_open;
+                    let (rect, response) = ui.allocate_exact_size(
+                        Vec2::new(AI_BUTTON - 6.0, 24.0),
+                        egui::Sense::click(),
+                    );
+                    if open || response.hovered() {
+                        let fill = if open {
+                            Color32::from_rgb(222, 234, 250)
+                        } else {
+                            Color32::from_gray(235)
+                        };
+                        ui.painter().rect_filled(rect, 3.0, fill);
+                    }
+                    icons::sparkle(
+                        ui.painter(),
+                        rect.left_center() + Vec2::new(11.0, 0.0),
+                        6.5,
+                        Color32::from_rgb(48, 110, 230),
+                    );
+                    ui.painter().text(
+                        rect.left_center() + Vec2::new(21.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        "AI",
+                        egui::FontId::proportional(12.5),
+                        Color32::from_gray(40),
+                    );
+                    if response.on_hover_text("AI 편집 패널 열기/닫기").clicked() {
+                        self.dispatch(A::Ext("view.ai_panel"), &ui.ctx().clone());
                     }
                     if !search_box {
                         let (rect, response) =
@@ -4022,7 +4084,18 @@ impl HwpApp {
                     })
                     .stroke(Stroke::new(1.0, Color32::from_rgb(210, 210, 210))),
             )
-            .show(ui, |ui| self.format_bar(ui));
+            .show(ui, |ui| self.format_bar_unless_locked(ui));
+    }
+    /// The 서식 도구 줄, disabled and faded as a whole while the AI edits: the colour and
+    /// line pieces draw their own colours, which a disabled Ui leaves as they are.
+    fn format_bar_unless_locked(&mut self, ui: &mut egui::Ui) {
+        let locked = self.ai_locked();
+        ui.add_enabled_ui(!locked, |ui| {
+            if locked {
+                ui.multiply_opacity(0.45);
+            }
+            self.format_bar(ui)
+        });
     }
     /// 서식 도구 줄. A narrowing window first narrows its boxes, then moves what still does
     /// not fit behind »: the language box first, then from the right end. Widths are what
@@ -4247,7 +4320,9 @@ fn widget_fallback(id: &str) -> Option<(Icon, &'static str, Action)> {
 
 /// Menu tab strip: the collapse button at the right end with its margins, the search box,
 /// the search button that replaces it when narrow, and the » holding tabs with no room.
-const TABS_RIGHT: f32 = 40.0;
+/// The ✦ AI button left of the collapse mark, with its gap.
+const AI_BUTTON: f32 = 50.0;
+const TABS_RIGHT: f32 = 40.0 + AI_BUTTON;
 const SEARCH_BOX: f32 = 166.0;
 const SEARCH_BUTTON: f32 = 30.0;
 const MORE_TABS: f32 = 28.0;
@@ -4627,6 +4702,84 @@ fn recent_row(ui: &mut egui::Ui, i: usize, path: &std::path::Path) -> egui::Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AI 편집 패널: while a question runs only viewing commands work, typing and opening
+    /// wait, and editing comes back when it ends.
+    #[test]
+    fn an_ai_question_locks_editing_but_not_viewing() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        let canvas = egui::Id::new("document-canvas");
+        let type_text = |a: &mut HwpApp, text: &str| {
+            ctx.memory_mut(|m| m.request_focus(canvas));
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1500.0, 916.0))),
+                events: vec![egui::Event::Text(text.into())],
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                a.page_view(ui);
+                a.keyboard(ui.ctx());
+            });
+            output.textures_delta.clear();
+        };
+        type_text(&mut a, "가");
+        assert_eq!(a.session.text(), "가", "typing reaches the page");
+
+        a.ai_set_busy_for_test(true);
+        type_text(&mut a, "나");
+        assert_eq!(a.session.text(), "가", "typing waits");
+        assert!(!a.enabled(A::Undo) && !a.enabled(A::Save) && !a.enabled(A::Ext("edit.paste")));
+        assert_eq!(
+            a.disabled_reason(A::Undo),
+            super::super::ext_shell::AI_LOCKED
+        );
+        a.dispatch(A::Undo, &a.ctx.clone());
+        assert_eq!(a.session.text(), "가");
+        assert_eq!(a.message, super::super::ext_shell::AI_LOCKED);
+        a.request(crate::Pending::New, &a.ctx.clone());
+        assert_eq!(a.session.text(), "가", "a new document waits");
+        // Viewing goes on.
+        assert!(a.enabled(A::ZoomIn) && a.enabled(A::Ext("view.ai_panel")));
+        let zoom = a.zoom;
+        a.dispatch(A::ZoomIn, &a.ctx.clone());
+        assert!(a.zoom > zoom);
+
+        a.ai_set_busy_for_test(false);
+        assert!(a.enabled(A::Undo));
+        type_text(&mut a, "나");
+        assert_eq!(a.session.text(), "가나");
+        Ok(())
+    }
+
+    /// While the AI edits, the 서식 도구 줄 is faded as a whole, the boxes and the colour
+    /// pieces that paint their own colours too.
+    #[test]
+    fn the_format_bar_fades_while_the_ai_edits() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        // The most opaque text in the bar.
+        let strongest = |a: &mut HwpApp| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1500.0, 200.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| a.format_bar_unless_locked(ui));
+            out.textures_delta.clear();
+            out.shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Text(t) => Some(t.fallback_color.a()),
+                    _ => None,
+                })
+                .max()
+        };
+        assert_eq!(strongest(&mut a), Some(255));
+        a.ai_set_busy_for_test(true);
+        let locked = strongest(&mut a).ok_or_else(|| anyhow::anyhow!("no text"))?;
+        assert!(locked < 128, "{locked}");
+        Ok(())
+    }
 
     #[test]
     fn recent_rows_show_the_format_and_say_when_a_file_is_gone() -> anyhow::Result<()> {

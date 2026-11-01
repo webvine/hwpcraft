@@ -127,6 +127,23 @@ PowerShell에서는 `$env:HWPCRAFT_MCP_TOKEN = Get-Content "$env:APPDATA\HwpCraf
 - `list_documents`는 데스크톱이 공유한 문서만 돌려줍니다. MCP로 만든 문서의 핸들은 만든 클라이언트만 압니다.
 - 한계: 창의 문서 하나만 연결되며, 창을 닫거나 연결을 끄면 그 `document_id`는 더 쓸 수 없습니다.
 
+### AI 편집 패널의 실행 (0.21)
+
+창 오른쪽 **AI 편집 패널**은 질문마다 이 연결 위에서 이 PC의 Claude Code·Codex CLI를 실행합니다. 그동안 브리지는 다음 규칙을 지킵니다.
+
+- **일회용 토큰**: 질문마다 새 토큰을 만들어 CLI에 환경 변수·임시 설정 파일로만 넘깁니다(명령줄에 쓰지 않음). 실행이 끝나면 그 토큰은 바로 401로 거절됩니다. 사용자가 직접 연결한 클라이언트는 기존 `mcp-http-token`으로 계속 접속합니다.
+- **실행 취소 한 단계**: 실행을 시작할 때 창 문서의 실행 취소 기록을 따로 보관하고, 끝날 때 그 질문의 편집 전체를 실행 취소 한 단계로 얹습니다. Ctrl+Z(macOS ⌘Z) 한 번이 질문 전으로, 다시 실행 한 번이 질문 뒤로 갑니다. 편집이 없었으면 기록과 다시 실행 기록을 그대로 둡니다. 실행 안에서도 `batch {atomic:true}`의 되돌리기와 `keepGoing`은 그대로 동작합니다.
+- **AI 토큰으로는 이 창의 문서만**: 다른 `document_id`는 거절하고, `new_document`·`open_document`·`open_protected_document`·`save_document`·`close_document`도 거절합니다(문서 열기·만들기·저장·닫기는 사람이 합니다).
+- **거절하는 명령**(`execute`·`batch` 단계·`hwp_action`·`macro.run` 단계, 데스크톱 창의 PDF 저장 작업까지 모두 같음, 엔진 `RESTRICTED_COMMANDS`):
+  - 파일 쓰기: `file.save`·`file.save_as`·`file.pdf`·`file.save_hml`·`file.save_pages`·`file.print_pdf`·`file.save_block`, `picture.save`·`picture.save_all`, `format.style.export`, `review.history.save_last`, `file.template.save`·`file.template.delete`
+  - 설정 폴더 쓰기: `tools.autotext.add`·`tools.autotext.delete`·`tools.autotext.body.add`·`tools.autotext.body.delete`, `macro.save`·`macro.delete`·`macro.record.stop`, `equation.macro.save`·`equation.macro.delete`, `format.style.set.save`·`format.style.set.delete`, `table.user_style.save`·`table.user_style.delete`
+  - 로컬 파일 읽기·문서 바꾸기: `file.open`·`file.insert`·`file.new`·`file.template.new`, `insert.picture`·`picture.insert`, `format.style.import`, `format.bullet.picture`, `review.compare`·`review.merge.plan`·`review.merge`, `page.master.object.insert`
+  - 사용자가 모르는 암호: `file.password`. 묶음 밖 기록: `edit.undo`·`edit.redo`
+  - 거절 결과는 `isError:true`이고, 글은 "AI 편집 중에는 `…`를 쓸 수 없습니다"입니다.
+- **다른 클라이언트**: 실행 중에도 창 문서를 읽을 수 있습니다(`get_text`·`inspect_document`·`render_page` 등). 그 문서를 바꾸는 `type_text`·`execute`·`batch`·`hwp_action`·`select_text`·`save_document`·`close_document`는 "AI가 이 문서를 편집하는 중입니다"로 거절합니다. MCP로 만든 다른 문서는 그대로 고칠 수 있습니다.
+- **끝낼 때**: 토큰을 먼저 무효로 한 뒤, 대기 중이던 요청을 제한을 유지한 채 마저 처리하고(최대 3초) 묶음을 닫습니다. 그래서 중지 직전에 보낸 요청도 같은 규칙과 같은 실행 취소 단계를 따릅니다.
+- 한계: 실행을 시작하기 직전에 다른 클라이언트가 보낸 편집은 그 질문의 실행 취소 단계에 섞일 수 있습니다. 실행 안의 단계는 최근 12개만 따로 되돌릴 수 있지만, 질문 전체는 언제나 한 번에 되돌립니다.
+
 ## 도구와 결과 읽기
 
 | 도구 | 주요 인자·동작 (`document_id`는 위 규칙 적용) |

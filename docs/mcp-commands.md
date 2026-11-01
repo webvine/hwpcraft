@@ -17,6 +17,8 @@ python scripts/mcp-command-docs.py ../.build/hwpcraft/release/hwpcraft-cli.exe -
 
 ## 실행 가능한 도움말
 
+MCP 없이도 같은 목록을 CLI로 봅니다: `hwpcraft-cli commands [검색어] --json`(명령마다 `paramsHelp`·`paramsExample`·`hwpActions`, `list_commands`와 같음), `hwpcraft-cli actions [검색어]`(한글 동작 이름과 대응 명령·기본 params, `hwp_action {query}`와 같음). 명령 하나를 시험하려면 `hwpcraft-cli run <문서|--new> <명령|한글 동작> '<params JSON>' [-o 출력]`을 씁니다(결과 JSON을 출력하고, `-o`가 있을 때만 저장). 데스크톱 AI 편집 패널이 실행하는 동안 거절되는 명령은 [MCP 안내의 AI 편집 패널 절](mcp.md#ai-편집-패널의-실행-021)에 있습니다.
+
 ```json
 {"name":"list_commands","arguments":{"query":"context.v2"}}
 {"name":"list_commands","arguments":{"query":"tools.autotext.body"}}

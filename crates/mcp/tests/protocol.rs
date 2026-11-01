@@ -1107,6 +1107,19 @@ fn lifecycle_errors_resources_and_bounded_framing() {
     );
     assert_eq!(rpc(&mut s, "missing", json!({}))["error"]["code"], -32601);
     assert_eq!(rpc(&mut s, "ping", json!({}))["error"]["code"], -32601);
+    // Methods 2026-07-28 removed are unknown methods there, whatever their params
+    // (the official conformance suite, SEP-2575 and SEP-2663).
+    for removed in [
+        "initialize",
+        "logging/setLevel",
+        "resources/subscribe",
+        "resources/unsubscribe",
+        "tasks/result",
+        "tasks/list",
+    ] {
+        let reply = rpc(&mut s, removed, json!({}));
+        assert_eq!(reply["error"]["code"], -32601, "{removed}: {reply}");
+    }
     for malformed in [
         "[]",
         "null",

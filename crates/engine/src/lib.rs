@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 mod ext_format;
 mod ext_object;
 mod ext_page;
+mod undo_group;
+pub use undo_group::RESTRICTED_COMMANDS;
 mod image_prewarm;
 use ext_page::ViewMarks;
 mod ext_table;
@@ -39,7 +41,7 @@ mod hwp_actions;
 pub use hanja::primary_reading;
 pub use hwp_actions::{HWP_ACTIONS, hwp_action};
 mod hwp_parameters;
-pub use hwp_parameters::{PreparedHwpAction, hwp_parameter_schema};
+pub use hwp_parameters::{PreparedHwpAction, explain_hwp_action_error, hwp_parameter_schema};
 mod contexts;
 pub use contexts::{CellStep, DocumentAddress};
 mod context_walk;
@@ -259,6 +261,10 @@ pub struct Checkpoint {
     visual_hint: Option<VisualHint>,
 }
 
+/// What a caret depends on: the document generation, the cursor and the visual hint's
+/// page and affinity.
+type CaretKey = (u64, Cursor, Option<(u32, Affinity)>);
+
 type CachedPageFields =
     std::result::Result<Option<std::rc::Rc<page_fields::PageFieldLayout>>, String>;
 
@@ -309,6 +315,8 @@ pub struct Session {
     render_highlights: std::cell::RefCell<Option<(u64, Vec<HighlightRect>)>>,
     /// A failed layout is cached as its message so per-frame callers do not retry it.
     page_field_cache: std::cell::RefCell<Option<(u64, CachedPageFields)>>,
+    /// The last caret: the screen asks for it several times a frame.
+    caret_memo: std::cell::RefCell<Option<(CaretKey, Value)>>,
     /// The last successful field projection, kept across `clear_geometry` so a
     /// plain body edit can be replayed onto it instead of re-laying out the copy.
     page_field_previous:
@@ -339,6 +347,10 @@ pub struct Session {
     context_growth: std::collections::HashMap<(u32, usize), (u32, u32)>,
     /// Colours the last 셀 음영 steps started from (see `ext_table::ShadeBase`).
     shade_base: Option<ext_table::ShadeBase>,
+    /// Open undo group (`begin_undo_group`): the user's history set aside.
+    undo_group: Option<undo_group::ActiveGroup>,
+    /// Refuse `RESTRICTED_COMMANDS` (`set_commands_restricted`).
+    commands_restricted: bool,
 }
 impl Session {
     pub fn new() -> Result<Self> {
@@ -383,6 +395,7 @@ impl Session {
             document_serial: next_document_serial(),
             render_highlights: std::cell::RefCell::new(None),
             page_field_cache: std::cell::RefCell::new(None),
+            caret_memo: std::cell::RefCell::new(None),
             page_field_previous: std::cell::RefCell::new(None),
             page_field_edit: std::cell::Cell::new(None),
             presentation_report_cache: std::cell::RefCell::new(None),
@@ -402,6 +415,8 @@ impl Session {
             track_editing: false,
             context_growth: Default::default(),
             shade_base: None,
+            undo_group: None,
+            commands_restricted: false,
         }
     }
     pub fn open(&mut self, path: &Path) -> Result<()> {
@@ -604,6 +619,7 @@ impl Session {
     }
     fn clear_geometry(&self) {
         self.geometry_cache.clear();
+        *self.caret_memo.borrow_mut() = None;
         if let Some((generation, Ok(Some(layout)))) = self.page_field_cache.borrow_mut().take() {
             *self.page_field_previous.borrow_mut() = Some((generation, layout));
         }
@@ -705,8 +721,22 @@ impl Session {
         self.caret_at(self.cursor)
     }
     pub fn caret_at(&self, c: Cursor) -> Result<Value> {
-        let layout = self.page_field_layout()?;
         let hint = self.current_visual_hint(c);
+        let key = (self.generation, c, hint.map(|h| (h.page, h.affinity)));
+        if let Some((at, value)) = self.caret_memo.borrow().as_ref()
+            && *at == key
+        {
+            return Ok(value.clone());
+        }
+        let value = self.caret_uncached(c, hint)?;
+        // Deferred pagination lays the pages out later without a new generation.
+        if !self.layout_deferred() {
+            *self.caret_memo.borrow_mut() = Some((key, value.clone()));
+        }
+        Ok(value)
+    }
+    fn caret_uncached(&self, c: Cursor, hint: Option<VisualHint>) -> Result<Value> {
+        let layout = self.page_field_layout()?;
         if let Some(layout) = layout.as_ref()
             && let Some(hint) = hint
         {
@@ -902,8 +932,9 @@ impl Session {
     fn snapshot(&mut self) -> Snapshot {
         // RHWP keeps at most 100 snapshots: 40 undo + 40 redo steps, the one taken
         // here and those of an enclosing atomic batch or checkpoint stay below it.
+        // An open undo group sets the user's history aside and keeps fewer steps.
         debug_assert!(
-            self.undo.len() + self.redo.len() <= 80,
+            self.undo.len() + self.redo.len() + self.undo_group_snapshots() <= 93,
             "history snapshots must stay under RHWP's limit of 100"
         );
         Snapshot {
@@ -1071,7 +1102,7 @@ impl Session {
             self.retire_history_snapshot(s.id);
         }
         self.undo.push(snapshot);
-        if self.undo.len() > 40 {
+        if self.undo.len() > self.undo_limit() {
             let old = self.undo.remove(0);
             self.retire_history_snapshot(old.id);
         }
@@ -1764,6 +1795,82 @@ mod tests {
             Some((generation, Err(_))) if *generation == s.generation
         ));
         assert_eq!(s.page_count().map_err(|e| e.to_string()), first);
+        Ok(())
+    }
+
+    /// The caret is remembered for the screen's repeated asks. A cursor move in the same
+    /// generation, or a line end shown at the end of the line above, is a new caret.
+    #[test]
+    fn the_remembered_caret_follows_cursor_moves_and_line_ends() -> Result<()> {
+        let mut s = Session::new()?;
+        s.execute(Command::Insert("가나다라 ".repeat(40)))?;
+        let end = s.caret()?;
+        assert!(s.caret_memo.borrow().is_some());
+        assert_eq!(s.caret()?, end);
+        let generation = s.generation;
+        s.cursor.offset = 0;
+        let start = s.caret()?;
+        assert_eq!(s.generation, generation);
+        assert_ne!(start, end);
+        assert_eq!(fresh_copy(&s)?.caret_at(s.cursor)?, start);
+        s.execute(Command::Insert("마".into()))?;
+        assert_ne!(s.caret()?["x"], start["x"]);
+        let wrap = s.paragraph(s.cursor)?.line_segs[1].text_start as usize;
+        s.cursor.offset = wrap;
+        let below = s.caret()?;
+        let page = below["pageIndex"].as_u64().unwrap_or(0) as u32;
+        s.set_visual_hint(s.cursor, page, Affinity::Upstream);
+        let above = s.caret()?;
+        assert!(above["y"].as_f64() < below["y"].as_f64(), "{above} {below}");
+        s.visual_hint.set(None);
+        assert_eq!(s.caret()?, below);
+        Ok(())
+    }
+
+    /// A full rollback goes back to the checkpoint's document; the caret follows it.
+    #[test]
+    fn the_remembered_caret_is_dropped_by_a_full_rollback() -> Result<()> {
+        let mut s = Session::new()?;
+        s.execute(Command::Insert("첫 줄".into()))?;
+        let token = s.full_checkpoint()?;
+        s.execute(Command::Insert(" 그리고 더 긴 글".into()))?;
+        let edited = s.caret()?;
+        s.rollback_full(token)?;
+        let back = s.caret()?;
+        assert_ne!(back["x"], edited["x"]);
+        assert_eq!(back, fresh_copy(&s)?.caret_at(s.cursor)?);
+        Ok(())
+    }
+
+    /// Table cells: each cell's caret, not the last one asked for.
+    #[test]
+    fn the_remembered_caret_follows_table_cells() -> Result<()> {
+        let mut s = Session::new()?;
+        s.run("table.create", json!({"rows": 2, "columns": 2}))?;
+        let Some(cell) = s.cursor.cell else {
+            bail!("표를 넣은 뒤 커서가 셀에 있어야 합니다.");
+        };
+        let first = s.caret()?;
+        s.cursor.cell = Some(hwpcraft_doc::Cell { index: 1, ..cell });
+        let second = s.caret()?;
+        assert_ne!(first["x"], second["x"]);
+        assert_eq!(second, fresh_copy(&s)?.caret_at(s.cursor)?);
+        s.cursor.cell = Some(cell);
+        assert_eq!(s.caret()?, first);
+        Ok(())
+    }
+
+    /// While pagination is deferred the caret is not remembered.
+    #[test]
+    fn a_deferred_layout_caret_is_not_remembered() -> Result<()> {
+        let mut s = Session::new()?;
+        s.execute(Command::Insert("가".into()))?;
+        s.defer_layout()?;
+        s.caret()?;
+        assert!(s.caret_memo.borrow().is_none());
+        s.resume_layout()?;
+        s.caret()?;
+        assert!(s.caret_memo.borrow().is_some());
         Ok(())
     }
 

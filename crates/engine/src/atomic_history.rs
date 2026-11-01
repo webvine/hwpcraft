@@ -109,8 +109,17 @@ impl Session {
         lease
     }
 
-    /// Core replacement would invalidate IDs held by a live full baseline.
+    /// Core replacement would invalidate IDs held by a live full baseline or an
+    /// open undo group.
     pub(crate) fn ensure_history_replacement_allowed(&mut self) -> Result<()> {
+        self.ensure_no_full_scope()?;
+        if self.undo_group_active() {
+            bail!("실행 취소 묶음 안에서는 문서를 교체할 수 없습니다.");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_no_full_scope(&mut self) -> Result<()> {
         self.reclaim_history_scopes();
         if self.history_scopes.active.is_some() {
             bail!("문서 전체 rollback 범위 안에서는 문서를 교체할 수 없습니다.");

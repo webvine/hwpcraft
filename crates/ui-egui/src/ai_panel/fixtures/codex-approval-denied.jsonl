@@ -1,0 +1,13 @@
+{"type": "thread.started", "thread_id": "01a1965f-b2f3-71c0-b6fb-b2e35c272d6a"}
+{"type": "turn.started"}
+{"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "열린 HwpCraft 문서 끝에 문단을 추가하겠습니다."}}
+{"type": "item.started", "item": {"id": "item_1", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "list_commands", "arguments": {"query": "move"}, "error": null, "status": "in_progress"}}
+{"type": "item.started", "item": {"id": "item_2", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "list_documents", "arguments": {}, "error": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_2", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "list_documents", "arguments": {}, "error": null, "status": "completed"}}
+{"type": "item.completed", "item": {"id": "item_1", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "list_commands", "arguments": {"query": "move"}, "error": null, "status": "completed"}}
+{"type": "item.started", "item": {"id": "item_3", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "execute", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "command": "caret.move", "params": {"motion": "document_end", "extend": false}}, "error": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_3", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "execute", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "command": "caret.move", "params": {"motion": "document_end", "extend": false}}, "error": {"message": "MCP tool call requires approval, but approval policy is never"}, "status": "failed"}}
+{"type": "item.started", "item": {"id": "item_4", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "get_selection", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1"}, "error": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_4", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "get_selection", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1"}, "error": null, "status": "completed"}}
+{"type": "item.completed", "item": {"id": "item_5", "type": "agent_message", "text": "열린 문서 끝에 ‘Codex 편집 시험’ 문단을 추가하려 했지만, 자동 승인 검토가 편집 동작을 승인 필요로 차단했고 현재 승인이 허용되지 않아 문서를 변경하지 못했습니다."}}
+{"type": "turn.completed"}

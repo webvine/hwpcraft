@@ -4,6 +4,22 @@ use super::*;
 use serde::Deserialize;
 use serde_json::Map;
 
+/// A Hangul action that failed for want of a value its name does not fix (an
+/// object's address, a border, a search word…): the error names the command it
+/// ran and what that command takes, instead of only the parser's words.
+pub fn explain_hwp_action_error(id: &str, command: &str, error: anyhow::Error) -> anyhow::Error {
+    let text = format!("{error:#}");
+    let wants = ["missing field", "매개 변수 오류", "JSON 객체여야"]
+        .iter()
+        .any(|k| text.contains(k));
+    match extensions::command_help(command) {
+        Some((help, example)) if wants && !help.is_empty() => anyhow!(
+            "{text} — 한글 동작 {id}은(는) {command} 명령으로 실행되며, 이 값은 호출 때 params로 주어야 합니다. {command}: {help} (예: {example})"
+        ),
+        _ => error,
+    }
+}
+
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("hwp.parameters.apply", "공개 ParameterSet 인자 적용", ""),
     ("hwp.parameters.schema", "공개 인자 어댑터 지원 범위", ""),
@@ -328,6 +344,7 @@ impl Session {
     ) -> Result<Value> {
         let prepared = self.prepare_hwp_action(id, params, parameter_set)?;
         self.run(prepared.command, prepared.params)
+            .map_err(|e| explain_hwp_action_error(id, prepared.command, e))
     }
 
     fn native_character(&self, native: &Map<String, Value>) -> Result<Map<String, Value>> {

@@ -2,6 +2,7 @@ pub const APP_NAME: &str = "HwpCraft";
 use anyhow::Result;
 use egui::{Color32, Event, ImeEvent, Key, Pos2, Rect, RichText, Stroke, Vec2};
 use hwpcraft_engine::{Command, Cursor, PageSetup, Session};
+mod ai_panel;
 mod autotext_dialog;
 mod body_autotext_editor;
 mod chrome;
@@ -423,6 +424,10 @@ impl HwpApp {
         self.page_setup = self.result(result);
     }
     fn request(&mut self, action: Pending, ctx: &egui::Context) {
+        if self.ai_locked() && !matches!(action, Pending::Quit) {
+            self.message = ext_shell::AI_LOCKED.into();
+            return;
+        }
         if self.session.dirty() {
             self.pending = Some(action);
         } else {
@@ -559,6 +564,7 @@ impl HwpApp {
                                         .wrap(),
                                 )
                                 .clicked()
+                                && !self.ai_locked()
                             {
                                 let r = self.session.select(c, false);
                                 self.result(r);
@@ -581,6 +587,9 @@ impl HwpApp {
             .size_range(100.0..=280.0)
             .resizable(true)
             .show(ui, |ui| {
+                if self.ai_locked() {
+                    ui.disable();
+                }
                 ui.horizontal(|ui| {
                     ui.strong(if self.session.cursor.cell.is_some() {
                         "표 셀 편집"
@@ -893,10 +902,16 @@ impl HwpApp {
             }
         }
         self.paint_margin_corners(ui, page, rect);
+        // While an AI question runs the page only shows; scrolling and zoom go on.
+        let locked = self.ai_locked();
         let response = ui.interact(
             rect,
             egui::Id::new(("document-page", self.pane, page)),
-            egui::Sense::click_and_drag(),
+            if locked {
+                egui::Sense::hover()
+            } else {
+                egui::Sense::click_and_drag()
+            },
         );
         // One shared focus target keeps keyboard and IME routing independent of the page.
         let canvas = egui::Id::new("document-canvas");
@@ -940,7 +955,7 @@ impl HwpApp {
             }
         }
         // Module canvas modes (e.g. table cell blocks) may take over pointer input.
-        if !self.ext_canvas(page, &response, rect) {
+        if !locked && !self.ext_canvas(page, &response, rect) {
             let hit = |s: &Self, p: Pos2| {
                 let pos = (p - rect.min) / s.zoom;
                 s.session.hit_test(page, pos.x as f64, pos.y as f64)
@@ -1003,7 +1018,9 @@ impl HwpApp {
                 }
             }
         }
-        response.context_menu(|ui| self.canvas_context_menu(ui));
+        if !locked {
+            response.context_menu(|ui| self.canvas_context_menu(ui));
+        }
         let Some(caret) = caret.filter(|c| c["pageIndex"].as_u64() == Some(page as u64)) else {
             return;
         };
@@ -1101,6 +1118,10 @@ impl HwpApp {
         }
         if was_open {
             ctx.memory_mut(|m| m.request_focus(canvas));
+        }
+        // While an AI question runs typing, IME and pasting do not reach the document.
+        if self.ai_locked() {
+            return;
         }
         let events = ctx.input(|i| i.events.clone());
         let canvas = ctx.memory(|m| m.focused() == Some(egui::Id::new("document-canvas")));
@@ -1318,6 +1339,7 @@ impl HwpApp {
             || self.password_prompt.is_some()
             || self.symbol_dialog_open()
             || self.ext_modal_open()
+            || self.ai_locked()
         {
             return;
         }
@@ -1540,9 +1562,9 @@ impl HwpApp {
         }
         if self.show_help {
             egui::Window::new("HwpCraft · 사용 안내").open(&mut self.show_help).default_width(580.0).show(ctx,|ui| {
-            ui.heading(format!("HwpCraft {}", hwpcraft_doc::VERSION.trim()));ui.label("Ctrl+마우스 휠: 문서 확대·축소 (10–500%)");ui.label("HWP / HWPX 문서를 로컬에서 편집합니다.");ui.label("문서를 열고 흰 쪽을 클릭해 입력하세요. 아래 문단 편집 패널에서도 한글을 입력하고 텍스트를 선택할 수 있습니다. 왼쪽 목록에서 문단과 표 셀을 선택합니다.");
-            ui.separator();ui.label("서식은 선택한 글자에 적용됩니다. 선택 영역이 없으면 현재 문단 전체에 적용됩니다. Ctrl+A는 현재 문단을 선택합니다. 여러 문단에 걸친 선택은 아직 지원하지 않습니다.");
-            for (_,label,key) in hwpcraft_engine::COMMANDS.iter().chain(hwpcraft_engine::extension_commands()) {ui.label(format!("{label}    {key}"));}
+            ui.heading(format!("HwpCraft {}", hwpcraft_doc::VERSION.trim()));ui.label(ribbon::platform_keys("Ctrl+마우스 휠: 문서 확대·축소 (10–500%)"));ui.label("HWP / HWPX 문서를 로컬에서 편집합니다.");ui.label("문서를 열고 흰 쪽을 클릭해 입력하세요. 아래 문단 편집 패널에서도 한글을 입력하고 텍스트를 선택할 수 있습니다. 왼쪽 목록에서 문단과 표 셀을 선택합니다.");
+            ui.separator();ui.label(ribbon::platform_keys("서식은 선택한 글자에 적용됩니다. 선택 영역이 없으면 현재 문단 전체에 적용됩니다. Ctrl+A는 현재 문단을 선택합니다. 여러 문단에 걸친 선택은 아직 지원하지 않습니다."));
+            for (_,label,key) in hwpcraft_engine::COMMANDS.iter().chain(hwpcraft_engine::extension_commands()) {ui.label(format!("{label}    {}", ribbon::shown_keys(key)));}
             ui.separator();ui.label("독립적인 초기 편집기이며 한컴오피스의 모든 기능이나 문서 배치의 완전한 일치를 보장하지 않습니다. 본문 수식·기본 도형·단순 주석과 글상자는 개체 목록에서 편집할 수 있습니다. 중첩 표와 고급 개체 편집에는 한계가 있습니다. 중요한 원본은 다른 이름으로 저장한 뒤 확인하세요.");
             ui.label("구조 참조: WordCraft · 문서 엔진: RHWP 0.8.7 (MIT) · Rust / egui 네이티브 데스크톱");ui.label("계정·서버·Docker 없이 동작하며 문서를 외부로 전송하지 않습니다.");
         });
@@ -1557,6 +1579,9 @@ impl eframe::App for HwpApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_pdf_export(ctx);
         self.serve_mcp_bridge(ctx);
+        if self.ai_busy() && ctx.input(|i| i.viewport().close_requested()) {
+            self.ai_stop();
+        }
         if self.hold_close_for_pdf(ctx) {
             // Closing waits for the running PDF export; the dirty check runs then.
         } else if ctx.input(|i| i.viewport().close_requested())

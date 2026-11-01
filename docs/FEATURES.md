@@ -68,14 +68,19 @@ HwpCraft가 하는 일을 영역별로 자세히 적은 목록입니다. 프로�
 
 ```text
 hwpcraft-cli --help
-hwpcraft-cli commands                       # 편집 명령 목록
+hwpcraft-cli commands [검색어] [--json]        # 편집 명령 목록(--json: 매개변수 도움말·예시)
+hwpcraft-cli actions  [검색어]                 # 한글 동작 이름과 대응 명령
 hwpcraft-cli info  input.hwp
 hwpcraft-cli convert input.hwp output.hwpx
-hwpcraft-cli render input.hwpx page.png 1
+hwpcraft-cli render input.hwpx page.png 1     # all이면 모든 쪽, --scale 0.25–2
+hwpcraft-cli run input.hwpx document.text '{"limit":20}'          # 명령 하나, 결과만 출력
+hwpcraft-cli run input.hwpx text.insert '{"text":"안녕"}' -o out.hwpx
 hwpcraft-cli edit --new commands.json output.hwpx
-hwpcraft-cli mcp --help                     # 로컬 stdio MCP 서버
+hwpcraft-cli mcp --help                     # 로컬 stdio·HTTP MCP 서버
 ```
 
-`edit`의 명령 파일은 `[{"command":"text.insert","params":{"text":"안녕하세요"}},{"command":"page.setup","params":{"landscape":true}}]` 형태의 JSON 배열이며 최대 1 MB / 1,000개 명령입니다. 전체 명령이 성공한 뒤에만 출력 파일을 저장합니다. 텍스트 위치(offset)는 유니코드 스칼라 값 단위입니다.
+`edit`의 명령 파일은 `[{"command":"text.insert","params":{"text":"안녕하세요"}},{"hwpAction":"MoveDocEnd"}]` 형태의 JSON 배열(`-`는 표준 입력)이며 최대 1 MB / 1,000개 명령입니다. 기본은 전체 명령이 성공한 뒤에만 출력 파일을 저장하고, `--keep-going`이면 실패한 명령을 건너뛰고 저장한 뒤 종료 코드 1로 알립니다. `run`은 명령 하나(또는 한글 동작 이름 하나)를 실행해 결과를 JSON으로 내며, `-o`를 줄 때만 저장합니다. 종료 코드는 0 성공, 1 실행 실패, 2 사용법 오류입니다. `--password`로 암호 문서를 열고, `--new-password`·`--remove-password`로 저장할 때 암호를 바꾸거나 풉니다. 텍스트 위치(offset)는 유니코드 스칼라 값 단위입니다.
+
+**AI 편집 패널(0.21)**: 창 오른쪽 패널에서 이 PC에 설치·로그인된 Claude Code나 Codex에게 말로 요청하면, 열린 문서를 데스크톱 MCP 연결로 바로 고칩니다. 선택 영역이나 커서 문단이 맥락으로 넘어가고, 질문 하나의 편집은 Ctrl+Z 한 번으로 되돌립니다. AI는 질문마다 새로 만든 일회용 토큰으로 이 창의 문서만 고치며, 저장·열기·파일 내보내기·파일 읽기·설정 폴더 쓰기·암호·실행 취소 명령은 거절됩니다. 그동안 다른 MCP 클라이언트는 그 문서를 읽기만 합니다. 자세한 규칙은 [MCP 안내](mcp.md#ai-편집-패널의-실행-021)에 있습니다.
 
 `hwpcraft-cli mcp`는 헤드리스 MCP 서버입니다(MCP `2026-07-28`과 2025년 판 클라이언트 지원). 기본 stdio 외에 `--transport http --listen 127.0.0.1:7082`를 지원합니다. HTTP는 loopback 주소에서만 열리고 모든 요청에 `Authorization: Bearer <토큰>`이 필요합니다. 토큰은 설정 폴더의 `mcp-http-token`(또는 `--auth-token-file`로 지정한 파일)에 있으며, 없으면 서버가 본인만 읽을 수 있게 새로 만듭니다. 요청에는 요청마다 프로토콜 `_meta`와 문서 작업의 명시적 `document_id`를 전달합니다. 한 프로세스에서 여러 문서를 격리하고 문서 생성·텍스트/서식/표/개체 편집·HWP/HWPX 저장·PDF/TXT 출력·PNG 확인·읽기/쓰기 폴더 제한을 제공합니다. `hwp_action`은 등록된 한글 동작 별칭과 일부 공개 ParameterSet을 공통 엔진으로 연결합니다. 별칭 등록이 모든 원래 옵션의 동등성을 뜻하지는 않습니다. `batch {atomic:true}`는 문서 편집을 되돌리고 파일·설정 쓰기를 사전에 거절합니다. 모든 도구는 결과 구조(`outputSchema`)를 선언하며, `execute`·`batch`처럼 명령마다 결과가 다른 부분은 공통 봉투만 고정합니다. 명령 인자는 `list_commands`에서 조회합니다. 데스크톱 앱의 도구 탭 **MCP 연결**을 켜면 같은 서버가 그 창 안에서 `127.0.0.1:7083`으로 열리고(같은 토큰), 클라이언트는 `list_documents`로 창의 문서를 찾아 그 `document_id`로 편집합니다. 고친 내용은 창에 바로 보이고 실행 취소로 되돌릴 수 있으며, MCP로는 그 문서를 닫을 수 없습니다. 한컴 프로그램은 제어하지 않습니다. [MCP 연결과 사용법](mcp.md), [명령 인자](mcp-commands.md)를 참조하세요.

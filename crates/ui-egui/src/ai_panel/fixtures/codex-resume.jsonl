@@ -1,0 +1,11 @@
+{"type": "thread.started", "thread_id": "01a1965f-b2f3-71c0-b6fb-b2e35c272d6a"}
+{"type": "turn.started"}
+{"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "문서 끝의 상태를 확인하고 요청하신 문단을 추가하겠습니다."}}
+{"type": "item.started", "item": {"id": "item_1", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "inspect_document", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "limit": 20}, "error": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_1", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "inspect_document", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "limit": 20}, "error": null, "status": "completed"}}
+{"type": "item.started", "item": {"id": "item_2", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "execute", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "command": "caret.move", "params": {"motion": "document_end", "extend": false}}, "error": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_2", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "execute", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "command": "caret.move", "params": {"motion": "document_end", "extend": false}}, "error": null, "status": "completed"}}
+{"type": "item.started", "item": {"id": "item_3", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "type_text", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "text": "\nCodex 두 번째"}, "error": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_3", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "type_text", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "text": "\nCodex 두 번째"}, "error": null, "status": "completed"}}
+{"type": "item.completed", "item": {"id": "item_4", "type": "agent_message", "text": "‘Codex 편집 시험’ 문단 뒤에 ‘Codex 두 번째’ 문단을 추가했습니다."}}
+{"type": "turn.completed"}

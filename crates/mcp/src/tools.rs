@@ -338,7 +338,9 @@ fn answer(b: &mut Headless, name: &str, mut args: Value) -> Result<Value> {
             let prepared = b
                 .session
                 .prepare_hwp_action(&id, p.params, p.parameter_set)?;
-            let value = b.execute(prepared.command, prepared.params)?;
+            let value = b
+                .execute(prepared.command, prepared.params)
+                .map_err(|e| hwpcraft_engine::explain_hwp_action_error(&id, prepared.command, e))?;
             json!({"action":id,"command":prepared.command,"mapping":prepared.mapping,"result":value})
         }
         "get_selection" => b.execute("select.get", args)?,

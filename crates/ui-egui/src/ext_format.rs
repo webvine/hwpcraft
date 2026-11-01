@@ -8,6 +8,7 @@ use super::format_dialogs::{
 use super::*;
 use egui::{Key, Modifiers};
 use serde_json::Value;
+use std::{cell::OnceCell, rc::Rc};
 
 mod cross_ref_dialog;
 mod drop_cap_dialog;
@@ -212,7 +213,10 @@ fn custom_shape_page(ui: &mut egui::Ui, c: &mut CustomShape, bullet: bool) {
                 ui.label(RichText::new(&c.bullet).size(20.0));
             });
             ui.label(
-                RichText::new("문자표(Ctrl+F10)에서 고른 기호를 붙여 넣을 수도 있습니다.").weak(),
+                RichText::new(crate::ribbon::platform_keys(
+                    "문자표(Ctrl+F10)에서 고른 기호를 붙여 넣을 수도 있습니다.",
+                ))
+                .weak(),
             );
         });
         return;
@@ -283,6 +287,16 @@ pub(crate) struct State {
     ruby: Option<ruby_dialog::RubyDialog>,
     style_set: Option<style_set_dialog::StyleSetDialog>,
     index: Option<index_dialog::IndexDialog>,
+    /// What the 서식 도구줄 shows, read once per egui pass (`toolbar_values`).
+    toolbar: Option<(u64, Rc<ToolbarValues>)>,
+}
+/// 글자 모양, 문단 모양 and the style list under the caret, shared by the widgets of
+/// one pass. A command a widget runs shows from the next pass, which egui draws
+/// because the click or key that ran it is input.
+struct ToolbarValues {
+    chars: Value,
+    para: Value,
+    styles: OnceCell<Value>,
 }
 /// 글자 겹치기 window: `control` is set when editing the control under the caret.
 struct OverlapDialog {
@@ -1848,14 +1862,15 @@ impl HwpApp {
         size: Vec2,
     ) -> Option<egui::Response> {
         format_dialogs::load_fonts(&self.renderer);
-        let chars = self.session.character_properties().unwrap_or_default();
-        let para = self.session.paragraph_format().unwrap_or_default();
+        let values = self.toolbar_values(ui.ctx());
+        let (chars, para) = (&values.chars, &values.para);
         Some(match id {
             "format.style" => {
-                let styles = self
-                    .session
-                    .run("format.style.list", json!({}))
-                    .unwrap_or_default();
+                let styles = values.styles.get_or_init(|| {
+                    self.session
+                        .run("format.style.list", json!({}))
+                        .unwrap_or_default()
+                });
                 let current = styles
                     .as_array()
                     .and_then(|a| a.iter().find(|s| s["current"] == true))
@@ -2007,7 +2022,7 @@ impl HwpApp {
             | "format.text_color"
             | "format.shade_color"
             | "format.highlight"
-            | "format.char_border" => self.split_button(ui, id, size, &chars),
+            | "format.char_border" => self.split_button(ui, id, size, chars),
             "format.align" => {
                 let align = para["alignment"].as_str().unwrap_or("justify").to_owned();
                 let r = big_button(ui, size, "문단 정렬", |p, r| paint_align(p, r, &align));
@@ -2028,10 +2043,25 @@ impl HwpApp {
                 r
             }
             "format.outline.toggle" | "format.bullet.toggle" | "format.numbering.toggle" => {
-                self.numbering_split(ui, id, size, &para)
+                self.numbering_split(ui, id, size, para)
             }
             _ => return None,
         })
+    }
+    fn toolbar_values(&mut self, ctx: &egui::Context) -> Rc<ToolbarValues> {
+        let pass = ctx.cumulative_pass_nr();
+        if let Some((at, values)) = &self.ext.format.toolbar
+            && *at == pass
+        {
+            return Rc::clone(values);
+        }
+        let values = Rc::new(ToolbarValues {
+            chars: self.session.character_properties().unwrap_or_default(),
+            para: self.session.paragraph_format().unwrap_or_default(),
+            styles: OnceCell::new(),
+        });
+        self.ext.format.toolbar = Some((pass, Rc::clone(&values)));
+        values
     }
     fn split_button(
         &mut self,

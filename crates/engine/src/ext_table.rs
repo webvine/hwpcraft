@@ -337,6 +337,9 @@ enum Kind {
 const LENGTH: Kind = Kind::Int(0, 14_173); // 0–50 mm
 const OFFSET: Kind = Kind::Int(-170_079, 170_079); // ±600 mm
 const SIZE: Kind = Kind::Int(283, 170_079); // 1–600 mm
+/// The smallest cell a resize leaves: 282 HU, the row height of a new table (RHWP's
+/// and Hangul's), so a row grown by 1 mm can shrink back to where it started.
+const MIN_CELL_HU: i64 = 282;
 
 const TABLE_KEYS: &[(&str, Kind)] = &[
     ("cellSpacing", Kind::Int(0, 2_834)),
@@ -1995,7 +1998,7 @@ impl Session {
         };
         let grow = |v: u32, d: i64| -> Result<u32> {
             let n = i64::from(v) + d;
-            if !(283..=170_079).contains(&n) {
+            if !(MIN_CELL_HU..=170_079).contains(&n) {
                 bail!("셀 크기는 1–600 mm 범위여야 합니다.");
             }
             Ok(n as u32)
@@ -2045,7 +2048,7 @@ impl Session {
         };
         for slot in &mut sizes[usize::from(start)..=usize::from(end)] {
             let next = i64::from(*slot) + delta;
-            if !(283..=170_079).contains(&next) {
+            if !(MIN_CELL_HU..=170_079).contains(&next) {
                 bail!("셀 크기는 1–600 mm 범위여야 합니다.");
             }
             *slot = next as u32;
@@ -2878,7 +2881,11 @@ impl Session {
         self.table_at(a)?
             .caption
             .as_ref()
-            .ok_or_else(|| anyhow!("캡션이 없는 표입니다. 먼저 캡션을 넣으세요."))
+            .ok_or_else(|| {
+                anyhow!(
+                    "캡션이 없는 표입니다. 먼저 캡션을 넣으세요(table.properties {{\"props\":{{\"hasCaption\":true}}}} 또는 한글 동작 TableCaptionPosBottom)."
+                )
+            })
     }
     /// Replace the words after the caption number (see `captions::rewrite`).
     pub fn set_table_caption_text(&mut self, a: ObjectAddress, text: &str) -> Result<()> {

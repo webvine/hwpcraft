@@ -1,0 +1,107 @@
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index bd31d029e..5f23f05a5 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -1058,16 +1058,11 @@ fn optional_master_page_number(
+         .map(usize::from)
+ }
+ 
+-/// [HwpCraft] The header/footer carry after section `idx`: the ones it defines (with
+-/// their odd/even scope), over those carried into it. A section paginated again and
+-/// one kept from the previous pass must hand on the same carry, or the next section
+-/// shows another header on its odd or even pages (the kept one used to read the carry
+-/// off its own pages, missing a parity its pages did not show).
+ /// [HwpCraft 0101] 한 구역의 머리말·꼬리말 컨트롤 (문단, 참조, 머리말인가, 적용 쪽)과, 그것을 모은
+-/// 문단 목록의 (주소, 길이).
++/// 문단 목록의 (구역 번호, 주소, 길이). [HwpCraft 0103] 구역 번호도 키다: 참조가 그 번호를 싣는다.
+ #[derive(Clone)]
+ pub(crate) struct HeaderFooterEntries {
+-    paragraphs: (usize, usize),
++    paragraphs: (usize, usize, usize),
+     entries: Vec<(
+         usize,
+         crate::renderer::pagination::HeaderFooterRef,
+@@ -1085,6 +1080,7 @@ fn header_footer_entries_cached<'a>(
+     fresh: bool,
+ ) -> &'a HeaderFooterEntries {
+     let key = (
++        idx,
+         section.paragraphs.as_ptr() as usize,
+         section.paragraphs.len(),
+     );
+@@ -1100,6 +1096,11 @@ fn header_footer_entries_cached<'a>(
+     })
+ }
+ 
++/// [HwpCraft] The header/footer carry after section `idx`: the ones it defines (with
++/// their odd/even scope), over those carried into it. A section paginated again and
++/// one kept from the previous pass must hand on the same carry, or the next section
++/// shows another header on its odd or even pages (the kept one used to read the carry
++/// off its own pages, missing a parity its pages did not show).
+ fn carry_header_footer_from_section(
+     idx: usize,
+     section: &Section,
+@@ -5660,9 +5661,9 @@ impl DocumentCore {
+                 }
+                 // [HwpCraft] The same header/footer carry as a section paginated again
+                 // (0101: from the entries kept for its unchanged paragraphs).
+-                if self.header_footer_entries.len() < self.document.sections.len() {
+-                    self.header_footer_entries
+-                        .resize(self.document.sections.len(), None);
++                // [HwpCraft 0103] 구역 수가 바뀌면 모은 목록을 모두 버린다.
++                if self.header_footer_entries.len() != self.document.sections.len() {
++                    self.header_footer_entries = vec![None; self.document.sections.len()];
+                 }
+                 let entries = header_footer_entries_cached(
+                     idx,
+@@ -6032,9 +6033,9 @@ impl DocumentCore {
+             // 머리말/꼬리말 carry 업데이트:
+             // 페이지 active_header뿐 아니라 구역에 정의된 머리말 컨트롤도 carry에 반영
+             // (짝수 페이지가 없어도 Even 머리말이 다음 구역에 상속되어야 함)
+-            if self.header_footer_entries.len() < self.document.sections.len() {
+-                self.header_footer_entries
+-                    .resize(self.document.sections.len(), None);
++            // [HwpCraft 0103] 구역 수가 바뀌면 모은 목록을 모두 버린다.
++            if self.header_footer_entries.len() != self.document.sections.len() {
++                self.header_footer_entries = vec![None; self.document.sections.len()];
+             }
+             let entries = header_footer_entries_cached(
+                 idx,
+@@ -11592,3 +11593,37 @@ mod optional_master_page_tests {
+         assert_eq!(refs, [Some(0), Some(1), Some(0)]);
+     }
+ }
++
++#[cfg(test)]
++mod hwpcraft_header_footer_entries_tests {
++    use super::*;
++
++    /// [HwpCraft 0103] The kept list is keyed by the section index too: the same
++    /// paragraph list seen at another index (a section inserted or removed before it)
++    /// is collected again, so its references name the index it is at now.
++    #[test]
++    fn a_section_seen_at_another_index_is_collected_again() {
++        let core = crate::document_core::DocumentCore::from_bytes(include_bytes!(
++            "../../../samples/issue5802/hf_cross_section_inherit.hwp"
++        ))
++        .expect("open");
++        let doc = core.document();
++        let (idx, section) = doc
++            .sections
++            .iter()
++            .enumerate()
++            .find(|(i, s)| !collect_header_footer_entries(*i, s).is_empty())
++            .expect("a section with a header or footer");
++        let mut cache = None;
++        let at = |cache: &mut Option<HeaderFooterEntries>, i: usize| {
++            header_footer_entries_cached(i, section, cache, false)
++                .entries
++                .iter()
++                .map(|e| e.1.source_section_index)
++                .collect::<Vec<_>>()
++        };
++        assert!(at(&mut cache, idx).iter().all(|&i| i == idx));
++        let other = idx + 7;
++        assert!(at(&mut cache, other).iter().all(|&i| i == other));
++    }
++}

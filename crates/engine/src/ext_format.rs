@@ -2620,7 +2620,18 @@ impl Session {
                 // clips them at the body edge, so a paragraph with no margin of
                 // its own gets Hangul's 20 pt (+10 pt per level).
                 if matches!(kind, HeadKind::Bullet | HeadKind::Number) && shape.margin_left == 0 {
-                    patch["marginLeft"] = json!(4000 + 2000 * i32::from(level));
+                    patch["marginLeft"] = json!(head_margin(level));
+                }
+            } else {
+                // Hangul's 문단 번호 / 글머리표 leave the paragraph's own margin alone
+                // (measured: LeftMargin 0 before, with and after the head). Taking a
+                // head off therefore also takes back the margin given above, when the
+                // paragraph still has exactly that margin.
+                let shape = self.para_shape_of(c)?;
+                if matches!(shape.head_type, HeadType::Number | HeadType::Bullet)
+                    && shape.margin_left == head_margin(shape.para_level.min(6))
+                {
+                    patch["marginLeft"] = json!(0);
                 }
             }
             self.apply_paragraph_at(c, patch)?;
@@ -3933,6 +3944,12 @@ enum Restart {
     Previous,
     New(u32),
 }
+/// The left margin a numbered or bulleted paragraph without one gets, so its head
+/// hangs inside the margin instead of being cut at the body edge: 20 pt, +10 pt a level.
+fn head_margin(level: u8) -> i32 {
+    4000 + 2000 * i32::from(level)
+}
+
 fn restart_value(p: RestartParams) -> Result<Restart> {
     Ok(match (p.mode.as_str(), p.start) {
         ("continue", None) => Restart::Continue,

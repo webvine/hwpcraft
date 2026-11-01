@@ -601,6 +601,14 @@ impl ExternalDocument {
             return None;
         }
         let begun = (|| -> Result<(hwpcraft_engine::PdfPrep, Value)> {
+            // This job skips `Headless::execute`, so an AI run's restriction is
+            // checked here.
+            if let Operation::Call { tool, args } = &job.operation
+                && tool == "execute"
+                && let Some(command) = args["command"].as_str()
+            {
+                backend.session.guard_restricted_command(command)?;
+            }
             hwpcraft_formats::file_access::confine(backend.roots.as_ref(), || {
                 hwpcraft_formats::file_access::check_write(&path.to_string_lossy())
             })

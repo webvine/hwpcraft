@@ -15,6 +15,7 @@ pub(crate) struct ExtState {
     pub contexts: context_editor::State,
     pub context_regions: context_editor_v2::State,
     pub mcp: mcp_bridge::State,
+    pub ai: ai_panel::State,
 }
 
 impl HwpApp {
@@ -70,6 +71,8 @@ impl HwpApp {
         self.shell_ext_dialogs(ctx);
         self.tools_ext_dialogs(ctx);
         self.mcp_ext_dialogs(ctx);
+        // Runs every frame, panel open or not: reads the AI run's output.
+        self.ai_panel_tick(ctx);
     }
     /// Module keyboard shortcuts, consumed before the built-in ones. True when handled.
     pub(crate) fn ext_shortcuts(&mut self, ctx: &egui::Context) -> bool {
@@ -113,6 +116,7 @@ impl HwpApp {
             || self.shell_ext_view(name)
             || self.tools_ext_view(name)
             || self.mcp_ext_view(name)
+            || self.ai_panel_view(name)
     }
     /// A module dialog that must block document typing and shortcuts.
     pub(crate) fn ext_modal_open(&self) -> bool {

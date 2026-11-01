@@ -1,5 +1,6 @@
-//! `--view bench`: drive scrolling, zoom and window resizing by script and log frame
-//! times, so screen performance can be measured without mouse or keyboard input.
+//! `--view bench`: drive scrolling, zoom, window resizing and opening/closing the AI 편집
+//! 패널 by script and log frame times, so screen performance can be measured without
+//! mouse or keyboard input.
 //! `--view bench-edit`: typing (one key, then until the screen shows it), a typing burst,
 //! ribbon tab switches, page jumps and typing with 찾기 open, with each frame split into
 //! the parts of `HwpApp::ui` (`Laps`).
@@ -27,6 +28,8 @@ enum Phase {
     Drag,
     Zoom(usize),
     Resize,
+    /// The AI 편집 패널 opened (even steps) or closed, until the pages are drawn again.
+    Panel(usize),
     /// bench-edit: one key at a time, each until the screen shows it.
     Type(usize),
     /// bench-edit: a key every frame.
@@ -84,6 +87,8 @@ impl Laps {
 
 const ZOOMS: [f32; 8] = [1.0, 1.25, 1.5, 2.0, 1.0, 0.75, 0.5, 1.0];
 const SIZES: [[f32; 2]; 2] = [[1501.0, 916.0], [1180.0, 800.0]];
+/// Panel steps: open, close, three times.
+const PANEL_STEPS: usize = 6;
 
 pub(crate) struct Bench {
     clock: Arc<Mutex<Clock>>,
@@ -448,7 +453,24 @@ impl HwpApp {
                 }
                 (bench.frames >= 90).then(|| {
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(SIZES[0].into()));
-                    Phase::Done
+                    Phase::Panel(0)
+                })
+            }
+            Phase::Panel(step) => {
+                if bench.frames == 1 {
+                    self.set_ai_panel_open(step % 2 == 0);
+                }
+                (bench.frames > 2 && settled || bench.frames >= 120).then(|| {
+                    let what = if step % 2 == 0 { "open" } else { "close" };
+                    bench.settle.push(format!(
+                        "panel {what}\tframes={}\tms={elapsed:.0}\tsettled={settled}",
+                        bench.frames
+                    ));
+                    if step + 1 < PANEL_STEPS {
+                        Phase::Panel(step + 1)
+                    } else {
+                        Phase::Done
+                    }
                 })
             }
             Phase::Done => {

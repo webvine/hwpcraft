@@ -8,12 +8,18 @@
 //! takes the next free port (7084, 7085 … up to 7099) and shows it in 연결 정보.
 use super::*;
 use crate::ext_shell::{dialog, group, notice};
-use hwpcraft_mcp::desktop_bridge::{DEFAULT_LISTEN, DesktopBridge};
+use anyhow::Context as _;
+use hwpcraft_mcp::desktop_bridge::{AiRun, DEFAULT_LISTEN, DesktopBridge};
 
 #[derive(Default)]
 pub(crate) struct State {
     bridge: Option<DesktopBridge>,
     show_info: bool,
+    /// The AI edit panel turned the connection on (it turns it off again).
+    panel_started: bool,
+    /// Whether the document changed in an AI run the connection ended when it
+    /// went off, for the panel's `ai_run_end`.
+    ended_run: Option<bool>,
 }
 
 /// Time per frame the window gives MCP requests before drawing again.
@@ -90,9 +96,58 @@ impl HwpApp {
     }
 
     fn stop_mcp_bridge(&mut self, message: &str) {
-        self.ext.mcp.bridge = None;
+        // An open AI run ends first, so its edits close into one undo step.
+        if let Some(mut bridge) = self.ext.mcp.bridge.take()
+            && bridge.ai_run_active()
+        {
+            let ended = bridge.end_ai_run(&mut self.session);
+            // Unknown after a failure: say it may have changed (one Ctrl+Z
+            // takes the run back either way).
+            self.ext.mcp.ended_run = Some(*ended.as_ref().unwrap_or(&true));
+            self.result(ended);
+        }
         self.ext.mcp.show_info = false;
+        self.ext.mcp.panel_started = false;
         self.message = message.into();
+    }
+
+    /// Start an AI run on this window's document for the AI edit panel, turning
+    /// the connection on first if it is off. Its edits become one undo step at
+    /// [`HwpApp::ai_run_end`].
+    pub(crate) fn ai_run_begin(&mut self, ctx: &egui::Context) -> anyhow::Result<AiRun> {
+        self.ext.mcp.ended_run = None;
+        if self.ext.mcp.bridge.is_none() {
+            self.start_mcp_bridge(ctx);
+            self.ext.mcp.show_info = false;
+            self.ext.mcp.panel_started = self.ext.mcp.bridge.is_some();
+        }
+        let bridge = self
+            .ext
+            .mcp
+            .bridge
+            .as_mut()
+            .context("MCP 연결을 켜지 못했습니다.")?;
+        bridge.begin_ai_run(&mut self.session)
+    }
+
+    /// End the AI run; returns whether the document changed.
+    pub(crate) fn ai_run_end(&mut self) -> anyhow::Result<bool> {
+        if let Some(changed) = self.ext.mcp.ended_run.take() {
+            return Ok(changed);
+        }
+        match self.ext.mcp.bridge.as_mut() {
+            Some(bridge) => bridge.end_ai_run(&mut self.session),
+            // The connection went away without ending the run.
+            None => DesktopBridge::end_orphaned_ai_run(&mut self.session),
+        }
+    }
+
+    /// Turn the connection off if the AI edit panel turned it on (the panel
+    /// closes); a connection the user turned on stays.
+    pub(crate) fn ai_panel_release_connection(&mut self) {
+        if self.ext.mcp.panel_started {
+            self.stop_mcp_bridge("AI 편집 패널의 MCP 연결을 껐습니다.");
+        }
     }
 
     /// Run queued MCP requests on this window's document; called every frame.

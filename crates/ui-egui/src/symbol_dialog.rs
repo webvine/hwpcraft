@@ -125,6 +125,9 @@ pub(crate) struct State {
     saved: Saved,
     /// Characters egui's fonts can draw, cached per character.
     glyphs: std::collections::HashMap<char, bool>,
+    /// The columns' width and height last frame: the title spans the width and the
+    /// dividers take the height.
+    body: Vec2,
 }
 
 impl State {
@@ -146,6 +149,7 @@ impl State {
             scroll_to: None,
             saved,
             glyphs: Default::default(),
+            body: Vec2::ZERO,
         };
         s.load_set();
         s
@@ -283,7 +287,7 @@ impl HwpApp {
         // list, the button column and the margins take about 490 px besides the grid.
         let cols = (((ctx.content_rect().width() - 490.0) / CELL) as usize).clamp(8, COLS);
         chrome::modal("symbol-dialog").show(ctx, |ui| {
-            ui.set_width(cols as f32 * CELL + 310.0);
+            ui.set_width((cols as f32 * CELL + 310.0).max(st.body.x));
             if chrome::title(ui, "문자표") {
                 close = true;
             }
@@ -321,9 +325,11 @@ impl HwpApp {
                 search(ui, &mut st);
             }
             ui.separator();
-            ui.horizontal_top(|ui| {
+            let divider = st.body.y;
+            let mut tall: f32 = 0.0;
+            let body = ui.horizontal_top(|ui| {
                 // Left: 문자 영역 list.
-                ui.vertical(|ui| {
+                let left = ui.vertical(|ui| {
                     ui.set_width(190.0);
                     ui.label("문자 영역");
                     egui::ScrollArea::vertical()
@@ -367,9 +373,10 @@ impl HwpApp {
                             }
                         });
                 });
-                ui.separator();
+                tall = tall.max(left.response.rect.height());
+                column_divider(ui, divider);
                 // Middle: grid.
-                ui.vertical(|ui| {
+                let middle = ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut st.only_available, "글꼴에 있는 문자만");
                         ui.label(egui::RichText::new(format!("{}자", st.chars.len())).weak());
@@ -379,7 +386,8 @@ impl HwpApp {
                     let mut area = egui::ScrollArea::vertical()
                         .id_salt("symbol-grid")
                         .max_height(CELL * GRID_ROWS as f32)
-                        .auto_shrink([false, false]);
+                        // As wide as its columns: the dialog's width follows its content.
+                        .auto_shrink([true, false]);
                     if let Some(row) = st.scroll_to.take() {
                         area = area.vertical_scroll_offset(row as f32 * CELL);
                     }
@@ -495,9 +503,10 @@ impl HwpApp {
                         }
                     });
                 });
-                ui.separator();
+                tall = tall.max(middle.response.rect.height());
+                column_divider(ui, divider);
                 // Right: 넣기 / 닫기 like Hangul's right-hand buttons.
-                ui.vertical(|ui| {
+                let right = ui.vertical(|ui| {
                     let (ok, cancel) = chrome::actions(
                         ui,
                         st.input
@@ -512,7 +521,9 @@ impl HwpApp {
                         close = true;
                     }
                 });
+                tall = tall.max(right.response.rect.height());
             });
+            st.body = Vec2::new(body.response.rect.width(), tall);
         });
         if let Some(text) = insert {
             let params = st.insert_params(&text);
@@ -527,6 +538,18 @@ impl HwpApp {
             self.symbol_dialog = Some(st);
         }
     }
+}
+
+/// A divider between the dialog's columns, as tall as the columns were last frame: a
+/// vertical separator takes the whole height the dialog may grow to (the window's),
+/// which left the 문자표 as tall as the window with its lower half empty.
+fn column_divider(ui: &mut egui::Ui, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(9.0, height.max(CELL)), egui::Sense::hover());
+    ui.painter().vline(
+        rect.center().x,
+        rect.y_range(),
+        ui.visuals().widgets.noninteractive.bg_stroke,
+    );
 }
 
 /// One grid cell: the character, greyed when the UI fonts cannot draw it.
@@ -572,6 +595,58 @@ fn cell(ui: &mut egui::Ui, c: char, selected: bool, available: bool) -> egui::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 문자표 is as tall as its columns, not the window, and its title bar spans the
+    /// dialog up to the 넣기·취소 column (800 and 1280 px windows).
+    #[test]
+    fn the_symbol_dialog_fits_its_columns() -> anyhow::Result<()> {
+        for (w, h) in [(1280.0, 800.0), (800.0, 600.0)] {
+            let mut app = crate::HwpApp::with_context(egui::Context::default(), None, None, false)?;
+            let ctx = app.ctx.clone();
+            app.open_symbol_dialog();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(w, h));
+            let mut texts = Vec::new();
+            for i in 0..5 {
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(f64::from(i)),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| app.symbol_dialog(ui.ctx()));
+                texts = out
+                    .shapes
+                    .iter()
+                    .filter_map(|c| match &c.shape {
+                        egui::Shape::Text(t) => Some((
+                            t.galley.text().to_owned(),
+                            t.galley.rect.translate(t.pos.to_vec2()),
+                        )),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                out.textures_delta.clear();
+            }
+            let find = |label: &str| {
+                texts
+                    .iter()
+                    .find(|(t, _)| t == label)
+                    .map(|(_, r)| *r)
+                    .ok_or_else(|| anyhow::anyhow!("{label} not painted at {w}"))
+            };
+            let close = find("×")?;
+            let insert = find("넣기(D)")?;
+            let font = find("선택 글꼴")?;
+            assert!(close.right() >= insert.right(), "{w}: {close:?} {insert:?}");
+            let area = ctx
+                .memory(|m| m.area_rect(egui::Id::new("symbol-dialog")))
+                .ok_or_else(|| anyhow::anyhow!("no dialog area at {w}"))?;
+            assert!(
+                area.bottom() < font.bottom() + 60.0,
+                "{w}: {area:?} {font:?}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn saved_round_trips_and_keeps_recent_order() {

@@ -177,6 +177,8 @@ pub enum Icon {
     Elbow,
     ElbowArrow,
     ElbowBoth,
+    /// AI 편집 패널 (✦), drawn here.
+    Sparkle,
 }
 
 const TILES: usize = Icon::FitTable as usize + 1;
@@ -633,7 +635,46 @@ fn draw_local(ui: &Ui, rect: Rect, icon: Icon, enabled: bool) {
             end(points[n - 1], points[n - 2], arrow_end);
             end(points[0], points[1], arrow_start);
         }
+        Icon::Sparkle => {
+            sparkle(
+                p,
+                r.center() + Vec2::new(-r.width() * 0.08, r.height() * 0.08),
+                r.width() * 0.42,
+                blue,
+            );
+            sparkle(
+                p,
+                r.right_top() + Vec2::new(-r.width() * 0.12, r.height() * 0.12),
+                r.width() * 0.16,
+                blue,
+            );
+        }
         _ => {}
+    }
+}
+
+/// A four-pointed star (✦) at `c`, `r` from the centre to each tip. Fonts may lack the
+/// character, so it is drawn: four kites around the centre.
+pub fn sparkle(p: &egui::Painter, c: Pos2, r: f32, color: Color32) {
+    let k = r * 0.3;
+    let tips = [
+        Vec2::new(0.0, -r),
+        Vec2::new(r, 0.0),
+        Vec2::new(0.0, r),
+        Vec2::new(-r, 0.0),
+    ];
+    let waist = [
+        Vec2::new(k, -k),
+        Vec2::new(k, k),
+        Vec2::new(-k, k),
+        Vec2::new(-k, -k),
+    ];
+    for i in 0..4 {
+        p.add(egui::Shape::convex_polygon(
+            vec![c, c + waist[(i + 3) % 4], c + tips[i], c + waist[i]],
+            color,
+            Stroke::NONE,
+        ));
     }
 }
 

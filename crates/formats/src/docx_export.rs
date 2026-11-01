@@ -13,7 +13,7 @@ use hwpcraft_doc::model::document::Document;
 use hwpcraft_doc::model::header_footer::HeaderFooterApply;
 use hwpcraft_doc::model::image::Picture;
 use hwpcraft_doc::model::page::ColumnDef;
-use hwpcraft_doc::model::paragraph::{NumberingMarker, Paragraph};
+use hwpcraft_doc::model::paragraph::{ColumnBreakType, NumberingMarker, Paragraph};
 use hwpcraft_doc::model::shape::{Caption, CaptionDirection, TextWrap};
 use hwpcraft_doc::model::style::{
     Alignment, BorderLine, BorderLineType, CharShape, HeadType, LineSpacingType, ParaShape,
@@ -294,6 +294,17 @@ impl<'a> Writer<'a> {
 
     fn paragraph_properties(&mut self, para: &Paragraph, sect: Option<&str>, out: &mut String) {
         out.push_str("<w:pPr>");
+        // A page break the author put in (not one the reader inferred from the
+        // stored page layout) starts the paragraph on a new page.
+        match para.column_type {
+            ColumnBreakType::Page if !para.page_break_synthesized => {
+                out.push_str("<w:pageBreakBefore/>");
+            }
+            // A new column layout (MultiColumn) becomes a Word section; a break to the
+            // next column is not written.
+            ColumnBreakType::Column => self.omit("단 나누기"),
+            _ => {}
+        }
         if let Some(ps) = self.para_shape(para.para_shape_id) {
             if matches!(ps.head_type, HeadType::Number | HeadType::Outline)
                 && matches!(para.numbering_marker, NumberingMarker::Unresolved)

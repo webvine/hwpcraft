@@ -44,9 +44,17 @@ pub(crate) struct HwpService {
     capabilities: ServerCapabilities,
     completion_window: Arc<Mutex<VecDeque<Instant>>>,
     tasks: TaskManager,
+    /// The desktop window's AI run (`DesktopBridge::begin_ai_run`).
+    ai_gate: Option<Arc<crate::ai_gate::AiGate>>,
 }
 
 impl HwpService {
+    /// Apply `gate`'s AI run rules to tool calls.
+    pub(crate) fn with_ai_gate(mut self, gate: Arc<crate::ai_gate::AiGate>) -> Self {
+        self.ai_gate = Some(gate);
+        self
+    }
+
     pub(crate) fn new(workers: Arc<DocumentWorkers>) -> Result<Self> {
         let mut definitions = tools::tool_definitions()
             .as_array()
@@ -116,6 +124,7 @@ impl HwpService {
             subscription_shutdown: None,
             completion_window: Arc::new(Mutex::new(VecDeque::new())),
             tasks: TaskManager::new(),
+            ai_gate: None,
             workers,
             tools: Arc::new(typed),
             validators: Arc::new(validators),
@@ -419,7 +428,7 @@ impl ServerHandler for HwpService {
     async fn on_custom_request(
         &self,
         request: CustomRequest,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CustomResult, McpError> {
         const KNOWN: &[&str] = &[
             "initialize",
@@ -442,8 +451,20 @@ impl ServerHandler for HwpService {
             "tasks/list",
             "tasks/cancel",
         ];
+        // 2026-07-28 removed these: for a request of that version they are unknown
+        // methods (-32601, HTTP 404), not malformed calls of a method it defines.
+        const REMOVED_IN_2026: &[&str] = &[
+            "initialize",
+            "logging/setLevel",
+            "resources/subscribe",
+            "resources/unsubscribe",
+            "tasks/result",
+            "tasks/list",
+        ];
         let method = request.method;
-        if KNOWN.contains(&method.as_str()) {
+        let removed = REMOVED_IN_2026.contains(&method.as_str())
+            && context.protocol_version().is_some_and(|v| v == VERSION);
+        if KNOWN.contains(&method.as_str()) && !removed {
             return Err(McpError::invalid_params(
                 format!(
                     "{method} 요청의 params 형식이 맞지 않습니다(필수 필드가 없거나 종류가 다름)."
@@ -527,6 +548,21 @@ impl ServerHandler for HwpService {
                 ),
                 None,
             ));
+        }
+        // An AI run's request is counted until answered, so ending the run waits
+        // for it (`DesktopBridge::end_ai_run`).
+        let mut _ai_flight = None;
+        if let Some(gate) = &self.ai_gate {
+            let ai = context
+                .extensions
+                .get::<axum::http::request::Parts>()
+                .is_some_and(|parts| parts.extensions.get::<crate::ai_gate::AiClient>().is_some());
+            if ai {
+                _ai_flight = Some(gate.admit());
+            }
+            if let Some(message) = gate.refusal(name, &args, ai) {
+                return tool_result(tools::result(json!({ "message": message }), true), None);
+            }
         }
         // Calls read from one stdio connection reach their queues in read order.
         let arrival = context

@@ -33,6 +33,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
     use std::io::Read;
 
     fn part(path: &Path, name: &str) -> Result<String> {
@@ -40,6 +41,26 @@ mod tests {
         let mut text = String::new();
         zip.by_name(name)?.read_to_string(&mut text)?;
         Ok(text)
+    }
+
+    #[test]
+    fn page_breaks_start_a_new_page_in_word() -> Result<()> {
+        let mut s = Session::new()?;
+        s.execute(crate::Command::Insert("첫 쪽".into()))?;
+        s.execute(crate::Command::PageBreak)?;
+        s.execute(crate::Command::Insert("둘째 쪽".into()))?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("pages.docx");
+        let omitted = s.export_docx(&path, false)?;
+        assert!(omitted.is_empty(), "{omitted:?}");
+        let document = part(&path, "word/document.xml")?;
+        assert_eq!(document.matches("<w:pageBreakBefore/>").count(), 1);
+        let second = document.find("둘째 쪽").context("second page text")?;
+        let brk = document
+            .find("<w:pageBreakBefore/>")
+            .context("page break")?;
+        assert!(brk < second && document[brk..second].matches("<w:p>").count() == 0);
+        Ok(())
     }
 
     #[test]

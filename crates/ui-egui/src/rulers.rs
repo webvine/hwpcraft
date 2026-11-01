@@ -147,6 +147,11 @@ impl HwpApp {
                 )
                 .show(ui, |ui| self.status_items(ui, &cache));
         }
+        // The AI 편집 패널 takes the window's right edge down to the status bar, like a task
+        // pane: the document tabs and the horizontal scroll bar stay under the document.
+        if self.tab != 0 {
+            self.ai_panel_dock(ui);
+        }
         if self.ext.shell.show_doc_tabs {
             egui::Panel::bottom("hwp-document-tab")
                 .exact_size(29.0)
@@ -291,6 +296,21 @@ impl HwpApp {
                             Color32::from_rgb(253, 243, 224),
                         )
                         .on_hover_text(hwpcraft_engine::DISTRIBUTION_READ_ONLY);
+                    }
+                    if self.ai_locked()
+                        && status_chip(
+                            ui,
+                            "AI 편집 중",
+                            Color32::from_rgb(40, 90, 190),
+                            Color32::from_rgb(232, 240, 253),
+                        )
+                        .on_hover_text(
+                            "AI가 문서를 고치는 동안 입력과 편집 명령이 잠깁니다(스크롤·확대·보기는 \
+                             됨). 패널의 [중지]로 멈춥니다. 누르면 AI 편집 패널을 엽니다.",
+                        )
+                        .clicked()
+                    {
+                        self.set_ai_panel_open(true);
                     }
                     if let Some(steps) = self.session.macro_recording() {
                         let tip = format!(

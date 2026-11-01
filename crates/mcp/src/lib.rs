@@ -3,6 +3,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod admission;
+mod ai_gate;
 mod atomic_batch;
 mod catalog;
 pub mod desktop_bridge;
@@ -92,6 +93,8 @@ impl Headless {
         if !params.is_object() {
             bail!("params는 JSON 객체여야 합니다.");
         }
+        // An AI run refuses file commands, which this server runs itself.
+        self.session.guard_restricted_command(command)?;
         if self.window && matches!(command, "file.new" | "file.open" | "file.open_protected") {
             // Replacing it would drop the user's document, unsaved work and undo
             // history without asking. Clients make documents of their own instead.

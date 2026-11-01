@@ -10,6 +10,11 @@ const SHORTCUT: &str = "shortcut";
 const USER_NAME: &str = "user_name";
 const AUTOCORRECT: &str = "autocorrect";
 const AUTOCORRECT_OFF: &str = "autocorrect_off";
+const AI_PANEL_OPEN: &str = "ai_panel_open";
+const AI_PANEL_WIDTH: &str = "ai_panel_width";
+/// AI 편집 패널 width: default and the range it may be dragged in, px.
+pub(crate) const AI_PANEL_DEFAULT_WIDTH: u32 = 320;
+pub(crate) const AI_PANEL_WIDTHS: std::ops::RangeInclusive<u32> = 260..=560;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Settings {
@@ -25,6 +30,9 @@ pub(crate) struct Settings {
     /// 빠른 교정: whether it applies while typing, and (typed word, replacement) pairs.
     pub autocorrect_enabled: bool,
     pub autocorrect: Vec<(String, String)>,
+    /// AI 편집 패널: shown, and its width in px.
+    pub ai_panel_open: bool,
+    pub ai_panel_width: u32,
 }
 
 impl Default for Settings {
@@ -37,6 +45,8 @@ impl Default for Settings {
             user_name: String::new(),
             autocorrect_enabled: true,
             autocorrect: Vec::new(),
+            ai_panel_open: false,
+            ai_panel_width: AI_PANEL_DEFAULT_WIDTH,
         }
     }
 }
@@ -63,6 +73,13 @@ impl Settings {
                     }
                 }
                 AUTOCORRECT_OFF => s.autocorrect_enabled = value != "1",
+                AI_PANEL_OPEN => s.ai_panel_open = value == "1",
+                AI_PANEL_WIDTH => {
+                    if let Ok(n) = value.parse::<u32>() {
+                        s.ai_panel_width =
+                            n.clamp(*AI_PANEL_WIDTHS.start(), *AI_PANEL_WIDTHS.end());
+                    }
+                }
                 AUTOCORRECT => {
                     if let Some((from, to)) = value.split_once('\t')
                         && super::autocorrect::valid_word(from.trim())
@@ -104,6 +121,12 @@ impl Settings {
         }
         if !self.autocorrect_enabled {
             out.push_str(&format!("{AUTOCORRECT_OFF}=1\n"));
+        }
+        if self.ai_panel_open {
+            out.push_str(&format!("{AI_PANEL_OPEN}=1\n"));
+        }
+        if self.ai_panel_width != AI_PANEL_DEFAULT_WIDTH {
+            out.push_str(&format!("{AI_PANEL_WIDTH}={}\n", self.ai_panel_width));
         }
         for (from, to) in &self.autocorrect {
             out.push_str(&format!("{AUTOCORRECT}={from}\t{to}\n"));
@@ -469,6 +492,8 @@ mod tests {
             user_name: "김검토".into(),
             autocorrect_enabled: false,
             autocorrect: vec![("ㄱㅅ".into(), "감사합니다".into())],
+            ai_panel_open: true,
+            ai_panel_width: 400,
         };
         let text = s.serialize();
         assert_eq!(Settings::parse(&text), s);
@@ -479,6 +504,10 @@ mod tests {
             "autosave_minutes=7\nstart_zoom=9000\nshortcut=K\ttable.create\nwhatever=1\n",
         );
         assert_eq!((odd.autosave_minutes, odd.start_zoom), (5, 400));
+        let wide = Settings::parse("ai_panel_open=1\nai_panel_width=9000\n");
+        assert!(wide.ai_panel_open);
+        assert_eq!(wide.ai_panel_width, *AI_PANEL_WIDTHS.end());
+        assert!(!Settings::default().serialize().contains("ai_panel"));
         assert!(
             odd.shortcuts.is_empty(),
             "a shortcut without Ctrl or Alt is ignored"

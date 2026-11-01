@@ -10,6 +10,7 @@
 //! when the user opens or makes another document in the window, the old
 //! `document_id` ends and the new document gets one of its own.
 use crate::Headless;
+use crate::ai_gate::AiGate;
 use crate::document_workers::{DocumentWorkers, ExternalDocument, ExternalInfo, Wake};
 use crate::sdk_http::{self, AuthToken};
 use crate::sdk_service::HwpService;
@@ -28,6 +29,10 @@ use tokio_util::sync::CancellationToken;
 /// Where the desktop server listens unless told otherwise (the CLI default is 7082,
 /// so both can run at once).
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7083";
+/// How long `end_ai_run` keeps running requests the AI sent before it ended.
+const AI_DRAIN_LIMIT: Duration = Duration::from_secs(3);
+/// One serving slice (and quiet wait) while draining.
+const AI_DRAIN_SLICE: Duration = Duration::from_millis(20);
 
 pub struct DesktopBridge {
     document: ExternalDocument,
@@ -44,6 +49,18 @@ pub struct DesktopBridge {
     token_file: PathBuf,
     /// The server thread's error, if it stopped on its own.
     failure: Arc<Mutex<Option<String>>>,
+    /// The AI edit panel's run, if one is open.
+    ai_gate: Arc<AiGate>,
+}
+
+/// An open AI run: the panel gives its CLI this address and token.
+pub struct AiRun {
+    /// The MCP endpoint, e.g. `http://127.0.0.1:7083/mcp`.
+    pub url: String,
+    /// Bearer token for this run only; it stops working at `end_ai_run`.
+    pub token: String,
+    /// The window document's `document_id`, the only document the run may edit.
+    pub document_id: String,
 }
 
 impl DesktopBridge {
@@ -66,7 +83,9 @@ impl DesktopBridge {
                 .map(|dir| dir.join("mcp-http-token"))
                 .context("설정 폴더가 없어 MCP 토큰 파일을 둘 곳이 없습니다.")?,
         };
-        let token: AuthToken = sdk_http::load_or_create_token(&token_file)?;
+        let ai_gate = Arc::new(AiGate::default());
+        let token: AuthToken =
+            sdk_http::load_or_create_token(&token_file)?.with_ai_gate(Arc::clone(&ai_gate));
         let listener = std::net::TcpListener::bind(listen).with_context(|| {
             format!(
                 "{listen}에서 MCP 연결을 받을 수 없습니다(다른 프로그램이 쓰는 중일 수 있습니다)."
@@ -83,6 +102,7 @@ impl DesktopBridge {
             let server_workers = Arc::clone(&workers);
             let shutdown = shutdown.clone();
             let failure = Arc::clone(&failure);
+            let ai_gate = Arc::clone(&ai_gate);
             std::thread::Builder::new()
                 .name("hwpcraft-desktop-mcp".into())
                 .spawn(move || {
@@ -93,7 +113,7 @@ impl DesktopBridge {
                             .build()?;
                         runtime.block_on(async move {
                             let listener = tokio::net::TcpListener::from_std(listener)?;
-                            let service = HwpService::new(server_workers)?;
+                            let service = HwpService::new(server_workers)?.with_ai_gate(ai_gate);
                             sdk_http::serve_listener(service, listener, token, shutdown).await
                         })
                     })();
@@ -118,7 +138,80 @@ impl DesktopBridge {
             url: format!("http://{address}/mcp"),
             token_file,
             failure,
+            ai_gate,
         })
+    }
+
+    /// Open an AI run on the window's document: its edits until `end_ai_run`
+    /// become one undo step, commands that touch files are refused, and other
+    /// clients may read but not edit this document. Returns the run's address and
+    /// one-time token for the panel's CLI.
+    pub fn begin_ai_run(&mut self, session: &mut Session) -> Result<AiRun> {
+        if self.ai_gate.active() {
+            bail!("AI 편집이 이미 실행 중입니다.");
+        }
+        self.follow(session)?;
+        session.begin_undo_group()?;
+        session.set_commands_restricted(true);
+        let token = self.ai_gate.begin(self.document.id());
+        Ok(AiRun {
+            url: self.url.clone(),
+            token,
+            document_id: self.document.id().to_owned(),
+        })
+    }
+
+    /// Close the AI run: its token stops working first; requests it already sent
+    /// still run under the run's rules and inside its group; then its edits
+    /// become one undo step. Returns whether the document changed.
+    pub fn end_ai_run(&mut self, session: &mut Session) -> Result<bool> {
+        self.ai_gate.end();
+        // A request that passed the token check may still be queued (the CLI was
+        // stopped mid-call). Run what is queued while the restriction and the
+        // group still hold, until the queue stays empty for a moment.
+        let deadline = std::time::Instant::now() + AI_DRAIN_LIMIT;
+        let mut quiet = 0;
+        let mut drained = Ok(());
+        // Also until every AI request already past the token check is answered.
+        while (quiet < 2 || self.ai_gate.in_flight() > 0) && std::time::Instant::now() < deadline {
+            match self.serve(session, AI_DRAIN_SLICE) {
+                Ok(0) => {
+                    quiet += 1;
+                    std::thread::sleep(AI_DRAIN_SLICE);
+                }
+                Ok(_) => quiet = 0,
+                // A failed request (an engine panic the window caught): stop
+                // draining, but still lift the restriction and close the group,
+                // or the user's next edits would join the AI's undo step.
+                Err(error) => {
+                    drained = Err(error);
+                    break;
+                }
+            }
+        }
+        session.set_commands_restricted(false);
+        let changed = if session.undo_group_active() {
+            session.end_undo_group()?
+        } else {
+            false
+        };
+        drained.map(|()| changed)
+    }
+
+    /// End an AI run whose connection is already gone (the window lost it):
+    /// lift the restriction and close the group. Returns whether the document
+    /// changed.
+    pub fn end_orphaned_ai_run(session: &mut Session) -> Result<bool> {
+        session.set_commands_restricted(false);
+        if !session.undo_group_active() {
+            return Ok(false);
+        }
+        session.end_undo_group()
+    }
+
+    /// True between `begin_ai_run` and `end_ai_run`.
+    pub fn ai_run_active(&self) -> bool {
+        self.ai_gate.active()
     }
 
     /// The MCP endpoint, e.g. `http://127.0.0.1:7083/mcp`.
@@ -539,6 +632,227 @@ mod tests {
     fn only_loopback_addresses_are_accepted() -> Result<()> {
         let session = Session::new()?;
         assert!(DesktopBridge::start("0.0.0.0:0".parse()?, None, &session, || {}).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn requests_queued_when_an_ai_run_ends_still_follow_its_rules() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut session = Session::new()?;
+        session.execute(Command::Insert("사용자 글".into()))?;
+        let mut bridge = DesktopBridge::start(
+            "127.0.0.1:0".parse()?,
+            Some(dir.path().join("token")),
+            &session,
+            || {},
+        )?;
+        let address = bridge
+            .url()
+            .trim_start_matches("http://")
+            .trim_end_matches("/mcp")
+            .to_owned();
+        let run = bridge.begin_ai_run(&mut session)?;
+        let saved = dir.path().join("late.hwpx");
+        // Both calls pass the token check and wait in the queue: the window does
+        // not serve until the run ends (a CLI stopped mid-call).
+        let save = {
+            let (a, t, i, p) = (
+                address.clone(),
+                run.token.clone(),
+                run.document_id.clone(),
+                saved.clone(),
+            );
+            std::thread::spawn(move || {
+                call(
+                    &a,
+                    &t,
+                    "execute",
+                    json!({"document_id": i, "command": "file.save_as", "params": {"path": p}}),
+                )
+            })
+        };
+        let insert = {
+            let (a, t, i) = (address.clone(), run.token.clone(), run.document_id.clone());
+            std::thread::spawn(move || {
+                call(
+                    &a,
+                    &t,
+                    "execute",
+                    json!({"document_id": i, "command": "text.insert", "params": {"text": " 늦은 편집"}}),
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(bridge.end_ai_run(&mut session)?);
+        let (save, insert) = (save.join().unwrap(), insert.join().unwrap());
+        assert_eq!(save["isError"], true, "{save}");
+        assert!(!saved.exists());
+        assert_eq!(insert["isError"], false, "{insert}");
+        assert_eq!(session.text(), "사용자 글 늦은 편집");
+        // The late edit is inside the run's single undo step.
+        session.execute(Command::Undo)?;
+        assert_eq!(session.text(), "사용자 글");
+        Ok(())
+    }
+
+    #[test]
+    fn an_ai_run_always_lifts_its_rules_even_when_draining_fails() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut session = Session::new()?;
+        session.execute(Command::Insert("사용자 글".into()))?;
+        let mut bridge = DesktopBridge::start(
+            "127.0.0.1:0".parse()?,
+            Some(dir.path().join("token")),
+            &session,
+            || {},
+        )?;
+        let run = bridge.begin_ai_run(&mut session)?;
+        session.execute(Command::Insert(" AI".into()))?;
+        // A queued request panics while the run ends.
+        bridge.workers.queue_panic(&run.document_id)?;
+        assert!(bridge.end_ai_run(&mut session).is_err());
+        assert!(!session.undo_group_active());
+        session.run("edit.undo", json!({}))?;
+        assert_eq!(session.text(), "사용자 글");
+        Ok(())
+    }
+
+    #[test]
+    fn an_ai_run_whose_connection_is_gone_still_closes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut session = Session::new()?;
+        session.execute(Command::Insert("사용자 글".into()))?;
+        let mut bridge = DesktopBridge::start(
+            "127.0.0.1:0".parse()?,
+            Some(dir.path().join("token")),
+            &session,
+            || {},
+        )?;
+        bridge.begin_ai_run(&mut session)?;
+        session.execute(Command::Insert(" AI".into()))?;
+        drop(bridge);
+        assert!(DesktopBridge::end_orphaned_ai_run(&mut session)?);
+        assert!(!session.undo_group_active());
+        session.run("edit.undo", json!({}))?;
+        assert_eq!(session.text(), "사용자 글");
+        assert!(!DesktopBridge::end_orphaned_ai_run(&mut session)?);
+        Ok(())
+    }
+
+    /// HTTP status of a tools/call made with `token`.
+    fn status(address: &str, token: &str) -> String {
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_documents","arguments":{}}}"#;
+        let mut socket = std::net::TcpStream::connect(address).unwrap();
+        write!(
+            socket,
+            "POST /mcp HTTP/1.1
+Host: {address}
+Authorization: Bearer {token}
+Content-Type: application/json
+Connection: close
+Content-Length: {}
+
+",
+            body.len()
+        )
+        .unwrap();
+        socket.write_all(body).unwrap();
+        let mut reply = String::new();
+        socket.read_to_string(&mut reply).unwrap();
+        reply.lines().next().unwrap_or_default().to_owned()
+    }
+
+    #[test]
+    fn an_ai_run_edits_only_the_window_document_and_undoes_in_one_step() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let token_file = dir.path().join("token");
+        let mut session = Session::new()?;
+        session.execute(Command::Insert("사용자 글".into()))?;
+        let mut bridge = DesktopBridge::start(
+            "127.0.0.1:0".parse()?,
+            Some(token_file.clone()),
+            &session,
+            || {},
+        )?;
+        let user = std::fs::read_to_string(&token_file)?.trim().to_owned();
+        let address = bridge
+            .url()
+            .trim_start_matches("http://")
+            .trim_end_matches("/mcp")
+            .to_owned();
+        let run = bridge.begin_ai_run(&mut session)?;
+        assert!(bridge.ai_run_active());
+        assert!(bridge.begin_ai_run(&mut session).is_err());
+        let saved = dir.path().join("saved.hwpx");
+        let (a, ai, u, id, path) = (
+            address.clone(),
+            run.token.clone(),
+            user.clone(),
+            run.document_id.clone(),
+            saved.clone(),
+        );
+        let client = std::thread::spawn(move || {
+            let insert = |token: &str, text: &str| {
+                call(
+                    &a,
+                    token,
+                    "execute",
+                    json!({"document_id": id, "command": "text.insert", "params": {"text": text}}),
+                )
+            };
+            [
+                insert(&ai, " 하나"),
+                insert(&ai, " 둘"),
+                call(
+                    &a,
+                    &ai,
+                    "save_document",
+                    json!({"document_id": id, "path": path}),
+                ),
+                call(
+                    &a,
+                    &ai,
+                    "execute",
+                    json!({"document_id": id, "command": "file.save_as", "params": {"path": path}}),
+                ),
+                call(
+                    &a,
+                    &ai,
+                    "execute",
+                    json!({"document_id": id, "command": "edit.undo", "params": {}}),
+                ),
+                call(&a, &ai, "new_document", json!({})),
+                insert(&u, " 사용자"),
+                call(&a, &u, "get_text", json!({"document_id": id})),
+            ]
+        });
+        let [one, two, save, save_as, undo, new, user_edit, user_read] =
+            serve_until(&mut bridge, &mut session, client);
+        for ok in [&one, &two, &user_read] {
+            assert_eq!(ok["isError"], false, "{ok}");
+        }
+        for refused in [&save, &save_as, &undo, &new, &user_edit] {
+            assert_eq!(refused["isError"], true, "{refused}");
+        }
+        assert!(!saved.exists());
+        assert_eq!(session.text(), "사용자 글 하나 둘");
+        assert!(bridge.end_ai_run(&mut session)?);
+        assert!(!bridge.ai_run_active());
+        // The run's token is gone; the user's token still works.
+        assert!(
+            status(&address, &run.token).contains("401"),
+            "{}",
+            status(&address, &run.token)
+        );
+        assert!(
+            !status(&address, &user).contains("401"),
+            "{}",
+            status(&address, &user)
+        );
+        session.execute(Command::Undo)?;
+        assert_eq!(session.text(), "사용자 글");
+        session.execute(Command::Redo)?;
+        assert_eq!(session.text(), "사용자 글 하나 둘");
         Ok(())
     }
 }

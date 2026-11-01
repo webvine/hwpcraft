@@ -27,9 +27,10 @@ const MIN_TOKEN_CHARS: usize = 32;
 const REJECTED_BODY_DRAIN_BYTES: usize = 64 * 1024;
 /// How long a rejected request may take to send that small body.
 const REJECTED_BODY_DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(5);
-/// Shared secret every HTTP request presents as `Authorization: Bearer <token>`.
+/// Shared secret every HTTP request presents as `Authorization: Bearer <token>`,
+/// and the desktop window's AI run whose own token is accepted too.
 #[derive(Clone)]
-pub(crate) struct AuthToken(Arc<str>);
+pub(crate) struct AuthToken(Arc<str>, Option<Arc<crate::ai_gate::AiGate>>);
 
 impl AuthToken {
     pub(crate) fn new(token: &str) -> Result<Self> {
@@ -38,7 +39,13 @@ impl AuthToken {
             token.len() >= MIN_TOKEN_CHARS && token.bytes().all(|b| b.is_ascii_graphic()),
             "MCP HTTP token must be at least {MIN_TOKEN_CHARS} printable ASCII characters"
         );
-        Ok(Self(token.into()))
+        Ok(Self(token.into(), None))
+    }
+
+    /// Also accept the token of `gate`'s open run, marking those requests.
+    pub(crate) fn with_ai_gate(mut self, gate: Arc<crate::ai_gate::AiGate>) -> Self {
+        self.1 = Some(gate);
+        self
     }
 
     fn accepts(&self, presented: &[u8]) -> bool {
@@ -107,7 +114,7 @@ pub(crate) fn load_or_create_token(path: &Path) -> Result<AuthToken> {
 
 async fn require_token(
     State(token): State<AuthToken>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
     let presented = request
@@ -119,6 +126,12 @@ async fn require_token(
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
         .map(|(_, token)| token);
     if presented.is_some_and(|value| token.accepts(value.as_bytes())) {
+        return next.run(request).await;
+    }
+    if let (Some(value), Some(gate)) = (presented, token.1.as_ref())
+        && gate.accepts(value.as_bytes())
+    {
+        request.extensions_mut().insert(crate::ai_gate::AiClient);
         return next.run(request).await;
     }
     // Read a small unread body before answering: closing a socket with unread

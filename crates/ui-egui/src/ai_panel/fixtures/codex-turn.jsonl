@@ -1,0 +1,19 @@
+{"type": "thread.started", "thread_id": "01a19660-51ed-7643-a8a0-3f658297f13f"}
+{"type": "turn.started"}
+{"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "열린 HwpCraft 문서 끝에 요청하신 문단을 추가하겠습니다.\n"}}
+{"type": "item.started", "item": {"id": "item_1", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "list_documents", "arguments": {}, "error": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_1", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "list_documents", "arguments": {}, "error": null, "status": "completed"}}
+{"type": "item.started", "item": {"id": "item_2", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "list_commands", "arguments": {"query": "move.document"}, "error": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_2", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "list_commands", "arguments": {"query": "move.document"}, "error": null, "status": "completed"}}
+{"type": "item.started", "item": {"id": "item_3", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "hwp_action", "arguments": {"query": "MoveDocEnd"}, "error": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_3", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "hwp_action", "arguments": {"query": "MoveDocEnd"}, "error": null, "status": "completed"}}
+{"type": "item.started", "item": {"id": "item_4", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "inspect_document", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "limit": 5}, "error": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_4", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "inspect_document", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "limit": 5}, "error": null, "status": "completed"}}
+{"type": "item.started", "item": {"id": "item_5", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "hwp_action", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "id": "MoveDocEnd"}, "error": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_5", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "hwp_action", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "id": "MoveDocEnd"}, "error": null, "status": "completed"}}
+{"type": "item.started", "item": {"id": "item_6", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "type_text", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "text": "\nCodex 편집 시험"}, "error": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_6", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "type_text", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1", "text": "\nCodex 편집 시험"}, "error": null, "status": "completed"}}
+{"type": "item.started", "item": {"id": "item_7", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "get_text", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1"}, "error": null, "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_7", "type": "mcp_tool_call", "server": "hwpcraft", "tool": "get_text", "arguments": {"document_id": "0e373679-caf5-4845-9aa8-e05fdb0983f1"}, "error": null, "status": "completed"}}
+{"type": "item.completed", "item": {"id": "item_8", "type": "agent_message", "text": "열린 HwpCraft 문서 끝에 ‘Codex 편집 시험’ 문단을 추가했습니다."}}
+{"type": "turn.completed"}
