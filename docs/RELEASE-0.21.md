@@ -51,6 +51,7 @@
 - 표: 새 표의 줄(282 HU)을 1mm 늘렸다가 원래대로 줄이면 크기 조절 하한(283 HU)에 걸려 거절되던 것.
 - RHWP 0103: 0101의 머리말·꼬리말 캐시가 구역 번호와 구역 수 변화를 키로 삼는다(구역을 넣거나 지운 뒤 다른 구역의 캐시를 쓰지 않게).
 - AI 편집 패널은 작업 창처럼 상태 표시줄까지 닿고, 좁은 창에서는 창 폭의 절반까지만 차지한다(기억한 폭은 넓은 창에서 다시 씀). AI가 편집하는 동안 서식 도구 줄 전체가 흐려지고 상태 표시줄에 'AI 편집 중'이 나온다. AI 실행을 끝낼 때는 요청이 실패했거나 연결이 먼저 끊겨도 제한을 풀고 실행 취소 단계를 닫는다.
+- AI 편집 패널: 긴 목록 줄이 든 답을 받으면 패널이 사라지고 다시 켜도 돌아오지 않던 것(목록 줄이 줄바꿈되지 않아 패널 폭을 넘음). 릴리스 직전 사용자 보고로 찾았다.
 - 문자표 창이 창 높이만큼 커지고 제목 줄이 짧던 것(0.20).
 - macOS: 단축키 시험이 ⌘ 표기를 기대하고, 다른 브라우저 출처의 요청을 거절할 때 본문을 먼저 읽어 macOS가 연결을 끊지 않고 403을 돌려준다(0.20 릴리스 빌드에서 찾음, v0.20에도 들어감).
 - 시험이 사용자 설정 폴더(최근 문서·보기 설정)에 쓰지 않고, 시험용 설정 폴더는 한 시간 뒤 다음 시험이 지운다. 화면 캡처·성능 측정 실행도 설정을 저장하지 않는다.
@@ -66,7 +67,7 @@
 - AI 대화 기록의 바뀐 곳은 본문·표 셀 문단의 글만 기록한다. 서식·그림·표 구조의 변화는 '바뀐 곳'에 나오지 않고, 그런 질문과 개체가 든 문단을 바꾼 질문은 그 뒤 문서가 바뀌면 패널에서 되돌리거나 변경 추적으로 남기지 않는다(Ctrl+Z는 됨). 이미 변경 추적이 있는 문서에는 AI 변경을 변경 추적으로 섞지 않는다. 문서는 본문 글의 지문으로도 찾아서 글이 같은 다른 문서가 같은 문서로 보일 수 있고, 같은 글의 문단이 여러 곳에 있으면 '되돌리기'가 자리를 정하지 못해 아무것도 바꾸지 않는다.
 - 글자처럼 취급한 개체 때문에 높아진 줄에서 ↓를 누르면 바로 아래 줄을 건너뛸 수 있고, 그런 문단을 마우스로 누르면 캐럿이 한 글자 앞에 놓일 수 있다(RHWP 위치 계산, 0.19부터 있었음, 다음 버전에서 고침).
 - 글자처럼 취급하지 않은 표(위아래 배치) 바로 뒤 문단은 저장한 문서를 다시 열면 표 바깥 여백(기본 1mm)만큼 표 마지막 줄에 겹쳐 그려지고, 떠 있는 표에 캡션을 달면 바로 다음 문단이 캡션 위에 겹쳐 그려진다. 글자처럼 취급한 표는 정상이다(RHWP 배치 한계, 0.19부터 있었음, 다음 버전에서 고침).
-- AI 편집 패널은 리본의 파일 탭(문서 정보·최근 문서 화면)에서는 숨고, 다른 탭으로 돌아오면 다시 보인다(✦ AI 단추는 켜진 채로 남음).
+- AI 편집 패널은 리본의 파일 탭(문서 정보·최근 문서 화면)에서는 숨고, 다른 탭으로 돌아오면 다시 보인다.
 - AI 편집 패널은 Windows에서 실제 창과 실제 Claude Code·Codex로 확인했다. macOS·Linux에서는 시험(Unix 프로세스 그룹 중지 포함)만 돌렸고 데스크톱 화면은 직접 확인하지 않았다.
 
 ---
@@ -124,6 +125,7 @@
 - Tables: a new table's 282 HU row grown by 1 mm could not be shrunk back (resize lower limit 283 HU).
 - RHWP 0103: the header / footer cache of 0101 is keyed by section number and dropped when the section count changes.
 - AI edit panel: the panel reaches the status bar like a task pane and takes at most half of a narrow window (the remembered width comes back in a wide one); while the AI edits, the whole formatting toolbar greys out and the status bar says "AI 편집 중"; ending a run always lifts its restrictions and closes its undo step, even after a failed request or a lost connection.
+- AI edit panel: an answer with a long list line made the panel disappear and it did not come back when turned on again (list lines did not wrap and ran past the panel). Found from a user report just before the release.
 - The character map grew to the window height with a short title bar (0.20).
 - macOS: shortcut tests expect ⌘, and a request from a foreign browser origin has its small body read before it is refused, so macOS answers 403 instead of resetting the connection (found by the 0.20 release build, also in v0.20).
 - Tests no longer write the user's settings folder (recent documents, view settings); test settings folders are removed by a later test run after an hour, and screen-capture and benchmark runs save no settings.
@@ -139,5 +141,5 @@
 - The AI conversation history records changes only as the text of body and table-cell paragraphs. Formatting, pictures and table structure do not appear under the changed places; once the document has changed since, the panel neither reverts nor records as tracked changes a question that changed them or a paragraph holding an object (Ctrl+Z still works). AI changes are not mixed into a document that already has tracked changes. Because a document is also recognized by a fingerprint of its body text, another document with the same text may look like the same one, and when the same paragraph text appears in more than one place, Revert cannot tell which one and changes nothing.
 - In a line made tall by an object treated as a character, ↓ may skip the next line, and clicking such a paragraph may put the caret one character early (RHWP position calculation, present since 0.19, to be fixed in the next version).
 - A paragraph right after a table that is not treated as a character (top-and-bottom wrap) is drawn over the table's last row by the table's outer margin (1 mm by default) once the saved document is opened again, and the paragraph after a floating table with a caption is drawn over the caption. Tables treated as characters are fine (an RHWP layout limit, present since 0.19, to be fixed in the next version).
-- The AI edit panel hides on the ribbon's File tab (document info and recent documents) and comes back on the other tabs (the ✦ AI button stays on).
+- The AI edit panel hides on the ribbon's File tab (document info and recent documents) and comes back on the other tabs.
 - The AI edit panel was checked on Windows with the real window and the real Claude Code and Codex; on macOS and Linux only its tests ran (stopping a Unix process group included), and the desktop screen was not checked by hand.

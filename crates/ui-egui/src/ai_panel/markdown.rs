@@ -91,7 +91,14 @@ pub(crate) fn spans(text: &str) -> Vec<(String, bool, bool)> {
     out
 }
 
-fn line_job(ui: &Ui, text: &str, size: f32, strong: bool, width: f32) -> LayoutJob {
+fn line_job(
+    ui: &Ui,
+    marker: Option<&str>,
+    text: &str,
+    size: f32,
+    strong: bool,
+    width: f32,
+) -> LayoutJob {
     let body = FontId::proportional(size);
     let mono = FontId::monospace(size - 1.0);
     let normal = if strong {
@@ -100,6 +107,17 @@ fn line_job(ui: &Ui, text: &str, size: f32, strong: bool, width: f32) -> LayoutJ
         ui.visuals().text_color()
     };
     let mut job = LayoutJob::default();
+    if let Some(m) = marker {
+        job.append(
+            &format!("{m} "),
+            0.0,
+            TextFormat {
+                font_id: body.clone(),
+                color: normal,
+                ..Default::default()
+            },
+        );
+    }
     for (s, bold, code) in spans(text) {
         let format = if code {
             TextFormat {
@@ -131,19 +149,27 @@ pub(crate) fn show(ui: &mut Ui, text: &str) {
     for block in blocks(text) {
         let width = ui.available_width();
         match block {
+            // Every line is one wrapped label in the panel's vertical layout: a
+            // horizontal row would let a long line run past the panel, and the
+            // dock then stops reserving its space (the document covers it).
             Block::Heading(h) => {
-                ui.label(line_job(ui, &h, size + 1.0, true, width));
+                ui.add(egui::Label::new(line_job(ui, None, &h, size + 1.0, true, width)).wrap());
             }
             Block::Paragraph(p) => {
-                ui.label(line_job(ui, &p, size, false, width));
+                ui.add(egui::Label::new(line_job(ui, None, &p, size, false, width)).wrap());
             }
             Block::Item(marker, t) => {
-                ui.horizontal_top(|ui| {
-                    ui.add_space(4.0);
-                    ui.label(marker);
-                    let width = ui.available_width();
-                    ui.label(line_job(ui, &t, size, false, width));
-                });
+                ui.add(
+                    egui::Label::new(line_job(
+                        ui,
+                        Some(&format!("  {marker}")),
+                        &t,
+                        size,
+                        false,
+                        width,
+                    ))
+                    .wrap(),
+                );
             }
             Block::Code(c) => {
                 egui::Frame::new()

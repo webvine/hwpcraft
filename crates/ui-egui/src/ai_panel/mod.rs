@@ -1285,6 +1285,58 @@ Reading additional input from stdin...
         }
     }
 
+    /// A Markdown answer with long list lines must not push the panel's
+    /// contents past its width: the dock then stops reserving its space and the
+    /// document covers the panel until the conversation is cleared (seen with a
+    /// real Claude Code answer, 0.21).
+    #[test]
+    fn a_long_markdown_answer_keeps_the_dock_beside_the_document() {
+        let line = "기존 문장은 그대로 두고, 행정은 도입 전에 검증하고 기업은 공공 실증 실적을 확보한다는 설명을 한 줄 더 넣었습니다";
+        let answer = format!(
+            "첫 번째 표의 **빈칸**을 모두 채웠습니다.\n\n- **개념**: {line}\n- **범위**: {line}\n1. `table.cell_text` {line}\n## {line}"
+        );
+        let mut t = Turn::default();
+        t.apply(stream::Event::Done {
+            answer: Some(answer),
+            error: None,
+        });
+        let document_right = |messages: Vec<Message>| {
+            let mut app =
+                HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+            app.ext.shell.settings.ai_panel_open = true;
+            app.ext.shell.settings.ai_panel_width = 560;
+            app.ext.ai.clis = Some(vec![]);
+            app.ext.ai.messages = messages;
+            let ctx = app.ctx.clone();
+            let mut left = Rect::NOTHING;
+            for _ in 0..4 {
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(1916.0, 1040.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.toolbar(ui);
+                        app.status_bar(ui);
+                        left = ui.available_rect_before_wrap();
+                    },
+                );
+                out.textures_delta.clear();
+            }
+            left.right()
+        };
+        let empty = document_right(Vec::new());
+        assert!(empty < 1916.0 - 500.0, "the dock takes its width: {empty}");
+        let answered = document_right(vec![Message {
+            turn: Some(t),
+            ..Message::ai()
+        }]);
+        assert_eq!(answered, empty, "the answer pushed the dock out");
+    }
+
     #[test]
     fn the_busy_flag_for_lock_tests() {
         let mut app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
