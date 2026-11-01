@@ -7,13 +7,34 @@ use hwpcraft_doc::model::paragraph::Paragraph;
 use hwpcraft_doc::model::shape::ShapeObject;
 use serde::Serialize;
 
-/// Caret and selection anchor within one paragraph of a nested container.
+/// A cell block of a table inside a table cell, picked by dragging (or Shift+click)
+/// from one of its cells to another: the table is `control` of the cell paragraph
+/// `host` names, and `range` is the block in its grid.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct NestedBlock {
+    pub host: DocumentAddress,
+    pub control: usize,
+    pub range: crate::ext_table::CellRange,
+}
+
+/// Cached page boxes of a nested block: (generation, page, block) and the boxes.
+pub(crate) type NestedBlockRects = ((u64, u32, NestedBlock), Vec<[f64; 4]>);
+
+/// A position in a nested container: the paragraph's index in the container (the
+/// last path step's paragraph) and a scalar offset in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct NestedPoint {
+    pub paragraph: usize,
+    pub offset: usize,
+}
+
+/// Caret and selection anchor in one nested container (a table cell or text box).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct NestedCaret {
     pub address: ContextAddress,
     pub offset: usize,
-    /// Selection anchor in the same paragraph, or `None` without a selection.
-    pub anchor: Option<usize>,
+    /// Selection anchor in the same container, or `None` without a selection.
+    pub anchor: Option<NestedPoint>,
     /// Column kept across up/down moves, in page pixels.
     #[serde(skip)]
     preferred_x: Option<f64>,
@@ -32,11 +53,39 @@ impl NestedCaret {
     pub fn at(address: ContextAddress, offset: usize) -> Self {
         Self::new(address, offset)
     }
-    /// The selected range, empty when there is no selection.
-    pub fn selection(&self) -> std::ops::Range<usize> {
-        let anchor = self.anchor.unwrap_or(self.offset);
-        anchor.min(self.offset)..anchor.max(self.offset)
+    /// The caret as a point of its container.
+    pub fn point(&self) -> NestedPoint {
+        NestedPoint {
+            paragraph: index(&self.address),
+            offset: self.offset,
+        }
     }
+    /// The selection as ordered (start, end) points; `None` when nothing is selected.
+    pub fn span(&self) -> Option<(NestedPoint, NestedPoint)> {
+        let (a, b) = (self.anchor?, self.point());
+        (a != b).then(|| (a.min(b), a.max(b)))
+    }
+    /// The selected range when it lies in the caret paragraph, else empty.
+    pub fn selection(&self) -> std::ops::Range<usize> {
+        match self.span() {
+            Some((a, b)) if a.paragraph == b.paragraph => a.offset..b.offset,
+            _ => self.offset..self.offset,
+        }
+    }
+}
+
+/// The paragraph index of the last path step (the caret paragraph in its container).
+fn index(address: &ContextAddress) -> usize {
+    address.path.last().map_or(0, ContextStep::paragraph)
+}
+
+/// Whether two addresses name paragraphs of the same container.
+fn same_container(a: &ContextAddress, b: &ContextAddress) -> bool {
+    a.section == b.section
+        && a.paragraph == b.paragraph
+        && a.path.len() == b.path.len()
+        && !a.path.is_empty()
+        && a.with_index(0) == b.with_index(0)
 }
 
 /// RHWP path entries `(control, cell, cell paragraph)`; a text box is cell 0.
@@ -89,6 +138,100 @@ impl Session {
     }
     pub fn clear_nested(&mut self) {
         self.nested = None;
+        self.nested_block = None;
+    }
+
+    /// The nested-table cell block, if one is picked.
+    pub fn nested_block(&self) -> Option<&NestedBlock> {
+        self.nested_block.as_ref()
+    }
+    pub fn clear_nested_block(&mut self) {
+        self.nested_block = None;
+    }
+
+    /// The nested table holding the caret's cell and the cell's index in it: the
+    /// paragraph that holds the table, the table's control index and the cell.
+    pub fn nested_table_cell(&self) -> Option<(DocumentAddress, usize, usize)> {
+        let caret = self.nested.as_ref()?;
+        table_cell_of(&caret.address)
+    }
+
+    /// (row, col, row span, col span) of `cell` in the nested table.
+    fn nested_cell_box(
+        &self,
+        host: &DocumentAddress,
+        control: usize,
+        cell: usize,
+    ) -> Option<(u16, u16, u16, u16)> {
+        let v = self.nested_table_info(host, control).ok()?;
+        let c = v["cells"].as_array()?.iter().find(|c| c["index"] == cell)?;
+        let n = |k: &str| c[k].as_u64().map(|v| v as u16);
+        Some((
+            n("row")?,
+            n("col")?,
+            n("rowSpan")?.max(1),
+            n("colSpan")?.max(1),
+        ))
+    }
+
+    /// Page boxes `[x, y, width, height]` of the block's cells on `page`.
+    pub fn nested_block_rects(&self, page: u32) -> Result<Vec<[f64; 4]>> {
+        let Some(block) = &self.nested_block else {
+            return Ok(vec![]);
+        };
+        let key = (self.generation, page, block.clone());
+        if let Some((k, rects)) = self.nested_block_rects.borrow().as_ref()
+            && *k == key
+        {
+            return Ok(rects.clone());
+        }
+        fn visit(
+            node: &hwpcraft_doc::RenderNode,
+            block: &NestedBlock,
+            inside: bool,
+            out: &mut Vec<[f64; 4]>,
+        ) {
+            use hwpcraft_doc::RenderNodeType;
+            let inside = match &node.node_type {
+                RenderNodeType::Table(t) => {
+                    t.section_index == Some(block.host.section)
+                        && t.control_index == Some(block.control)
+                        && t.cell_context.as_ref().is_some_and(|c| {
+                            c.parent_para_index == block.host.paragraph
+                            // The path runs through the host cells and ends at this
+                            // table's own entry.
+                            && c.path.len() == block.host.path.len() + 1
+                            && c.path.last().is_some_and(|e| e.control_index == block.control)
+                            && c.path.iter().zip(&block.host.path).all(|(e, s)| {
+                                e.control_index == s.control
+                                    && e.cell_index == s.cell
+                                    && e.cell_para_index == s.paragraph
+                            })
+                        })
+                }
+                RenderNodeType::TableCell(c) if inside => {
+                    let r = &block.range;
+                    if (r.start_row..=r.end_row).contains(&c.row)
+                        && (r.start_col..=r.end_col).contains(&c.col)
+                    {
+                        let b = &node.bbox;
+                        out.push([b.x, b.y, b.width, b.height]);
+                    }
+                    false
+                }
+                _ => inside,
+            };
+            for child in &node.children {
+                visit(child, block, inside, out);
+            }
+        }
+        let layout = self.page_field_layout()?;
+        let core = layout.as_ref().map_or(&self.core, |layout| &layout.core);
+        let tree = core.build_page_render_tree(page).map_err(err)?;
+        let mut out = Vec::new();
+        visit(&tree.root, block, false, &mut out);
+        *self.nested_block_rects.borrow_mut() = Some((key, out.clone()));
+        Ok(out)
     }
 
     /// Typed address for RHWP path entries: each step is a table cell or a text box,
@@ -197,14 +340,48 @@ impl Session {
         Ok(Some(NestedCaret::new(address, offset)))
     }
 
-    /// Put the nested caret at `caret`; `extend` keeps the anchor when it is the same
-    /// paragraph (a selection does not cross paragraphs here).
+    /// Put the nested caret at `caret`; `extend` keeps the anchor when it is in the
+    /// same container, so a selection may run over its paragraphs.
     pub fn set_nested(&mut self, mut caret: NestedCaret, extend: bool) -> Result<()> {
         let len = self.nested_len(&caret.address)?;
         caret.offset = caret.offset.min(len);
+        // Extending from one cell of a nested table into another picks a cell block,
+        // as dragging over a top-level table's cells does; the caret stays.
+        if extend
+            && let Some(old) = &self.nested
+            && let (Some(from), Some(to)) =
+                (table_cell_of(&old.address), table_cell_of(&caret.address))
+            && from.0 == to.0
+            && from.1 == to.1
+            && from.2 != to.2
+        {
+            let anchor = self
+                .nested_block
+                .as_ref()
+                .filter(|b| b.host == from.0 && b.control == from.1)
+                .map(|_| from.2)
+                .unwrap_or(from.2);
+            if let (Some(a), Some(b)) = (
+                self.nested_cell_box(&from.0, from.1, anchor),
+                self.nested_cell_box(&to.0, to.1, to.2),
+            ) {
+                self.nested_block = Some(NestedBlock {
+                    host: from.0,
+                    control: from.1,
+                    range: crate::ext_table::CellRange {
+                        start_row: a.0.min(b.0),
+                        start_col: a.1.min(b.1),
+                        end_row: (a.0 + a.2 - 1).max(b.0 + b.2 - 1),
+                        end_col: (a.1 + a.3 - 1).max(b.1 + b.3 - 1),
+                    },
+                });
+                return Ok(());
+            }
+        }
+        self.nested_block = None;
         caret.anchor = match &self.nested {
-            Some(old) if extend && old.address == caret.address => {
-                Some(old.anchor.unwrap_or(old.offset))
+            Some(old) if extend && same_container(&old.address, &caret.address) => {
+                Some(old.anchor.unwrap_or(old.point()))
             }
             _ => None,
         };
@@ -236,13 +413,81 @@ impl Session {
         Ok(())
     }
 
+    /// Delete a selection that runs over paragraphs: the tail of the first, the
+    /// paragraphs between and the head of the last, joined into the first, as one
+    /// undo step. The caret goes to the start of the selection.
+    fn nested_delete_span(&mut self, start: NestedPoint, end: NestedPoint) -> Result<()> {
+        let caret = self.nested_or_err()?;
+        let first = caret.address.with_index(start.paragraph);
+        self.transaction(|s| {
+            let edit = |s: &mut Self, command: &str, mut params: Value| -> Result<Value> {
+                params["expected_generation"] = json!(s.generation);
+                s.run(command, params)
+            };
+            let clear = |s: &mut Self, address: &ContextAddress, from: usize, to: usize| {
+                if from < to {
+                    edit(
+                        s,
+                        "context.v2.replace",
+                        json!({"address":address,"start":from,"end":to,"text":""}),
+                    )?;
+                }
+                Ok::<_, anyhow::Error>(())
+            };
+            // Back to front, so earlier offsets stay valid: the head of the last
+            // paragraph, the paragraphs between, then the tail of the first.
+            clear(s, &caret.address.with_index(end.paragraph), 0, end.offset)?;
+            for k in (start.paragraph + 1..end.paragraph).rev() {
+                let address = caret.address.with_index(k);
+                let len = s.nested_len(&address)?;
+                clear(s, &address, 0, len)?;
+            }
+            let len = s.nested_len(&first)?;
+            clear(s, &first, start.offset, len)?;
+            for _ in start.paragraph..end.paragraph {
+                let next = caret.address.with_index(start.paragraph + 1);
+                edit(s, "context.v2.merge", json!({ "address": next }))?;
+            }
+            Ok(())
+        })?;
+        self.nested = Some(NestedCaret::new(first, start.offset));
+        Ok(())
+    }
+
+    /// Delete the selection if there is one; `true` when something was selected.
+    fn nested_delete_selection(&mut self) -> Result<bool> {
+        let caret = self.nested_or_err()?;
+        match caret.span() {
+            None => Ok(false),
+            Some((a, b)) if a.paragraph == b.paragraph => {
+                let address = caret.address.with_index(a.paragraph);
+                self.nested = Some(NestedCaret::new(address, a.offset));
+                self.nested_replace(a.offset..b.offset, "")?;
+                Ok(true)
+            }
+            Some((a, b)) => {
+                self.nested_delete_span(a, b)?;
+                Ok(true)
+            }
+        }
+    }
+
     /// Type `text` at the caret, replacing the selection; line breaks split paragraphs.
     pub fn nested_insert(&mut self, text: &str) -> Result<()> {
         let mut lines = text.split('\n');
         let first = lines.next().unwrap_or_default().trim_end_matches('\r');
         let caret = self.nested_or_err()?;
         let range = caret.selection();
-        if !range.is_empty() || !first.is_empty() {
+        if caret
+            .span()
+            .is_some_and(|(a, b)| a.paragraph != b.paragraph)
+        {
+            self.nested_delete_selection()?;
+            if !first.is_empty() {
+                let at = self.nested_or_err()?.offset;
+                self.nested_replace(at..at, first)?;
+            }
+        } else if !range.is_empty() || !first.is_empty() {
             self.nested_replace(range, first)?;
         }
         for line in lines {
@@ -259,11 +504,10 @@ impl Session {
     /// Backspace: the selection, the character before the caret, or a merge with the
     /// previous paragraph of the same container.
     pub fn nested_backspace(&mut self) -> Result<()> {
-        let caret = self.nested_or_err()?;
-        let range = caret.selection();
-        if !range.is_empty() {
-            return self.nested_replace(range, "");
+        if self.nested_delete_selection()? {
+            return Ok(());
         }
+        let caret = self.nested_or_err()?;
         if caret.offset > 0 {
             return self.nested_replace(caret.offset - 1..caret.offset, "");
         }
@@ -285,11 +529,10 @@ impl Session {
     /// Delete: the selection, the character after the caret, or a merge of the next
     /// paragraph of the same container into this one.
     pub fn nested_delete(&mut self) -> Result<()> {
-        let caret = self.nested_or_err()?;
-        let range = caret.selection();
-        if !range.is_empty() {
-            return self.nested_replace(range, "");
+        if self.nested_delete_selection()? {
+            return Ok(());
         }
+        let caret = self.nested_or_err()?;
         let (paragraph, count) = self.nested_paragraph(&caret.address)?;
         let len = paragraph.text.chars().count();
         if caret.offset < len {
@@ -310,11 +553,7 @@ impl Session {
 
     /// Enter: delete the selection, then split the paragraph at the caret.
     pub fn nested_enter(&mut self) -> Result<()> {
-        let caret = self.nested_or_err()?;
-        let range = caret.selection();
-        if !range.is_empty() {
-            self.nested_replace(range, "")?;
-        }
+        self.nested_delete_selection()?;
         let caret = self.nested_or_err()?;
         let generation = self.generation;
         let result = self.run(
@@ -339,12 +578,12 @@ impl Session {
         let mut next = caret.clone();
         match motion {
             Motion::Left if caret.offset > 0 => next.offset -= 1,
-            Motion::Left if index > 0 && !extend => {
+            Motion::Left if index > 0 => {
                 next.address = caret.address.with_index(index - 1);
                 next.offset = self.nested_len(&next.address)?;
             }
             Motion::Right if caret.offset < len => next.offset += 1,
-            Motion::Right if index + 1 < count && !extend => {
+            Motion::Right if index + 1 < count => {
                 next.address = caret.address.with_index(index + 1);
                 next.offset = 0;
             }
@@ -394,7 +633,7 @@ impl Session {
                 let moved = hit_path(&v)?;
                 let address =
                     self.nested_address(caret.address.section, caret.address.paragraph, &moved)?;
-                if extend && address != caret.address {
+                if extend && !same_container(&address, &caret.address) {
                     return Ok(());
                 }
                 next.address = address;
@@ -406,14 +645,11 @@ impl Session {
         if !matches!(motion, Motion::Up | Motion::Down) {
             next.preferred_x = None;
         }
-        next.anchor = if extend {
-            Some(caret.anchor.unwrap_or(caret.offset))
+        next.anchor = if extend && same_container(&next.address, &caret.address) {
+            Some(caret.anchor.unwrap_or(caret.point()))
         } else {
             None
         };
-        if next.address != caret.address {
-            next.anchor = None;
-        }
         self.nested = Some(next);
         Ok(())
     }
@@ -468,8 +704,12 @@ impl Session {
         while end < chars.len() && editing::class(chars[end]) == kind {
             end += 1;
         }
+        let paragraph = index(&caret.address);
         self.nested = Some(NestedCaret {
-            anchor: Some(start),
+            anchor: Some(NestedPoint {
+                paragraph,
+                offset: start,
+            }),
             ..NestedCaret::new(caret.address, end)
         });
         Ok(())
@@ -479,8 +719,12 @@ impl Session {
     pub fn nested_select_paragraph(&mut self) -> Result<()> {
         let caret = self.nested_or_err()?;
         let len = self.nested_len(&caret.address)?;
+        let paragraph = index(&caret.address);
         self.nested = Some(NestedCaret {
-            anchor: Some(0),
+            anchor: Some(NestedPoint {
+                paragraph,
+                offset: 0,
+            }),
             ..NestedCaret::new(caret.address, len)
         });
         Ok(())
@@ -535,12 +779,10 @@ impl Session {
     /// Selection rectangles `[{pageIndex, x, y, width, height}]` in page pixels.
     pub fn nested_selection_rects(&self) -> Result<Vec<Value>> {
         let caret = self.nested_or_err()?;
-        let range = caret.selection();
-        if range.is_empty() {
+        let Some((start, end)) = caret.span() else {
             return Ok(vec![]);
-        }
+        };
         let mut path = triples(&caret.address)?;
-        let index = path.last().map_or(0, |step| step.2);
         // The path names the container; the range carries the paragraph.
         if let Some(last) = path.last_mut() {
             last.2 = 0;
@@ -553,10 +795,10 @@ impl Session {
                     caret.address.section,
                     caret.address.paragraph,
                     &path_json(&path),
-                    index,
-                    range.start,
-                    index,
-                    range.end,
+                    start.paragraph,
+                    start.offset,
+                    end.paragraph,
+                    end.offset,
                     None,
                 )
                 .map_err(err)?,
@@ -564,34 +806,60 @@ impl Session {
         Ok(v.as_array().cloned().unwrap_or_default())
     }
 
-    /// The selected text of the nested caret paragraph.
+    /// The selected text, paragraphs joined by line breaks.
     pub fn nested_selected_text(&self) -> Result<String> {
+        let mut lines = Vec::new();
+        for (address, from, to) in self.nested_ranges(false)? {
+            let text = &self.nested_paragraph(&address)?.0.text;
+            lines.push(text.chars().skip(from).take(to - from).collect::<String>());
+        }
+        Ok(lines.join("\n"))
+    }
+
+    /// The paragraphs of the selection with the character range in each. Without a
+    /// selection: the whole caret paragraph when `whole`, else nothing.
+    fn nested_ranges(&self, whole: bool) -> Result<Vec<(ContextAddress, usize, usize)>> {
         let caret = self.nested_or_err()?;
-        let range = caret.selection();
-        let (paragraph, _) = self.nested_paragraph(&caret.address)?;
-        Ok(paragraph
-            .text
-            .chars()
-            .skip(range.start)
-            .take(range.len())
-            .collect())
+        let Some((start, end)) = caret.span() else {
+            if !whole {
+                return Ok(vec![]);
+            }
+            let len = self.nested_len(&caret.address)?;
+            return Ok(vec![(caret.address, 0, len)]);
+        };
+        (start.paragraph..=end.paragraph)
+            .map(|k| {
+                let address = caret.address.with_index(k);
+                let len = self.nested_len(&address)?;
+                let from = if k == start.paragraph {
+                    start.offset
+                } else {
+                    0
+                };
+                let to = if k == end.paragraph { end.offset } else { len };
+                Ok((address, from.min(len), to.min(len).max(from.min(len))))
+            })
+            .collect()
     }
 
     /// Character format for the selection, or the whole paragraph without one.
     pub fn nested_character(&mut self, format: Value) -> Result<()> {
         let caret = self.nested_or_err()?;
-        let range = caret.selection();
-        let (start, end) = if range.is_empty() {
-            (0, self.nested_len(&caret.address)?)
-        } else {
-            (range.start, range.end)
-        };
-        let generation = self.generation;
-        self.run(
-            "context.v2.character",
-            json!({"address":caret.address,"start":start,"end":end,"format":format,
-                   "expected_generation":generation}),
-        )?;
+        let ranges = self.nested_ranges(true)?;
+        self.transaction(|s| {
+            for (address, start, end) in ranges {
+                if start == end && s.nested_len(&address)? > 0 {
+                    continue;
+                }
+                let generation = s.generation;
+                s.run(
+                    "context.v2.character",
+                    json!({"address":address,"start":start,"end":end,"format":format,
+                           "expected_generation":generation}),
+                )?;
+            }
+            Ok(())
+        })?;
         self.nested = Some(caret);
         Ok(())
     }
@@ -599,13 +867,45 @@ impl Session {
     /// Paragraph format for the caret paragraph.
     pub fn nested_paragraph_format(&mut self, format: Value) -> Result<()> {
         let caret = self.nested_or_err()?;
-        let generation = self.generation;
-        self.run(
-            "context.v2.paragraph",
-            json!({"address":caret.address,"format":format,"expected_generation":generation}),
-        )?;
+        let ranges = self.nested_ranges(true)?;
+        self.transaction(|s| {
+            for (address, ..) in ranges {
+                let generation = s.generation;
+                s.run(
+                    "context.v2.paragraph",
+                    json!({"address":address,"format":format,"expected_generation":generation}),
+                )?;
+            }
+            Ok(())
+        })?;
         self.nested = Some(caret);
         Ok(())
+    }
+
+    /// The character shape at the nested caret, for the format queries the dialogs
+    /// read: the start of the selection, or the character before the caret (the
+    /// first one at a paragraph start). `None` without a nested caret.
+    pub(crate) fn nested_char_shape_id(&self) -> Result<Option<u16>> {
+        let Some(caret) = &self.nested else {
+            return Ok(None);
+        };
+        let (address, offset) = match caret.span() {
+            Some((start, _)) => (caret.address.with_index(start.paragraph), start.offset),
+            None => (caret.address.clone(), caret.offset.saturating_sub(1)),
+        };
+        let paragraph = self.nested_paragraph(&address)?.0;
+        let id = paragraph.char_shape_id_at(offset).unwrap_or(0);
+        Ok(Some(u16::try_from(id).unwrap_or(0)))
+    }
+
+    /// The section and paragraph shape of the nested caret paragraph; `None` without
+    /// a nested caret.
+    pub(crate) fn nested_para_shape_id(&self) -> Result<Option<(usize, u16)>> {
+        let Some(caret) = &self.nested else {
+            return Ok(None);
+        };
+        let paragraph = self.nested_paragraph(&caret.address)?.0;
+        Ok(Some((caret.address.section, paragraph.para_shape_id)))
     }
 
     /// After undo/redo or another edit: keep the caret only while its paragraph exists.
@@ -617,12 +917,59 @@ impl Session {
             Ok(len) => {
                 let mut caret = caret;
                 caret.offset = caret.offset.min(len);
-                caret.anchor = caret.anchor.map(|a| a.min(len));
+                caret.anchor = caret.anchor.and_then(|a| {
+                    let len = self
+                        .nested_len(&caret.address.with_index(a.paragraph))
+                        .ok()?;
+                    Some(NestedPoint {
+                        offset: a.offset.min(len),
+                        ..a
+                    })
+                });
                 self.nested = Some(caret);
             }
-            Err(_) => self.nested = None,
+            Err(_) => {
+                self.nested = None;
+                self.nested_block = None;
+            }
         }
     }
+}
+
+/// The cell paragraph holding the table (as a `DocumentAddress`), the table's
+/// control index and the cell index, when `address` names a nested table cell.
+fn table_cell_of(address: &ContextAddress) -> Option<(DocumentAddress, usize, usize)> {
+    let (last, before) = address.path.split_last()?;
+    let ContextStep::TableCell { control, cell, .. } = last else {
+        return None;
+    };
+    if before.is_empty() {
+        return None;
+    }
+    let path = before
+        .iter()
+        .map(|step| match step {
+            ContextStep::TableCell {
+                control,
+                cell,
+                paragraph,
+            } => Some(crate::contexts::CellStep {
+                control: *control,
+                cell: *cell,
+                paragraph: *paragraph,
+            }),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((
+        DocumentAddress {
+            section: address.section,
+            paragraph: address.paragraph,
+            path,
+        },
+        *control,
+        *cell,
+    ))
 }
 
 fn hit_path(v: &Value) -> Result<Vec<(usize, usize, usize)>> {

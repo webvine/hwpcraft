@@ -1,0 +1,387 @@
+diff --git a/src/renderer/float_placement.rs b/src/renderer/float_placement.rs
+index 0e850ea..12f208c 100644
+--- a/src/renderer/float_placement.rs
++++ b/src/renderer/float_placement.rs
+@@ -3779,6 +3779,51 @@ pub(crate) fn square_float_outer_margin_top_hu(table: &Table) -> Option<i32> {
+     Some(i32::from(table.outer_margin_top))
+ }
+ 
++/// 왼쪽 정렬 **글 앞으로/글 뒤로** 표의 왼쪽 바깥여백 (HU).
++///
++/// 그림(#6596)과 같이 저장 오프셋은 바깥 여백 상자의 왼끝을 가리키고 표는 거기서
++/// `outMargin.left` 만큼 안쪽에 그려진다. 정본 실측(samples↔pdf 한컴 PDF, 10문서
++/// 표 53개): 문단(`issue4514` 141HU → +1.36pt, `issue7015` 140HU, `issue7500`)·단
++/// (`2025 행정업무운영 편람` 140HU → +1.05..1.13pt, `issue6969` 283HU → +2.62pt)·
++/// 용지(`issue2217` 852HU → +8.47pt) 기준 모두 같다. 쪽 기준과 가운데·오른쪽 정렬은
++/// 실측이 없어 열지 않는다.
++pub(crate) fn overlay_float_outer_margin_left_hu(table: &Table) -> Option<i32> {
++    if !matches!(
++        table.common.text_wrap,
++        TextWrap::BehindText | TextWrap::InFrontOfText
++    ) || table.common.treat_as_char
++        || !matches!(
++            table.common.horz_rel_to,
++            HorzRelTo::Para | HorzRelTo::Column | HorzRelTo::Paper
++        )
++        || !matches!(table.common.horz_align, HorzAlign::Left | HorzAlign::Inside)
++        || table.outer_margin_left <= 0
++    {
++        return None;
++    }
++    Some(i32::from(table.outer_margin_left))
++}
++
++/// 문단 기준 위 정렬 **글 앞으로/글 뒤로** 표의 위쪽 바깥여백 (HU).
++///
++/// 가로 [`overlay_float_outer_margin_left_hu`] 의 세로판이다. 같은 실측에서 표 위끝이
++/// 문단 기준 오프셋 아래 `outMargin.top` 만큼 내려와 있다(141HU → +1.0..1.34pt,
++/// 283HU → +2.68..2.77pt). 용지·쪽 기준은 `absolute_table_vertical_geometry` 가 이미
++/// 위 여백을 싣는다(`issue2217` 세로 차 0).
++pub(crate) fn overlay_float_outer_margin_top_hu(table: &Table) -> Option<i32> {
++    if !matches!(
++        table.common.text_wrap,
++        TextWrap::BehindText | TextWrap::InFrontOfText
++    ) || table.common.treat_as_char
++        || !matches!(table.common.vert_rel_to, VertRelTo::Para)
++        || !matches!(table.common.vert_align, VertAlign::Top | VertAlign::Inside)
++        || table.outer_margin_top <= 0
++    {
++        return None;
++    }
++    Some(i32::from(table.outer_margin_top))
++}
++
+ pub(crate) fn topbottom_float_outer_margin_left_hu(table: &Table) -> Option<i32> {
+     if !matches!(table.common.text_wrap, TextWrap::TopAndBottom)
+         || table.common.treat_as_char
+diff --git a/src/renderer/layout/shape_layout.rs b/src/renderer/layout/shape_layout.rs
+index 5cf20b8..b5957a9 100644
+--- a/src/renderer/layout/shape_layout.rs
++++ b/src/renderer/layout/shape_layout.rs
+@@ -913,12 +913,12 @@ impl LayoutEngine {
+             );
+             // [#5808] 어울림(Square) **도형**의 왼쪽 바깥여백은 한글이 가로 위치에
+             // 가산한다 (156518601 1쪽 묶음: 오프셋 29138+여백 566 HU = 471.6px,
+-            // 한글 실측 471.3 — 미가산이면 7.2px 왼쪽). 그림은 반대 계약이 이미
+-            // 핀돼 있다(#3821: 그림의 om_left 는 wrap 간격이지 위치 이동이 아님) —
+-            // 그림 경로가 함께 쓰는 compute_object_position 이 아니라 도형 호출부
+-            // 에서만 가산한다. 실측이 Left 정렬뿐이라 Center/Right 는 종전 유지.
++            // 한글 실측 471.3 — 미가산이면 7.2px 왼쪽). 그림(#6596)·글 앞/뒤 표처럼
++            // 바깥 여백은 본문과의 배치와 무관하게 개체 상자의 일부라, 왼쪽 정렬
++            // 도형은 배치마다 왼쪽 여백만큼 안쪽에 그린다(글 앞 글상자 기본 1 mm 를
++            // 한글 2024 가 여백만큼 오른쪽·아래에 그림). 실측이 왼쪽·위 정렬뿐이라
++            // 가운데·오른쪽·아래 정렬은 종전 유지(위 여백은 아래 세로 클램프 뒤에 더함).
+             if !common.treat_as_char
+-                && matches!(common.text_wrap, crate::model::shape::TextWrap::Square)
+                 && matches!(
+                     common.horz_align,
+                     crate::model::shape::HorzAlign::Left | crate::model::shape::HorzAlign::Inside
+@@ -928,6 +928,16 @@ impl LayoutEngine {
+             }
+             (x, y)
+         };
++        let margin_top_inset = if inline_pos.is_none()
++            && !common.treat_as_char
++            && matches!(
++                common.vert_align,
++                crate::model::shape::VertAlign::Top | crate::model::shape::VertAlign::Inside
++            ) {
++            hwpunit_to_px(i32::from(common.margin.top), self.dpi)
++        } else {
++            0.0
++        };
+ 
+         // 캡션 높이 및 간격 계산
+         let caption_opt = shape_caption_for_layout(shape);
+@@ -970,10 +980,15 @@ impl LayoutEngine {
+                 } else {
+                     0.0
+                 };
+-            let body_bottom = col_area.y + col_area.height - total_h;
+-            shape_y.min(body_bottom.max(col_area.y))
++            // 그림(`layout_body_picture`)처럼 위·아래 바깥 여백을 포함한 상자를 단 안에 둔다.
++            let margin_box = hwpunit_to_px(
++                i32::from(common.margin.top) + i32::from(common.margin.bottom),
++                self.dpi,
++            );
++            let body_bottom = col_area.y + col_area.height - total_h - margin_box;
++            shape_y.min(body_bottom.max(col_area.y)) + margin_top_inset
+         } else {
+-            shape_y
++            shape_y + margin_top_inset
+         };
+         let adjusted_shape_x = shape_x + caption_left_offset;
+         let adjusted_shape_y = shape_y + caption_top_offset;
+@@ -4683,3 +4698,231 @@ mod tests {
+         assert_eq!(para.line_segs[0].segment_width, px_to_hwpunit(80.0, 96.0));
+     }
+ }
++
++#[cfg(test)]
++mod outer_margin_box_tests {
++    //! 바깥 여백은 개체 상자의 일부다: 저장 오프셋은 여백을 포함한 상자를 가리키고,
++    //! 한글은 개체를 왼쪽·위 여백만큼 안쪽에 그린다(그림 #6596 과 같은 규칙).
++    use super::super::super::hwpunit_to_px;
++    use super::super::super::render_tree::{BoundingBox, RenderNode};
++    use crate::document_core::DocumentCore;
++    use crate::model::control::Control;
++
++    const DPI: f64 = 96.0;
++
++    fn first_box(node: &RenderNode, kind: &str) -> Option<BoundingBox> {
++        let name = serde_json::to_value(&node.node_type)
++            .ok()
++            .and_then(|v| v.as_object().and_then(|o| o.keys().next().cloned()));
++        if name.as_deref() == Some(kind) {
++            return Some(node.bbox);
++        }
++        node.children.iter().find_map(|c| first_box(c, kind))
++    }
++
++    fn page_box(core: &DocumentCore, kind: &str) -> BoundingBox {
++        let tree = core.build_page_render_tree(0).expect("render page");
++        first_box(&tree.root, kind).expect("object node")
++    }
++
++    fn ctrl_of(res: &str) -> (usize, usize) {
++        let field = |key: &str| {
++            res.split(key)
++                .nth(1)
++                .and_then(|s| {
++                    s.split(|c: char| !c.is_ascii_digit())
++                        .find(|t| !t.is_empty())
++                })
++                .and_then(|s| s.parse::<usize>().ok())
++                .expect("index in result")
++        };
++        (field("\"paraIdx\":"), field("\"controlIdx\":"))
++    }
++
++    fn margins(m: i16) -> String {
++        format!(
++            r#""outerMarginLeft":{m},"outerMarginTop":{m},"outerMarginRight":{m},"outerMarginBottom":{m}"#
++        )
++    }
++
++    fn core_with_text() -> DocumentCore {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        core.insert_text_native(0, 0, 0, "바깥 여백 상자 확인용 문단입니다.")
++            .unwrap();
++        core
++    }
++
++    #[test]
++    fn a_left_top_text_box_is_drawn_inside_its_outer_margin_in_every_wrap() {
++        let mut core = core_with_text();
++        let res = core
++            .create_shape_control_native(
++                0,
++                0,
++                0,
++                11339,
++                5669,
++                5000,
++                6000,
++                false,
++                "InFrontOfText",
++                "textbox",
++                false,
++                false,
++                &[],
++            )
++            .unwrap();
++        let (para, ctrl) = ctrl_of(&res);
++        for wrap in ["InFrontOfText", "BehindText", "Square", "TopAndBottom"] {
++            core.set_shape_properties_native(
++                0,
++                para,
++                ctrl,
++                &format!(r#"{{"textWrap":"{wrap}",{}}}"#, margins(0)),
++            )
++            .unwrap();
++            let bare = page_box(&core, "Rectangle");
++            assert!(
++                (bare.x - hwpunit_to_px(5000, DPI)).abs() < 0.01,
++                "{wrap}: {bare:?}"
++            );
++            assert!(
++                (bare.y - hwpunit_to_px(6000, DPI)).abs() < 0.01,
++                "{wrap}: {bare:?}"
++            );
++            core.set_shape_properties_native(0, para, ctrl, &format!("{{{}}}", margins(283)))
++                .unwrap();
++            let boxed = page_box(&core, "Rectangle");
++            assert!(
++                (boxed.x - bare.x - hwpunit_to_px(283, DPI)).abs() < 0.01,
++                "{wrap}: {bare:?} -> {boxed:?}"
++            );
++            assert!(
++                (boxed.y - bare.y - hwpunit_to_px(283, DPI)).abs() < 0.01,
++                "{wrap}: {bare:?} -> {boxed:?}"
++            );
++            assert_eq!((boxed.width, boxed.height), (bare.width, bare.height));
++        }
++    }
++
++    #[test]
++    fn a_shape_kept_in_the_column_keeps_its_bottom_margin_inside_too() {
++        // 쪽 영역 안으로 제한된 문단 기준 도형은 그림처럼 위·아래 여백을 포함한 상자가
++        // 단 안에 들어오도록 끌어올린다.
++        let mut core = core_with_text();
++        let res = core
++            .create_shape_control_native(
++                0,
++                0,
++                0,
++                11339,
++                5669,
++                5000,
++                6000,
++                false,
++                "InFrontOfText",
++                "textbox",
++                false,
++                false,
++                &[],
++            )
++            .unwrap();
++        let (para, ctrl) = ctrl_of(&res);
++        let props = |bottom: i16| {
++            format!(
++                r#"{{"vertRelTo":"Para","vertAlign":"Top","restrictInPage":true,"vertOffset":200000,"outerMarginLeft":283,"outerMarginTop":283,"outerMarginRight":283,"outerMarginBottom":{bottom}}}"#
++            )
++        };
++        core.set_shape_properties_native(0, para, ctrl, &props(0))
++            .unwrap();
++        let bare = page_box(&core, "Rectangle");
++        core.set_shape_properties_native(0, para, ctrl, &props(1000))
++            .unwrap();
++        let boxed = page_box(&core, "Rectangle");
++        assert!(
++            (bare.y - boxed.y - hwpunit_to_px(1000, DPI)).abs() < 0.01,
++            "{bare:?} -> {boxed:?}"
++        );
++    }
++
++    #[test]
++    fn right_and_bottom_aligned_shapes_keep_their_position() {
++        // 오른쪽·아래 정렬 도형은 한글 실측이 없어 종전 위치를 지킨다.
++        let mut core = core_with_text();
++        let res = core
++            .create_shape_control_native(
++                0,
++                0,
++                0,
++                11339,
++                5669,
++                5000,
++                6000,
++                false,
++                "InFrontOfText",
++                "rectangle",
++                false,
++                false,
++                &[],
++            )
++            .unwrap();
++        let (para, ctrl) = ctrl_of(&res);
++        core.set_shape_properties_native(
++            0,
++            para,
++            ctrl,
++            &format!(
++                r#"{{"horzAlign":"Right","vertAlign":"Bottom",{}}}"#,
++                margins(0)
++            ),
++        )
++        .unwrap();
++        let bare = page_box(&core, "Rectangle");
++        core.set_shape_properties_native(0, para, ctrl, &format!("{{{}}}", margins(283)))
++            .unwrap();
++        let boxed = page_box(&core, "Rectangle");
++        assert!((boxed.x - bare.x).abs() < 0.01 && (boxed.y - bare.y).abs() < 0.01);
++    }
++
++    #[test]
++    fn an_overlay_table_is_drawn_inside_its_outer_margin() {
++        for (wrap, rel) in [
++            ("InFrontOfText", "Para"),
++            ("BehindText", "Para"),
++            ("InFrontOfText", "Column"),
++        ] {
++            let mut core = core_with_text();
++            let res = core.create_table_native(0, 0, 0, 2, 2).unwrap();
++            let (para, ctrl) = ctrl_of(&res);
++            let props = format!(
++                r#"{{"treatAsChar":false,"textWrap":"{wrap}","vertRelTo":"Para","horzRelTo":"{rel}","horzAlign":"Left","vertAlign":"Top","horzOffset":2000,"vertOffset":1000}}"#
++            );
++            // 표 조판은 `outer_margin_*` 를 읽는다(`outerLeft` 속성은 공통 여백만 바꾼다).
++            let mut layout_with_margin = |m: i16| {
++                let Control::Table(t) =
++                    &mut core.document.sections[0].paragraphs[para].controls[ctrl]
++                else {
++                    panic!("table control");
++                };
++                t.outer_margin_left = m;
++                t.outer_margin_top = m;
++                t.outer_margin_right = m;
++                t.outer_margin_bottom = m;
++                core.set_table_properties_native(0, para, ctrl, &props)
++                    .unwrap();
++                page_box(&core, "Table")
++            };
++            let bare = layout_with_margin(0);
++            let boxed = layout_with_margin(283);
++            assert!(
++                (boxed.x - bare.x - hwpunit_to_px(283, DPI)).abs() < 0.01,
++                "{wrap}/{rel}: {bare:?} -> {boxed:?}"
++            );
++            assert!(
++                (boxed.y - bare.y - hwpunit_to_px(283, DPI)).abs() < 0.01,
++                "{wrap}/{rel}: {bare:?} -> {boxed:?}"
++            );
++        }
++    }
++}
+diff --git a/src/renderer/layout/table_layout.rs b/src/renderer/layout/table_layout.rs
+index 49a3a15..2dd3957 100644
+--- a/src/renderer/layout/table_layout.rs
++++ b/src/renderer/layout/table_layout.rs
+@@ -18,8 +18,9 @@ use crate::model::paragraph::Paragraph;
+ use crate::model::style::{Alignment, BorderLine, CenterLine};
+ use crate::model::table::{TablePageBreak, VerticalAlign};
+ use crate::renderer::float_placement::{
+-    original_hwpx_column_rowbreak_equal_outer_margin_hu, signed_hwpunit,
+-    topbottom_float_outer_margin_left_hu, topbottom_flow_vertical_offset_hu,
++    original_hwpx_column_rowbreak_equal_outer_margin_hu, overlay_float_outer_margin_left_hu,
++    overlay_float_outer_margin_top_hu, signed_hwpunit, topbottom_float_outer_margin_left_hu,
++    topbottom_flow_vertical_offset_hu,
+ };
+ 
+ const ROWBREAK_OBJECT_BOTTOM_BLEED_TOLERANCE_PX: f64 = 64.0;
+@@ -5327,8 +5328,12 @@ impl LayoutEngine {
+                     (col_area.x + om_l, col_area.width)
+                 }
+             };
++            // 글 앞으로/글 뒤로 표도 저장 오프셋이 바깥 여백 상자를 가리킨다.
++            let overlay_om_l = overlay_float_outer_margin_left_hu(table)
++                .map(|hu| hwpunit_to_px(hu, self.dpi))
++                .unwrap_or(0.0);
+             match horz_align {
+-                HorzAlign::Left | HorzAlign::Inside => ref_x + h_offset,
++                HorzAlign::Left | HorzAlign::Inside => ref_x + h_offset + overlay_om_l,
+                 HorzAlign::Center => ref_x + (ref_w - table_width).max(0.0) / 2.0 + h_offset,
+                 // Task #347: picture_footnote.rs:185와 동일하게 - h_offset (오른쪽 끝에서 안쪽으로 오프셋).
+                 HorzAlign::Right | HorzAlign::Outside => {
+@@ -5565,8 +5570,10 @@ impl LayoutEngine {
+             // [#6598] `Para` 도 저장 기준점으로 옮긴 경우에는 바깥여백 위를 더한다 —
+             // 한/글 실측 171.5 = 저장 상단 138.4 + v_offset 31.41 + om_top 1.88.
+             // 기준점을 안 옮긴 문단 기준 표는 종전대로 0 이다(근거 없이 넓히지 않는다).
++            // 글 앞으로/글 뒤로 문단 기준 표도 위 여백 아래에 그린다.
+             let om_top_px = if matches!(vert_rel_to, crate::model::shape::VertRelTo::Paper)
+                 || para_stored_anchor_y.is_some()
++                || overlay_float_outer_margin_top_hu(table).is_some()
+             {
+                 hwpunit_to_px(table.outer_margin_top as i32, self.dpi)
+             } else {

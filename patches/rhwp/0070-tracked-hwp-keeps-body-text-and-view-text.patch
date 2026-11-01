@@ -1,0 +1,257 @@
+diff --git a/src/parser/mod.rs b/src/parser/mod.rs
+index e4467db..79e1a6c 100644
+--- a/src/parser/mod.rs
++++ b/src/parser/mod.rs
+@@ -457,6 +457,7 @@ fn parse_hwp_with_cfb(
+ 
+     // 4. BodyText 섹션별 파싱
+     let section_count = cfb.section_count();
++    let mut view_streams = Vec::new();
+     let sections = parse_sections_strict(
+         &mut cfb,
+         section_count,
+@@ -465,6 +466,7 @@ fn parse_hwp_with_cfb(
+         encrypted,
+         password,
+         &mut decompression_budget,
++        &mut view_streams,
+     )?;
+ 
+     // 5-7. 미리보기, BinData, 추가 스트림
+@@ -479,13 +481,15 @@ fn parse_hwp_with_cfb(
+         encrypted,
+         password,
+     );
+-    let extra_streams = collect_extra_streams(
++    let mut extra_streams = collect_extra_streams(
+         &mut cfb,
+         &doc_info.bin_data_list,
+         &bin_data_content,
+         encrypted,
+         password,
+     );
++    // [HwpCraft 0070] 원본 ViewText — 손대지 않은 구역만 저장기가 다시 쓴다.
++    extra_streams.extend(view_streams);
+ 
+     // Document 조립
+     let model_header = ModelFileHeader {
+@@ -821,10 +825,12 @@ fn parse_sections_strict(
+     encrypted: bool,
+     password: Option<&[u8]>,
+     decompression_budget: &mut Hwp5DocumentOpenDecompressionBudget,
++    view_streams: &mut Vec<(String, Vec<u8>)>,
+ ) -> Result<Vec<crate::model::document::Section>, ParseError> {
+     let mut sections = Vec::new();
+ 
+     for i in 0..section_count {
++        let mut tracked_body: Option<Vec<u8>> = None;
+         let section_output_limit = decompression_budget.stream_limit();
+         let section_raw_limit = decompression_budget.raw_stream_limit();
+         let section_data = if distribution {
+@@ -852,12 +858,38 @@ fn parse_sections_strict(
+         } else {
+             // [#5169] 비배포 문서라도 정상 복호되는 ViewText 가 있으면 한글이 렌더하는
+             // 본문이므로 우선한다. 복호 실패·스텁이면 BodyText 로 폴백한다.
+-            let rendered = cfb
++            let view_raw = cfb
+                 .read_viewtext_section_raw_limited(i, section_raw_limit)
+-                .ok()
++                .ok();
++            let rendered = view_raw
++                .clone()
+                 .and_then(|raw| decode_rendered_viewtext(raw, compressed, section_output_limit));
+             match rendered {
+-                Some(decoded) => decoded,
++                Some(decoded) => {
++                    // [HwpCraft 0070] 변경 추적 등으로 갈라진 문서: 모델은 ViewText(삭제 글과
++                    // 변경 범위 태그가 있는 쪽)로 읽지만, 한글의 결과본은 BodyText 다. 손대지
++                    // 않은 구역을 저장할 때 둘 다 원래대로 쓰도록 원본 BodyText(복호)를
++                    // raw_stream 으로, 원본 ViewText 스트림을 추가 스트림으로 둔다. 암호 문서의
++                    // ViewText 는 암호문이라 그대로 옮기지 않는다.
++                    if !encrypted {
++                        if let Some(view) = view_raw {
++                            let body = cfb
++                                .read_body_text_section_raw_limited(i, section_raw_limit)
++                                .and_then(|raw| {
++                                    cfb_reader::decode_stream_limited(
++                                        raw,
++                                        compressed,
++                                        section_output_limit,
++                                    )
++                                });
++                            if let Ok(body) = body {
++                                tracked_body = Some(body);
++                                view_streams.push((format!("/ViewText/Section{i}"), view));
++                            }
++                        }
++                    }
++                    decoded
++                }
+                 None => {
+                     let raw = cfb
+                         .read_body_text_section_raw_limited(i, section_raw_limit)
+@@ -874,7 +906,7 @@ fn parse_sections_strict(
+         match body_text::parse_body_text_section(&section_data) {
+             Ok(mut section) => {
+                 // 원본 BodyText 스트림 보존 (라운드트립용)
+-                section.raw_stream = Some(section_data);
++                section.raw_stream = Some(tracked_body.take().unwrap_or(section_data));
+                 sections.push(section);
+             }
+             Err(e @ body_text::BodyTextError::DrawingTextStructure(_)) => {
+@@ -946,8 +978,10 @@ fn parse_hwp_with_lenient(
+     // BodyText 섹션별 파싱
+     let section_count = lenient.section_count();
+     let mut sections = Vec::new();
++    let mut view_streams: Vec<(String, Vec<u8>)> = Vec::new();
+ 
+     for i in 0..section_count {
++        let mut tracked_body: Option<Vec<u8>> = None;
+         let section_output_limit = decompression_budget.stream_limit();
+         let section_raw_limit = decompression_budget.raw_stream_limit();
+         let section_data = if distribution {
+@@ -971,12 +1005,38 @@ fn parse_hwp_with_lenient(
+         } else {
+             // [#5169] 비배포 문서라도 정상 복호되는 ViewText 가 있으면 우선한다(위 strict
+             // 경로와 동일 규칙). 복호 실패·스텁이면 BodyText 로 폴백.
+-            let rendered = lenient
++            let view_raw = lenient
+                 .read_viewtext_section_raw_limited(i, section_raw_limit)
+-                .ok()
++                .ok();
++            let rendered = view_raw
++                .clone()
+                 .and_then(|raw| decode_rendered_viewtext(raw, compressed, section_output_limit));
+             match rendered {
+-                Some(decoded) => decoded,
++                Some(decoded) => {
++                    // [HwpCraft 0070] 변경 추적 등으로 갈라진 문서: 모델은 ViewText(삭제 글과
++                    // 변경 범위 태그가 있는 쪽)로 읽지만, 한글의 결과본은 BodyText 다. 손대지
++                    // 않은 구역을 저장할 때 둘 다 원래대로 쓰도록 원본 BodyText(복호)를
++                    // raw_stream 으로, 원본 ViewText 스트림을 추가 스트림으로 둔다. 암호 문서의
++                    // ViewText 는 암호문이라 그대로 옮기지 않는다.
++                    if !encrypted {
++                        if let Some(view) = view_raw {
++                            let body = lenient
++                                .read_body_text_section_raw_limited(i, section_raw_limit)
++                                .and_then(|raw| {
++                                    cfb_reader::decode_stream_limited(
++                                        raw,
++                                        compressed,
++                                        section_output_limit,
++                                    )
++                                });
++                            if let Ok(body) = body {
++                                tracked_body = Some(body);
++                                view_streams.push((format!("/ViewText/Section{i}"), view));
++                            }
++                        }
++                    }
++                    decoded
++                }
+                 None => {
+                     let raw = lenient
+                         .read_body_text_section_raw_limited(i, section_raw_limit)
+@@ -992,7 +1052,7 @@ fn parse_hwp_with_lenient(
+ 
+         match body_text::parse_body_text_section(&section_data) {
+             Ok(mut section) => {
+-                section.raw_stream = Some(section_data);
++                section.raw_stream = Some(tracked_body.take().unwrap_or(section_data));
+                 sections.push(section);
+             }
+             Err(e @ body_text::BodyTextError::DrawingTextStructure(_)) => {
+@@ -1039,7 +1099,7 @@ fn parse_hwp_with_lenient(
+         sections,
+         preview: None,
+         bin_data_content,
+-        extra_streams: Vec::new(),
++        extra_streams: view_streams,
+         is_hwpx_variant: false,
+         hwpx_aux_entries: Vec::new(),
+         is_hwp3_variant: false,
+@@ -3812,4 +3872,55 @@ mod tests {
+             ORPHAN_TEXT
+         );
+     }
++
++    /// [HwpCraft 0070] BodyText(결과본)와 ViewText(표시본)가 갈라진 문서(변경 추적)를
++    /// 손대지 않고 저장하면 BodyText 는 원본 내용 그대로, ViewText 는 원본 바이트 그대로
++    /// 쓴다. 구역을 고치면 그 구역의 ViewText 는 옛 내용이라 쓰지 않는다.
++    #[test]
++    fn hwp5_untouched_viewtext_section_keeps_body_text_and_view_text() {
++        use crate::document_core::DocumentCore;
++
++        let source = std::fs::read("samples/2010-01-06.hwp").expect("sample 존재");
++        let (_, body) = hwp5_doc_info_and_first_section(&source);
++        // 표시본: 첫 문단 앞에 글을 더해 RHWP 로 저장한 구역 0.
++        let mut core = DocumentCore::from_bytes(&source).expect("원본 열기");
++        core.insert_text_native(0, 0, 0, "표시본 ").expect("표시본 글 넣기");
++        let shown = core.export_hwp_native().expect("표시본 저장");
++        let (_, view) = hwp5_doc_info_and_first_section(&shown);
++        assert_ne!(view, body);
++        let view_raw = raw_deflate(&view);
++        let tracked = add_raw_streams(&source, &[("/ViewText/Section0", &view_raw)]);
++
++        let doc = parse_hwp(&tracked).expect("갈라진 문서 열기");
++        assert!(
++            doc.sections[0].paragraphs[0].text.starts_with("표시본 "),
++            "모델은 ViewText 로 읽는다"
++        );
++        let saved = crate::serializer::serialize_hwp(&doc).expect("그대로 저장");
++        let (_, saved_body) = hwp5_doc_info_and_first_section(&saved);
++        assert_eq!(saved_body, body, "BodyText 는 원본 결과본");
++        let mut cfb = cfb_reader::CfbReader::open(&saved).expect("저장본 CFB");
++        assert_eq!(
++            cfb.read_stream_raw("/ViewText/Section0")
++                .expect("저장본 ViewText"),
++            view_raw,
++            "ViewText 는 원본 바이트"
++        );
++        let reopened = parse_hwp(&saved).expect("저장본 다시 열기");
++        assert_eq!(
++            reopened.sections[0].paragraphs[0].text,
++            doc.sections[0].paragraphs[0].text
++        );
++
++        // 고친 구역: 모델로 다시 만든 BodyText 만 쓰고 옛 ViewText 는 뺀다.
++        let mut core = DocumentCore::from_bytes(&tracked).expect("갈라진 문서 열기");
++        core.insert_text_native(0, 0, 0, "고침 ").expect("고치기");
++        let edited = core.export_hwp_native().expect("고친 뒤 저장");
++        let mut cfb = cfb_reader::CfbReader::open(&edited).expect("고친 저장본 CFB");
++        assert!(cfb.read_stream_raw("/ViewText/Section0").is_err());
++        let reopened = parse_hwp(&edited).expect("고친 저장본 다시 열기");
++        assert!(reopened.sections[0].paragraphs[0]
++            .text
++            .starts_with("고침 표시본 "));
++    }
+ }
+diff --git a/src/serializer/cfb_writer.rs b/src/serializer/cfb_writer.rs
+index 721a6ce..3b6a4c9 100644
+--- a/src/serializer/cfb_writer.rs
++++ b/src/serializer/cfb_writer.rs
+@@ -219,6 +219,24 @@ fn serialize_hwp_inner(
+     let mut content_loss = ContentLossReport::new(SerializedFormat::Hwp);
+     let mut extra_streams = doc.extra_streams.clone();
+     extra_streams.retain(|(path, _)| path != crate::model::hyperlink_format::HWP_STREAM);
++    // [HwpCraft 0070] 원본 ViewText(변경 추적 등)는 그 구역을 원본 바이트로 다시 쓸 때만
++    // 함께 쓴다. 고친 구역의 BodyText 는 모델로 다시 만들어져 옛 ViewText 와 맞지 않고,
++    // 구역을 가른 경우에는 번호가 어긋난다.
++    let unchanged: Vec<bool> = doc
++        .sections
++        .iter()
++        .map(|section| section.raw_provenance_permits_reuse())
++        .collect();
++    let same_sections = section_bytes_list.len() == doc.sections.len();
++    extra_streams.retain(|(path, _)| {
++        let Some(index) = path
++            .strip_prefix("/ViewText/Section")
++            .and_then(|n| n.parse::<usize>().ok())
++        else {
++            return true;
++        };
++        same_sections && unchanged.get(index).copied().unwrap_or(false)
++    });
+     if let Some(bytes) = crate::model::hyperlink_format::encode(doc) {
+         extra_streams.push((crate::model::hyperlink_format::HWP_STREAM.into(), bytes));
+     }

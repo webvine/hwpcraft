@@ -107,7 +107,10 @@ impl Session {
         }
         let section = self.cursor.section;
         Ok(match self.span() {
-            Some((a, b)) => (section, a.paragraph..b.paragraph + 1),
+            Some((a, b)) if a.section != b.section => {
+                bail!("정렬은 한 구역 안의 문단을 선택해 사용하세요.")
+            }
+            Some((a, b)) => (a.section, a.paragraph..b.paragraph + 1),
             None => {
                 let n = self
                     .core
@@ -283,6 +286,11 @@ impl Session {
             _ => None,
         };
         let para = &self.core.document().sections[section].paragraphs[paragraph];
+        // A field's own control has a range and an end slot this path does not remove;
+        // fields go through their own commands (field / link / memo removal).
+        if matches!(para.controls.get(control), Some(Control::Field(_))) {
+            bail!("누름틀·링크·메모 같은 필드는 개체 지우기로 지울 수 없습니다.");
+        }
         let ids: Vec<Option<u32>> = para
             .field_ranges
             .iter()

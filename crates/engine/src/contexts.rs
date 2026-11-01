@@ -656,14 +656,21 @@ pub(super) fn guard_inline_deletion(para: &Paragraph, start: usize, end: usize) 
     Ok(())
 }
 
+/// RHWP split APIs count inline controls as logical characters; text editing and the
+/// public cursor use scalar text offsets. At the end of a paragraph that ends with an
+/// automatic number's placeholder space the number stays in front of the split.
 pub(super) fn logical_split_offset(para: &Paragraph, offset: usize) -> usize {
+    let at_trailing_placeholder = offset == para.text.chars().count() && para.text.ends_with(' ');
     offset
         + para
             .controls
             .iter()
             .zip(para.control_text_positions())
             .filter(|(control, position)| {
-                *position < offset
+                (*position < offset
+                    || (at_trailing_placeholder
+                        && *position == offset
+                        && matches!(control, Control::AutoNumber(_))))
                     && matches!(
                         control,
                         Control::Shape(_)
@@ -683,8 +690,10 @@ impl Session {
     /// A nested insertion changes the minimum content height of every ancestor
     /// cell. RHWP intentionally trusts stored inline-table frames, so rebuilding
     /// caches alone cannot make an old short frame contain a new child table.
-    /// Grow only affected rows, never shrink user-declared minima. All callers
-    /// run this inside the same source transaction as the initiating edit.
+    /// Grow only affected rows, never shrink user-declared minima: a row shrinks
+    /// back only by what this session grew it, while its height is still the grown
+    /// one. All callers run this inside the same source transaction as the
+    /// initiating edit.
     pub(crate) fn context_reflow_ancestors(&mut self, address: &DocumentAddress) -> Result<()> {
         if address.path.is_empty() {
             return Ok(());
@@ -775,36 +784,60 @@ impl Session {
             }
             // Negative/automatic source sizes use the renderer's own content
             // sizing contract; do not replace their sentinel with a new value.
-            if target.height >= 0x8000_0000 || required <= f64::from(target.height) {
+            if target.height >= 0x8000_0000 {
                 continue;
             }
-            if table.common.size_protect {
-                bail!("크기가 보호된 조상 표에는 새 내용을 담을 높이가 부족합니다.");
-            }
-            let delta = (required as u32).saturating_sub(target.height);
             let row = usize::from(target.row)
                 .checked_add(usize::from(target.row_span).max(1) - 1)
                 .ok_or_else(|| anyhow!("조상 셀의 행 범위가 올바르지 않습니다."))?;
             if row >= usize::from(table.row_count) {
                 bail!("조상 셀의 행 범위가 표를 벗어났습니다.");
             }
+            let key = (table.common.instance_id, row);
+            let height = target.height;
+            let delta: i64 = if required > f64::from(height) {
+                if table.common.size_protect {
+                    bail!("크기가 보호된 조상 표에는 새 내용을 담을 높이가 부족합니다.");
+                }
+                i64::from((required as u32).saturating_sub(height))
+            } else {
+                match self.context_growth.get(&key) {
+                    Some(&(grown, at)) if key.0 != 0 && at == height => {
+                        -i64::from(grown.min(height - (required as u32).min(height)))
+                    }
+                    _ => 0,
+                }
+            };
+            if delta == 0 {
+                continue;
+            }
+            if key.0 != 0 {
+                let grown = self
+                    .context_growth
+                    .get(&key)
+                    .map_or(0, |&(g, at)| if at == height { g } else { 0 });
+                let grown = u32::try_from(i64::from(grown) + delta).unwrap_or(0);
+                let now = u32::try_from(i64::from(height) + delta).unwrap_or(0);
+                if grown == 0 {
+                    self.context_growth.remove(&key);
+                } else {
+                    self.context_growth.insert(key, (grown, now));
+                }
+            }
+            let shift = |value: u32| -> Result<u32> {
+                u32::try_from(i64::from(value) + delta)
+                    .map_err(|_| anyhow!("조상 셀 높이 한도 초과"))
+            };
             // A physical row is shared by all covering cells, including merged
             // spans. Preserve their existing heights and add the same growth.
             for cell in &mut table.cells {
                 let start = usize::from(cell.row);
                 let end = start.saturating_add(usize::from(cell.row_span).max(1));
                 if start <= row && row < end && cell.height < 0x8000_0000 {
-                    cell.height = cell
-                        .height
-                        .checked_add(delta)
-                        .ok_or_else(|| anyhow!("조상 셀 높이 한도 초과"))?;
+                    cell.height = shift(cell.height)?;
                 }
             }
-            table.common.height = table
-                .common
-                .height
-                .checked_add(delta)
-                .ok_or_else(|| anyhow!("조상 표 높이 한도 초과"))?;
+            table.common.height = shift(table.common.height)?;
             if table.raw_ctrl_data.len() >= 20 {
                 table.raw_ctrl_data[16..20].copy_from_slice(&table.common.height.to_le_bytes());
             }
@@ -1038,6 +1071,26 @@ impl Session {
             s.core.document_mut().doc_info = doc_info;
             s.core.document_mut().sections[p.address.section].raw_stream = None;
             s.core.set_document(s.core.document().clone());
+            if host_address.path.is_empty() {
+                // The host's rows were laid out at the end of the scratch copy. Start them
+                // where the paragraph before ends; an empty native insertion then lays the
+                // host out in place and moves the rows after it (a cell host gets the
+                // same from its ancestors below).
+                let paragraphs =
+                    &mut s.core.document_mut().sections[host_address.section].paragraphs;
+                let start = index
+                    .checked_sub(1)
+                    .and_then(|i| paragraphs[i].line_segs.last())
+                    .map_or(0, |l| l.vertical_pos + l.line_height + l.line_spacing);
+                let host = &mut paragraphs[index];
+                let shift = start - host.line_segs.first().map_or(start, |l| l.vertical_pos);
+                for row in &mut host.line_segs {
+                    row.vertical_pos += shift;
+                }
+                s.core
+                    .insert_text_native(host_address.section, index, 0, "")
+                    .map_err(err)?;
+            }
             s.context_reflow_ancestors(&host_address)?;
             rebase_inserted_paragraph(&mut s.cursor, &p.address, index);
             if let Some(anchor) = &mut s.span_anchor {

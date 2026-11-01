@@ -97,12 +97,24 @@ impl HanjaDialog {
     }
 }
 
+/// How the engine says there is no word at the caret (`tools.hanja.candidates`).
+const NO_WORD: &str = "한자로 바꿀 낱말이 없습니다";
+
 impl HwpApp {
     /// Open 한자로 바꾸기 for the selection or the word at the caret.
     pub(crate) fn open_hanja_dialog(&mut self) {
-        let r = self.session.run("tools.hanja.candidates", json!({}));
-        let Some(v) = self.result(r) else {
-            return;
+        let v = match self.session.run("tools.hanja.candidates", json!({})) {
+            Ok(v) => v,
+            // Nothing at the caret to convert is a hint for the status bar, as Hangul only
+            // beeps; the error box is for commands that failed.
+            Err(e) if e.to_string().starts_with(NO_WORD) => {
+                self.message = e.to_string();
+                return;
+            }
+            Err(e) => {
+                self.result::<()>(Err(e));
+                return;
+            }
         };
         let dialog = HanjaDialog::from_candidates(&v);
         match dialog {
@@ -305,5 +317,21 @@ impl HwpApp {
         } else {
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("document-canvas")));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F9 with no word at the caret leaves a hint in the status bar, not an error box.
+    #[test]
+    fn no_word_at_the_caret_is_a_status_hint() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        a.open_hanja_dialog();
+        assert!(a.error.is_none(), "no error box: {:?}", a.error);
+        assert!(a.message.starts_with(NO_WORD), "{}", a.message);
+        assert!(a.ext.tools.hanja.is_none());
+        Ok(())
     }
 }

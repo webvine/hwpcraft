@@ -52,7 +52,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "tools.index",
-        "매개 변수 없음. 문서의 색인 표시로 캐럿 위치(본문)에 색인을 넣습니다: 첫소리 묶음 머리 (ᄀ)…, 항목 '첫째 키<탭>쪽, 쪽', 둘째 키는 그 아래 '   둘째 키<탭>쪽'(한글 2024 색인 만들기 기본 모양, 바탕글). 한글은 새 문서에 만들고 HwpCraft는 캐럿 위치에 넣습니다(다시 부르면 새로 하나 더 넣음). 결과: entries, groups, section, first, paragraphs.",
+        "매개 변수 없음. 문서의 색인 표시로 캐럿 위치(본문)에 색인을 넣습니다: 첫소리 묶음 머리 (ᄀ)…, 항목 '첫째 키<탭>쪽, 쪽', 둘째 키는 그 아래 '   둘째 키<탭>쪽'(한글 2024 색인 만들기 기본 모양, 바탕글). 한글은 새 문서에 만들고 HwpCraft는 캐럿 위치에 \"색인\" 스타일(바탕글 모양)로 넣습니다. 문서에 이미 색인이 있으면 캐럿과 상관없이 그 자리에서 새로 고칩니다(실행 취소 한 단계). 결과: entries, groups, section, first, paragraphs, updated(새로 고쳤으면 true).",
         r#"{}"#,
     ),
 ];
@@ -61,6 +61,8 @@ const MAX_KEY: usize = 200;
 /// In front of a second key, as Hangul writes it.
 const INDENT: &str = "   ";
 const PAGE_PASSES: usize = 3;
+/// The style index paragraphs are written in; making the index again finds them by it.
+const INDEX_STYLE: &str = "색인";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -374,28 +376,122 @@ impl Session {
             .collect()
     }
 
-    fn make_index(&mut self) -> Result<Value> {
-        if self.cursor.cell.is_some() {
-            bail!("색인은 본문에 넣습니다. 표 밖에 캐럿을 두세요.");
+    /// The index paragraphs (style "색인") already in the document: section, first
+    /// paragraph and count of the first run.
+    fn index_block(&self, style: usize) -> Option<(usize, usize, usize)> {
+        for (s, section) in self.core.document().sections.iter().enumerate() {
+            let is_index = |p: &Paragraph| usize::from(p.style_id) == style;
+            let Some(first) = section.paragraphs.iter().position(is_index) else {
+                continue;
+            };
+            let count = section.paragraphs[first..]
+                .iter()
+                .take_while(|p| is_index(p))
+                .count();
+            return Some((s, first, count));
         }
+        None
+    }
+
+    /// The "색인" style the index is written in: 바탕글's shapes, as Hangul's index
+    /// looks, under a name of its own so that making the index again finds it.
+    fn index_style(&mut self) -> Result<usize> {
+        let styles = &self.core.document().doc_info.styles;
+        if let Some(id) = styles.iter().position(|s| s.local_name == INDEX_STYLE) {
+            return Ok(id);
+        }
+        let base = &styles[0];
+        let (para, chars) = (base.para_shape_id, base.char_shape_id);
+        self.create_style_now(ext_format::NewStyle::plain(
+            INDEX_STYLE,
+            "Index",
+            para,
+            chars,
+        ))
+    }
+
+    fn make_index(&mut self) -> Result<Value> {
         let (lines, entries, groups) = index_lines(&self.index_entries());
         if lines.is_empty() {
             bail!("색인 표시가 없습니다. 먼저 index.mark.insert로 낱말에 색인 표시를 넣으세요.");
         }
-        let at = self.cursor;
-        let first = at.paragraph + usize::from(at.offset > 0);
-        let written: Vec<(String, usize, bool)> =
-            lines.iter().map(|l| (l.clone(), 0, false)).collect();
+        let existing = self
+            .core
+            .document()
+            .doc_info
+            .styles
+            .iter()
+            .position(|s| s.local_name == INDEX_STYLE)
+            .and_then(|style| self.index_block(style));
+        if existing.is_none() && self.cursor.cell.is_some() {
+            bail!("색인은 본문에 넣습니다. 표 밖에 캐럿을 두세요.");
+        }
+        let mut place = (0, 0);
         self.transaction(|s| {
             s.clear_selection();
-            s.write_lines(at, first, &written, Default::default())?;
+            let style = s.index_style()?;
+            let written: Vec<(String, usize, bool)> =
+                lines.iter().map(|l| (l.clone(), style, false)).collect();
+            let (section, first) = match existing {
+                // Made before: write the new index where the old one was, in one step.
+                Some((section, first, count)) => {
+                    let last = first + count - 1;
+                    s.deferred_layout(|s| {
+                        let len = s.core.document().sections[section].paragraphs[last]
+                            .text
+                            .chars()
+                            .count();
+                        s.core
+                            .delete_range_native(section, first, 0, last, len, None)
+                            .map_err(err)?;
+                        Ok(())
+                    })?;
+                    let at = Cursor {
+                        section,
+                        paragraph: first,
+                        offset: 0,
+                        cell: None,
+                    };
+                    s.write_lines(at, first, &written, Default::default())?;
+                    // What was left of the old index follows the new one, empty: join it
+                    // to the new last line.
+                    let n = written.len();
+                    s.deferred_layout(|s| {
+                        let paragraphs = &s.core.document().sections[section].paragraphs;
+                        let end = paragraphs[first + n - 1].text.chars().count();
+                        if paragraphs[first + n].text.is_empty()
+                            && paragraphs[first + n].controls.is_empty()
+                        {
+                            s.core
+                                .delete_range_native(
+                                    section,
+                                    first + n - 1,
+                                    end,
+                                    first + n,
+                                    0,
+                                    None,
+                                )
+                                .map_err(err)?;
+                        }
+                        Ok(())
+                    })?;
+                    (section, first)
+                }
+                None => {
+                    let at = s.cursor;
+                    let first = at.paragraph + usize::from(at.offset > 0);
+                    s.write_lines(at, first, &written, Default::default())?;
+                    (at.section, first)
+                }
+            };
+            place = (section, first);
             // Pages move when the index pushes marked text down; rewrite them in place.
             for _ in 0..PAGE_PASSES {
                 let (now, _, _) = index_lines(&s.index_entries());
                 if now.len() != lines.len() {
                     bail!("색인을 넣는 동안 색인 표시가 바뀌었습니다.");
                 }
-                let paragraphs = &s.core.document().sections[at.section].paragraphs;
+                let paragraphs = &s.core.document().sections[section].paragraphs;
                 let stale: Vec<(usize, String)> = now
                     .iter()
                     .enumerate()
@@ -407,15 +503,15 @@ impl Session {
                 }
                 s.deferred_layout(|s| {
                     for (paragraph, line) in &stale {
-                        let len = s.core.document().sections[at.section].paragraphs[*paragraph]
+                        let len = s.core.document().sections[section].paragraphs[*paragraph]
                             .text
                             .chars()
                             .count();
                         s.core
-                            .delete_range_native(at.section, *paragraph, 0, *paragraph, len, None)
+                            .delete_range_native(section, *paragraph, 0, *paragraph, len, None)
                             .map_err(err)?;
                         s.core
-                            .insert_text_native(at.section, *paragraph, 0, line)
+                            .insert_text_native(section, *paragraph, 0, line)
                             .map_err(err)?;
                     }
                     Ok(())
@@ -423,16 +519,17 @@ impl Session {
                 s.refresh_layout()?;
             }
             s.cursor = Cursor {
-                section: at.section,
+                section,
                 paragraph: first + lines.len(),
                 offset: 0,
                 cell: None,
             };
             Ok(())
         })?;
+        let (section, first) = place;
         Ok(
-            json!({"entries": entries, "groups": groups, "section": at.section,
-            "first": first, "paragraphs": lines.len()}),
+            json!({"entries": entries, "groups": groups, "section": section,
+            "first": first, "paragraphs": lines.len(), "updated": existing.is_some()}),
         )
     }
 }

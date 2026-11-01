@@ -1,0 +1,22 @@
+diff --git a/src/document_core/commands/formatting.rs b/src/document_core/commands/formatting.rs
+index 7999ae3..602c6a0 100644
+--- a/src/document_core/commands/formatting.rs
++++ b/src/document_core/commands/formatting.rs
+@@ -481,7 +481,7 @@ impl DocumentCore {
+     }
+ 
+     /// charShapeId로 직접 글자 속성 JSON을 빌드 (스타일 상세 조회용)
+-    pub(crate) fn build_char_properties_json_by_id(&self, char_shape_id: u16) -> String {
++    pub fn build_char_properties_json_by_id(&self, char_shape_id: u16) -> String {
+         let style = self.styles.char_styles.get(char_shape_id as usize);
+         match style {
+             Some(cs) => {
+@@ -709,7 +709,7 @@ impl DocumentCore {
+     }
+ 
+     /// 문단 속성 JSON 생성 헬퍼
+-    pub(crate) fn build_para_properties_json(&self, para_shape_id: u16, sec_idx: usize) -> String {
++    pub fn build_para_properties_json(&self, para_shape_id: u16, sec_idx: usize) -> String {
+         use crate::model::style::{Alignment, HeadType};
+         let ps = self.styles.para_styles.get(para_shape_id as usize);
+ 

@@ -1,0 +1,85 @@
+diff --git a/src/renderer/typeset/section.rs b/src/renderer/typeset/section.rs
+index 633f624..76646ee 100644
+--- a/src/renderer/typeset/section.rs
++++ b/src/renderer/typeset/section.rs
+@@ -130,6 +130,19 @@ impl TypesetEngine {
+         // [#2559] 조건부(Even/Odd)까지 포함해 어떤 꼬리말이라도 정의돼 있으면
+         // 밴드가 점유될 수 있다. 완전히 비어 있는 구역에서만 각주 회수를 허용한다.
+         st.record_footer_presence(!hf_entries.iter().any(|(_, _, is_header, _)| !is_header));
++        {
++            let (stored, synthetic) = paragraphs
++                .iter()
++                .flat_map(|p| p.line_segs.iter())
++                .fold((0usize, 0usize), |(stored, synthetic), ls| {
++                    if is_synthetic_line_seg(ls) {
++                        (stored, synthetic + 1)
++                    } else {
++                        (stored + 1, synthetic)
++                    }
++                });
++            st.record_synthetic_lines(synthetic > stored);
++        }
+         // [#2668 진단] 밴드 회수 판정 관측 — 동작 불변.
+         // "꼬리말 위치 쪽 번호(PageNumberPos)가 밴드를 점유하므로 회수 대상에서 빼야 한다"는
+         // 판별자 가설을 이 출력으로 반증했다(회귀군·개선군 양쪽에 고루 존재).
+diff --git a/src/renderer/typeset/state/commands.rs b/src/renderer/typeset/state/commands.rs
+index fd309f5..6888aa2 100644
+--- a/src/renderer/typeset/state/commands.rs
++++ b/src/renderer/typeset/state/commands.rs
+@@ -306,6 +306,9 @@ impl TypesetState {
+     pub(in crate::renderer::typeset) fn record_footer_presence(&mut self, no_footer: bool) {
+         self.data.section_has_no_footer = no_footer;
+     }
++    pub(in crate::renderer::typeset) fn record_synthetic_lines(&mut self, mostly: bool) {
++        self.data.mostly_synthetic_lines = mostly;
++    }
+     pub(in crate::renderer::typeset) fn observe_following_paragraph(
+         &mut self,
+         vpos: Option<i32>,
+diff --git a/src/renderer/typeset/state/data.rs b/src/renderer/typeset/state/data.rs
+index 292840c..7917a7e 100644
+--- a/src/renderer/typeset/state/data.rs
++++ b/src/renderer/typeset/state/data.rs
+@@ -201,6 +201,10 @@ pub(in crate::renderer::typeset) struct StateView {
+     /// 문서 전체에 실제 저장 LineSeg가 있는지 여부. HWP5-origin CFB라도 LineSeg가 전부
+     /// 비어 있으면 저장 vpos 기반 흐름이 아니라 재조판 흐름으로 취급한다.
+     pub(in crate::renderer::typeset) has_stored_line_segs: bool,
++    /// 구역 본문 줄 대부분이 rhwp 가 계산한 합성 LineSeg(tag bit31)인지 여부.
++    /// 편집기가 새로 만든 문서는 저장 흐름이 아니라 rhwp 계산 줄이다. 한컴 저장본에도
++    /// 합성 줄이 일부 섞이므로(#2559 표본) "하나라도"가 아니라 다수결로 가른다.
++    pub(in crate::renderer::typeset) mostly_synthetic_lines: bool,
+     /// [Task #362] 한컴 빈 줄 감추기 옵션 (SectionDef bit 19). true 이면 페이지 시작에서
+     /// overflow 유발하는 빈 paragraph 최대 2개까지 height=0 처리.
+     pub(in crate::renderer::typeset) hide_empty_line: bool,
+diff --git a/src/renderer/typeset/state/notes.rs b/src/renderer/typeset/state/notes.rs
+index c8c1e7a..ea87354 100644
+--- a/src/renderer/typeset/state/notes.rs
++++ b/src/renderer/typeset/state/notes.rs
+@@ -18,9 +18,15 @@ impl TypesetState {
+         if std::env::var("RHWP_FB_OFF").is_ok() {
+             return 0.0;
+         }
++        // 밴드 회수는 한글 저장 흐름(저장 LineSeg)의 쪽당 과소 적재를 상쇄하는 보정이다.
++        // 한글은 각주를 본문 영역 안에 그리므로(task_2668 실측 741쪽 중 밴드 사용 0쪽),
++        // 줄 대부분을 rhwp 가 계산한 구역(편집기가 새로 만든 문서)에서 회수하면 본문
++        // 줄이 그려진 각주 영역에 겹친다. 저장 줄이 없는 구역도 마찬가지다.
+         if self.data.section_has_no_footer
+             && footnote_height > 0.0
+             && !self.data.current_footnote_body_bottom_reserved
++            && self.data.has_stored_line_segs
++            && !self.data.mostly_synthetic_lines
+         {
+             self.data.layout.footer_area.height.max(0.0)
+         } else {
+diff --git a/src/renderer/typeset/state/transition.rs b/src/renderer/typeset/state/transition.rs
+index ad45e02..7e3368a 100644
+--- a/src/renderer/typeset/state/transition.rs
++++ b/src/renderer/typeset/state/transition.rs
+@@ -78,6 +78,7 @@ impl TypesetState {
+                 strict_plain_text_fit_after_empty_host_float_once: false,
+                 profile: Default::default(),
+                 has_stored_line_segs: false,
++                mostly_synthetic_lines: false,
+                 hide_empty_line: false,
+                 hidden_empty_lines: 0,
+                 hidden_empty_page_idx: usize::MAX,

@@ -1,0 +1,416 @@
+diff --git a/src/renderer/float_placement.rs b/src/renderer/float_placement.rs
+index 7569504..0e850ea 100644
+--- a/src/renderer/float_placement.rs
++++ b/src/renderer/float_placement.rs
+@@ -3878,15 +3878,15 @@ pub(crate) fn empty_host_physical_ladder_extras_hu(
+ /// [#3931] native HWP5 다행 RowBreak 표가 cell 내부 저장 page reset을 갖고,
+ /// 후속 source 문단도 host anchor 위로 되감기는 빈-host 형상인지 판별한다.
+ ///
+-/// 반환값은 host의 저장 line advance다. 첫 fragment를 앞선 표 바로 뒤에 그릴 때
+-/// layout cursor에 남은 이전 host trailing margin이 이 advance 이내면 회수할 수
+-/// 있다는 구조 증거로 사용한다.
++/// 반환값은 host 저장 줄의 (줄 높이, line advance)다. 첫 fragment 앞 흐름 원점이 앞선
++/// 표 아래로 host 줄 높이 이상 내려가 있으면 그 줄 높이만큼 되돌린다 — 앞 문단의
++/// 줄간격은 한글도 남긴다(편람 구역 10 질의응답 표).
+ pub(crate) fn native_multirow_internal_reset_rowbreak_anchor_advance_hu(
+     native_hwp5_layout: bool,
+     para: &Paragraph,
+     table: &Table,
+     next_para: Option<&Paragraph>,
+-) -> Option<i32> {
++) -> Option<(i32, i32)> {
+     let has_non_whitespace_text = |paragraph: &Paragraph| {
+         paragraph
+             .text
+@@ -3940,7 +3940,7 @@ pub(crate) fn native_multirow_internal_reset_rowbreak_anchor_advance_hu(
+     }
+ 
+     let advance = host_seg.line_height + host_seg.line_spacing.max(0);
+-    (advance > 0).then_some(advance)
++    (advance > 0).then_some((host_seg.line_height.max(0), advance))
+ }
+ 
+ /// Native HWP5가 빈 host의 저장 LINE_SEG 사다리에 표의 outer box 전체를 기록한
+diff --git a/src/renderer/layout/table_layout.rs b/src/renderer/layout/table_layout.rs
+index 4d1f2ac..49a3a15 100644
+--- a/src/renderer/layout/table_layout.rs
++++ b/src/renderer/layout/table_layout.rs
+@@ -16475,6 +16475,134 @@ impl LayoutEngine {
+             .collect()
+     }
+ 
++    /// 셀마다 저장 되감김이 시작되는 CellUnit 번호. 앞 유닛의 마지막 저장 줄보다 다음
++    /// 유닛의 첫 저장 줄 vpos 가 앞서면(문단 안이든 문단 경계든) 그 유닛 앞이 경계다.
++    /// 셀 순서는 `row_stored_rewind_unit_indices` 와 같다.
++    pub(crate) fn row_stored_rewind_unit_boundaries(
++        &self,
++        table: &crate::model::table::Table,
++        row: usize,
++        styles: &ResolvedStyleSet,
++    ) -> Vec<Vec<usize>> {
++        let mut cells: Vec<&crate::model::table::Cell> = table
++            .cells
++            .iter()
++            .filter(|cell| cell.row as usize == row && cell.row_span == 1)
++            .collect();
++        cells.sort_by_key(|cell| cell.col);
++        cells
++            .iter()
++            .map(|cell| {
++                let units = self.cell_units(cell, table, styles);
++                (1..units.len())
++                    .filter(|&end| Self::unit_starts_stored_rewind(cell, &units, end))
++                    .collect()
++            })
++            .collect()
++    }
++
++    fn unit_starts_stored_rewind(
++        cell: &crate::model::table::Cell,
++        units: &[CellUnit],
++        end: usize,
++    ) -> bool {
++        let (Some(closing), Some(next)) = (
++            end.checked_sub(1).and_then(|i| units.get(i)),
++            units.get(end),
++        ) else {
++            return false;
++        };
++        let closing_seg = closing
++            .vis_end
++            .checked_sub(1)
++            .and_then(|li| cell.paragraphs.get(closing.para_idx)?.line_segs.get(li));
++        let next_seg = cell
++            .paragraphs
++            .get(next.para_idx)
++            .and_then(|para| para.line_segs.get(next.vis_start));
++        let synthetic = |seg: &crate::model::paragraph::LineSeg| {
++            seg.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
++        };
++        matches!((closing_seg, next_seg), (Some(closing), Some(next))
++            if !synthetic(closing)
++                && !synthetic(next)
++                && closing.vertical_pos > 0
++                && next.vertical_pos < closing.vertical_pos)
++    }
++
++    /// 행 컷이 어느 셀에서든 저장 되감김 바로 앞에서 끝나는가. 컷 뒤 첫 줄의 저장 vpos 가
++    /// 컷의 마지막 줄보다 앞서면(문단 안이든 문단 경계든) 한글이 거기서 쪽을 끊었다.
++    pub(crate) fn row_cut_ends_at_stored_rewind(
++        &self,
++        table: &crate::model::table::Table,
++        row: usize,
++        end_cut: &[usize],
++        styles: &ResolvedStyleSet,
++    ) -> bool {
++        let mut cells: Vec<&crate::model::table::Cell> = table
++            .cells
++            .iter()
++            .filter(|cell| cell.row as usize == row && cell.row_span == 1)
++            .collect();
++        cells.sort_by_key(|cell| cell.col);
++        cells.iter().zip(end_cut).any(|(cell, &end)| {
++            let units = self.cell_units(cell, table, styles);
++            Self::unit_starts_stored_rewind(cell, &units, end)
++        })
++    }
++
++    /// 행 컷이 저장 사다리로 닫는 잉크 상자 높이(px)와 그 뒤 전진(px).
++    /// 잉크 상자는 셀마다 `패딩 + 마지막 줄 vpos + 줄 높이` 중 최댓값이고, 전진은 마지막
++    /// 줄의 줄간격(문단 끝 줄이면 문단 뒤 간격 포함) 중 최댓값이다. 셀 순서는
++    /// `row_stored_rewind_unit_indices` 와 같다.
++    pub(crate) fn row_cut_stored_ink_box(
++        &self,
++        table: &crate::model::table::Table,
++        row: usize,
++        end_cut: &[usize],
++        styles: &ResolvedStyleSet,
++    ) -> (f64, f64) {
++        let mut cells: Vec<&crate::model::table::Cell> = table
++            .cells
++            .iter()
++            .filter(|cell| cell.row as usize == row && cell.row_span == 1)
++            .collect();
++        cells.sort_by_key(|cell| cell.col);
++        cells
++            .iter()
++            .zip(end_cut)
++            .filter_map(|(cell, &end)| {
++                let units = self.cell_units(cell, table, styles);
++                let closing = units.get(end.checked_sub(1)?)?;
++                let para = cell.paragraphs.get(closing.para_idx)?;
++                let seg = para.line_segs.get(closing.vis_end.checked_sub(1)?)?;
++                let padding = cell.effective_padding(&table.padding);
++                let ink = hwpunit_to_px(
++                    i32::from(padding.top)
++                        + seg.vertical_pos.max(0)
++                        + seg.line_height.max(0)
++                        + i32::from(padding.bottom),
++                    self.dpi,
++                );
++                let after = if closing.vis_end == para.line_segs.len() {
++                    styles
++                        .para_styles
++                        .get(para.para_shape_id as usize)
++                        .map(|style| style.spacing_after)
++                        .unwrap_or(0.0)
++                } else {
++                    0.0
++                };
++                Some((
++                    ink,
++                    hwpunit_to_px(seg.line_spacing.max(0), self.dpi) + after,
++                ))
++            })
++            .fold((0.0, 0.0), |(ink, advance), (cell_ink, cell_advance)| {
++                (f64::max(ink, cell_ink), f64::max(advance, cell_advance))
++            })
++    }
++
+     /// [#6761] 줄 원점(`vpos = 0`)에서 시작한 줄 **바로 다음 줄도 0** 인 저장 되감김을 셀마다
+     /// CellUnit 번호로 돌려준다. 앞 줄이 양수에서 되감기는 `row_stored_rewind_unit_indices` 가
+     /// 못 보는 형상이다 — 셀의 첫 줄이 쪽 끝에 남고 둘째 줄이 새 쪽 원점에서 재개한 자리다.
+diff --git a/src/renderer/layout/table_partial.rs b/src/renderer/layout/table_partial.rs
+index 5965b4c..463ef33 100644
+--- a/src/renderer/layout/table_partial.rs
++++ b/src/renderer/layout/table_partial.rs
+@@ -4506,12 +4506,18 @@ impl LayoutEngine {
+         let reclaim_previous_host_margin = if !is_continuation && start_cut.is_empty() {
+             paragraphs.get(para_index).and_then(|host| {
+                 native_multirow_internal_reset_rowbreak_anchor_advance_hu(
+-                    self.profile.get().hwp5_stored_pagination_layout(),
++                    self.profile.get().hwp5_stored_pagination_layout()
++                        || self.profile.get().hwpx_stored_layout(),
+                     host,
+                     table,
+                     paragraphs.get(para_index + 1),
+                 )
+-                .map(|advance| hwpunit_to_px(advance, self.dpi))
++                .map(|(line_height, advance)| {
++                    (
++                        hwpunit_to_px(line_height, self.dpi),
++                        hwpunit_to_px(advance, self.dpi),
++                    )
++                })
+             })
+         } else {
+             None
+@@ -4549,13 +4555,18 @@ impl LayoutEngine {
+                     Some(child.bbox.y + child.bbox.height + repeated_previous_bottom)
+                 })
+                 .fold(f64::NEG_INFINITY, f64::max);
+-            let reclaims_previous_host_margin = reclaim_previous_host_margin.is_some_and(|max| {
+-                prev_table_end.is_finite()
+-                    && y_start > prev_table_end
+-                    && y_start - prev_table_end <= max + 0.5
++            // 흐름 원점이 빈 host 줄을 이미 지나쳤을 때만 그 줄 높이를 되돌린다. 앞 문단의
++            // 줄간격은 한글도 남긴다 — 편람 구역 10 질문 5·7·9 첫 조각은 앞 표 아래
++            // 7.5~8px(앞 문단 ls)에서, 질문 11(pi=23)은 흐름 원점 20.9px 중 host 줄 13.3px만
++            // 되돌린 7.5px 에서 시작한다(한글 2024 PDF 283·284·287·291쪽). 원본 HWPX 도
++            // 같은 저장 관계를 가지므로 같은 규칙을 쓴다.
++            let reclaimed_host_line = reclaim_previous_host_margin.and_then(|(line, advance)| {
++                let gap = y_start - prev_table_end;
++                (prev_table_end.is_finite() && gap + 0.5 >= line && gap <= advance + 0.5)
++                    .then_some(line)
+             });
+-            if reclaims_previous_host_margin {
+-                prev_table_end
++            if let Some(line) = reclaimed_host_line {
++                y_start - line
+             } else if repeat_fragment_outer_margin {
+                 // The strict native-HWP shape uses the painted predecessor plus its trailing
+                 // margin as the flow base, then opens this fragment's top margin.  Apply the
+diff --git a/src/renderer/typeset.rs b/src/renderer/typeset.rs
+index 4c301e2..6750b6a 100644
+--- a/src/renderer/typeset.rs
++++ b/src/renderer/typeset.rs
+@@ -8400,4 +8400,89 @@ mod tests {
+             "답변 셀은 저장 되감김 앞 2줄에서 끝나야 한다"
+         );
+     }
++
++    /// 편람 구역 10 질의응답 표(빈 host 다행 RowBreak)의 첫 조각은 앞 표 아래 앞 문단
++    /// 줄간격을 두고 시작해 선언 상자 안에서 끝난다. 한글 2024 PDF(.hwp·.hwpx 같음):
++    /// 질문 5 735.0~886.8px, 질문 7 692.8~866.6px, 질문 9 692.3~875.4px, 질문 11 은 앞 표
++    /// 하단 7.5px 아래 시작해 866.3px 에서 끝난다.
++    #[test]
++    fn handbook_q_and_a_fragments_keep_the_previous_line_spacing() {
++        use crate::renderer::render_tree::{RenderNode, RenderNodeType};
++
++        fn collect(node: &RenderNode, body: &mut f64, tables: &mut Vec<(usize, f64, f64)>) {
++            match &node.node_type {
++                RenderNodeType::Body { .. } => *body = node.bbox.y + node.bbox.height,
++                RenderNodeType::Table(table) => {
++                    if let Some(para) = table.para_index {
++                        tables.push((para, node.bbox.y, node.bbox.y + node.bbox.height));
++                    }
++                    return;
++                }
++                _ => {}
++            }
++            for child in &node.children {
++                collect(child, body, tables);
++            }
++        }
++
++        for ext in ["hwp", "hwpx"] {
++            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++                .join(format!("samples/2025 행정업무운영 편람(최종).{ext}"));
++            let Ok(bytes) = std::fs::read(&path) else {
++                eprintln!("skip: {} 없음", path.display());
++                continue;
++            };
++            let core =
++                crate::document_core::DocumentCore::from_bytes(&bytes).expect("parse handbook");
++            let section_start: usize = core.pagination[..10].iter().map(|pr| pr.pages.len()).sum();
++            // (문단, 한글 상단, 한글 하단) — 상단은 앞 표 하단 + 앞 문단 줄간격.
++            for (para, top, bottom) in [
++                (12, 735.0, 886.8),
++                (14, 692.8, 866.6),
++                (23, 472.0, 866.3),
++                (35, 692.3, 875.4),
++            ] {
++                let local = core.pagination[10]
++                    .pages
++                    .iter()
++                    .position(|page| {
++                        page.column_contents.iter().any(|column| {
++                            column.items.iter().any(|item| {
++                                matches!(item, PageItem::PartialTable {
++                                    para_index,
++                                    is_continuation: false,
++                                    ..
++                                } if *para_index == para)
++                            })
++                        })
++                    })
++                    .unwrap_or_else(|| panic!("{ext} pi={para} 첫 조각 쪽"));
++                let tree = core
++                    .build_page_render_tree((section_start + local) as u32)
++                    .expect("render tree");
++                let mut body_bottom = 0.0;
++                let mut tables = Vec::new();
++                collect(&tree.root, &mut body_bottom, &mut tables);
++                let (_, y, end) = tables
++                    .iter()
++                    .copied()
++                    .find(|t| t.0 == para)
++                    .unwrap_or_else(|| panic!("{ext} pi={para} 표 노드: {tables:?}"));
++                assert!(
++                    (y - top).abs() <= 1.0,
++                    "{ext} pi={para} 상단 {y:.1}px (한글 {top}px)"
++                );
++                assert!(
++                    end <= body_bottom + 0.5,
++                    "{ext} pi={para} 첫 조각 하단 {end:.1} 이 본문 하단 {body_bottom:.1} 을 넘는다"
++                );
++                if ext == "hwp" {
++                    assert!(
++                        (end - bottom).abs() <= 1.0,
++                        "{ext} pi={para} 하단 {end:.1}px (한글 {bottom}px)"
++                    );
++                }
++            }
++        }
++    }
+ }
+diff --git a/src/renderer/typeset/table/continuation/fragment/emit.rs b/src/renderer/typeset/table/continuation/fragment/emit.rs
+index 697a02f..d93ff1a 100644
+--- a/src/renderer/typeset/table/continuation/fragment/emit.rs
++++ b/src/renderer/typeset/table/continuation/fragment/emit.rs
+@@ -347,6 +347,62 @@ impl TypesetEngine {
+                 }
+             }
+         }
++        // 블록이 아닌 행 컷도 같은 계약이다. 첫 프레임이 끝 행 안의 저장 되감김(문단
++        // 안이든 문단 경계든)에서 닫히고, 선언 상자의 잔여가 그 컷의 저장 잉크 상자
++        // (패딩 + 마지막 줄 vpos + 줄 높이) 이상이면 끝 행을 그 잔여로 그린다. 컷 유닛은
++        // 마지막 줄 뒤 줄간격·문단 뒤 간격까지 담아 상자보다 크다 — 편람 구역 10
++        // 질문 5(잔여 72.5px, 유닛 79.2px, 한글 상자 735.0~886.8)·질문 9(잔여 103.9px,
++        // 유닛 122.8px, 한글 상자 하단 875.4). 다음 조각은 남은 유닛과 셀 패딩으로
++        // 다시 열리므로 잔여 밴드를 넘기지 않는다.
++        if !source_frame_trailing_trim_applied
++            && !is_continuation
++            && cursor_row == 0
++            && start_cut.is_empty()
++            && split_block_start.is_none()
++            && !split_end_cut.is_empty()
++            && end_row_height_override.is_none()
++            && table_footnotes.is_empty()
++            && !st.profile.session_edited()
++            && !self.render_normalization.table_text_reflowed(table)
++            && std::ptr::eq(table, row_geometry_table)
++            && end_row > 0
++            && source_first_fragment_row_end == Some(end_row - 1)
++            // 빈 host·내부 되감김·다음 문단 되감김을 가진 다행 RowBreak 표(편람 질의응답
++            // 형상)만. 저장 형식 판정은 프로파일 게이트가 이미 했으므로 형상만 본다.
++            && crate::renderer::float_placement::native_multirow_internal_reset_rowbreak_anchor_advance_hu(
++                true,
++                input.source.paragraph,
++                table,
++                input.source.paragraphs_all.get(para_idx + 1),
++            )
++            .is_some()
++        {
++            if let Some((frame_height, _)) = saved_first_fragment_source_frame {
++                let last = end_row - 1;
++                let before_last = cut_row_h.iter().take(last).sum::<f64>()
++                    + mt.cell_spacing * end_row.saturating_sub(2) as f64;
++                let last_height = frame_height - before_last;
++                let painted =
++                    layout_engine.row_cut_content_height(table, last, &[], &split_end_cut, styles);
++                let (stored_ink, closing_advance) =
++                    layout_engine.row_cut_stored_ink_box(table, last, &split_end_cut, styles);
++                if last_height > 0.5
++                    && painted > last_height + 0.5
++                    && layout_engine.row_cut_ends_at_stored_rewind(
++                        table,
++                        last,
++                        &split_end_cut,
++                        styles,
++                    )
++                    && last_height + 0.5 >= stored_ink
++                    && last_height <= stored_ink + closing_advance + 0.5
++                {
++                    end_row_height_override = Some(last_height);
++                    partial_height = frame_height;
++                    source_frame_trailing_trim_applied = true;
++                }
++            }
++        }
+         // 문단 내부 원점0만으로는 쪽 경계를 입증하지 못한다. 일반 저장 리셋이 없으면
+         // 호스트 뒤 원문의 쪽 원점 되감김으로 닫힌 두 줄 프레임을 확인한다.
+         let opening_frame_has_source_boundary =
+diff --git a/src/renderer/typeset/table/scan/runner/row_step.rs b/src/renderer/typeset/table/scan/runner/row_step.rs
+index 9080018..90ddf34 100644
+--- a/src/renderer/typeset/table/scan/runner/row_step.rs
++++ b/src/renderer/typeset/table/scan/runner/row_step.rs
+@@ -485,7 +485,14 @@ impl TypesetEngine {
+                         source_tail_cut.end_cut = correction.end_cut;
+                         source_tail_cut.consumed_height = correction.consumed_height;
+                         source_tail_cut.fully_consumed = false;
+-                    } else if !is_continuation && source_first_fragment_row_end == Some(r) {
++                    } else if !is_continuation
++                        // 첫 조각의 프레임 끝 행이거나, 꼬리가 이 쪽의 남은 공간을 넘는 경우.
++                        // 넘치는 꼬리 안의 저장 되감김은 한글이 그 앞에서 쪽을 끊었다는 증거다
++                        // (편람 .hwpx 질문 7: 5줄 꼬리 대신 되감김 앞 3줄, 한글 PDF 284쪽).
++                        && row_start_cut.is_empty()
++                        && (source_first_fragment_row_end == Some(r)
++                            || source_tail_cut.consumed_height > content_budget + 0.5)
++                    {
+                         if let Some(correction) = source_tail_query.opening_frame_rewind_correction(
+                             &res,
+                             &source_tail_cut,
+diff --git a/src/renderer/typeset/table/scan/source_tail/extension.rs b/src/renderer/typeset/table/scan/source_tail/extension.rs
+index f84075f..819df43 100644
+--- a/src/renderer/typeset/table/scan/source_tail/extension.rs
++++ b/src/renderer/typeset/table/scan/source_tail/extension.rs
+@@ -150,7 +150,7 @@ impl SourceTailQuery<'_> {
+             styles,
+             ..
+         } = *rows;
+-        let stored_rewinds = layout_engine.row_stored_rewind_unit_indices(table, r, styles);
++        let stored_rewinds = layout_engine.row_stored_rewind_unit_boundaries(table, r, styles);
+         let mut clipped = source_tail_cut.end_cut.clone();
+         let mut clipped_any = false;
+         for (idx, end) in clipped.iter_mut().enumerate() {

@@ -177,3 +177,59 @@ fn hangul_written_marks_are_listed() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Making the index again refreshes the one already in the document instead of adding
+/// a second, wherever the caret is, in one undo step; the reopened file finds it too.
+#[test]
+fn making_the_index_again_refreshes_it() -> anyhow::Result<()> {
+    let mut s = document()?;
+    s.run("caret.move", json!({"motion": "document_end"}))?;
+    s.run("text.insert", json!({"text": "\n"}))?;
+    let made = s.run("tools.index", json!({}))?;
+    assert_eq!(made["updated"], false, "{made}");
+    let first = made["first"].as_u64().unwrap_or(0) as usize;
+    let count = texts(&s).len();
+    // A new mark on page 1, then the index again from the document start.
+    s.cursor = Cursor::default();
+    s.cursor.offset = 3;
+    s.run("index.mark.insert", json!({"first": "빨강"}))?;
+    s.cursor = Cursor::default();
+    let before = texts(&s);
+    let again = s.run("tools.index", json!({}))?;
+    assert_eq!(again["updated"], true, "{again}");
+    assert_eq!(again["first"].as_u64(), Some(first as u64), "{again}");
+    let index: Vec<String> = texts(&s)[first..].to_vec();
+    assert_eq!(
+        index,
+        [
+            "(ᄇ)",
+            "배",
+            "   과일\t2",
+            "",
+            "(ᄈ)",
+            "빨강\t1",
+            "",
+            "(ᄉ)",
+            "사과\t1, 3",
+            ""
+        ],
+        "one index, refreshed in place"
+    );
+    assert_eq!(
+        texts(&s).len(),
+        count + 3,
+        "three new lines, no second index"
+    );
+    s.run("edit.undo", json!({}))?;
+    assert_eq!(texts(&s), before);
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("again.hwpx");
+    s.save(&path)?;
+    let mut back = Session::new()?;
+    back.open(&path)?;
+    let reopened = back.run("tools.index", json!({}))?;
+    assert_eq!(reopened["updated"], true, "{reopened}");
+    assert_eq!(texts(&back).len(), count + 3);
+    Ok(())
+}

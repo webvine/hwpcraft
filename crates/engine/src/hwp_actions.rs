@@ -5,6 +5,24 @@
 
 /// (Hangul action id, HwpCraft command id, default params JSON, mapping: mapped|partial)
 pub const HWP_ACTIONS: &[(&str, &str, &str, &str)] = &[
+    (
+        "AcceptAllChangesInDoc",
+        "document.track_changes.accept",
+        r##"{"all":true}"##,
+        "mapped",
+    ),
+    (
+        "AcceptAllChangesShown",
+        "document.track_changes.accept",
+        r##"{"all":true}"##,
+        "partial",
+    ),
+    (
+        "AcceptChange",
+        "document.track_changes.accept",
+        r##"{}"##,
+        "partial",
+    ),
     ("AddStyleDlg", "format.style.create", r##"{}"##, "mapped"),
     ("AllReplace", "edit.replace_all", r##"{}"##, "partial"),
     (
@@ -2519,6 +2537,24 @@ pub const HWP_ACTIONS: &[(&str, &str, &str, &str)] = &[
         r##"{}"##,
         "mapped",
     ),
+    (
+        "RejectAllChangesInDoc",
+        "document.track_changes.reject",
+        r##"{"all":true}"##,
+        "partial",
+    ),
+    (
+        "RejectAllChangesShown",
+        "document.track_changes.reject",
+        r##"{"all":true}"##,
+        "partial",
+    ),
+    (
+        "RejectChange",
+        "document.track_changes.reject",
+        r##"{}"##,
+        "partial",
+    ),
     ("RepeatFind", "edit.find", r##"{}"##, "partial"),
     ("ReplaceDlg", "edit.replace", r##"{}"##, "partial"),
     (
@@ -4408,6 +4444,24 @@ pub const HWP_ACTIONS: &[(&str, &str, &str, &str)] = &[
         r##"{"transparentBorders":true}"##,
         "mapped",
     ),
+    (
+        "TrackChange",
+        "document.track_changes.record",
+        r##"{"on":true}"##,
+        "partial",
+    ),
+    (
+        "TrackChanges",
+        "document.track_changes.record",
+        r##"{"on":true}"##,
+        "partial",
+    ),
+    (
+        "TrackChangesButton",
+        "document.track_changes.record",
+        r##"{"on":true}"##,
+        "partial",
+    ),
     ("Undo", "edit.undo", r##"{}"##, "mapped"),
     ("UndoButton", "edit.undo", r##"{}"##, "partial"),
     ("UserAutoFill", "table.auto_fill", r##"{}"##, "mapped"),
@@ -4425,6 +4479,12 @@ pub const HWP_ACTIONS: &[(&str, &str, &str, &str)] = &[
         "partial",
     ),
     ("ViewOutlineWS", "document.outline", r##"{}"##, "partial"),
+    (
+        "ViewTrackChangeInfo",
+        "document.track_changes",
+        r##"{}"##,
+        "partial",
+    ),
 ];
 
 /// Look up a Hangul action id (case-sensitive, as in Hangul's own tables).

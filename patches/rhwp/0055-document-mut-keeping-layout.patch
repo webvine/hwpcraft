@@ -1,0 +1,47 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 8ee35f0..39a65a6 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -2571,6 +2571,16 @@ impl DocumentCore {
+         &mut self.document
+     }
+ 
++    /// [HwpCraft 0055] 조판 입력을 바꾸지 않는 변경을 위한 IR mutable 참조: 저장기만 읽는
++    /// 값(요약 정보의 저장 시각, 탭 폭 기록)이나, 저장하는 동안만 바꿨다가 저장이 끝나면
++    /// 그대로 되돌리는 값(줄 캐시 숨김, 저장용 새 줄로 바꿔 끼우기). [`Self::document_mut`]
++    /// 와 달리 스냅샷 복원과 조판 결과 재사용을 끄지 않는다. 호출자는 조판에 쓰이는 값을
++    /// 다음 조판·렌더링·스냅샷 전에 원래대로 돌려놓아야 한다.
++    pub fn document_mut_keeping_layout(&mut self) -> &mut Document {
++        self.flush_cell_format_vpos();
++        &mut self.document
++    }
++
+     /// 문서 IR을 직접 설정한다 (테스트/네이티브 전용).
+     ///
+     /// [#4582] 이미 문서가 들어 있던 core 에도 쓸 수 있으므로 파생 상태는 손으로 고르지 않고
+@@ -4274,3 +4284,25 @@ mod source_format_tests {
+         assert!(!has_marker(&core.export_hwpx_native().unwrap()));
+     }
+ }
++
++#[cfg(test)]
++mod save_scoped_mutation_tests {
++    use super::DocumentCore;
++
++    /// A model change undone before the next layout keeps snapshot and typeset reuse on;
++    /// `document_mut` turns both off until the next full rebuild.
++    #[test]
++    fn a_save_scoped_change_keeps_reuse_on() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().expect("blank");
++        let _ = core.page_count();
++        let tag = core.document().sections[0].paragraphs[0].line_segs[0].tag;
++        core.document_mut_keeping_layout().sections[0].paragraphs[0].line_segs[0].tag |=
++            0x8000_0000;
++        core.document_mut_keeping_layout().sections[0].paragraphs[0].line_segs[0].tag = tag;
++        assert!(!core.untracked_model_edit);
++        assert!(core.typeset_marks.iter().all(|m| !m.untracked));
++        let _ = core.document_mut();
++        assert!(core.untracked_model_edit);
++    }
++}

@@ -52,6 +52,10 @@ impl ClipboardReplay {
         let (Some((first, start)), Some((last, end))) = (selected.first(), selected.last()) else {
             bail!("복사할 문단을 찾지 못했습니다.");
         };
+        // Rich copy covers one section; over sections the plain text still goes out.
+        if first.section != last.section {
+            bail!("구역을 넘는 선택은 글자만 복사합니다.");
+        }
         let range = if let Some(cell) = first.cell {
             CopyRange::Cell {
                 section: first.section,

@@ -148,7 +148,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "table.move_border",
-        "table, vertical(true: 세로 경계선), boundary(경계선 번호), delta_mm, range?(셀 블록: 세로 안쪽 선을 그 블록의 줄에서만 옮김, 한글처럼 경계가 어긋난 표가 됨; 가로 선은 거부)",
+        "table, vertical(true: 세로 경계선), boundary(경계선 번호), delta_mm, range?(셀 블록: 안쪽 선을 그 블록의 줄(세로 선)이나 칸(가로 선)에서만 옮김, 한글처럼 경계가 어긋난 표가 됨; 가로 선은 한 쪽에 놓인 표만, 셀 내용보다 작게는 거부)",
         r##"{"vertical":true,"boundary":1,"delta_mm":5.0}"##,
     ),
     (
@@ -193,7 +193,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "table.cell_shade",
-        "table, range(없으면 커서 셀), darker(true: 어둡게, false: 밝게) → 바뀐 셀 수",
+        "table, range(없으면 커서 셀), darker(true: 어둡게, false: 밝게; 한글처럼 처음 색에서 한 단계까지만 — 같은 쪽으로 다시 누르면 그대로, 반대로 누르면 처음 색. 다른 편집을 하면 그때 색이 새 기준) → 바뀐 셀 수",
         r##"{"darker":true}"##,
     ),
     (
@@ -265,6 +265,17 @@ fn gray_of(c: [u8; 3]) -> [u8; 3] {
 /// Hangul's 셀 음영 어둡게/밝게 (measured): the "ink" (255 − channel) grows ×1.54 or
 /// shrinks ×0.54; a white cell becomes #f2f2f2 and anything that light goes back to no
 /// fill. `None` means "no fill".
+/// The colour each cell had when 셀 음영 started and how many steps (-1, 0, 1) it is
+/// away from it. Hangul shades a cell at most one step from that colour: pressing
+/// 어둡게 again keeps the colour, 밝게 then goes back to it. The base holds while the
+/// same table's cells are shaded with no other edit in between.
+pub(crate) struct ShadeBase {
+    document: u64,
+    generation: u64,
+    table: ObjectAddress,
+    cells: std::collections::BTreeMap<usize, (Option<[u8; 3]>, i8)>,
+}
+
 fn shade(c: Option<[u8; 3]>, darker: bool) -> Option<[u8; 3]> {
     let c = c.unwrap_or([255, 255, 255]);
     let ink = c.map(|v| f64::from(255 - v));
@@ -1265,8 +1276,9 @@ impl Session {
                     );
                 }
                 let r = s.reserve_object_position()?;
+                let plain = s.plain_para_shape_id();
                 s.core
-                    .create_table_ex_native(
+                    .create_table_ex_with_cell_para_shape_native(
                         r.section,
                         r.paragraph,
                         r.offset,
@@ -1275,12 +1287,25 @@ impl Session {
                         true,
                         widths.as_deref(),
                         None,
+                        Some(plain),
                     )
                     .map_err(err)?
             } else {
                 let at = s.split_offset(c)?;
+                // Cells start in 바탕글's paragraph shape (`plain_table_cells`).
+                let options = hwpcraft_doc::TableCreationOptions {
+                    cell_para_shape_id: Some(s.plain_para_shape_id()),
+                    ..Default::default()
+                };
                 s.core
-                    .create_table_native(c.section, c.paragraph, at, p.rows, p.columns)
+                    .create_table_with_options_native(
+                        c.section,
+                        c.paragraph,
+                        at,
+                        p.rows,
+                        p.columns,
+                        &options,
+                    )
                     .map_err(err)?
             };
             let v: Value = serde_json::from_str(&response)?;
@@ -1294,6 +1319,7 @@ impl Session {
                 paragraph: index("paraIdx")?,
                 control: index("controlIdx")?,
             };
+            s.plain_table_cells(a)?;
             if !p.treat_as_char
                 && let Some(w) = &widths
             {
@@ -2139,6 +2165,7 @@ impl Session {
             _ => bail!("op는 sum, average, product 중 하나입니다."),
         };
         let r = self.block(a, range)?;
+        self.refuse_protected_block(a, &r)?;
         let t = self.table_at(a)?;
         let empty = |row: u16, col: u16| {
             t.cell_index_at(row, col)
@@ -2203,6 +2230,20 @@ impl Session {
         Ok(count)
     }
 
+    /// 셀 보호: a block command refuses a block that holds a protected cell.
+    fn refuse_protected_block(&self, a: ObjectAddress, r: &CellRange) -> Result<()> {
+        let t = self.table_at(a)?;
+        let inside = |c: &hwpcraft_doc::model::table::Cell| {
+            c.row <= r.end_row
+                && c.row + c.row_span.max(1) > r.start_row
+                && c.col <= r.end_col
+                && c.col + c.col_span.max(1) > r.start_col
+        };
+        if t.cells.iter().any(|c| c.cell_protect() && inside(c)) {
+            bail!("보호된 셀이 있는 블록은 고칠 수 없습니다.");
+        }
+        Ok(())
+    }
     /// 셀 보호: true when `c` is in a table cell marked protected.
     pub(crate) fn cell_protected(&self, c: Cursor) -> bool {
         let Some(t) = c.cell else {
@@ -2310,6 +2351,7 @@ impl Session {
             Some(out)
         }
         let r = self.block(a, range)?;
+        self.refuse_protected_block(a, &r)?;
         let t = self.table_at(a)?;
         let mut edits = Vec::new();
         for index in Self::block_cells(t, r) {
@@ -2373,6 +2415,13 @@ impl Session {
             bail!("문자열을 표로 바꾸기는 본문 문단에서 사용하세요.");
         }
         let paragraphs = self.selected_paragraphs()?;
+        if paragraphs
+            .first()
+            .zip(paragraphs.last())
+            .is_some_and(|(a, b)| a.0.section != b.0.section)
+        {
+            bail!("문자열을 표로 바꾸기는 한 구역 안의 문단을 선택해 사용하세요.");
+        }
         let mut rows: Vec<Vec<String>> = Vec::new();
         for (c, _) in &paragraphs {
             let p = self.paragraph(*c)?;
@@ -2487,18 +2536,25 @@ impl Session {
             lines.push(row.join(&sep));
         }
         let text = lines.join("\n");
+        let host = Cursor {
+            section: a.section,
+            paragraph: a.paragraph,
+            offset: 0,
+            cell: None,
+        };
+        // The text takes the table's place in its paragraph ("앞[표]뒤" → 앞, text, 뒤).
+        let place = self
+            .paragraph(host)?
+            .control_text_positions()
+            .get(a.control)
+            .copied();
         self.transaction(|s| {
             s.core
                 .delete_table_control_native(a.section, a.paragraph, a.control)
                 .map_err(err)?;
-            s.cursor = Cursor {
-                section: a.section,
-                paragraph: a.paragraph,
-                offset: 0,
-                cell: None,
-            };
+            s.cursor = host;
             s.clear_selection();
-            s.cursor.offset = s.len();
+            s.cursor.offset = place.unwrap_or(usize::MAX).min(s.len());
             s.insert(&text)
         })
     }
@@ -2512,6 +2568,7 @@ impl Session {
         descending: bool,
     ) -> Result<()> {
         let r = self.block(a, range)?;
+        self.refuse_protected_block(a, &r)?;
         if r.start_row == r.end_row {
             bail!("정렬할 줄을 두 줄 이상 선택하세요.");
         }
@@ -2594,6 +2651,9 @@ impl Session {
         if total > 1_000_000 {
             bail!("채울 글은 모두 1 MB 이하로 넣으세요.");
         }
+        for text in cells.iter().flatten().flatten() {
+            crate::check_typed_text(text)?;
+        }
         let t = self.table_at(a)?;
         let mut edits = Vec::new();
         for (i, line) in cells.iter().enumerate() {
@@ -2617,6 +2677,9 @@ impl Session {
                 let cell = &t.cells[index];
                 if (cell.row, cell.col) != (r, c) {
                     bail!("{r}행 {c}열은 병합된 셀에 가려진 칸입니다. null로 두세요.");
+                }
+                if cell.cell_protect() {
+                    bail!("{r}행 {c}열은 보호된 셀이라 고칠 수 없습니다.");
                 }
                 let plain = cell.paragraphs.iter().all(|p| {
                     p.controls.is_empty()
@@ -2743,6 +2806,7 @@ impl Session {
     /// (or row, for a one-row block): numbers, 월, 요일, 분기, 갑을병정, 가나다.
     pub fn auto_fill(&mut self, a: ObjectAddress, range: Option<CellRange>) -> Result<usize> {
         let r = self.block(a, range)?;
+        self.refuse_protected_block(a, &r)?;
         let t = self.table_at(a)?;
         let down = r.end_row > r.start_row;
         if !down && r.end_col == r.start_col {
@@ -2996,7 +3060,9 @@ impl Session {
         }
     }
 
-    /// 셀 음영 어둡게/밝게 for every cell of the block; returns the number of cells changed.
+    /// 셀 음영 어둡게/밝게 for every cell of the block, one step at most from the colour
+    /// the cell had when the shading started (`ShadeBase`); returns the number of cells
+    /// changed.
     pub fn cell_shade(
         &mut self,
         a: ObjectAddress,
@@ -3009,10 +3075,27 @@ impl Session {
             .into_iter()
             .map(|i| (i, t.cells[i].row, t.cells[i].col))
             .collect();
+        let bases = self
+            .shade_base
+            .take()
+            .filter(|b| {
+                b.document == self.document_serial
+                    && b.generation == self.generation
+                    && b.table == a
+            })
+            .map(|b| b.cells)
+            .unwrap_or_default();
+        let mut steps = std::collections::BTreeMap::new();
         let mut edits: Vec<(CellRange, Value)> = Vec::new();
         for (i, row, col) in targets {
             let current = self.cell_fill_rgb(a, i)?;
-            let next = shade(current, darker);
+            let (base, step) = bases.get(&i).copied().unwrap_or((current, 0));
+            let step = (step + if darker { 1 } else { -1 }).clamp(-1, 1);
+            steps.insert(i, (base, step));
+            let next = match step {
+                0 => base,
+                step => shade(base, step > 0),
+            };
             if next == current {
                 continue;
             }
@@ -3030,16 +3113,24 @@ impl Session {
                 props,
             ));
         }
-        if edits.is_empty() {
-            return Ok(0);
-        }
         let count = edits.len();
-        self.deferred_transaction(|s| {
-            for (range, props) in &edits {
-                s.cell_properties_raw(a, *range, props, None)?;
-            }
-            Ok(())
-        })?;
+        if count > 0 {
+            self.deferred_transaction(|s| {
+                for (range, props) in &edits {
+                    s.cell_properties_raw(a, *range, props, None)?;
+                }
+                Ok(())
+            })?;
+        }
+        // Cells shaded before in this run keep their base even when not in this block.
+        let mut cells = bases;
+        cells.extend(steps);
+        self.shade_base = Some(ShadeBase {
+            document: self.document_serial,
+            generation: self.generation,
+            table: a,
+            cells,
+        });
         Ok(count)
     }
 

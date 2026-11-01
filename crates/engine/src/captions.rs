@@ -99,6 +99,9 @@ pub(crate) fn rewrite(cap: &mut Caption, text: &str) -> Result<()> {
     p.char_offsets = offsets;
     // Characters, the number control and the paragraph end.
     p.char_count = at + 1;
+    // Rows a file stored break and size the old text; a caption without rows is laid
+    // out from its text, as a new one is.
+    p.line_segs.clear();
     Ok(())
 }
 
@@ -114,6 +117,7 @@ impl Session {
     /// Replace the words after the caption number as one undo step.
     pub fn set_object_caption_text(&mut self, a: ObjectAddress, text: &str) -> Result<()> {
         // Validate everything before the transaction so a refusal changes nothing.
+        self.guard_object_lock(a)?;
         let mut probe = control_caption(self.object(a)?)?
             .ok_or_else(|| {
                 anyhow!("캡션이 없는 개체입니다. object.properties hasCaption으로 먼저 넣으세요.")

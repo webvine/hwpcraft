@@ -22,9 +22,11 @@ fn with_highlights(mut svg: String, page: u32, rects: &[HighlightRect]) -> Resul
         }
         // Match the former desktop-only alpha (110/255). Append above text so
         // screen and exported output use exactly the same compositing order.
+        // Change-tracking marks are opaque lines.
+        let opacity = if rect.solid { "1" } else { "0.43137255" };
         overlay.push_str(&format!(
-            "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#{}\" fill-opacity=\"0.43137255\"/>\n",
-            rect.x, rect.y, rect.width, rect.height, color
+            "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#{}\" fill-opacity=\"{}\"/>\n",
+            rect.x, rect.y, rect.width, rect.height, color, opacity
         ));
     }
     if !overlay.is_empty() {

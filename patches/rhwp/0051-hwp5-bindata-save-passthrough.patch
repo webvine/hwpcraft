@@ -1,0 +1,114 @@
+diff --git a/src/serializer/cfb_writer.rs b/src/serializer/cfb_writer.rs
+index 721a6ce..9d4521b 100644
+--- a/src/serializer/cfb_writer.rs
++++ b/src/serializer/cfb_writer.rs
+@@ -357,6 +357,20 @@ fn write_hwp_cfb(
+         let storage_name = format!("BIN{:04X}.{}", storage_id, ext);
+         let path = format!("/BinData/{}", storage_name);
+ 
++        // 원본 HWP5 에서 바뀌지 않은 항목은 저장된 스트림을 그대로 쓴다. 압축을 풀었다가
++        // 다시 압축하는 것과 내용이 같고(OLE 크기 prefix 도 원본 그대로다), 원본 바이트를
++        // 보존한다. 편집·추가한 바이트는 저장 형태가 없어 아래 경로로 다시 만든다.
++        // 저장 압축 상태가 이 문서가 기대하는 상태와 다르면(암호 저장의 압축 강제 등)
++        // 통과시키지 않는다.
++        if let Some(stored) = content
++            .data
++            .load_raw()
++            .filter(|stored| stored.compressed == should_compress)
++        {
++            streams.push((path, encrypt_if_password(stored.bytes, password)));
++            continue;
++        }
++
+         // [#2550] 압축 해제 상한. 초과 항목(deflate bomb 포함)은 해제 없이 원본
+         // 저장 바이트를 그대로 통과시킨다 — 재압축·OLE prefix 복원·매직 판정은
+         // 해제된 바이트에만 의미가 있고, 원본 스트림은 이미 그 처리가 끝난
+diff --git a/src/serializer/cfb_writer/tests.rs b/src/serializer/cfb_writer/tests.rs
+index 633c65c..84788d2 100644
+--- a/src/serializer/cfb_writer/tests.rs
++++ b/src/serializer/cfb_writer/tests.rs
+@@ -1802,3 +1802,84 @@ fn test_compressed_ole_storage_payload_is_deflated() {
+     );
+     assert_eq!(&payload[4..], &ole_cfb[..]);
+ }
++
++// HWP5 저장은 바뀌지 않은 그림(BinData)의 저장 스트림을 원본 그대로 쓰고, 바꾼 그림은
++// 새 내용으로 쓴다(업스트림 5a973437f `tests/cases/bindata_save_passthrough.rs`, 0.19 의
++// tests/cases 하네스가 없어 lib 테스트로 옮겼다).
++mod bindata_save_passthrough {
++    use crate::document_core::DocumentCore;
++    use crate::model::bin_data::BinDataBytes;
++    use crate::parser::parse_document;
++
++    const FIXTURE: &str = "samples/exam_kor.hwp";
++
++    fn read_fixture() -> Vec<u8> {
++        std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE))
++            .unwrap_or_else(|error| panic!("read {FIXTURE}: {error}"))
++    }
++
++    #[test]
++    fn unchanged_bin_data_keeps_stored_stream_and_content() {
++        let bytes = read_fixture();
++        let original = parse_document(&bytes).expect("parse fixture");
++        let core = DocumentCore::from_bytes(&bytes).expect("open fixture");
++        let saved = parse_document(&core.export_hwp_native().expect("save")).expect("reparse");
++
++        assert!(
++            !original.bin_data_content.is_empty(),
++            "{FIXTURE} 에 그림이 있어야 검사가 의미 있다"
++        );
++        assert_eq!(
++            saved.bin_data_content.len(),
++            original.bin_data_content.len()
++        );
++        for (before, after) in original
++            .bin_data_content
++            .iter()
++            .zip(&saved.bin_data_content)
++        {
++            assert_eq!(after.id, before.id);
++            assert_eq!(
++                after.data.load(),
++                before.data.load(),
++                "BIN{:04X} 내용이 저장 뒤 달라졌다",
++                before.id
++            );
++            let (Some(stored_before), Some(stored_after)) =
++                (before.data.load_raw(), after.data.load_raw())
++            else {
++                panic!("BIN{:04X} 저장 형태를 읽지 못했다", before.id);
++            };
++            assert_eq!(stored_after.compressed, stored_before.compressed);
++            assert!(
++                stored_after.bytes == stored_before.bytes,
++                "BIN{:04X} 저장 스트림이 원본과 다르다",
++                before.id
++            );
++        }
++    }
++
++    #[test]
++    fn replaced_bin_data_is_written_with_new_content() {
++        let bytes = read_fixture();
++        let mut core = DocumentCore::from_bytes(&bytes).expect("open fixture");
++        let target = core.document().bin_data_content[0].id;
++        let mut replacement = core.document().bin_data_content[0].data.load();
++        // 같은 형식을 유지하되 내용을 바꾼다(끝 바이트 반전).
++        let last = replacement.len() - 1;
++        replacement[last] ^= 0xff;
++        core.document_mut().bin_data_content[0].data = BinDataBytes::Loaded(replacement.clone());
++
++        let saved = parse_document(&core.export_hwp_native().expect("save")).expect("reparse");
++        let after = saved
++            .bin_data_content
++            .iter()
++            .find(|content| content.id == target)
++            .expect("saved bin data");
++        assert_eq!(
++            after.data.load(),
++            replacement,
++            "바꾼 그림이 원본 저장 스트림으로 덮였다"
++        );
++    }
++}

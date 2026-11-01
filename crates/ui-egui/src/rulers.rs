@@ -12,6 +12,9 @@ const RULER: f32 = 28.0;
 const BAND: (f32, f32) = (8.0, 21.0);
 
 /// Values the rulers need, refreshed when the document or cursor changes.
+/// Body column boxes of one laid-out page (column index, x/y/width/height), keyed by
+/// (generation, page).
+type PageColumns = ((u64, u32), Vec<(u16, [f64; 4])>);
 #[derive(Clone, Default)]
 pub(crate) struct RulerCache {
     key: (u64, usize, usize, Option<hwpcraft_doc::Cell>),
@@ -19,6 +22,7 @@ pub(crate) struct RulerCache {
     /// Paragraph left margin, right margin and first-line indent in mm.
     indent: (f32, f32, f32),
     chars: usize,
+    columns: Option<PageColumns>,
 }
 
 impl HwpApp {
@@ -58,6 +62,7 @@ impl HwpApp {
                 page,
                 indent,
                 chars,
+                columns: None,
             };
         }
         self.ext.shell.rulers.clone()
@@ -191,13 +196,27 @@ impl HwpApp {
         let pages = self.layout_page_count().max(1);
         let sections = self.session.core.document().sections.len().max(1);
         let (line, column) = self.line_and_column();
-        let page = self
-            .session
-            .caret()
-            .ok()
+        let caret = self.session.caret().ok();
+        let page = caret
+            .as_ref()
             .and_then(|v| v["pageIndex"].as_u64())
             .unwrap_or(self.page as u64)
             + 1;
+        // The column (단) holding the caret, from the page's laid-out column boxes.
+        let zone = caret
+            .as_ref()
+            .and_then(|v| Some((v["x"].as_f64()?, v["y"].as_f64()?)))
+            .map_or(1, |(x, y)| {
+                let key = (self.session.generation, (page - 1) as u32);
+                let cache = &mut self.ext.shell.rulers.columns;
+                if cache.as_ref().is_none_or(|(k, _)| *k != key) {
+                    let boxes = self.session.page_columns(key.1).unwrap_or_default();
+                    *cache = Some((key, boxes));
+                }
+                cache
+                    .as_ref()
+                    .map_or(1, |(_, boxes)| hwpcraft_engine::column_number(boxes, x, y))
+            });
         ui.horizontal_centered(|ui| {
             let full = ui.max_rect();
             let split = (full.right() - 300.0).max(full.left());
@@ -239,7 +258,7 @@ impl HwpApp {
                     {
                         self.page = (page as u32) % pages;
                     }
-                    cell(ui, "1단".into(), "현재 단");
+                    cell(ui, format!("{zone}단"), "현재 단");
                     cell(ui, format!("{line}줄"), "쪽 안에서의 줄");
                     cell(ui, format!("{column}칸"), "줄 안에서의 칸");
                     cell(ui, format!("{}글자", cache.chars), "문서 전체 글자 수");
@@ -257,15 +276,9 @@ impl HwpApp {
                     if cell(ui, mode.into(), "삽입/수정 전환 (Insert)").clicked() {
                         self.session.overwrite = !self.session.overwrite;
                     }
-                    if self.session.has_unkept_track_changes() {
+                    if let Some((label, tip)) = self.track_status() {
                         ui.add_enabled_ui(false, |ui| {
-                            cell(
-                                ui,
-                                "변경 추적 기록 있음(저장 시 결과본)".into(),
-                                "이 문서에는 한글의 변경 추적 기록이 있습니다. HwpCraft는 지금 보이는 \
-                                 결과본을 보여 주며 변경 표시는 그리지 않습니다. HWP/HWPX로 저장하면 \
-                                 확인 뒤 변경 내용이 결과본으로 합쳐지고 변경 기록은 지워집니다.",
-                            );
+                            cell(ui, label.into(), tip);
                         });
                     }
                     // Running states the user should not forget: a macro being recorded and
@@ -312,15 +325,16 @@ impl HwpApp {
                     }
                     if !self.message.is_empty() && !start_hint_is_stale(self) {
                         ui.add_space(12.0);
+                        let message = crate::ribbon::platform_keys(&self.message);
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&self.message)
+                                RichText::new(message.as_ref())
                                     .color(Color32::from_gray(110))
                                     .size(11.5),
                             )
                             .truncate(),
                         )
-                        .on_hover_text(&self.message);
+                        .on_hover_text(message.as_ref());
                     }
                 },
             );
@@ -334,7 +348,9 @@ impl HwpApp {
                     let zoom = format!("{:.0}%", self.zoom * 100.0);
                     let response = ui
                         .add_sized([64.0, 24.0], egui::Button::new(zoom).frame(false))
-                        .on_hover_text("여기서는 휠만, 문서 위에서는 Ctrl+휠: 확대/축소 (10–500%)");
+                        .on_hover_text(crate::ribbon::platform_keys(
+                            "여기서는 휠만, 문서 위에서는 Ctrl+휠: 확대/축소 (10–500%)",
+                        ));
                     self.status_wheel_zoom(&response);
                     let popup = egui::Id::new("hwp-zoom-menu");
                     if response.clicked() {

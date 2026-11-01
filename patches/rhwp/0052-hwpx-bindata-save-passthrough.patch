@@ -1,0 +1,475 @@
+diff --git a/src/model/bin_data.rs b/src/model/bin_data.rs
+index 242c015..8978c13 100644
+--- a/src/model/bin_data.rs
++++ b/src/model/bin_data.rs
+@@ -151,6 +151,21 @@ pub trait BinDataResolver:
+     fn resolve_raw(&self, _key: &str) -> Option<StoredBinData> {
+         None
+     }
++
++    /// 원본 ZIP 엔트리가 deflate 로 저장돼 있으면 그 압축 바이트와 CRC-32·비압축 크기를
++    /// 반환한다 (압축 해제 없음). HWPX 저장이 바뀌지 않은 엔트리를 다시 압축하지 않고
++    /// 옮길 때 쓴다. ZIP 컨테이너가 아니거나 deflate 가 아니면 `None` 이다 (기본값).
++    fn resolve_deflated_zip_entry(&self, _key: &str) -> Option<DeflatedZipEntry> {
++        None
++    }
++}
++
++/// 원본 ZIP 의 deflate 엔트리 — 압축 바이트와 그 해제 내용의 CRC-32·크기.
++#[derive(Debug, Clone)]
++pub struct DeflatedZipEntry {
++    pub crc32: u32,
++    pub uncompressed_size: u64,
++    pub compressed_bytes: Vec<u8>,
+ }
+ 
+ /// 세션 중 추가된 바이트를 기존 공개 enum 모양을 바꾸지 않고 공유한다.
+@@ -285,6 +300,15 @@ impl BinDataBytes {
+         }
+     }
+ 
++    /// 원본 ZIP 의 deflate 엔트리를 그대로 얻는다 (압축 해제 없음). `Loaded` 와 ZIP 이 아닌
++    /// 컨테이너는 `None` 이다.
++    pub fn load_deflated_zip_entry(&self) -> Option<DeflatedZipEntry> {
++        match self {
++            BinDataBytes::Loaded(_) => None,
++            BinDataBytes::Lazy { resolver, key } => resolver.resolve_deflated_zip_entry(key),
++        }
++    }
++
+     /// 바이트 길이. `Lazy` 인 경우 압축 해제가 발생하므로 렌더 경로의
+     /// 반복 호출은 피하고 `load()` 결과를 재사용한다.
+     pub fn len(&self) -> usize {
+diff --git a/src/parser/hwpx/mod.rs b/src/parser/hwpx/mod.rs
+index 7045507..512a5fa 100644
+--- a/src/parser/hwpx/mod.rs
++++ b/src/parser/hwpx/mod.rs
+@@ -149,6 +149,17 @@ impl crate::model::bin_data::BinDataResolver for HwpxBinResolver {
+     fn resolved_is_empty(&self, key: &str) -> bool {
+         self.resolved_len(key) == 0
+     }
++
++    fn resolve_deflated_zip_entry(
++        &self,
++        key: &str,
++    ) -> Option<crate::model::bin_data::DeflatedZipEntry> {
++        let mut reader = match self.reader.lock() {
++            Ok(reader) => reader,
++            Err(poisoned) => poisoned.into_inner(),
++        };
++        reader.raw_deflated_entry(key)
++    }
+ }
+ 
+ /// HWPX 파싱 에러
+diff --git a/src/parser/hwpx/reader.rs b/src/parser/hwpx/reader.rs
+index 35cf5de..abbdc23 100644
+--- a/src/parser/hwpx/reader.rs
++++ b/src/parser/hwpx/reader.rs
+@@ -227,6 +227,30 @@ impl HwpxReader {
+         Ok(size)
+     }
+ 
++    /// deflate 로 저장된 엔트리의 압축 바이트와 CRC-32·비압축 크기 (압축 해제 없음).
++    ///
++    /// deflate 가 아니거나 압축 크기가 [`MAX_BINDATA_SIZE`] 를 넘으면 `None` 이다.
++    pub fn raw_deflated_entry(
++        &mut self,
++        path: &str,
++    ) -> Option<crate::model::bin_data::DeflatedZipEntry> {
++        let index = self.archive.index_for_name(path)?;
++        let mut file = self.archive.by_index_raw(index).ok()?;
++        if file.compression() != zip::CompressionMethod::Deflated {
++            return None;
++        }
++        let compressed = usize::try_from(file.compressed_size())
++            .ok()
++            .filter(|size| *size <= MAX_BINDATA_SIZE)?;
++        let mut compressed_bytes = Vec::with_capacity(compressed);
++        file.read_to_end(&mut compressed_bytes).ok()?;
++        Some(crate::model::bin_data::DeflatedZipEntry {
++            crc32: file.crc32(),
++            uncompressed_size: file.size(),
++            compressed_bytes,
++        })
++    }
++
+     /// 아카이브 내 파일 목록을 반환한다.
+     pub fn file_names(&self) -> Vec<String> {
+         self.archive.file_names().map(|s| s.to_string()).collect()
+diff --git a/src/serializer/hwpx/bindata_save_passthrough_tests.rs b/src/serializer/hwpx/bindata_save_passthrough_tests.rs
+new file mode 100644
+index 0000000..c2e44a5
+--- /dev/null
++++ b/src/serializer/hwpx/bindata_save_passthrough_tests.rs
+@@ -0,0 +1,105 @@
++//! HWPX 저장은 바뀌지 않은 그림(BinData)을 다시 압축하지 않고 원본 deflate 바이트를
++//! 옮기고, 바꾼 그림은 새 내용으로 쓴다(업스트림 eff62aba1
++//! `tests/cases/hwpx_bindata_save_passthrough.rs`, 0.19 의 tests/cases 하네스가 없어 lib
++//! 테스트로 옮겼다).
++
++use std::io::{Cursor, Read};
++
++use crate::document_core::DocumentCore;
++use crate::model::bin_data::BinDataBytes;
++use crate::parser::parse_document;
++
++fn read_fixture(path: &str) -> Vec<u8> {
++    std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
++        .unwrap_or_else(|error| panic!("read {path}: {error}"))
++}
++
++/// BinData/ 아래 deflate 엔트리의 (이름, 압축 바이트, 해제 바이트).
++fn bin_data_entries(zip_bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
++    let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes.to_vec())).expect("zip");
++    let mut entries = Vec::new();
++    for index in 0..archive.len() {
++        let (name, raw) = {
++            let mut entry = archive.by_index_raw(index).expect("raw entry");
++            let name = entry.name().to_string();
++            if !name.starts_with("BinData/")
++                || entry.compression() != zip::CompressionMethod::Deflated
++            {
++                continue;
++            }
++            let mut raw = Vec::new();
++            entry.read_to_end(&mut raw).expect("read raw");
++            (name, raw)
++        };
++        let mut content = Vec::new();
++        archive
++            .by_index(index)
++            .expect("entry")
++            .read_to_end(&mut content)
++            .expect("read content");
++        entries.push((name, raw, content));
++    }
++    entries
++}
++
++#[test]
++fn hwpx_source_keeps_original_deflate_bytes() {
++    let source = read_fixture("samples/hwpx/exam_kor.hwpx");
++    let original = bin_data_entries(&source);
++    assert!(
++        !original.is_empty(),
++        "원본에 deflate 그림 엔트리가 있어야 한다"
++    );
++
++    let core = DocumentCore::from_bytes(&source).expect("open");
++    let saved = bin_data_entries(&core.export_hwpx_native().expect("save hwpx"));
++    for (name, raw, content) in &original {
++        let (_, saved_raw, saved_content) = saved
++            .iter()
++            .find(|(saved_name, ..)| saved_name == name)
++            .unwrap_or_else(|| panic!("{name} 가 저장본에 없다"));
++        assert_eq!(saved_content, content, "{name} 내용이 달라졌다");
++        assert!(saved_raw == raw, "{name} 압축 바이트가 원본과 다르다");
++    }
++}
++
++#[test]
++fn hwp_source_reuses_stored_deflate_stream() {
++    let source = read_fixture("samples/exam_kor.hwp");
++    let original = parse_document(&source).expect("parse hwp");
++    let core = DocumentCore::from_bytes(&source).expect("open");
++    let saved = bin_data_entries(&core.export_hwpx_native().expect("save hwpx"));
++    assert!(!saved.is_empty());
++
++    for content in &original.bin_data_content {
++        let Some(stored) = content.data.load_raw().filter(|stored| stored.compressed) else {
++            continue;
++        };
++        let loaded = content.data.load();
++        let (name, saved_raw, saved_content) = saved
++            .iter()
++            .find(|(_, _, saved_content)| *saved_content == loaded)
++            .unwrap_or_else(|| panic!("BIN{:04X} 내용의 엔트리가 저장본에 없다", content.id));
++        assert!(
++            *saved_raw == stored.bytes,
++            "{name} 가 HWP 저장 스트림을 그대로 쓰지 않았다"
++        );
++        assert_eq!(*saved_content, loaded);
++    }
++}
++
++#[test]
++fn replaced_image_is_written_with_new_content() {
++    let source = read_fixture("samples/hwpx/exam_kor.hwpx");
++    let mut core = DocumentCore::from_bytes(&source).expect("open");
++    let mut replacement = core.document().bin_data_content[0].data.load();
++    let last = replacement.len() - 1;
++    replacement[last] ^= 0xff;
++    core.document_mut().bin_data_content[0].data = BinDataBytes::Loaded(replacement.clone());
++
++    let saved = bin_data_entries(&core.export_hwpx_native().expect("save hwpx"));
++    assert!(
++        saved.iter().any(|(_, _, content)| *content == replacement),
++        "바꾼 그림이 원본 엔트리로 덮였다"
++    );
++}
+diff --git a/src/serializer/hwpx/mod.rs b/src/serializer/hwpx/mod.rs
+index 1aa05f2..a3ed0c7 100644
+--- a/src/serializer/hwpx/mod.rs
++++ b/src/serializer/hwpx/mod.rs
+@@ -28,6 +28,9 @@ pub mod table;
+ pub mod utils;
+ pub mod writer;
+ 
++#[cfg(test)]
++mod bindata_save_passthrough_tests;
++
+ use std::collections::HashSet;
+ use std::fmt::Write as _;
+ 
+@@ -40,6 +43,43 @@ use content::BinDataEntry as ContentBinDataEntry;
+ use context::SerializeContext;
+ use writer::HwpxZipWriter;
+ 
++/// 저장할 내용(`payload`)과 같은 내용의 원본 deflate 바이트가 있으면 다시 압축하지 않고 쓴다.
++///
++/// - HWPX 원본: 원본 ZIP 엔트리가 deflate 이고 CRC-32·크기가 `payload` 와 같을 때.
++/// - HWP5 원본: 저장 스트림을 raw deflate 로 풀어 낸 CRC-32·크기가 `payload` 와 같을 때.
++///   HWP5 읽기는 raw deflate 가 실패하면 zlib 으로도 푸는데, zlib 스트림은 ZIP 엔트리가
++///   될 수 없으므로 raw deflate 로 풀리는지까지 확인한다.
++fn reusable_deflate(
++    data: &crate::model::bin_data::BinDataBytes,
++    payload: &[u8],
++) -> Option<crate::model::bin_data::DeflatedZipEntry> {
++    let crc32 = || {
++        let mut crc = flate2::Crc::new();
++        crc.update(payload);
++        crc.sum()
++    };
++    if let Some(entry) = data.load_deflated_zip_entry() {
++        return (entry.uncompressed_size == payload.len() as u64 && entry.crc32 == crc32())
++            .then_some(entry);
++    }
++    let stored = data.load_raw().filter(|stored| stored.compressed)?;
++    let mut inflated =
++        flate2::CrcReader::new(flate2::read::DeflateDecoder::new(stored.bytes.as_slice()));
++    let inflated_size = std::io::copy(
++        &mut std::io::Read::take(&mut inflated, payload.len() as u64 + 1),
++        &mut std::io::sink(),
++    )
++    .ok()?;
++    let crc = crc32();
++    (inflated_size == payload.len() as u64 && inflated.crc().sum() == crc).then_some(
++        crate::model::bin_data::DeflatedZipEntry {
++            crc32: crc,
++            uncompressed_size: payload.len() as u64,
++            compressed_bytes: stored.bytes,
++        },
++    )
++}
++
+ /// Document IR을 HWPX(ZIP+XML) 바이트로 직렬화한다.
+ ///
+ /// Stage 0 이후: 빈 문서 특수 분기를 제거하고 **항상 동적 경로**를 탄다.
+@@ -198,7 +238,15 @@ pub fn serialize_hwpx_with_report(doc: &Document) -> Result<SerializedDocument,
+         } else {
+             bytes
+         };
+-        z.write_deflated(&entry.href, &payload)?;
++        match reusable_deflate(&data.data, &payload) {
++            Some(raw) => z.write_precompressed_deflated(
++                &entry.href,
++                raw.crc32,
++                raw.uncompressed_size,
++                &raw.compressed_bytes,
++            )?,
++            None => z.write_deflated(&entry.href, &payload)?,
++        }
+         zip_bin_entries.insert(entry.href.clone());
+     }
+ 
+diff --git a/src/serializer/hwpx/writer.rs b/src/serializer/hwpx/writer.rs
+index 595a631..2ee3e32 100644
+--- a/src/serializer/hwpx/writer.rs
++++ b/src/serializer/hwpx/writer.rs
+@@ -78,6 +78,31 @@ impl HwpxZipWriter {
+         Ok(())
+     }
+ 
++    /// 이미 deflate 한 데이터로 DEFLATED 엔트리를 추가한다(다시 압축하지 않는다).
++    ///
++    /// `raw_deflate` 는 `uncompressed_size` 바이트(CRC-32 `crc32`)를 raw deflate 한 바이트다.
++    /// zip 크레이트는 압축된 데이터를 다른 ZIP 에서만 옮길 수 있으므로, 이 엔트리 하나만
++    /// 든 임시 ZIP 을 [`Self::write_deflated`] 와 같은 결정론 메타데이터(고정 mtime·UNIX
++    /// 호스트·기본 권한)로 만들어 합친다. 그래서 같은 압축 바이트라면 `write_deflated` 와
++    /// 같은 엔트리가 된다. zip 8 의 `raw_copy_file_rename` 은 호스트 OS 를 원본에서 가져오지
++    /// 않고 빌드한 호스트로 채우므로(Windows 에서 MS-DOS) 엔트리째 합치는 `merge_archive`
++    /// 를 쓴다.
++    pub fn write_precompressed_deflated(
++        &mut self,
++        name: &str,
++        crc32: u32,
++        uncompressed_size: u64,
++        raw_deflate: &[u8],
++    ) -> Result<(), SerializeError> {
++        let staged = single_deflated_entry_zip(name, crc32, uncompressed_size, raw_deflate)
++            .ok_or_else(|| SerializeError::ZipError(format!("{name}: 엔트리가 4GiB 를 넘는다")))?;
++        let archive = zip::ZipArchive::new(Cursor::new(staged))
++            .map_err(|e| SerializeError::ZipError(e.to_string()))?;
++        self.inner
++            .merge_archive(archive)
++            .map_err(|e| SerializeError::ZipError(e.to_string()))
++    }
++
+     /// ZIP을 마감하고 바이트를 반환한다.
+     pub fn finish(self) -> Result<Vec<u8>, SerializeError> {
+         let cursor = self
+@@ -88,8 +113,153 @@ impl HwpxZipWriter {
+     }
+ }
+ 
++/// [`HwpxZipWriter::write_deflated`] 가 남기는 엔트리 메타데이터로 엔트리 하나짜리 ZIP 을 만든다.
++///
++/// 4GiB 이상은 ZIP64 가 필요해 다루지 않는다. ASCII 가 아닌 이름은 zip 크레이트처럼
++/// UTF-8 플래그(비트 11)를 켠다.
++fn single_deflated_entry_zip(
++    name: &str,
++    crc32: u32,
++    uncompressed_size: u64,
++    raw_deflate: &[u8],
++) -> Option<Vec<u8>> {
++    const VERSION: u16 = 20;
++    const DEFLATED: u16 = 8;
++    // 1980-01-01 00:00:00 (ZIP epoch) — `HwpxZipWriter::fixed_mtime`.
++    const DOS_TIME: u16 = 0;
++    const DOS_DATE: u16 = (1 << 5) | 1;
++    // 기본 파일 권한(0o100644)을 UNIX 외부 속성 상위 16비트에 둔다.
++    const EXTERNAL_ATTRIBUTES: u32 = 0o100644 << 16;
++    let host_system = HwpxZipWriter::FIXED_HOST_SYSTEM as u16;
++    let name_bytes = name.as_bytes();
++    let name_len = u16::try_from(name_bytes.len()).ok()?;
++    let flags: u16 = if name.is_ascii() { 0 } else { 1 << 11 };
++    let size = u32::try_from(uncompressed_size)
++        .ok()
++        .filter(|v| *v < u32::MAX)?;
++    let compressed = u32::try_from(raw_deflate.len())
++        .ok()
++        .filter(|v| *v < u32::MAX)?;
++
++    let mut zip = Vec::with_capacity(raw_deflate.len() + 128);
++    let local_header_offset = 0u32;
++    zip.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
++    for value in [VERSION, flags, DEFLATED, DOS_TIME, DOS_DATE] {
++        zip.extend_from_slice(&value.to_le_bytes());
++    }
++    for value in [crc32, compressed, size] {
++        zip.extend_from_slice(&value.to_le_bytes());
++    }
++    zip.extend_from_slice(&name_len.to_le_bytes());
++    zip.extend_from_slice(&0u16.to_le_bytes());
++    zip.extend_from_slice(name_bytes);
++    zip.extend_from_slice(raw_deflate);
++
++    let central_offset = u32::try_from(zip.len()).ok()?;
++    zip.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
++    for value in [
++        (host_system << 8) | VERSION,
++        VERSION,
++        flags,
++        DEFLATED,
++        DOS_TIME,
++        DOS_DATE,
++    ] {
++        zip.extend_from_slice(&value.to_le_bytes());
++    }
++    for value in [crc32, compressed, size] {
++        zip.extend_from_slice(&value.to_le_bytes());
++    }
++    for value in [name_len, 0, 0, 0, 0] {
++        zip.extend_from_slice(&value.to_le_bytes());
++    }
++    zip.extend_from_slice(&EXTERNAL_ATTRIBUTES.to_le_bytes());
++    zip.extend_from_slice(&local_header_offset.to_le_bytes());
++    zip.extend_from_slice(name_bytes);
++    let central_size = u32::try_from(zip.len()).ok()? - central_offset;
++
++    zip.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
++    for value in [0u16, 0, 1, 1] {
++        zip.extend_from_slice(&value.to_le_bytes());
++    }
++    zip.extend_from_slice(&central_size.to_le_bytes());
++    zip.extend_from_slice(&central_offset.to_le_bytes());
++    zip.extend_from_slice(&0u16.to_le_bytes());
++    Some(zip)
++}
++
+ impl Default for HwpxZipWriter {
+     fn default() -> Self {
+         Self::new()
+     }
+ }
++
++// 미리 deflate 한 데이터로 쓴 HWPX ZIP 엔트리는, 같은 압축 바이트라면 일반 경로로 쓴
++// 엔트리와 바이트 단위로 같다(결정론 메타데이터 — mtime·호스트·권한 — 를 공유).
++// 업스트림 eff62aba1 `tests/cases/hwpx_precompressed_entry.rs` 를 lib 테스트로 옮겼다.
++#[cfg(test)]
++mod tests {
++    use std::io::{Cursor, Read};
++
++    use super::HwpxZipWriter;
++
++    fn payload() -> Vec<u8> {
++        // 압축이 되는 내용과 안 되는 내용을 섞는다.
++        let mut data = b"<hp:p>".repeat(2000);
++        data.extend((0..20_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8));
++        data
++    }
++
++    fn normal_archive(name: &str, data: &[u8]) -> Vec<u8> {
++        let mut zip = HwpxZipWriter::new();
++        zip.write_stored("mimetype", b"application/hwp+zip")
++            .unwrap();
++        zip.write_deflated(name, data).unwrap();
++        zip.finish().unwrap()
++    }
++
++    #[test]
++    fn precompressed_entry_matches_normal_entry_bytes() {
++        assert_precompressed_matches_normal("BinData/image1.bmp");
++    }
++
++    /// ASCII 가 아닌 이름은 UTF-8 플래그까지 일반 경로와 같아야 한다(0.19 이식에서 추가).
++    #[test]
++    fn precompressed_entry_with_non_ascii_name_matches_normal_entry_bytes() {
++        assert_precompressed_matches_normal("BinData/그림1.bmp");
++    }
++
++    fn assert_precompressed_matches_normal(name: &str) {
++        let data = payload();
++        let normal = normal_archive(name, &data);
++
++        // 일반 경로가 만든 엔트리의 압축 바이트·CRC 를 그대로 다시 쓴다.
++        let mut archive = zip::ZipArchive::new(Cursor::new(normal.clone())).unwrap();
++        let (crc32, size, raw) = {
++            let index = archive.index_for_name(name).unwrap();
++            let mut entry = archive.by_index_raw(index).unwrap();
++            let mut raw = Vec::new();
++            entry.read_to_end(&mut raw).unwrap();
++            (entry.crc32(), entry.size(), raw)
++        };
++        assert!(raw.len() < data.len(), "검사 데이터가 실제로 압축돼야 한다");
++
++        let mut zip = HwpxZipWriter::new();
++        zip.write_stored("mimetype", b"application/hwp+zip")
++            .unwrap();
++        zip.write_precompressed_deflated(name, crc32, size, &raw)
++            .unwrap();
++        let precompressed = zip.finish().unwrap();
++
++        assert!(
++            precompressed == normal,
++            "미리 압축한 엔트리의 ZIP 바이트가 일반 경로와 다르다"
++        );
++
++        let mut reread = zip::ZipArchive::new(Cursor::new(precompressed)).unwrap();
++        let mut entry = reread.by_name(name).unwrap();
++        let mut back = Vec::new();
++        entry.read_to_end(&mut back).unwrap();
++        assert_eq!(back, data);
++    }
++}

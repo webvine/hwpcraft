@@ -94,6 +94,7 @@ fn title(address: &ContextAddress) -> String {
             ContextStep::Footer { paragraph, .. } => ("꼬리말".into(), paragraph),
             ContextStep::Footnote { paragraph, .. } => ("각주".into(), paragraph),
             ContextStep::Endnote { paragraph, .. } => ("미주".into(), paragraph),
+            ContextStep::MasterPage { paragraph, .. } => ("바탕쪽".into(), paragraph),
             ContextStep::TextBox {
                 paragraph,
                 shape_path,

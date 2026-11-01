@@ -88,14 +88,20 @@ impl Session {
             return (index + 1) as u16;
         }
         // A fresh storage id names the embedded stream; reusing one would swap images.
-        let storage_id = doc
+        let used: std::collections::HashSet<u16> = doc
             .bin_data_content
             .iter()
             .map(|c| c.id)
             .chain(doc.doc_info.bin_data_list.iter().map(|b| b.storage_id))
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+            .collect();
+        let next = used.iter().max().copied().unwrap_or(0).saturating_add(1);
+        // The HWP bullet record repeats the id in one byte: past 255, take a free id
+        // that fits it when there is one.
+        let storage_id = if next > 0xff {
+            (1..=0xff).find(|id| !used.contains(id)).unwrap_or(next)
+        } else {
+            next
+        };
         doc.bin_data_content.push(BinDataContent {
             id: storage_id,
             data: BinDataBytes::from_shared(bytes.to_vec()),

@@ -78,7 +78,7 @@ impl HwpApp {
         match clicked {
             Some(0) => {
                 let why = if d.base.is_empty() {
-                    Some("본문 한 문단 안에서 덧말을 달 글자를 먼저 선택하세요.")
+                    Some("본문이나 표 셀의 한 문단 안에서 덧말을 달 글자를 먼저 선택하세요.")
                 } else if d.text.trim().is_empty() {
                     Some("덧말을 입력하세요.")
                 } else {

@@ -4,6 +4,7 @@ fn main() -> anyhow::Result<()> {
     let mut screenshot = None;
     let mut exit = false;
     let mut view = None;
+    let mut size = [1501.0, 916.0];
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--version" {
@@ -16,6 +17,16 @@ fn main() -> anyhow::Result<()> {
                     .to_string_lossy()
                     .into_owned(),
             );
+        } else if arg == "--window" {
+            // Capture helper: `--window <width>x<height>` sets the starting window size.
+            size = args
+                .next()
+                .and_then(|s| {
+                    let s = s.to_str()?.to_owned();
+                    let (w, h) = s.split_once('x')?;
+                    Some([w.parse().ok()?, h.parse().ok()?])
+                })
+                .ok_or_else(|| anyhow::anyhow!("--window <너비>x<높이>"))?;
         } else if arg == "--screenshot" {
             screenshot = args.next().map(std::path::PathBuf::from);
         } else if arg == "--exit-after-screenshot" {
@@ -37,7 +48,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
     let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_inner_size([1501.0, 916.0])
+        .with_inner_size(size)
         .with_min_inner_size([980.0, 720.0])
         // Wayland/X11 app id: matches `hwpcraft.desktop` so Linux docks show the icon.
         .with_app_id("hwpcraft");

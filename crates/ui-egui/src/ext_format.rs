@@ -134,6 +134,132 @@ struct NumberingDialog {
     restart: usize,
     start: f64,
     previous: usize,
+    /// 사용자 정의: a shape edited by hand instead of a gallery choice.
+    custom: Option<CustomShape>,
+}
+
+/// The 사용자 정의 page of 글머리표 및 문단 번호: a bullet character, or per-level number
+/// formats (`^1.`) and number kinds.
+struct CustomShape {
+    level: usize,
+    formats: [String; 7],
+    codes: [u8; 7],
+    bullet: String,
+}
+
+impl CustomShape {
+    /// Start from what the gallery shows selected (the first preset when nothing is).
+    fn from(d: &NumberingDialog) -> Self {
+        let (_, formats, codes) = NUMBERINGS
+            .get(d.numbering.wrapping_sub(1))
+            .unwrap_or(&NUMBERINGS[0]);
+        Self {
+            level: 0,
+            formats: formats.map(str::to_owned),
+            codes: *codes,
+            bullet: BULLETS
+                .get(d.bullet.wrapping_sub(1))
+                .unwrap_or(&BULLETS[0])
+                .to_string(),
+        }
+    }
+    fn number_text(&self, level: usize) -> String {
+        let mut out = self.formats[level].clone();
+        for k in (1..=7).rev() {
+            out = out.replace(&format!("^{k}"), &number_sample(self.codes[k - 1], 1));
+        }
+        out
+    }
+}
+
+/// HWP number kinds (표 43) offered on the 사용자 정의 page, with how they count.
+const NUMBER_KINDS: [(u8, &str); 14] = [
+    (0, "1, 2, 3"),
+    (1, "①, ②, ③"),
+    (2, "I, II, III"),
+    (3, "i, ii, iii"),
+    (4, "A, B, C"),
+    (5, "a, b, c"),
+    (6, "Ⓐ, Ⓑ, Ⓒ"),
+    (7, "ⓐ, ⓑ, ⓒ"),
+    (8, "가, 나, 다"),
+    (9, "㉮, ㉯, ㉰"),
+    (10, "ㄱ, ㄴ, ㄷ"),
+    (11, "㉠, ㉡, ㉢"),
+    (12, "일, 이, 삼"),
+    (13, "一, 二, 三"),
+];
+
+/// The 사용자 정의 page: edits `c` in place.
+fn custom_shape_page(ui: &mut egui::Ui, c: &mut CustomShape, bullet: bool) {
+    if bullet {
+        group(ui, "사용자 정의 글머리표", |ui| {
+            ui.horizontal(|ui| {
+                lbl(ui, "글머리표 문자", 79.0);
+                let mut text = c.bullet.clone();
+                if ui
+                    .add(egui::TextEdit::singleline(&mut text).desired_width(60.0))
+                    .changed()
+                {
+                    // One character: the last one typed replaces the old.
+                    c.bullet = text
+                        .chars()
+                        .rev()
+                        .find(|ch| !ch.is_control())
+                        .map(String::from)
+                        .unwrap_or_default();
+                }
+                ui.label(RichText::new(&c.bullet).size(20.0));
+            });
+            ui.label(
+                RichText::new("문자표(Ctrl+F10)에서 고른 기호를 붙여 넣을 수도 있습니다.").weak(),
+            );
+        });
+        return;
+    }
+    group(ui, "사용자 정의 문단 번호", |ui| {
+        ui.horizontal(|ui| {
+            lbl(ui, "수준", 79.0);
+            egui::ComboBox::from_id_salt("custom-level")
+                .selected_text(format!("{}수준", c.level + 1))
+                .show_ui(ui, |ui| {
+                    for level in 0..7 {
+                        ui.selectable_value(&mut c.level, level, format!("{}수준", level + 1));
+                    }
+                });
+        });
+        let level = c.level;
+        ui.horizontal(|ui| {
+            lbl(ui, "번호 서식", 79.0);
+            ui.add(egui::TextEdit::singleline(&mut c.formats[level]).desired_width(120.0));
+        });
+        ui.label(RichText::new("^1은 1수준 번호, ^2는 2수준 번호 자리입니다(예: ^1.^2).").weak());
+        ui.horizontal(|ui| {
+            lbl(ui, "번호 모양", 79.0);
+            let current = NUMBER_KINDS
+                .iter()
+                .find(|(code, _)| *code == c.codes[level])
+                .map_or("1, 2, 3", |(_, name)| *name);
+            egui::ComboBox::from_id_salt("custom-kind")
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for (code, name) in NUMBER_KINDS {
+                        ui.selectable_value(&mut c.codes[level], code, name);
+                    }
+                });
+        });
+        ui.add_space(4.0);
+        ui.label("미리 보기");
+        for l in 0..7 {
+            let text = c.number_text(l);
+            let line = format!("{}{}", "  ".repeat(l), text);
+            if l == level {
+                ui.label(RichText::new(line).strong());
+            } else {
+                ui.label(line);
+            }
+        }
+    });
 }
 
 /// Dialog and tool state owned by this module. Stored in `HwpApp::ext.format`.
@@ -469,6 +595,7 @@ impl HwpApp {
             restart: if previous > 0 { 0 } else { 2 },
             start: 1.0,
             previous,
+            custom: None,
         });
     }
     /// 개요 번호 모양 (Ctrl+K,O): tab 3 of the numbering window, preselecting the section's shape.
@@ -499,6 +626,7 @@ impl HwpApp {
             restart: 2,
             start,
             previous: 0,
+            custom: None,
         });
     }
     /// 글자 겹치기 window: edits the control at the caret when there is one, else inserts.
@@ -754,6 +882,12 @@ impl HwpApp {
             "format-style" => self.open_style(false),
             "format-style-add" => self.open_style(true),
             "numbering" => self.open_numbering(1),
+            "numbering-custom" | "bullet-custom" => {
+                self.open_numbering(usize::from(name == "numbering-custom"));
+                if let Some(d) = self.ext.format.numbering.as_mut() {
+                    d.custom = Some(CustomShape::from(d));
+                }
+            }
             "bullet" => self.open_numbering(0),
             "outline" => self.open_outline(),
             "tabs" => self.open_shape(false, 2),
@@ -1469,6 +1603,11 @@ impl HwpApp {
                                 );
                             }
                             match d.tab {
+                                0 | 1 | 3 if d.custom.is_some() => {
+                                    if let Some(c) = d.custom.as_mut() {
+                                        custom_shape_page(ui, c, d.tab == 0);
+                                    }
+                                }
                                 0 => {
                                     group(ui, "글머리표 모양", |ui| {
                                         let mut items = vec![None];
@@ -1590,7 +1729,17 @@ impl HwpApp {
                         });
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        ui.add_enabled(false, egui::Button::new("사용자 정의..."));
+                        if d.custom.is_some() {
+                            if ui.button("모양 목록으로").clicked() {
+                                d.custom = None;
+                            }
+                        } else if ui
+                            .add_enabled(d.tab != 2, egui::Button::new("사용자 정의..."))
+                            .on_hover_text("번호 서식·번호 모양이나 글머리표 문자를 직접 정합니다.")
+                            .clicked()
+                        {
+                            d.custom = Some(CustomShape::from(&d));
+                        }
                         format_dialogs::icon_button(ui, "clear", "지우기", false);
                     });
                 });
@@ -1598,7 +1747,19 @@ impl HwpApp {
                 ui.vertical(|ui| {
                     let grey = match d.tab {
                         2 => Some("그림 글머리표는 서식 탭의 그림 글머리표 단추로 넣습니다."),
-                        3 if d.numbering == 0 => Some("개요 번호 모양을 고르세요."),
+                        0 if d.custom.as_ref().is_some_and(|c| c.bullet.is_empty()) => {
+                            Some("글머리표 문자를 넣으세요.")
+                        }
+                        1 | 3
+                            if d.custom
+                                .as_ref()
+                                .is_some_and(|c| c.formats.iter().any(|f| f.trim().is_empty())) =>
+                        {
+                            Some("모든 수준의 번호 서식을 넣으세요.")
+                        }
+                        3 if d.numbering == 0 && d.custom.is_none() => {
+                            Some("개요 번호 모양을 고르세요.")
+                        }
                         _ => None,
                     };
                     let (a, c) = chrome::actions(ui, grey, "설정(D)");
@@ -1607,7 +1768,26 @@ impl HwpApp {
                 });
             });
         });
-        if apply && d.tab == 3 {
+        // The 사용자 정의 page stands in for the gallery choice.
+        let custom = d.custom.as_ref().map(|c| {
+            (
+                c.formats.iter().map(String::as_str).collect::<Vec<_>>(),
+                c.codes.to_vec(),
+                c.bullet.clone(),
+            )
+        });
+        if apply
+            && d.tab == 3
+            && let Some((formats, codes, _)) = &custom
+        {
+            if self.run(
+                "format.outline.shape",
+                json!({"levelFormats": formats, "numberFormats": codes,
+                    "startNumber": d.start as u16}),
+            ) {
+                return;
+            }
+        } else if apply && d.tab == 3 {
             if let Some((_, formats, codes)) = NUMBERINGS.get(d.numbering.wrapping_sub(1))
                 && self.run(
                     "format.outline.shape",
@@ -1618,14 +1798,22 @@ impl HwpApp {
                 return;
             }
         } else if apply {
+            let chosen = NUMBERINGS
+                .get(d.numbering.wrapping_sub(1))
+                .map(|(_, f, c)| (f.to_vec(), c.to_vec()));
             let params = if d.tab == 0 {
-                match BULLETS.get(d.bullet.wrapping_sub(1)) {
-                    Some(c) => json!({"kind": "bullet", "char": c.to_string()}),
-                    None => json!({"kind": "none"}),
+                match (&custom, BULLETS.get(d.bullet.wrapping_sub(1))) {
+                    (Some((_, _, bullet)), _) => json!({"kind": "bullet", "char": bullet}),
+                    (None, Some(c)) => json!({"kind": "bullet", "char": c.to_string()}),
+                    (None, None) => json!({"kind": "none"}),
                 }
             } else {
-                match NUMBERINGS.get(d.numbering.wrapping_sub(1)) {
-                    Some((_, formats, codes)) => {
+                let shape = match &custom {
+                    Some((formats, codes, _)) => Some((formats.clone(), codes.clone())),
+                    None => chosen,
+                };
+                match shape {
+                    Some((formats, codes)) => {
                         let mut p = json!({"kind": "number", "levelFormats": formats, "numberFormats": codes});
                         match d.restart {
                             0 => p["restart"] = json!({"mode": "continue"}),
@@ -1895,7 +2083,7 @@ impl HwpApp {
                 egui::StrokeKind::Inside,
             );
         }
-        // Same 18 px '가' glyphs as the other 서식 도구줄 icons (icons.rs, owner 04).
+        // Same 18 px '가' glyphs as the other 서식 도구줄 icons (icons.rs).
         let icon = match id {
             "format.underline" => super::icons::Icon::Underline,
             "format.strikethrough" => super::icons::Icon::Strike,

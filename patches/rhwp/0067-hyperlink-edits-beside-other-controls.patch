@@ -1,0 +1,274 @@
+diff --git a/src/document_core/hyperlink.rs b/src/document_core/hyperlink.rs
+index 91929b2..f474dad 100644
+--- a/src/document_core/hyperlink.rs
++++ b/src/document_core/hyperlink.rs
+@@ -78,7 +78,7 @@ impl DocumentCore {
+         uri: &str,
+     ) -> Result<u32, HwpError> {
+         let command = web_command(uri)?;
+-        self.validate_hyperlink_paragraph(target)?;
++        self.validate_hyperlink_paragraph(target, Some((start, end)))?;
+         let mut candidate = self.hyperlink_paragraph(target)?.clone();
+         let len = candidate.text.chars().count();
+         if start >= end || end > len {
+@@ -179,7 +179,7 @@ impl DocumentCore {
+         uri: &str,
+     ) -> Result<bool, HwpError> {
+         let command = web_command(uri)?;
+-        self.validate_hyperlink_paragraph(target)?;
++        self.validate_hyperlink_paragraph(target, None)?;
+         let p = self.hyperlink_paragraph(target)?;
+         let (_, idx) = find_link(p, field_id)?;
+         let Control::Field(field) = &p.controls[idx] else {
+@@ -236,9 +236,10 @@ impl DocumentCore {
+         if text.trim().is_empty() || text.chars().any(char::is_control) {
+             return Err(invalid("표시할 글자를 한 줄로 입력해 주세요"));
+         }
+-        self.validate_hyperlink_paragraph(target)?;
+         let mut candidate = self.hyperlink_paragraph(target)?.clone();
+         let (range_idx, ctrl_idx) = find_link(&candidate, field_id)?;
++        let span = &candidate.field_ranges[range_idx];
++        self.validate_hyperlink_paragraph(target, Some((span.start_char_idx, span.end_char_idx)))?;
+         let mut original_format = match &candidate.controls[ctrl_idx] {
+             Control::Field(f) => f.hyperlink_format.clone(),
+             _ => None,
+@@ -263,6 +264,36 @@ impl DocumentCore {
+         if old == text {
+             return Ok(false);
+         }
++        // Other controls (bookmarks, notes, objects …) keep their slots: the offsets
++        // are rebuilt below from the field ranges alone, so note where they sit. One
++        // that shares a gap with any field marker of the paragraph is refused, since
++        // the rebuilt gap would not say which comes first.
++        let positions = candidate.control_text_positions();
++        let others: Vec<usize> = positions
++            .iter()
++            .zip(&candidate.controls)
++            .filter(|(at, c)| **at > 0 && !matches!(c, Control::Field(_)))
++            .map(|(at, _)| *at)
++            .collect();
++        if others.iter().any(|at| {
++            ranges
++                .iter()
++                .any(|r| r.start_char_idx == *at || r.end_char_idx == *at)
++        }) {
++            return Err(invalid(
++                "필드 경계에 개체가 붙어 있는 문단의 링크 글은 아직 바꿀 수 없습니다",
++            ));
++        }
++        let kept: Vec<usize> = others
++            .into_iter()
++            .map(|at| {
++                if at >= end {
++                    at - (end - start) + text.chars().count()
++                } else {
++                    at
++                }
++            })
++            .collect();
+         let raw_start = raw_boundary(&candidate, start);
+         let shape = candidate
+             .char_shapes
+@@ -299,6 +330,12 @@ impl DocumentCore {
+             candidate.char_shapes.sort_by_key(|s| s.start_pos);
+         }
+         super::queries::field_query::rebuild_char_offsets(&mut candidate);
++        for at in kept {
++            for offset in candidate.char_offsets.iter_mut().skip(at) {
++                *offset += 8;
++            }
++            candidate.char_count += 8;
++        }
+         candidate.stored_text_partition_dirty = true;
+         self.commit_hyperlink_paragraph(target, candidate, field_id)?;
+         Ok(true)
+@@ -320,10 +357,13 @@ impl DocumentCore {
+         field_id: u32,
+         restore_format: bool,
+     ) -> Result<(), HwpError> {
+-        self.validate_hyperlink_paragraph(target)?;
+         let mut candidate = self.hyperlink_paragraph(target)?.clone();
+         let (range_idx, ctrl_idx) = find_link(&candidate, field_id)?;
+         let range = candidate.field_ranges[range_idx].clone();
++        self.validate_hyperlink_paragraph(
++            target,
++            Some((range.start_char_idx, range.end_char_idx)),
++        )?;
+         let formats = match &candidate.controls[ctrl_idx] {
+             Control::Field(f) if restore_format => f
+                 .hyperlink_format
+@@ -417,7 +457,18 @@ impl DocumentCore {
+         Ok((paragraphs, para_idx))
+     }
+ 
+-    fn validate_hyperlink_paragraph(&self, target: &HyperlinkTarget) -> Result<(), HwpError> {
++    /// `span` is the link's text range (scalar indexes) when the edit moves marker
++    /// slots or text; `None` when it only changes the address. Other controls in the
++    /// paragraph (bookmarks, notes, equations, objects …) may stay as long as none
++    /// sits on or inside that range: their positions come from the char-offset gaps
++    /// minus the hidden field-end slots (`control_text_positions`), and shifting the
++    /// raw axis by whole 8-unit slots keeps them, but a gap holding both a control
++    /// and a link marker has no defined order between the two.
++    fn validate_hyperlink_paragraph(
++        &self,
++        target: &HyperlinkTarget,
++        span: Option<(usize, usize)>,
++    ) -> Result<(), HwpError> {
+         let p = self.hyperlink_paragraph(target)?;
+         if p.field_ranges.iter().any(|r| {
+             r.start_char_idx > r.end_char_idx
+@@ -426,9 +477,11 @@ impl DocumentCore {
+         }) {
+             return Err(invalid("필드 범위가 문단과 일치하지 않습니다"));
+         }
++        let positions = p.control_text_positions();
+         if self.document.header.version.major == 3
+             || !p.orphan_field_ends.is_empty()
+             || !p.title_marks.is_empty()
++            || p.char_offsets.len() != p.text.chars().count()
+             || p.controls.iter().enumerate().any(|(idx, c)| match c {
+                 Control::SectionDef(_) | Control::ColumnDef(_) => false,
+                 Control::Field(_) => !p.field_ranges.iter().any(|r| {
+@@ -436,9 +489,12 @@ impl DocumentCore {
+                         && r.start_char_idx <= r.end_char_idx
+                         && r.inner_slot_count == 0
+                 }),
+-                _ => true,
++                _ => span.is_some_and(|(start, end)| {
++                    positions
++                        .get(idx)
++                        .is_none_or(|&at| start <= at && at <= end)
++                }),
+             })
+-            || p.char_offsets.len() != p.text.chars().count()
+         {
+             return Err(invalid(
+                 "개체·다단락 필드·HWP3 문단의 링크 편집은 아직 지원하지 않습니다",
+@@ -594,6 +650,127 @@ mod hwpcraft_link_end_tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod hwpcraft_link_beside_controls_tests {
++    use super::HyperlinkTarget;
++    use crate::document_core::DocumentCore;
++    use crate::model::control::{Control, FieldType};
++
++    fn links(core: &DocumentCore) -> Vec<(usize, usize, String)> {
++        let p = &core.document().sections[0].paragraphs[0];
++        p.field_ranges
++            .iter()
++            .filter_map(|r| match p.controls.get(r.control_idx) {
++                Some(Control::Field(f)) if f.field_type == FieldType::Hyperlink => {
++                    Some((r.start_char_idx, r.end_char_idx, f.command.clone()))
++                }
++                _ => None,
++            })
++            .collect()
++    }
++
++    fn others(core: &DocumentCore) -> usize {
++        let p = &core.document().sections[0].paragraphs[0];
++        p.controls
++            .iter()
++            .filter(|c| matches!(c, Control::Bookmark(_) | Control::Footnote(_)))
++            .count()
++    }
++
++    /// "책갈피·각주 앞 링크 뒤": a bookmark and a footnote before the link, outside
++    /// its range. Address, text and removal edits work there and survive saves.
++    fn sample() -> (DocumentCore, HyperlinkTarget, u32) {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        let target = HyperlinkTarget::body(0, 0);
++        core.insert_text_native(0, 0, 0, "앞 링크 뒤").unwrap();
++        core.add_bookmark_native(0, 0, 0, "처음").unwrap();
++        core.insert_footnote_native(0, 0, 1).unwrap();
++        let id = core
++            .insert_hyperlink_native(&target, 2, 4, "https://a.example")
++            .unwrap();
++        (core, target, id)
++    }
++
++    #[test]
++    fn links_beside_a_bookmark_and_a_footnote_are_edited_and_saved() {
++        let (mut core, target, id) = sample();
++        assert_eq!(others(&core), 2);
++        assert!(core
++            .update_hyperlink_native(&target, id, "https://b.example")
++            .unwrap());
++        assert!(core
++            .replace_hyperlink_text_native(&target, id, "새 링크")
++            .unwrap());
++        let expected = links(&core);
++        assert_eq!(expected.len(), 1);
++        assert_eq!((expected[0].0, expected[0].1), (2, 6));
++        assert!(expected[0].2.contains("b.example"));
++        for bytes in [
++            core.export_hwpx_native().unwrap(),
++            core.export_hwp_native().unwrap(),
++        ] {
++            let reopened = DocumentCore::from_bytes(&bytes).unwrap();
++            assert_eq!(links(&reopened), expected);
++            assert_eq!(others(&reopened), 2);
++            assert_eq!(
++                reopened.document().sections[0].paragraphs[0].text,
++                core.document().sections[0].paragraphs[0].text
++            );
++        }
++        core.remove_hyperlink_native(&target, id).unwrap();
++        assert!(links(&core).is_empty());
++        assert_eq!(others(&core), 2);
++        let reopened = DocumentCore::from_bytes(&core.export_hwpx_native().unwrap()).unwrap();
++        assert!(links(&reopened).is_empty());
++        assert_eq!(others(&reopened), 2);
++    }
++
++    /// A bookmark on another link's start: renaming the first link is refused
++    /// rather than leaving the shared gap's order undefined; its address still
++    /// changes, and the second link keeps its range through saves.
++    #[test]
++    fn a_control_on_another_link_boundary_refuses_renaming() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        let target = HyperlinkTarget::body(0, 0);
++        core.insert_text_native(0, 0, 0, "링크A 와 링크B").unwrap();
++        let first = core
++            .insert_hyperlink_native(&target, 0, 3, "https://a.example")
++            .unwrap();
++        core.insert_hyperlink_native(&target, 6, 9, "https://b.example")
++            .unwrap();
++        core.add_bookmark_native(0, 0, 6, "둘째").unwrap();
++        let before = links(&core);
++        assert!(core
++            .replace_hyperlink_text_native(&target, first, "첫 링크")
++            .is_err());
++        assert!(core
++            .update_hyperlink_native(&target, first, "https://c.example")
++            .unwrap());
++        let reopened = DocumentCore::from_bytes(&core.export_hwpx_native().unwrap()).unwrap();
++        let after: Vec<_> = links(&reopened).into_iter().map(|l| (l.0, l.1)).collect();
++        assert_eq!(
++            after,
++            before.into_iter().map(|l| (l.0, l.1)).collect::<Vec<_>>()
++        );
++    }
++
++    /// A control on the link's boundary or inside it is still refused: the gap
++    /// holding both would have no defined order.
++    #[test]
++    fn a_control_on_the_link_range_still_refuses_text_edits() {
++        let (mut core, target, id) = sample();
++        core.insert_footnote_native(0, 0, 3).unwrap();
++        assert!(core
++            .replace_hyperlink_text_native(&target, id, "다른")
++            .is_err());
++        assert!(core
++            .update_hyperlink_native(&target, id, "https://c.example")
++            .unwrap());
++    }
++}
++
+ fn shift_axis(p: &mut Paragraph, boundary: u32, delta: i32) -> Result<(), HwpError> {
+     let shift = |v: &mut u32| -> Result<(), HwpError> {
+         if *v >= boundary {

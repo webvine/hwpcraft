@@ -288,6 +288,9 @@ impl Session {
         Ok(self.scrub_distribution(value))
     }
     fn run_unrecorded(&mut self, id: &str, params: Value) -> Result<Value> {
+        if let Some(result) = self.run_master_addressed(id, &params) {
+            return result;
+        }
         let object = params
             .as_object()
             .context("명령 params는 JSON 객체여야 합니다.")?;
@@ -595,8 +598,16 @@ impl Session {
                     _ => Command::Redo,
                 }
             }
-            "format.character" => Command::Character(params),
-            "format.paragraph" => Command::Paragraph(params),
+            "format.character" => {
+                let mut params = params;
+                crate::formatting::without_read_only(&mut params, true);
+                Command::Character(params)
+            }
+            "format.paragraph" => {
+                let mut params = params;
+                crate::formatting::without_read_only(&mut params, false);
+                Command::Paragraph(params)
+            }
             "insert.table" => {
                 let t: Table = serde_json::from_value(params)?;
                 Command::Table {

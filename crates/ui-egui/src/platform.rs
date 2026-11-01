@@ -39,34 +39,131 @@ pub(crate) enum PrintOutcome {
     Failed,
 }
 
-/// Print `pdf` `copies` times on the default printer, the way each OS offers it:
-/// the Windows shell `Print` verb (Windows 11's default PDF app, Edge, has none,
-/// so the PDF is opened instead), and CUPS `lp` on macOS and Linux, falling back
-/// to `open` / `xdg-open`.
-pub(crate) fn print_pdf(pdf: &Path, copies: u32) -> PrintOutcome {
+/// Each monitor's work area (the desktop minus task bars) in desktop coordinates, on
+/// Windows through PowerShell's `Screen.AllScreens`; empty elsewhere or when it fails.
+/// Blocks for the moment PowerShell takes to start.
+pub(crate) fn monitor_work_areas() -> Vec<egui::Rect> {
+    if !cfg!(target_os = "windows") {
+        return Vec::new();
+    }
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             [System.Windows.Forms.Screen]::AllScreens | ForEach-Object { $w = $_.WorkingArea; \
+             \"$($w.X) $($w.Y) $($w.Width) $($w.Height)\" }",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    out.ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_work_areas(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// `x y width height` lines.
+fn parse_work_areas(text: &str) -> Vec<egui::Rect> {
+    text.lines()
+        .filter_map(|line| {
+            let n: Vec<f32> = line
+                .split_whitespace()
+                .map(|v| v.parse().ok())
+                .collect::<Option<_>>()?;
+            let [x, y, w, h] = n[..] else {
+                return None;
+            };
+            (w >= 200.0 && h >= 150.0)
+                .then(|| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)))
+        })
+        .collect()
+}
+
+/// A printer the OS knows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Printer {
+    pub name: String,
+    pub default: bool,
+}
+
+/// The OS printers, the default one first; empty when none could be listed. Windows asks
+/// WMI through PowerShell, macOS and Linux CUPS `lpstat`. Takes a moment (run it off the
+/// UI thread); nothing is printed.
+pub(crate) fn printers() -> Vec<Printer> {
+    let text = |command: &mut Command| {
+        command
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let mut list = if cfg!(target_os = "windows") {
+        parse_windows_printers(&text(Command::new("powershell").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+             Get-CimInstance Win32_Printer | ForEach-Object { \"$($_.Default)`t$($_.Name)\" }",
+        ])))
+    } else {
+        parse_lpstat(
+            &text(Command::new("lpstat").arg("-d")),
+            &text(Command::new("lpstat").arg("-a")),
+        )
+    };
+    list.sort_by_key(|p| !p.default);
+    list
+}
+
+/// `True<TAB>name` lines (PowerShell over `Win32_Printer`).
+fn parse_windows_printers(text: &str) -> Vec<Printer> {
+    text.lines()
+        .filter_map(|line| {
+            let (default, name) = line.trim_end_matches('\r').split_once('\t')?;
+            let name = name.trim();
+            (!name.is_empty()).then(|| Printer {
+                name: name.to_owned(),
+                default: default.trim().eq_ignore_ascii_case("true"),
+            })
+        })
+        .collect()
+}
+
+/// `lpstat -d` ("system default destination: name") and `lpstat -a` ("name accepting
+/// requests since …" per printer).
+fn parse_lpstat(default: &str, all: &str) -> Vec<Printer> {
+    let default = default
+        .lines()
+        .find_map(|l| l.split_once(':').map(|(_, name)| name.trim().to_owned()))
+        .unwrap_or_default();
+    all.lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .map(|name| Printer {
+            name: name.to_owned(),
+            default: name == default,
+        })
+        .collect()
+}
+
+/// Print `pdf` `copies` times on `printer` (the default one when `None`), the way each OS
+/// offers it: the Windows shell `Print` / `PrintTo` verbs (Windows 11's default PDF app,
+/// Edge, has neither, so the PDF is opened instead), and CUPS `lp` (`-d` for a printer)
+/// on macOS and Linux, falling back to `open` / `xdg-open`.
+pub(crate) fn print_pdf(pdf: &Path, copies: u32, printer: Option<&str>) -> PrintOutcome {
     let copies = copies.clamp(1, 99);
     let printed = if cfg!(target_os = "windows") {
-        (0..copies).all(|_| {
-            succeeds(
-                Command::new("powershell")
-                    .args([
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-WindowStyle",
-                        "Hidden",
-                        "-Command",
-                        "Start-Process -FilePath $args[0] -Verb Print -ErrorAction Stop",
-                    ])
-                    .arg(pdf),
-            )
-        })
+        (0..copies).all(|_| succeeds(&mut windows_print_command(pdf, printer)))
     } else {
-        succeeds(
-            Command::new("lp")
-                .arg("-n")
-                .arg(copies.to_string())
-                .arg(pdf),
-        )
+        let mut lp = Command::new("lp");
+        if let Some(printer) = printer {
+            lp.arg("-d").arg(printer);
+        }
+        succeeds(lp.arg("-n").arg(copies.to_string()).arg(pdf))
     };
     if printed {
         return PrintOutcome::Printed;
@@ -76,6 +173,36 @@ pub(crate) fn print_pdf(pdf: &Path, copies: u32) -> PrintOutcome {
     } else {
         PrintOutcome::Failed
     }
+}
+
+/// The PowerShell command that hands `pdf` to the shell's `Print` verb, or to `PrintTo`
+/// with the printer's name.
+fn windows_print_command(pdf: &Path, printer: Option<&str>) -> Command {
+    let mut command = Command::new("powershell");
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+    ]);
+    match printer {
+        Some(printer) => {
+            command
+                .arg(
+                    "Start-Process -FilePath $args[0] -Verb PrintTo \
+                     -ArgumentList ('\"' + $args[1] + '\"') -ErrorAction Stop",
+                )
+                .arg(pdf)
+                .arg(printer);
+        }
+        None => {
+            command
+                .arg("Start-Process -FilePath $args[0] -Verb Print -ErrorAction Stop")
+                .arg(pdf);
+        }
+    }
+    command
 }
 
 /// Open `path` with the OS default application.
@@ -118,6 +245,67 @@ fn succeeds(command: &mut Command) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_areas_are_parsed() {
+        let areas =
+            parse_work_areas("0 0 5120 1392\r\n-1920 120 1920 1040\r\nbad\r\n0 0 10 10\r\n");
+        assert_eq!(
+            areas,
+            [
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(5120.0, 1392.0)),
+                egui::Rect::from_min_size(egui::pos2(-1920.0, 120.0), egui::vec2(1920.0, 1040.0)),
+            ]
+        );
+    }
+
+    /// The printer lists are read, never printed to: nothing here sends a job.
+    #[test]
+    fn printer_lists_are_parsed_with_the_default_first() {
+        let windows = parse_windows_printers(
+            "False\tMicrosoft Print to PDF\r\nTrue\t사무실 복합기\r\n\nFalse\t \r\n",
+        );
+        assert_eq!(
+            windows,
+            [
+                Printer {
+                    name: "Microsoft Print to PDF".into(),
+                    default: false
+                },
+                Printer {
+                    name: "사무실 복합기".into(),
+                    default: true
+                },
+            ]
+        );
+        let cups = parse_lpstat(
+            "system default destination: Office\n",
+            "Office accepting requests since Fri 31 Oct\nPDF accepting requests since Fri 31 Oct\n",
+        );
+        assert_eq!(cups.iter().filter(|p| p.default).count(), 1);
+        assert_eq!(cups[0].name, "Office");
+        assert!(parse_lpstat("no system default destination\n", "").is_empty());
+    }
+
+    /// A chosen printer goes to `PrintTo` by name; no printer keeps the `Print` verb.
+    #[test]
+    fn the_windows_print_command_names_the_printer() {
+        let pdf = Path::new("a.pdf");
+        let args = |c: &Command| -> Vec<String> {
+            c.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let to = args(&windows_print_command(pdf, Some("사무실 복합기")));
+        assert!(to.iter().any(|a| a.contains("-Verb PrintTo")), "{to:?}");
+        assert_eq!(to.last().map(String::as_str), Some("사무실 복합기"));
+        let default = args(&windows_print_command(pdf, None));
+        assert!(
+            default.iter().any(|a| a.contains("-Verb Print ")),
+            "{default:?}"
+        );
+        assert_eq!(default.last().map(String::as_str), Some("a.pdf"));
+    }
 
     #[test]
     fn window_icon_is_square_rgba() {

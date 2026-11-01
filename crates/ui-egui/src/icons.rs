@@ -347,7 +347,7 @@ impl Icons {
         if menu {
             chevron(ui, Pos2::new(rect.right() - 8.0, rect.center().y), color);
         }
-        response.on_hover_text(tooltip)
+        response.on_hover_text(crate::ribbon::platform_keys(tooltip))
     }
 }
 

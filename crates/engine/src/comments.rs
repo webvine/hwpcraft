@@ -4,8 +4,10 @@
 //! application sidecar is written. HWP5 MEMO_LIST content is restored at load
 //! because the underlying reader currently leaves these lists in raw records.
 use super::*;
+use crate::control_slots::{open_field_end, remove_control, remove_field_end, take_field_end};
 use hwpcraft_doc::model::control::{Field, FieldType, Parameter, ParameterList};
 use hwpcraft_doc::model::document::{DocInfo, Document};
+use hwpcraft_doc::model::paragraph::OrphanFieldEnd;
 use hwpcraft_doc::{HwpRecord, HyperlinkTarget, parse_hwp_paragraph_list};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -22,7 +24,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "memo.list",
-        "매개 변수 없음. 메모 필드마다 id, author, content, anchor. 표 셀 메모도 나열합니다.",
+        "매개 변수 없음. 메모 필드마다 id, author, content, anchor. 표 셀 메모도 나열합니다. 여러 문단에 걸친 메모는 start·end가 null이고 spanStart(첫 문단의 시작 글자 위치)와 endAt{section, paragraph, offset}(끝 표식 자리)이 있으며, anchor는 문단 사이를 줄 바꿈으로 이은 범위 글입니다.",
         "{}",
     ),
     (
@@ -32,7 +34,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "memo.create",
-        "text(1 MiB까지), author?(기본 사용자; 데스크톱의 개인 정보 이름은 여기 쓰이지 않음), expected_generation?. 지금 본문 한 문단 안의 선택, 또는 빈 캐럿 범위에 메모를 답니다. 범위 글은 바꾸지 않습니다. expected_generation이 낡았으면 바꾸기 전에 실패합니다.",
+        "text(1 MiB까지), author?(기본 사용자; 데스크톱의 개인 정보 이름은 여기 쓰이지 않음), expected_generation?. 지금 본문 한 문단 안의 선택, 같은 구역의 여러 본문 문단에 걸친 선택(한글처럼 첫 문단에서 시작해 마지막 문단에서 끝나는 메모), 또는 빈 캐럿 범위에 메모를 답니다. 범위 글은 바꾸지 않습니다. expected_generation이 낡았으면 바꾸기 전에 실패합니다.",
         r#"{"text":"내용을 확인해 주세요.","author":"검토자"}"#,
     ),
     (
@@ -42,7 +44,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "memo.reply",
-        "id(메모 또는 그 스레드의 아무 댓글), text, author?(기본 사용자), expected_generation?. 한글이 저장하는 방식대로 댓글을 답니다: 같은 글에 단 또 하나의 메모를 스레드 안쪽에 중첩. memo.list의 댓글에는 replyTo(스레드 첫 메모)와 바깥에서 안쪽 순서의 thread가 있습니다. 빈 캐럿 범위의 메모에는 댓글을 달 수 없습니다. 한 번 실행 취소.",
+        "id(메모 또는 그 스레드의 아무 댓글), text, author?(기본 사용자), expected_generation?. 한글이 저장하는 방식대로 댓글을 답니다: 같은 글에 단 또 하나의 메모를 스레드 안쪽에 중첩. memo.list의 댓글에는 replyTo(스레드 첫 메모)와 바깥에서 안쪽 순서의 thread가 있습니다. 빈 캐럿 범위의 메모와 여러 문단에 걸친 메모에는 댓글을 달 수 없습니다. 한 번 실행 취소.",
         r#"{"id":1,"text":"반영했습니다.","author":"작성자"}"#,
     ),
     (
@@ -126,7 +128,7 @@ fn filetime_tokens() -> (u32, u32) {
 fn default_author() -> String {
     "사용자".into()
 }
-fn is_memo(field: &Field) -> bool {
+pub(crate) fn is_memo(field: &Field) -> bool {
     field.field_type == FieldType::Memo || field.command.starts_with("MEMO/")
 }
 fn memo_number(field: &Field) -> u32 {
@@ -565,6 +567,51 @@ impl Session {
                 );
             }
         }
+        // A body memo ending in a later paragraph: where it starts and ends, and its text.
+        let doc = self.core.document();
+        let ends = spanning_memo_ends(doc);
+        for item in &mut out {
+            let at = &item["at"];
+            if !item["end"].is_null() || !at["cell"].is_null() {
+                continue;
+            }
+            let id = item["id"].as_u64().and_then(|v| u32::try_from(v).ok());
+            let Some(&(end_section, end_paragraph, end_offset)) = id.and_then(|id| ends.get(&id))
+            else {
+                continue;
+            };
+            let n = |k: &str| at[k].as_u64().unwrap_or(0) as usize;
+            let (section, paragraph, control) = (n("section"), n("paragraph"), n("control"));
+            let Some(paragraphs) = doc.sections.get(section).map(|s| &s.paragraphs) else {
+                continue;
+            };
+            let start = paragraphs[paragraph]
+                .control_text_positions()
+                .get(control)
+                .copied()
+                .unwrap_or(0);
+            if end_section == section && end_paragraph > paragraph {
+                let mut parts: Vec<String> = Vec::new();
+                for (p, para) in paragraphs
+                    .iter()
+                    .enumerate()
+                    .take(end_paragraph + 1)
+                    .skip(paragraph)
+                {
+                    let from = if p == paragraph { start } else { 0 };
+                    let to = if p == end_paragraph {
+                        end_offset
+                    } else {
+                        usize::MAX
+                    };
+                    parts.push(para.text.chars().take(to).skip(from).collect());
+                }
+                item["anchor"] = json!(parts.join("\n"));
+            }
+            item["spanStart"] = json!(start);
+            item["endAt"] =
+                json!({"section": end_section, "paragraph": end_paragraph, "offset": end_offset});
+        }
         // Memos on the same text in one paragraph form a thread (Hangul's 댓글), first
         // memo outermost; later ones reply to it, numbered from outside in.
         let mut first: BTreeMap<String, (u64, u64)> = BTreeMap::new();
@@ -608,8 +655,8 @@ impl Session {
         let content = body_paragraphs(&request.text)?;
         self.guard_protected()?;
         let cursor = self.cursor;
-        if self.span_anchor.is_some() {
-            bail!("여러 문단에 걸친 메모는 아직 지원하지 않습니다.");
+        if let Some((from, to)) = self.span() {
+            return self.create_spanning_memo(from, to, &request.author, content);
         }
         let range = self.selection();
         let start = range.start;
@@ -633,6 +680,60 @@ impl Session {
         let mut created_id = 0;
         self.transaction(|s| {
             created_id = s.place_memo(cursor, start, end, index, &request.author, content)?;
+            Ok(())
+        })?;
+        self.memo_get(created_id)
+    }
+
+    /// A memo from `from` in one body paragraph to `to` in a later one of the same
+    /// section, stored as Hangul stores one: the field begins in the first paragraph and
+    /// its end marker sits in the last (RHWP keeps such an end with the text since 0064).
+    fn create_spanning_memo(
+        &mut self,
+        from: Cursor,
+        to: Cursor,
+        author: &str,
+        content: Vec<Paragraph>,
+    ) -> Result<Value> {
+        if from.cell.is_some() || to.cell.is_some() || from.section != to.section {
+            bail!("여러 문단에 걸친 메모는 같은 구역의 본문 문단 사이에만 만들 수 있습니다.");
+        }
+        let len = self.paragraph(from)?.text.chars().count();
+        if from.offset > len || to.offset > self.paragraph(to)?.text.chars().count() {
+            bail!("메모 범위가 문단을 벗어났습니다.");
+        }
+        let index = self.next_memo_number()?;
+        let mut created_id = 0;
+        self.transaction(|s| {
+            // A memo to the end of the first paragraph, whose end then moves to `to`.
+            let id = s.place_memo(from, from.offset, len, index, author, content)?;
+            let paragraphs = &mut s.core.document_mut().sections[from.section].paragraphs;
+            let first = &mut paragraphs[from.paragraph];
+            let (range, ctrl_id) = first
+                .field_ranges
+                .iter()
+                .enumerate()
+                .find_map(|(i, r)| match first.controls.get(r.control_idx) {
+                    Some(Control::Field(f)) if f.field_id == id => Some((i, f.ctrl_id)),
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow!("만든 메모의 범위를 찾지 못했습니다."))?;
+            let taken = take_field_end(first, range);
+            open_field_end(
+                &mut paragraphs[to.paragraph],
+                to.offset,
+                OrphanFieldEnd {
+                    char_idx: to.offset,
+                    begin_id_ref: id,
+                    field_id: taken.end_field_id,
+                    begin_ctrl_id: ctrl_id,
+                },
+            );
+            s.core.document_mut().sections[from.section].raw_stream = None;
+            relayout_paragraph(s, from)?;
+            relayout_paragraph(s, to)?;
+            s.clear_selection();
+            created_id = id;
             Ok(())
         })?;
         self.memo_get(created_id)
@@ -742,7 +843,7 @@ impl Session {
             .iter()
             .find(|r| r.control_idx == at.control)
             .map(|r| (r.start_char_idx, r.end_char_idx))
-            .ok_or_else(|| anyhow!("메모 범위를 찾지 못했습니다."))?;
+            .ok_or_else(|| anyhow!("여러 문단에 걸친 메모에는 아직 댓글을 달 수 없습니다."))?;
         if start >= end {
             bail!("글자 범위 없이 캐럿 자리에 단 메모에는 댓글을 달 수 없습니다.");
         }
@@ -795,6 +896,9 @@ impl Session {
         self.transaction(|s| {
             for id in &ids {
                 let at = find_body(s.core.document(), *id)?;
+                if s.delete_spanning_memo(&at, *id)? {
+                    continue;
+                }
                 // Removing a range field uses the same native marker-axis primitive
                 // as hyperlinks; keep all body text and its character formatting.
                 field_mut(s.core.document_mut(), &at)?.field_type = FieldType::Hyperlink;
@@ -806,6 +910,55 @@ impl Session {
         })?;
         Ok(json!({"id":id,"removed":true,"removedIds":ids,"generation":self.generation}))
     }
+}
+
+impl Session {
+    /// Remove a body memo whose end marker is in a later paragraph: its begin control and
+    /// that end marker, with their slots. `false` when the memo ends in its own paragraph.
+    fn delete_spanning_memo(&mut self, at: &Location, id: u32) -> Result<bool> {
+        let closed = self
+            .paragraph(at.cursor)?
+            .field_ranges
+            .iter()
+            .any(|r| r.control_idx == at.control);
+        if closed || at.cursor.cell.is_some() {
+            return Ok(false);
+        }
+        let doc = self.core.document_mut();
+        remove_control(
+            &mut doc.sections[at.cursor.section].paragraphs[at.cursor.paragraph],
+            at.control,
+        );
+        doc.sections[at.cursor.section].raw_stream = None;
+        let end = spanning_memo_ends(doc).remove(&id);
+        if let Some((section, paragraph, _)) = end {
+            let para = &mut doc.sections[section].paragraphs[paragraph];
+            if let Some(i) = para
+                .orphan_field_ends
+                .iter()
+                .position(|o| o.begin_id_ref == id)
+            {
+                remove_field_end(para, i);
+            }
+            doc.sections[section].raw_stream = None;
+        }
+        self.refresh_layout()?;
+        Ok(true)
+    }
+}
+
+/// Where the body memos that end in a later paragraph end: field id → (section,
+/// paragraph, character offset of the end marker).
+fn spanning_memo_ends(doc: &Document) -> std::collections::HashMap<u32, (usize, usize, usize)> {
+    let mut ends = std::collections::HashMap::new();
+    for (s, section) in doc.sections.iter().enumerate() {
+        for (p, para) in section.paragraphs.iter().enumerate() {
+            for end in &para.orphan_field_ends {
+                ends.entry(end.begin_id_ref).or_insert((s, p, end.char_idx));
+            }
+        }
+    }
+    ends
 }
 
 /// Restore HWP5 memo bodies from preserved section records before a new session

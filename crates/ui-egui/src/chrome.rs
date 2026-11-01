@@ -11,16 +11,60 @@ impl Tokens {
     pub const PANEL: Color32 = Color32::WHITE;
     pub const INPUT: Color32 = Color32::from_rgb(252, 252, 252);
 }
-pub fn modal(id: impl std::hash::Hash + std::fmt::Debug) -> Modal {
-    Modal::new(Id::new(id))
-        .backdrop_color(Color32::from_black_alpha(8))
-        .frame(
-            Frame::new()
-                .fill(Tokens::PANEL)
-                .stroke(Stroke::new(1.0, Tokens::FRAME))
-                .corner_radius(0)
-                .inner_margin(12),
-        )
+pub fn modal(id: impl std::hash::Hash + std::fmt::Debug) -> Dialog {
+    Dialog(
+        Modal::new(Id::new(id))
+            .backdrop_color(Color32::from_black_alpha(8))
+            .frame(
+                Frame::new()
+                    .fill(Tokens::PANEL)
+                    .stroke(Stroke::new(1.0, Tokens::FRAME))
+                    .corner_radius(0)
+                    .inner_margin(12),
+            ),
+    )
+}
+/// A modal dialog window. One taller than the app window (800×600, or a tall
+/// preview) scrolls inside it instead of running off screen with its title and
+/// buttons out of reach; [`crate::ext_shell::dialog`] also narrows to the window.
+pub struct Dialog(Modal);
+impl Dialog {
+    pub fn show<R>(
+        self,
+        ctx: &egui::Context,
+        body: impl FnOnce(&mut Ui) -> R,
+    ) -> egui::ModalResponse<R> {
+        // The frame's margin and stroke take 26 px; keep 8 px clear of the window edge.
+        let room = ctx.content_rect().size() - Vec2::splat(42.0);
+        self.0.show(ctx, |ui| {
+            // Hangul leaves a wider gap than egui's 4 px between options on one row.
+            ui.spacing_mut().item_spacing.x = 8.0;
+            // The modal area does not know its height on the first frame; the minimum lets
+            // the viewport grow to the window instead of the area's first guess.
+            egui::ScrollArea::vertical()
+                .max_height(room.y.max(150.0))
+                .min_scrolled_height(room.y.max(150.0))
+                .show(ui, body)
+                .inner
+        })
+    }
+}
+/// A colour button whose outline shows on a dialog: egui draws the 1 px outline in the
+/// widget fill, which [`title`] makes white, so a white colour vanished into the page.
+pub fn color_button(ui: &mut Ui, color: &mut Color32) -> egui::Response {
+    ui.scope(|ui| {
+        ui.visuals_mut().widgets.inactive.bg_fill = Color32::from_gray(150);
+        ui.color_edit_button_srgba(color)
+    })
+    .inner
+}
+/// [`color_button`] for an RGB value (no alpha control: the value is saved without one).
+pub fn color_button_rgb(ui: &mut Ui, rgb: &mut [u8; 3]) -> egui::Response {
+    ui.scope(|ui| {
+        ui.visuals_mut().widgets.inactive.bg_fill = Color32::from_gray(150);
+        egui::color_picker::color_edit_button_srgb(ui, rgb)
+    })
+    .inner
 }
 pub fn title(ui: &mut Ui, label: &str) -> bool {
     let visuals = ui.visuals_mut();
@@ -59,6 +103,11 @@ pub fn section(ui: &mut Ui, label: &str) {
 pub fn tabs(ui: &mut Ui, selected: &mut usize, labels: &[&str]) {
     ui.horizontal(|ui| {
         for (i, label) in labels.iter().enumerate() {
+            // Frameless tabs need more room than the space inside a name, or "문단 번호"
+            // and "그림 글머리표" read as one tab (a frameless button has no padding).
+            if i > 0 {
+                ui.add_space(14.0);
+            }
             let r = ui.add(
                 egui::Button::new(*label)
                     .frame(false)
@@ -125,4 +174,34 @@ pub fn actions(ui: &mut Ui, grey: Option<&str>, label: &str) -> (bool, bool) {
         .add(egui::Button::new("취소").min_size(Vec2::new(80.0, 28.0)))
         .clicked();
     (apply, cancel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A white colour keeps a visible outline in a dialog (문서 보기 색's 바탕 색).
+    #[test]
+    fn a_white_colour_button_has_a_visible_outline_in_a_dialog() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            title(ui, "색");
+            let mut white = Color32::WHITE;
+            color_button(ui, &mut white);
+        });
+        // Debug builds check that a dropped output frees its font atlas delta.
+        out.textures_delta.clear();
+        let outlines: Vec<Color32> = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Rect(r) if r.stroke.width > 0.0 => Some(r.stroke.color),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            outlines.iter().any(|c| *c == Color32::from_gray(150)),
+            "outlines painted: {outlines:?}"
+        );
+    }
 }

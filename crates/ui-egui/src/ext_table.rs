@@ -120,6 +120,8 @@ struct Split {
 
 #[derive(Clone)]
 struct GridLine {
+    /// Page the drag started on; `start` and the pointer are in its coordinates.
+    page: u32,
     table: ObjectAddress,
     vertical: bool,
     boundary: u16,
@@ -275,7 +277,7 @@ fn line_picker(ui: &mut egui::Ui, id: &str, b: &mut Borders) {
             });
         ui.end_row();
         ui.label("색");
-        egui::color_picker::color_edit_button_srgb(ui, &mut b.color);
+        chrome::color_button_rgb(ui, &mut b.color);
         ui.end_row();
     });
 }
@@ -386,7 +388,7 @@ fn fill_tab(ui: &mut egui::Ui, cell: &mut Value) {
             for (label, key) in [("면 색", "fillColor"), ("무늬 색", "patternColor")] {
                 ui.label(label);
                 let mut c = css_color(&cell[key]);
-                if egui::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
+                if chrome::color_button_rgb(ui, &mut c).changed() {
                     cell[key] = json!(color_css(c));
                 }
                 ui.end_row();
@@ -524,6 +526,10 @@ impl HwpApp {
     }
     /// Return true when the command id was handled.
     pub(crate) fn table_ext_dispatch(&mut self, id: &str, _ctx: &egui::Context) -> bool {
+        // A caret in a table inside a table cell: merge / split go to that table.
+        if let Some(done) = self.nested_table_dispatch(id) {
+            return done;
+        }
         if self.table_tool_dispatch(id) {
             return true;
         }
@@ -567,7 +573,7 @@ impl HwpApp {
                 if let Some(v) = self.result(r) {
                     self.ext.table.layout = None;
                     self.message = if v["cells"] == 0 {
-                        "더 바꿀 음영이 없습니다.".into()
+                        "음영은 처음 색에서 한 단계까지만 바꿉니다.".into()
                     } else {
                         format!("{}개 셀의 음영을 바꿨습니다.", v["cells"])
                     };
@@ -973,6 +979,7 @@ impl HwpApp {
                     None
                 };
                 return Some(GridLine {
+                    page,
                     table,
                     vertical,
                     boundary: boundary as u16,
@@ -1001,7 +1008,10 @@ impl HwpApp {
         if let Some(p) = crate::table_drawing::page_press(response).map(|p| to_page(self, p)) {
             self.ext.table.line = self.grid_line_at(page, p, tol, true);
         }
-        let Some(l) = self.ext.table.line.clone() else {
+        // Every visible page runs this each frame. Only the page the drag started on
+        // may finish it: another page would measure the release in its own
+        // coordinates, a page height away, and move the border by that much.
+        let Some(l) = self.ext.table.line.clone().filter(|l| l.page == page) else {
             return false;
         };
         let Some(p) = response
@@ -1039,7 +1049,6 @@ impl HwpApp {
                 // for the block's rows (columns) only, as in Hangul.
                 if let Some(b) = self.ext.table.block
                     && b.table == l.table
-                    && l.vertical
                     && l.nested.is_none()
                 {
                     let range = b.range();
@@ -1559,7 +1568,7 @@ impl HwpApp {
                                 ui.end_row();
                                 ui.label("색");
                                 let mut col = css_color(&c["diagonalColor"]);
-                                if egui::color_picker::color_edit_button_srgb(ui, &mut col).changed() {
+                                if chrome::color_button_rgb(ui, &mut col).changed() {
                                     c["diagonalColor"] = json!(color_css(col));
                                 }
                                 ui.end_row();
@@ -2393,6 +2402,64 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("outer line"))?;
         assert!(line.nested.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn a_click_on_a_grid_line_leaves_the_table_alone_with_the_previous_page_in_view() {
+        use hwpcraft_engine::Command;
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        a.session.execute(Command::Insert("첫 쪽".into())).unwrap();
+        a.session.execute(Command::PageBreak).unwrap();
+        a.session
+            .run("table.create", json!({"rows":2,"columns":2}))
+            .unwrap();
+        let layout = a.page_layout(1);
+        let table = layout["controls"]
+            .as_array()
+            .and_then(|c| c.iter().find(|t| t["type"] == "table"))
+            .cloned()
+            .expect("table on the second page");
+        let f = |k: &str| table["cells"][0][k].as_f64().unwrap() as f32;
+        // The first row's bottom line, as the page shows it.
+        let line = Pos2::new(f("x") + f("w") / 2.0, f("y") + f("h"));
+        let size = Vec2::new(794.0, 1123.0) * a.zoom;
+        let first = Rect::from_min_size(Pos2::new(50.0, -1000.0), size);
+        let second = Rect::from_min_size(Pos2::new(50.0, first.max.y + 10.0), size);
+        let point = second.min + line.to_vec2() * a.zoom;
+        let frame = |a: &mut HwpApp, events: Vec<egui::Event>| {
+            let ctx = a.ctx.clone();
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1100.0, 1400.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    // The previous page's bottom edge is still in view; it runs first.
+                    for (page, rect) in [(0, first), (1, second)] {
+                        let response = ui.interact(
+                            rect,
+                            egui::Id::new(("page-test", page)),
+                            egui::Sense::click_and_drag(),
+                        );
+                        a.ext_canvas(page, &response, rect);
+                    }
+                },
+            );
+            out.textures_delta.clear();
+        };
+        let button = |pressed| egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let generation = a.session.generation;
+        frame(&mut a, vec![]);
+        frame(&mut a, vec![egui::Event::PointerMoved(point), button(true)]);
+        frame(&mut a, vec![button(false)]);
+        assert!(a.error.is_none(), "{:?}", a.error);
+        assert_eq!(a.session.generation, generation, "{:?}", a.message);
     }
 
     #[test]

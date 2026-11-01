@@ -136,6 +136,12 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "",
     ),
     ("format.footnote.paragraph", "각주 / 미주 문단 모양", ""),
+    ("format.footnote.character", "각주 / 미주 글자 모양", ""),
+    (
+        "format.footnote.character.get",
+        "각주 / 미주 글자 모양 조회",
+        "",
+    ),
     (
         "format.footnote.paragraph.get",
         "각주 / 미주 문단 모양 조회",
@@ -163,12 +169,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("format.style.move", "스타일 목록 위 / 아래로 이동", ""),
     ("format.style.export", "스타일 내보내기 (JSON)", ""),
     ("format.style.import", "스타일 가져오기 (JSON)", ""),
-    (
-        "format.paragraph.apply",
-        "문단 모양 창 적용 (모양 + 문단 종류)",
-        "",
-    ),
-    ("format.outline.shape", "개요 번호 모양", ""),
+    // format.paragraph.apply and format.outline.shape are listed in lib.rs.
     ("format.char_overlap", "글자 겹치기 넣기", ""),
     ("format.char_overlap.get", "글자 겹치기 조회", ""),
     ("format.char_overlap.update", "글자 겹치기 고치기", ""),
@@ -478,7 +479,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "format.copy_shape.apply",
-        "character?/paragraph?: 복사한 모양 패치를 한 번 실행 취소로 적용합니다(모양 복사 Alt+C).",
+        "character?/paragraph?: 복사한 모양 패치를 한 번 실행 취소로 적용합니다(모양 복사 Alt+C). format.character.get·format.paragraph.get 결과를 그대로 받으며, 그 가운데 모양 번호(charShapeId·paraShapeId·borderFillId)와 defaultTabSpacing은 읽기 전용이라 무시합니다.",
         r##"{"character":{"bold":true},"paragraph":{"alignment":"center"}}"##,
     ),
     (
@@ -503,13 +504,23 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "format.footnote.paragraph",
-        "paragraph?: 각주가 든 문단(기본 캐럿), control: 각주·미주 번호, footnoteParagraph?, format: 문단 패치.",
-        r##"{"control":0,"format":{"alignment":"justify"}}"##,
+        "paragraph?: 각주가 든 문단(기본 캐럿), control: 각주가 든 문단의 개체 번호(각주 번호가 아님: note.insert·insert.footnote 결과 address.control 또는 object.list의 control. 새 문서 첫 문단은 0·1이 구역·단 정의라 첫 각주는 2), footnoteParagraph?, format: 문단 패치.",
+        r##"{"paragraph":0,"control":2,"format":{"alignment":"justify"}}"##,
     ),
     (
         "format.footnote.paragraph.get",
-        "paragraph?, control, footnoteParagraph?.",
-        r##"{"control":0}"##,
+        "paragraph?, control(format.footnote.paragraph와 같음), footnoteParagraph?.",
+        r##"{"paragraph":0,"control":2}"##,
+    ),
+    (
+        "format.footnote.character",
+        "paragraph?: 각주가 든 문단(기본 캐럿), control: 각주가 든 문단의 개체 번호(각주 번호가 아님: note.insert·insert.footnote 결과 address.control 또는 object.list의 control. 새 문서 첫 문단은 0·1이 구역·단 정의라 첫 각주는 2), footnoteParagraph?, start?/end?: 오프셋(기본 문단 전체, 번호 글자 포함), format: format.character와 같은 글자 패치. 한 번 실행 취소.",
+        r##"{"paragraph":0,"control":2,"start":2,"format":{"italic":true}}"##,
+    ),
+    (
+        "format.footnote.character.get",
+        "paragraph?, control(format.footnote.character와 같음), footnoteParagraph?, offset?.",
+        r##"{"paragraph":0,"control":2,"offset":2}"##,
     ),
     (
         "format.char_overlap",
@@ -669,6 +680,107 @@ fn restyle_section(
     }
 }
 
+/// A paragraph in a header, footer, note, text box or caption anchored in a body
+/// paragraph: the ones RHWP re-breaks by address. Deeper ones (inside cells, groups or
+/// master pages) only have their rows invalidated.
+#[derive(Clone, Copy)]
+struct NestedParagraph {
+    section: usize,
+    paragraph: usize,
+    control: usize,
+    index: usize,
+    kind: NestedKind,
+}
+
+#[derive(Clone, Copy)]
+enum NestedKind {
+    /// Text box (cell 0), table caption (cell 65534) or picture caption, through RHWP's
+    /// cell paragraph commands.
+    Boxed(usize),
+    HeaderFooter {
+        header: bool,
+        apply: u8,
+    },
+    Note,
+}
+
+/// The paragraph list of a body-level control that [`NestedParagraph`] reaches.
+fn nested_list(control: &Control) -> Option<(&[Paragraph], NestedKind)> {
+    Some(match control {
+        Control::Table(t) => (
+            &t.caption.as_ref()?.paragraphs[..],
+            NestedKind::Boxed(65534),
+        ),
+        Control::Picture(p) => (&p.caption.as_ref()?.paragraphs[..], NestedKind::Boxed(0)),
+        Control::Shape(s)
+            if !matches!(
+                s.as_ref(),
+                hwpcraft_doc::model::shape::ShapeObject::Group(_)
+            ) =>
+        {
+            (
+                &s.drawing()?.text_box.as_ref()?.paragraphs[..],
+                NestedKind::Boxed(0),
+            )
+        }
+        Control::Header(h) => (
+            &h.paragraphs[..],
+            NestedKind::HeaderFooter {
+                header: true,
+                apply: hf_apply_of(h.apply_to),
+            },
+        ),
+        Control::Footer(f) => (
+            &f.paragraphs[..],
+            NestedKind::HeaderFooter {
+                header: false,
+                apply: hf_apply_of(f.apply_to),
+            },
+        ),
+        Control::Footnote(n) => (&n.paragraphs[..], NestedKind::Note),
+        Control::Endnote(n) => (&n.paragraphs[..], NestedKind::Note),
+        _ => return None,
+    })
+}
+
+/// The [`NestedParagraph`]s whose style is `style`.
+fn nested_paragraphs(
+    document: &hwpcraft_doc::model::document::Document,
+    style: usize,
+) -> Vec<NestedParagraph> {
+    let mut out = Vec::new();
+    for (section, sec) in document.sections.iter().enumerate() {
+        for (paragraph, para) in sec.paragraphs.iter().enumerate() {
+            for (control, c) in para.controls.iter().enumerate() {
+                let Some((list, kind)) = nested_list(c) else {
+                    continue;
+                };
+                for (index, p) in list.iter().enumerate() {
+                    if p.style_id as usize == style {
+                        out.push(NestedParagraph {
+                            section,
+                            paragraph,
+                            control,
+                            index,
+                            kind,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// RHWP's header/footer `apply_to` code (see `hf_apply_code`).
+fn hf_apply_of(apply: HeaderFooterApply) -> u8 {
+    match apply {
+        HeaderFooterApply::Even => 1,
+        HeaderFooterApply::Odd => 2,
+        _ => 0,
+    }
+}
+
 fn char_mods(v: &Value) -> CharShapeMods {
     let b = |k: &str| v[k].as_bool();
     let n = |k: &str| v[k].as_i64();
@@ -768,7 +880,7 @@ fn para_mods(v: &Value) -> ParaShapeMods {
     }
 }
 /// A complete (already completed) border/fill patch → BorderFill, starting from `base`.
-fn border_fill(v: &Value, base: Option<&BorderFill>) -> BorderFill {
+pub(crate) fn border_fill(v: &Value, base: Option<&BorderFill>) -> BorderFill {
     let mut bf = base.cloned().unwrap_or_else(|| BorderFill {
         borders: [BorderLine {
             line_type: BorderLineType::None,
@@ -927,6 +1039,12 @@ impl Session {
             }
             "format.footnote.paragraph.get" => {
                 parse(id, params).and_then(|p| self.fmt_footnote_paragraph_get(&p))
+            }
+            "format.footnote.character" => {
+                parse(id, params).and_then(|p| self.fmt_footnote_character(p))
+            }
+            "format.footnote.character.get" => {
+                parse(id, params).and_then(|p| self.fmt_footnote_character_get(&p))
             }
             "format.superscript.cycle" => no_params(id, params).and_then(|_| self.cycle_script()),
             "format.indent.at_caret" => no_params(id, params).and_then(|_| self.indent_at_caret()),
@@ -1143,7 +1261,7 @@ impl Session {
         self.core.document_mut().sections[c.section].raw_stream = None;
         Ok(())
     }
-    fn paragraph_mut(&mut self, c: Cursor) -> Result<&mut Paragraph> {
+    pub(crate) fn paragraph_mut(&mut self, c: Cursor) -> Result<&mut Paragraph> {
         let p = self
             .core
             .document_mut()
@@ -1167,9 +1285,16 @@ impl Session {
     // ---- 모양 복사 ----
 
     /// 모양 복사 (Alt+C) applies the copied 글자 모양 and 문단 모양 in one undo step.
-    fn copy_shape_apply(&mut self, p: CopyShape) -> Result<Value> {
+    fn copy_shape_apply(&mut self, mut p: CopyShape) -> Result<Value> {
         if p.character.is_none() && p.paragraph.is_none() {
             bail!("복사한 글자 모양이나 문단 모양이 필요합니다.");
+        }
+        // A copied shape is a get result: drop its read-only ids.
+        if let Some(v) = &mut p.character {
+            crate::formatting::without_read_only(v, true);
+        }
+        if let Some(v) = &mut p.paragraph {
+            crate::formatting::without_read_only(v, false);
         }
         if let Some(v) = &p.character {
             validate_format(v, true)?;
@@ -1182,9 +1307,13 @@ impl Session {
                 s.apply_character_now(v)?;
             }
             if let Some(v) = p.paragraph {
-                for (c, _) in s.selected_paragraphs()? {
-                    s.apply_paragraph_at(c, v.clone())?;
-                }
+                // One layout pass for all the paragraphs, not one per paragraph.
+                s.deferred_layout(|s| {
+                    for (c, _) in s.selected_paragraphs()? {
+                        s.apply_paragraph_at(c, v.clone())?;
+                    }
+                    Ok(())
+                })?;
             }
             Ok(())
         })?;
@@ -1407,6 +1536,61 @@ impl Session {
             )
             .map_err(err)?;
         self.with_raw_units(serde_json::from_str(&raw)?, shape)
+    }
+    /// The `context.v2` address of a footnote/endnote paragraph.
+    fn fmt_footnote_address(
+        &self,
+        paragraph: Option<usize>,
+        control: usize,
+        index: usize,
+    ) -> Result<ContextAddress> {
+        let (host, _) = self.fmt_footnote_paragraph_ref(paragraph, control, index)?;
+        let note = self.paragraph(Cursor {
+            section: self.cursor.section,
+            paragraph: host,
+            ..Default::default()
+        })?;
+        let step = match note.controls.get(control) {
+            Some(Control::Endnote(_)) => ContextStep::Endnote {
+                control,
+                paragraph: index,
+            },
+            _ => ContextStep::Footnote {
+                control,
+                paragraph: index,
+            },
+        };
+        Ok(ContextAddress {
+            version: 2,
+            section: self.cursor.section,
+            paragraph: host,
+            path: vec![step],
+        })
+    }
+    /// 각주 / 미주 글자 모양: RHWP has no note character API, so this goes through the
+    /// region editor (`context.v2.character`), with its protection and undo.
+    fn fmt_footnote_character(&mut self, p: FootnoteCharacter) -> Result<Value> {
+        let address = self.fmt_footnote_address(p.paragraph, p.control, p.footnote_paragraph)?;
+        validate_format(&p.format, true)?;
+        let mut params = json!({"address": address, "format": p.format,
+            "expected_generation": self.generation});
+        if let Some(start) = p.start {
+            params["start"] = json!(start);
+        }
+        if let Some(end) = p.end {
+            params["end"] = json!(end);
+        }
+        self.run("context.v2.character", params)?;
+        self.fmt_footnote_character_get(&FootnoteCharacterQuery {
+            paragraph: p.paragraph,
+            control: p.control,
+            footnote_paragraph: p.footnote_paragraph,
+            offset: p.start.unwrap_or(0),
+        })
+    }
+    fn fmt_footnote_character_get(&self, q: &FootnoteCharacterQuery) -> Result<Value> {
+        let address = self.fmt_footnote_address(q.paragraph, q.control, q.footnote_paragraph)?;
+        Ok(self.context_v2_info(&address, q.offset)?["character"].take())
     }
     fn step_character(&mut self, id: &str) -> Result<Value> {
         let p = self.character_properties()?;
@@ -1858,10 +2042,13 @@ impl Session {
                 u32::from(old_cs),
                 u32::from(new_cs),
             );
+            // Its stored rows no longer fit the new shapes.
+            para.invalidate_layout_inputs();
             true
         };
         // Body paragraphs and first-level cells using the style, reflowed below; the
-        // rest (headers, notes, text boxes, deeper cells) follow the section layout.
+        // rest (headers, notes, text boxes, deeper cells) are laid out afresh from
+        // the rows invalidated above.
         let mut touched = Vec::new();
         for (si, section) in doc.sections.iter().enumerate() {
             for (pi, para) in section.paragraphs.iter().enumerate() {
@@ -1902,10 +2089,13 @@ impl Session {
         for c in touched {
             self.reflow(c)?;
         }
+        for n in nested_paragraphs(self.core.document(), id) {
+            self.reflow_nested(n)?;
+        }
         Ok(())
     }
     /// Re-run RHWP's line breaking for one paragraph by re-applying its own left margin.
-    fn reflow(&mut self, c: Cursor) -> Result<()> {
+    pub(crate) fn reflow(&mut self, c: Cursor) -> Result<()> {
         let margin = {
             let para = self.paragraph(c)?;
             self.core
@@ -1929,6 +2119,67 @@ impl Session {
         } else {
             self.core
                 .apply_para_format_native(c.section, c.paragraph, &props)
+        }
+        .map_err(err)?;
+        Ok(())
+    }
+    /// [`Self::reflow`] for a paragraph in a header, footer, note, text box or caption.
+    fn reflow_nested(&mut self, n: NestedParagraph) -> Result<()> {
+        let doc = self.core.document();
+        let Some(sec) = doc.sections.get(n.section) else {
+            return Ok(());
+        };
+        let Some(para) = sec
+            .paragraphs
+            .get(n.paragraph)
+            .and_then(|p| p.controls.get(n.control))
+            .and_then(nested_list)
+            .and_then(|(list, _)| list.get(n.index))
+        else {
+            return Ok(());
+        };
+        if let NestedKind::HeaderFooter { header, apply } = n.kind {
+            // RHWP finds the section's first header or footer of that kind.
+            let first = sec.paragraphs.iter().enumerate().find_map(|(pi, p)| {
+                p.controls
+                    .iter()
+                    .position(|c| {
+                        nested_list(c).is_some_and(|(_, k)| {
+                            matches!(k, NestedKind::HeaderFooter { header: h, apply: a }
+                            if h == header && a == apply)
+                        })
+                    })
+                    .map(|ci| (pi, ci))
+            });
+            if first != Some((n.paragraph, n.control)) {
+                return Ok(());
+            }
+        }
+        let margin = doc
+            .doc_info
+            .para_shapes
+            .get(para.para_shape_id as usize)
+            .map_or(0, |p| p.margin_left);
+        let props = json!({"marginLeft": margin}).to_string();
+        match n.kind {
+            NestedKind::Boxed(cell) => self.core.apply_para_format_in_cell_native(
+                n.section,
+                n.paragraph,
+                n.control,
+                cell,
+                n.index,
+                &props,
+            ),
+            NestedKind::HeaderFooter { header, apply } => self
+                .core
+                .apply_para_format_in_hf_native(n.section, header, apply, n.index, &props),
+            NestedKind::Note => self.core.apply_para_format_in_footnote_native(
+                n.section,
+                n.paragraph,
+                n.control,
+                n.index,
+                &props,
+            ),
         }
         .map_err(err)?;
         Ok(())
@@ -2012,6 +2263,7 @@ impl Session {
                 .map_err(err)?;
             }
             let removed = p.id as u8;
+            let nested = nested_paragraphs(s.core.document(), p.id);
             let doc = s.core.document_mut();
             // Paragraphs the engine's entries do not reach (headers, notes, text boxes,
             // deeper cells, master pages) take the replacement style and its shapes.
@@ -2039,6 +2291,7 @@ impl Session {
                         u32::from(old.char_shape_id),
                         u32::from(new.char_shape_id),
                     );
+                    para.invalidate_layout_inputs();
                     changed = true;
                 }
                 if para.style_id > removed {
@@ -2052,6 +2305,9 @@ impl Session {
             }
             doc.doc_info.raw_stream_dirty = true;
             s.refresh_layout()?;
+            for n in nested {
+                s.reflow_nested(n)?;
+            }
             Ok(json!({"replaced": users.len()}))
         })
     }
@@ -2150,9 +2406,12 @@ impl Session {
         let empty = p.format.as_object().is_none_or(|o| o.is_empty());
         self.transaction(|s| {
             if !empty {
-                for (c, _) in s.selected_paragraphs()? {
-                    s.apply_paragraph_at(c, p.format.clone())?;
-                }
+                s.deferred_layout(|s| {
+                    for (c, _) in s.selected_paragraphs()? {
+                        s.apply_paragraph_at(c, p.format.clone())?;
+                    }
+                    Ok(())
+                })?;
             }
             if let Some((kind, level)) = head {
                 // Keep an existing definition of the same kind; otherwise use the default.
@@ -2339,6 +2598,16 @@ impl Session {
                 }),
             ),
         };
+        self.deferred_layout(|s| s.apply_head(head, id, level, kind))
+    }
+    /// The head patch of `set_head` on every selected paragraph.
+    fn apply_head(
+        &mut self,
+        head: &str,
+        id: Option<u16>,
+        level: Option<u8>,
+        kind: HeadKind,
+    ) -> Result<()> {
         for (c, _) in self.selected_paragraphs()? {
             let mut patch = json!({ "headType": head });
             if let Some(id) = id {
@@ -2379,10 +2648,12 @@ impl Session {
             return Ok(self.info());
         }
         self.transaction(|s| {
-            for (c, next) in changes {
-                s.apply_paragraph_at(c, json!({ "paraLevel": next }))?;
-            }
-            Ok(())
+            s.deferred_layout(|s| {
+                for (c, next) in changes {
+                    s.apply_paragraph_at(c, json!({ "paraLevel": next }))?;
+                }
+                Ok(())
+            })
         })?;
         Ok(self.info())
     }
@@ -2491,11 +2762,13 @@ impl Session {
         if target == old && !matches!(restart, Restart::New(_)) {
             return Ok(());
         }
-        self.apply_paragraph_at(c, json!({"numberingId": target}))?;
-        for p in after {
-            self.apply_paragraph_at(p, json!({"numberingId": target}))?;
-        }
-        Ok(())
+        self.deferred_layout(|s| {
+            s.apply_paragraph_at(c, json!({"numberingId": target}))?;
+            for p in after {
+                s.apply_paragraph_at(p, json!({"numberingId": target}))?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -3462,6 +3735,31 @@ struct FootnoteParagraph {
     #[serde(default)]
     footnote_paragraph: usize,
     format: Value,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct FootnoteCharacter {
+    #[serde(default)]
+    paragraph: Option<usize>,
+    control: usize,
+    #[serde(default)]
+    footnote_paragraph: usize,
+    #[serde(default)]
+    start: Option<usize>,
+    #[serde(default)]
+    end: Option<usize>,
+    format: Value,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct FootnoteCharacterQuery {
+    #[serde(default)]
+    paragraph: Option<usize>,
+    control: usize,
+    #[serde(default)]
+    footnote_paragraph: usize,
+    #[serde(default)]
+    offset: usize,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]

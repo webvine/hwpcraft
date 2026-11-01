@@ -70,6 +70,11 @@ fn footnotes_restart_on_every_page_in_the_area_and_the_body() -> anyhow::Result<
     let check = |s: &Session, label: &str| -> anyhow::Result<()> {
         let pages = page_numbers(s)?;
         for (page, (area, body)) in pages.iter().enumerate() {
+            // The last paragraph ("본문 ", no note) may be alone on the last page now
+            // that body lines stay above the footnote area (RHWP 0063).
+            if area.is_empty() && body.is_empty() && page + 1 == pages.len() {
+                continue;
+            }
             let expected: Vec<u32> = (1..=area.len() as u32).collect();
             assert!(!area.is_empty(), "{label} page {page}: {pages:?}");
             assert_eq!(area, &expected, "{label} page {page} area");
@@ -129,22 +134,26 @@ fn separator_lengths_are_the_ones_hwp_can_keep() -> anyhow::Result<()> {
             json!({"kind": kind, "props": {"separatorLength": n}}),
         )
     };
-    // 16-bit HWP field: a longer line would wrap on save, and -4 (column width) is
-    // an endnote preset only.
+    let above = |s: &mut Session| -> anyhow::Result<Value> {
+        Ok(s.run("note.shape.get", json!({"kind": "footnote"}))?["separatorMarginTop"].clone())
+    };
+    // Hangul's 구분선 위 for a new document's footnotes (3 mm).
+    assert_eq!(above(&mut s)?, 850);
+    // The HWP field is 32 bits, and -4 (column width) is an endnote preset only.
     let generation = s.generation;
     for (kind, n) in [
-        ("footnote", 32_768),
+        ("footnote", 2_147_483_648),
         ("footnote", -4),
         ("footnote", -2),
-        ("endnote", 40_000),
         ("endnote", -3),
     ] {
         assert!(set(&mut s, kind, n).is_err(), "{kind} {n}");
     }
     assert_eq!(s.generation, generation);
-    set(&mut s, "footnote", 32_767)?;
+    // Longer than 16 bits: an HWP save used to wrap it.
+    set(&mut s, "footnote", 40_000)?;
     set(&mut s, "endnote", -4)?;
-    assert_eq!(length(&mut s, "footnote")?, 32_767);
+    assert_eq!(length(&mut s, "footnote")?, 40_000);
     assert_eq!(length(&mut s, "endnote")?, -4);
     let dir = tempfile::tempdir()?;
     for ext in ["hwp", "hwpx"] {
@@ -152,7 +161,8 @@ fn separator_lengths_are_the_ones_hwp_can_keep() -> anyhow::Result<()> {
         s.save(&path)?;
         let mut r = Session::new()?;
         r.open(&path)?;
-        assert_eq!(length(&mut r, "footnote")?, 32_767, "{ext}");
+        assert_eq!(length(&mut r, "footnote")?, 40_000, "{ext}");
+        assert_eq!(above(&mut r)?, 850, "{ext}");
         assert_eq!(length(&mut r, "endnote")?, -4, "{ext}");
     }
     // The 5 cm preset stays a preset on endnotes too (not 0, which is no line).
@@ -198,6 +208,10 @@ fn per_page_numbers_reach_the_print_output_from_concurrent_threads() -> anyhow::
                         let area = numbers_before(&text, "주석끝");
                         // Body marks use the numbers of the page being laid out.
                         let body = numbers_before(&text, "본문");
+                        // The note-less last paragraph may be alone on the last page.
+                        if area.is_empty() && body.is_empty() && page + 1 == pages {
+                            continue;
+                        }
                         let expected: Vec<u32> = (1..=area.len() as u32).collect();
                         assert!(!area.is_empty(), "worker {worker} page {page}");
                         assert_eq!(area, expected, "worker {worker} page {page}");

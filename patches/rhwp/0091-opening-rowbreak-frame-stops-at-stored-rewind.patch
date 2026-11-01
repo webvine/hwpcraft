@@ -1,0 +1,125 @@
+diff --git a/src/renderer/typeset.rs b/src/renderer/typeset.rs
+index bcc81e7..4c301e2 100644
+--- a/src/renderer/typeset.rs
++++ b/src/renderer/typeset.rs
+@@ -8366,4 +8366,38 @@ mod tests {
+             "구역 12 p17 이 빈 쪽을 만든다 (한글 PDF에는 없음)"
+         );
+     }
++
++    /// 편람 구역 10 질문 5(pi=12) 표의 첫 조각은 답변 문단의 저장 되감김(2줄 뒤)에서
++    /// 끝난다. 한글 2024 PDF 283쪽은 그 2줄만 담고 상자를 본문 안(886.8px)에서 닫는다.
++    /// 파생 문단 꼬리가 3줄을 실으면 조각이 본문 하단을 넘는다.
++    #[test]
++    fn handbook_q5_opening_fragment_stops_at_stored_rewind() {
++        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++            .join("samples/2025 행정업무운영 편람(최종).hwp");
++        let Ok(bytes) = std::fs::read(&path) else {
++            eprintln!("skip: {} 없음", path.display());
++            return;
++        };
++        let core = crate::document_core::DocumentCore::from_bytes(&bytes).expect("parse handbook");
++        let opening_cut = core.pagination[10]
++            .pages
++            .iter()
++            .flat_map(|page| &page.column_contents)
++            .flat_map(|column| &column.items)
++            .find_map(|item| match item {
++                PageItem::PartialTable {
++                    para_index: 12,
++                    is_continuation: false,
++                    end_cut,
++                    ..
++                } => Some(end_cut.clone()),
++                _ => None,
++            })
++            .expect("질문 5 표의 첫 조각");
++        assert_eq!(
++            opening_cut,
++            vec![1, 1, 2],
++            "답변 셀은 저장 되감김 앞 2줄에서 끝나야 한다"
++        );
++    }
+ }
+diff --git a/src/renderer/typeset/table/scan/runner/row_step.rs b/src/renderer/typeset/table/scan/runner/row_step.rs
+index 35b4977..9080018 100644
+--- a/src/renderer/typeset/table/scan/runner/row_step.rs
++++ b/src/renderer/typeset/table/scan/runner/row_step.rs
+@@ -485,6 +485,16 @@ impl TypesetEngine {
+                         source_tail_cut.end_cut = correction.end_cut;
+                         source_tail_cut.consumed_height = correction.consumed_height;
+                         source_tail_cut.fully_consumed = false;
++                    } else if !is_continuation && source_first_fragment_row_end == Some(r) {
++                        if let Some(correction) = source_tail_query.opening_frame_rewind_correction(
++                            &res,
++                            &source_tail_cut,
++                            padding,
++                        ) {
++                            source_tail_cut.end_cut = correction.end_cut;
++                            source_tail_cut.consumed_height = correction.consumed_height;
++                            source_tail_cut.fully_consumed = false;
++                        }
+                     }
+                     let table::scan::source_tail::extension::SourceTailFit {
+                         extension,
+diff --git a/src/renderer/typeset/table/scan/source_tail/extension.rs b/src/renderer/typeset/table/scan/source_tail/extension.rs
+index 2f72590..f84075f 100644
+--- a/src/renderer/typeset/table/scan/source_tail/extension.rs
++++ b/src/renderer/typeset/table/scan/source_tail/extension.rs
+@@ -124,6 +124,56 @@ impl SourceTailQuery<'_> {
+         None
+     }
+ 
++    /// 첫 조각의 저장 프레임이 끝나는 행에서는 꼬리를 그 행의 첫 저장 되감김에서 멈춘다.
++    ///
++    /// 선언 `common.height` 가 첫 물리 조각 상자이고 그 상자가 이 행 안에서 끝난다
++    /// (`source_first_fragment_row_end`). 그러면 이 행의 저장 되감김(양수 vpos → 0)은
++    /// 한글이 그 상자를 닫은 자리다. 파생 문단 꼬리(`paragraph_tail_cut_for_row`)는
++    /// 문단 경계에서만 멈추므로 같은 문단 안의 되감김을 지나 다음 쪽 몫까지 당긴다 —
++    /// 편람 구역 10 질문 5(pi=12)는 답변 첫 문단 3줄 중 2줄이 첫 조각이고(저장
++    /// `1838 → 0`, 선언 11382HU = 한글 PDF 상자 151.8px), 꼬리가 3줄을 실어 본문 하단을
++    /// 31px 넘겼다. 가시 셀이 하나여도 첫 프레임의 끝은 선언 상자가 증언하므로
++    /// `mirrored_correction`(가시 셀 둘 이상)과 겹치지 않는 여집합만 다룬다.
++    pub(in crate::renderer::typeset) fn opening_frame_rewind_correction(
++        &self,
++        res: &RowCutResult,
++        source_tail_cut: &RowCutResult,
++        padding: f64,
++    ) -> Option<SourceTailCorrection> {
++        let Self {
++            row, row_start_cut, ..
++        } = *self;
++        let RowScanQuery { rows, r, .. } = *row;
++        let RowBlockQuery {
++            layout_engine,
++            table,
++            styles,
++            ..
++        } = *rows;
++        let stored_rewinds = layout_engine.row_stored_rewind_unit_indices(table, r, styles);
++        let mut clipped = source_tail_cut.end_cut.clone();
++        let mut clipped_any = false;
++        for (idx, end) in clipped.iter_mut().enumerate() {
++            let pre = res.end_cut.get(idx).copied().unwrap_or(0);
++            if let Some(boundary) = stored_rewinds
++                .get(idx)
++                .and_then(|rewinds| rewinds.iter().copied().find(|b| pre <= *b && *b < *end))
++            {
++                *end = boundary;
++                clipped_any = true;
++            }
++        }
++        if !clipped_any {
++            return None;
++        }
++        let clipped_total =
++            layout_engine.row_cut_content_height(table, r, row_start_cut, &clipped, styles);
++        Some(SourceTailCorrection {
++            end_cut: clipped,
++            consumed_height: (clipped_total - padding).max(0.0),
++        })
++    }
++
+     /// 보정이 반영된 후보를 받는다. avail_for_rows를 잔여 예산으로 재해석하지 않는다.
+     pub(in crate::renderer::typeset) fn extension_fit(
+         &self,

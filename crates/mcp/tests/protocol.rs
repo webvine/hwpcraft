@@ -871,6 +871,138 @@ fn typed_regions_edit_header_note_and_textbox_through_mcp() {
     }
 }
 
+/// A 2025-era client (Codex CLI 0.164 opens with `initialize` 2025-06-18) negotiates
+/// its version, then uses tools without per-request `_meta`, as the 2025 revisions
+/// define. A connection opened this way stays in that lifecycle.
+#[test]
+fn a_2025_client_initializes_and_edits_over_stdio() {
+    for version in ["2025-06-18", "2025-11-25", "2025-03-26"] {
+        let mut s = TestClient::new(None);
+        let init = s.exact(
+            json!(1),
+            "initialize",
+            json!({"protocolVersion":version,"capabilities":{},
+                "clientInfo":{"name":"codex-mcp-client","version":"0.164.0"}}),
+        );
+        assert_eq!(init["result"]["protocolVersion"], version, "{init}");
+        assert_eq!(init["result"]["serverInfo"]["name"], "hwpcraft", "{init}");
+        // Only what a 2025 session serves: no resources/subscribe, no Tasks extension.
+        let capabilities = &init["result"]["capabilities"];
+        assert!(
+            capabilities["resources"].get("subscribe").is_none(),
+            "{init}"
+        );
+        assert!(
+            capabilities["extensions"]
+                .get("io.modelcontextprotocol/tasks")
+                .is_none(),
+            "{init}"
+        );
+        assert!(capabilities.get("tools").is_some(), "{init}");
+        let mut initialized =
+            serde_json::to_vec(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+                .unwrap();
+        initialized.push(b'\n');
+        s.send_bytes(&initialized);
+        let tools = s.exact(json!(2), "tools/list", json!({}));
+        let names: Vec<&str> = tools["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{version}: {tools}"))
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(names.contains(&"execute"), "{version}: {names:?}");
+        let made = s.exact(
+            json!(3),
+            "tools/call",
+            json!({"name":"new_document","arguments":{}}),
+        );
+        assert_eq!(made["result"]["isError"], false, "{version}: {made}");
+        let id = made["result"]["structuredContent"]["document_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{version}: {made}"))
+            .to_owned();
+        let edit = s.exact(
+            json!(4),
+            "tools/call",
+            json!({"name":"execute","arguments":{"document_id":id,
+                "command":"text.insert","params":{"text":"코덱스에서 쓴 글"}}}),
+        );
+        assert_eq!(edit["result"]["isError"], false, "{version}: {edit}");
+        let text = s.exact(
+            json!(5),
+            "tools/call",
+            json!({"name":"execute","arguments":{"document_id":id,
+                "command":"document.text","params":{}}}),
+        );
+        assert!(
+            text.to_string().contains("코덱스에서 쓴 글"),
+            "{version}: {text}"
+        );
+        // The 2025 lifecycle keeps its ping.
+        let ping = s.exact(json!(6), "ping", json!({}));
+        assert!(ping.get("error").is_none(), "{version}: {ping}");
+    }
+}
+
+/// Calls sent on one connection without waiting for the answers run on their
+/// document in the order they were sent (MCP 2nd review B-D1: 60 pipelined
+/// type_text calls used to land as <0><15><1>...).
+#[test]
+fn pipelined_calls_on_one_document_run_in_send_order() {
+    let mut s = server();
+    let id = s.current_document.clone().expect("document");
+    let mut bytes = Vec::new();
+    for n in 0..60 {
+        let request = json!({"jsonrpc":"2.0","id":format!("pipe-{n}"),"method":"tools/call",
+            "params":with_meta(json!({"name":"type_text",
+                "arguments":{"document_id":id,"text":format!("<{n}>")}}))});
+        bytes.extend(serde_json::to_vec(&request).unwrap());
+        bytes.push(b'\n');
+    }
+    s.send_bytes(&bytes);
+    for n in 0..60 {
+        let reply = s.receive(Some(&json!(format!("pipe-{n}"))));
+        assert_eq!(reply["result"]["isError"], false, "{n}: {reply}");
+    }
+    let text = tool(&mut s, "get_text", json!({}));
+    let expected: String = (0..60).map(|n| format!("<{n}>")).collect();
+    assert!(text.to_string().contains(&expected), "{text}");
+}
+
+/// A known method with malformed params is -32602 with a reason, not -32601 with
+/// the method name as the whole message (MCP 2nd review D5).
+#[test]
+fn malformed_params_of_a_known_method_are_invalid_params() {
+    let mut s = server();
+    for params in [
+        json!({"name":"list_commands","arguments":[]}),
+        json!({"arguments":{}}),
+    ] {
+        let reply = rpc(&mut s, "tools/call", params.clone());
+        assert_eq!(reply["error"]["code"], -32602, "{params}: {reply}");
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("params")),
+            "{reply}"
+        );
+    }
+    let unknown = rpc(&mut s, "own/unknown", json!({}));
+    assert_eq!(unknown["error"]["code"], -32601, "{unknown}");
+    assert!(unknown.to_string().contains("own/unknown"), "{unknown}");
+    // The schema's "integer" takes 1.0, so the tool does too (D6); values past the
+    // reader's range are refused by the schema, before the tool runs.
+    tool(&mut s, "type_text", json!({"text":"쪽"}));
+    let page = raw_tool(&mut s, "render_page", json!({"page":1.0}));
+    assert_eq!(page["isError"], false, "{page}");
+    let far = raw_tool(&mut s, "render_page", json!({"page":4294967296u64}));
+    assert_eq!(far["isError"], true, "{far}");
+    assert!(far.get("rpcError").is_some(), "schema refusal: {far}");
+    let text = raw_tool(&mut s, "get_text", json!({"start":0.0,"limit":10.0}));
+    assert_eq!(text["isError"], false, "{text}");
+}
+
 #[test]
 fn lifecycle_errors_resources_and_bounded_framing() {
     let mut s = TestClient::new(None);
@@ -968,10 +1100,10 @@ fn lifecycle_errors_resources_and_bounded_framing() {
             "tools/call",
             json!({"name":"type_text","arguments":[]})
         )["error"]["code"],
-        // The SDK routes a request that cannot decode as CallToolRequest to
-        // the unsupported custom-request branch. Valid tool input with a
-        // schema violation is separately asserted as -32602 by raw_tool.
-        -32601
+        // The SDK routes a request that cannot decode as CallToolRequest to the
+        // custom-request branch, which answers a known method's malformed params
+        // with -32602 (see malformed_params_of_a_known_method_are_invalid_params).
+        -32602
     );
     assert_eq!(rpc(&mut s, "missing", json!({}))["error"]["code"], -32601);
     assert_eq!(rpc(&mut s, "ping", json!({}))["error"]["code"], -32601);
@@ -1077,6 +1209,39 @@ fn lifecycle_errors_resources_and_bounded_framing() {
             .unwrap();
         assert_eq!(eof.receive(None)["error"]["code"], code);
     }
+}
+
+/// A batch of large reads keeps its results up to a bound and lists the rest
+/// without them, so it cannot exhaust memory or pass the transport's message limit.
+#[test]
+fn batch_results_are_bounded() {
+    let mut s = server();
+    discover_and_create(&mut s);
+    // 100 paragraphs of 1,000 characters: about 290 KB per read, so 32 reads pass
+    // the 8 MiB the batch keeps.
+    let line = format!(
+        "{}
+",
+        "가나다라마바사아자차카타파하 ".repeat(66)
+    )
+    .repeat(100);
+    tool(&mut s, "type_text", json!({"text": line}));
+    let commands: Vec<Value> = (0..32)
+        .map(|_| json!({"command": "document.text", "params": {}}))
+        .collect();
+    let out = raw_tool(&mut s, "batch", json!({"commands": commands}));
+    let results = out["structuredContent"]["results"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(results.len(), 32, "{}", out.to_string().len());
+    assert!(results.iter().all(|r| r["ok"] == true));
+    let omitted = results
+        .iter()
+        .filter(|r| r["resultOmitted"] == true)
+        .count();
+    assert!(omitted > 0 && omitted < 32, "omitted {omitted}");
+    assert!(out.to_string().len() < 32 << 20);
 }
 
 #[test]
@@ -1667,7 +1832,7 @@ fn korean_report_authored_end_to_end_through_mcp() {
 }
 
 #[test]
-fn change_tracked_save_is_refused_unless_accepted() {
+fn change_tracked_saves_keep_the_tracking_unless_accepted() {
     let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../rhwp/samples/issue5169_viewtext_changetracking.hwp");
     if !sample.exists() {
@@ -1680,19 +1845,30 @@ fn change_tracked_save_is_refused_unless_accepted() {
     tool(&mut s, "open_document", json!({"path":input}));
     let state = execute(&mut s, "document.track_changes", json!({}));
     assert_eq!(state["tracked"], true, "{state}");
-    let plain = dir.path().join("plain.hwpx");
-    fails(&mut s, "save_document", json!({"path":plain}));
-    assert!(!plain.exists());
-    // Saving over the source is refused too, and leaves it intact.
-    let before = std::fs::read(&input).unwrap();
-    fails(&mut s, "save_document", json!({}));
-    assert_eq!(std::fs::read(&input).unwrap(), before);
+    // HWP and HWPX saves keep the tracking, edited or not.
+    assert_eq!(state["keptOnHwpSave"], true, "{state}");
+    let saved = tool(&mut s, "save_document", json!({}));
+    assert_eq!(saved["trackChangesKept"], true, "{saved}");
+    tool(&mut s, "type_text", json!({"text":"x"}));
+    let as_hwpx = dir.path().join("edited.hwpx");
+    let saved = tool(&mut s, "save_document", json!({"path":as_hwpx}));
+    assert_eq!(saved["trackChangesKept"], true, "{saved}");
+    let saved = tool(&mut s, "save_document", json!({"path":input}));
+    assert_eq!(saved["trackChangesKept"], true, "{saved}");
+    let state = execute(&mut s, "document.track_changes", json!({}));
+    assert_eq!(state["tracked"], true, "{state}");
+    // DOCX cannot hold it: refused, and nothing is written.
+    let docx = dir.path().join("tracked.docx");
+    fails(&mut s, "save_document", json!({"path":docx}));
+    assert!(!docx.exists());
+    // acceptTrackChanges saves the result with every change accepted.
     let accepted = dir.path().join("accepted.hwp");
-    tool(
+    let saved = tool(
         &mut s,
         "save_document",
         json!({"path":accepted,"acceptTrackChanges":true}),
     );
+    assert_eq!(saved["trackChangesKept"], false, "{saved}");
     assert!(accepted.exists());
     let state = execute(&mut s, "document.track_changes", json!({}));
     assert_eq!(state["tracked"], false, "{state}");
@@ -1805,7 +1981,7 @@ fn distribution_documents_never_hand_out_text_or_save_through_any_tool() {
 }
 
 #[test]
-fn picture_effects_save_as_hwp_is_refused_unless_dropped() {
+fn picture_effects_are_kept_in_hwp_and_hwpx() {
     let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../rhwp/samples/hwpx/aift.hwpx");
     if !sample.exists() {
@@ -1820,19 +1996,44 @@ fn picture_effects_save_as_hwp_is_refused_unless_dropped() {
     let kept = dir.path().join("kept.hwpx");
     let saved = tool(&mut s, "save_document", json!({"path":kept}));
     assert!(saved.get("droppedPictureEffects").is_none(), "{saved}");
+    // HWP keeps it too; dropPictureEffects from older callers drops nothing.
     let hwp = dir.path().join("out.hwp");
-    std::fs::write(&hwp, b"preserve").unwrap();
-    fails(&mut s, "save_document", json!({"path":hwp}));
-    assert_eq!(std::fs::read(&hwp).unwrap(), b"preserve");
+    let saved = tool(&mut s, "save_document", json!({"path":hwp}));
+    assert!(saved.get("droppedPictureEffects").is_none(), "{saved}");
     let dropped = tool(
         &mut s,
         "save_document",
         json!({"path":hwp,"dropPictureEffects":true}),
     );
-    assert_eq!(dropped["droppedPictureEffects"], 1, "{dropped}");
-    assert_ne!(std::fs::read(&hwp).unwrap(), b"preserve");
-    // Saving again needs no drop: the effects left the document.
-    tool(&mut s, "save_document", json!({"path":hwp}));
+    assert_eq!(dropped["droppedPictureEffects"], 0, "{dropped}");
+}
+
+/// .hwp has no place for combo box items: refused unless dropComboItems says to save
+/// without them; HWPX keeps them.
+#[test]
+fn an_hwp_save_with_combo_items_asks_for_drop_combo_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = server();
+    execute(
+        &mut s,
+        "form.insert",
+        json!({"kind":"combo_box","items":["봄","여름"],"text":"봄"}),
+    );
+    let hwp = dir.path().join("form.hwp");
+    let refused = raw_tool(&mut s, "save_document", json!({"path":hwp}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(refused.to_string().contains("dropComboItems"), "{refused}");
+    assert!(!hwp.exists());
+    let hwpx = dir.path().join("form.hwpx");
+    let saved = tool(&mut s, "save_document", json!({"path":hwpx}));
+    assert!(saved.get("droppedComboItems").is_none(), "{saved}");
+    let dropped = tool(
+        &mut s,
+        "save_document",
+        json!({"path":hwp,"dropComboItems":true}),
+    );
+    assert_eq!(dropped["droppedComboItems"], 1, "{dropped}");
+    assert!(hwp.exists());
 }
 
 #[test]
@@ -2172,4 +2373,94 @@ fn report_round_trip(strict_hwpx: bool, style_set: bool) {
         assert_eq!(number["show"], "number", "{ext}: {references}");
         assert_eq!(number["expected"], number["text"], "{ext}: {references}");
     }
+}
+
+/// save_document refuses .hwp for a document with an 임의 쪽 master page (HWP has no
+/// place for its page) with the reason and the way out, and writes nothing.
+#[test]
+fn save_document_refuses_hwp_for_an_optional_master_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = server();
+    tool(&mut s, "type_text", json!({"text":"일"}));
+    execute(&mut s, "insert.page_break", json!({}));
+    tool(&mut s, "type_text", json!({"text":"이"}));
+    execute(
+        &mut s,
+        "page.master.set",
+        json!({"applyTo":"optional","page":2,"text":"둘째쪽글"}),
+    );
+    let hwp = dir.path().join("임의쪽.hwp");
+    let result = raw_tool(&mut s, "save_document", json!({"path":hwp}));
+    assert_eq!(result["isError"], true, "{result}");
+    let message = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        message.contains("임의 쪽") && message.contains(".hwpx"),
+        "{message}"
+    );
+    assert!(!hwp.exists());
+    let hwpx = dir.path().join("임의쪽.hwpx");
+    tool(&mut s, "save_document", json!({"path":hwpx}));
+    assert!(hwpx.exists());
+}
+
+#[test]
+fn master_page_objects_and_text_are_edited_through_mcp() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = server();
+    tool(&mut s, "type_text", json!({"text":"바탕쪽 본문"}));
+    execute(
+        &mut s,
+        "page.master.set",
+        json!({"applyTo":"both","text":"대외비"}),
+    );
+    execute(
+        &mut s,
+        "page.master.object.insert",
+        json!({"applyTo":"both","kind":"rectangle","x_mm":20.0,"y_mm":30.0,
+            "width_mm":50.0,"height_mm":10.0}),
+    );
+    let listed = execute(&mut s, "page.master.object.list", json!({}));
+    let address = listed["objects"][0]["address"].clone();
+    assert_eq!(address["master"], "both");
+    execute(
+        &mut s,
+        "object.move_by",
+        json!({"addresses":[address],"dx_mm":10.0,"dy_mm":5.0}),
+    );
+    execute(
+        &mut s,
+        "object.size",
+        json!({"address":address,"width_mm":70.0,"height_mm":12.0}),
+    );
+    let contexts = execute(
+        &mut s,
+        "context.v2.list",
+        json!({"include":["master_page"]}),
+    );
+    let row = contexts["items"][0].clone();
+    assert_eq!(row["text"], "대외비");
+    execute(
+        &mut s,
+        "context.v2.replace",
+        json!({"address":row["address"],"start":0,"end":3,"text":"사내 한정",
+            "expected_generation":contexts["generation"]}),
+    );
+    let path = dir.path().join("master.hwpx");
+    tool(&mut s, "save_document", json!({"path":path}));
+    tool(&mut s, "new_document", json!({"force":true}));
+    tool(&mut s, "open_document", json!({"path":path}));
+    let object = &execute(&mut s, "page.master.object.list", json!({}))["objects"][0];
+    assert_eq!(
+        [
+            &object["x_mm"],
+            &object["y_mm"],
+            &object["width_mm"],
+            &object["height_mm"]
+        ],
+        [&json!(30.0), &json!(35.0), &json!(70.0), &json!(12.0)]
+    );
+    assert_eq!(
+        execute(&mut s, "page.master.get", json!({}))["text"],
+        "사내 한정"
+    );
 }

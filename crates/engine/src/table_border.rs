@@ -116,6 +116,16 @@ pub(crate) fn move_border_in_block(
             None
         }
     };
+    // When no cell outside the block has an edge on this border, every other row just
+    // crosses it: moving it for the block is moving it for the whole table, and a new
+    // grid line would only make columns that no cell width can pin down.
+    let outside_edge = t.cells.iter().any(|c| {
+        let (pos, span, cpos, cspan) = along(c, vertical);
+        (pos + span == b || pos == b) && inside(cpos, cspan) == Some(false)
+    });
+    if !outside_edge {
+        return move_whole_border(t, vertical, b, d);
+    }
     // Which cells touch the border, and on which side, before anything moves.
     let mut plan = Vec::with_capacity(t.cells.len());
     for c in &t.cells {
@@ -177,6 +187,13 @@ pub(crate) fn move_border_in_block(
     if vertical {
         t.col_count += 1;
         t.set_column_widths(&sizes).map_err(|e| anyhow!(e))?;
+        // RHWP lays a table out from the column widths its cells solve to; a column no
+        // cell pins down falls back to a default width and the whole table breaks.
+        if t.get_column_widths() != sizes {
+            bail!(
+                "이 표에서는 블록만큼 경계선을 옮기면 칸 너비를 정할 수 없습니다. 줄 전체의 경계선을 옮기세요."
+            );
+        }
     } else {
         t.row_count += 1;
         for c in &mut t.cells {
@@ -254,18 +271,17 @@ impl Session {
         if cross == (0, count - 1) {
             return self.move_border(a, vertical, boundary, delta_mm);
         }
-        // Row heights follow the cell contents at layout time, so a fresh table stores
-        // only minimum heights and a partial horizontal edge has no reliable size to
-        // split; only vertical borders move for part of a table.
-        if !vertical {
-            bail!(
-                "가로 경계선은 블록만큼 옮길 수 없습니다. 블록을 풀고 줄 전체의 경계선을 옮기세요."
-            );
-        }
         let d = (delta_mm * 7200.0 / 25.4).round() as i64;
         if d == 0 {
             return Ok(());
         }
+        // Row heights follow the cell contents at layout time (a fresh table stores only
+        // minimum heights), so a horizontal edge splits the rows as they are drawn.
+        let drawn = if vertical {
+            None
+        } else {
+            Some(self.drawn_table(a)?)
+        };
         self.transaction(|s| {
             let doc = s.core.document_mut();
             let section = doc
@@ -279,11 +295,107 @@ impl Session {
             else {
                 bail!("표를 찾지 못했습니다.");
             };
+            if let Some((rows, _)) = &drawn {
+                pin_row_heights(table, rows);
+            }
             move_border_in_block(table, vertical, boundary, d, cross)?;
             section.raw_stream = None;
-            s.refresh_layout()
+            s.refresh_layout()?;
+            // A cell whose text needs more room than the edge left grows its row again
+            // and the table with it: refuse instead, as Hangul stops the drag there.
+            if let Some((_, height)) = drawn
+                && (s.drawn_table(a)?.1 - height).abs() > 1.0
+            {
+                bail!("셀 내용보다 작게 줄일 수 없습니다. 경계선을 덜 옮기세요.");
+            }
+            Ok(())
         })
     }
+
+    /// Drawn row heights (HWPUNIT, `None` where no cell starts and ends a grid row) and
+    /// the drawn height (px) of a table that lies on one page.
+    fn drawn_table(&self, a: ObjectAddress) -> Result<(Vec<Option<u32>>, f64)> {
+        let page: Value = serde_json::from_str(
+            &self
+                .core
+                .get_page_of_position_native(a.section, a.paragraph)
+                .map_err(err)?,
+        )?;
+        let page = page["page"].as_u64().unwrap_or(0) as u32;
+        let find = |page: u32| -> Result<Option<Value>> {
+            let layout: Value = serde_json::from_str(
+                &self
+                    .core
+                    .get_page_control_layout_native(page)
+                    .map_err(err)?,
+            )?;
+            Ok(layout["controls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|t| {
+                    t["type"] == "table"
+                        && t["secIdx"] == a.section
+                        && t["paraIdx"] == a.paragraph
+                        && t["controlIdx"] == a.control
+                })
+                .cloned())
+        };
+        let table = find(page)?.ok_or_else(|| anyhow!("쪽 배치에서 표를 찾지 못했습니다."))?;
+        if page + 1 < self.core.page_count() && find(page + 1)?.is_some() {
+            bail!(
+                "여러 쪽에 걸친 표는 가로 경계선을 블록만큼 옮길 수 없습니다. 줄 전체의 경계선을 옮기세요."
+            );
+        }
+        let rows = usize::from(self.table_at(a)?.row_count);
+        let mut lines: Vec<Option<f64>> = vec![None; rows + 1];
+        for c in table["cells"].as_array().into_iter().flatten() {
+            let (Some(row), Some(y), Some(h)) =
+                (c["row"].as_u64(), c["y"].as_f64(), c["h"].as_f64())
+            else {
+                continue;
+            };
+            let row = row as usize;
+            let end = (row + c["rowSpan"].as_u64().unwrap_or(1).max(1) as usize).min(rows);
+            lines[row].get_or_insert(y);
+            lines[end].get_or_insert(y + h);
+        }
+        let heights = (0..rows)
+            .map(|k| match (lines[k], lines[k + 1]) {
+                (Some(top), Some(bottom)) if bottom > top => {
+                    Some(((bottom - top) * 75.0).round() as u32)
+                }
+                _ => None,
+            })
+            .collect();
+        Ok((heights, table["h"].as_f64().unwrap_or(0.0)))
+    }
+}
+
+/// Store the drawn row heights in the cells, so the grid rows `move_border_in_block` splits
+/// are the ones on screen. A row drawn within a few HWPUNIT of its stored height (the
+/// layout rounds to 0.1 px) keeps the stored one.
+fn pin_row_heights(t: &mut Table, drawn: &[Option<u32>]) {
+    if t.cell_spacing != 0 {
+        return;
+    }
+    let stored = grid_sizes(t, false);
+    let rows: Vec<u32> = stored
+        .iter()
+        .zip(drawn)
+        .map(|(s, d)| match d {
+            Some(d) if *d > s + 8 => *d,
+            _ => *s,
+        })
+        .collect();
+    if rows == stored {
+        return;
+    }
+    for c in &mut t.cells {
+        let (r, span) = (usize::from(c.row), usize::from(c.row_span.max(1)));
+        c.height = rows[r..(r + span).min(rows.len())].iter().sum();
+    }
+    t.rebuild_grid();
 }
 
 #[cfg(test)]

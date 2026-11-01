@@ -86,7 +86,7 @@ jobs:
           NAME=HwpCraft-$VERSION-${{ matrix.name }}
           mkdir -p dist/$NAME/licenses
           cp target/${{ matrix.target }}/release/hwpcraft${{ matrix.exe }} target/${{ matrix.target }}/release/hwpcraft-cli${{ matrix.exe }} dist/$NAME/
-          cp README.md LICENSE THIRD-PARTY-NOTICES.txt THIRD-PARTY-DEPENDENCIES.md VERSION dist/$NAME/
+          cp README.md README.en.md LICENSE THIRD-PARTY-NOTICES.txt THIRD-PARTY-DEPENDENCIES.md VERSION dist/$NAME/
           cp assets/licenses/* dist/$NAME/licenses/
           cp assets/icons/lucide/LICENSE.txt dist/$NAME/licenses/LICENSE-Lucide-ISC.txt
           cp ../rhwp/LICENSE dist/$NAME/licenses/LICENSE-RHWP.txt

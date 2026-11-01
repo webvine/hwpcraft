@@ -584,6 +584,7 @@ pub(crate) fn context_kind(address: &ContextAddress) -> &'static str {
         Some(ContextStep::Footnote { .. }) => "footnote",
         Some(ContextStep::Endnote { .. }) => "endnote",
         Some(ContextStep::TextBox { .. }) => "textbox",
+        Some(ContextStep::MasterPage { .. }) => "master_page",
     }
 }
 

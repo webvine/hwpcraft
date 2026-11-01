@@ -14,7 +14,7 @@ pub fn tool_definitions() -> Value {
     let text = json!({"type":"string"});
     let boolean = json!({"type":"boolean"});
     let window = object(
-        json!({"start":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":100}}),
+        json!({"start":{"type":"integer","minimum":0,"maximum":MAX_SAFE_INTEGER,"default":0},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":100}}),
         &[],
     );
     let command = object(
@@ -57,9 +57,9 @@ pub fn tool_definitions() -> Value {
         ),
         tool(
             "save_document",
-            "Save HWP/HWPX or export PDF/TXT/DOCX, by path extension. DOCX results list what DOCX could not carry (drawing objects, equations, numbering text, …) in omitted. Omit path to save to the current HWP/HWPX path. Exports do not clear dirty state. A document with Hangul change tracking is refused as HWP/HWPX (HwpCraft cannot keep the tracking) unless acceptTrackChanges is true, which merges the changes into the shown text and drops the tracking records; see execute document.track_changes. Picture effects (shadow, glow, soft edge, reflection) cannot be written to .hwp yet: such a save is refused unless dropPictureEffects is true, which removes them first (one undo step) and returns droppedPictureEffects; HWPX keeps them.",
+            "Save HWP/HWPX or export PDF/TXT/DOCX, by path extension. DOCX results list what DOCX could not carry (drawing objects, equations, numbering text, …) in omitted. Omit path to save to the current HWP/HWPX path. Exports do not clear dirty state. A document with Hangul change tracking keeps its tracking when saved as HWP or HWPX, edited or not (HWP: the accepted result in BodyText, the marked text in ViewText; the result says trackChangesKept); DOCX, page/block saves and a password-protected HWP cannot hold it and are refused unless acceptTrackChanges is true, which accepts every change (deleted text goes, inserted text stays) and drops the tracking records. execute document.track_changes lists the changes, document.track_changes.accept/.reject resolve them, and document.track_changes.record turns recording of typing and deleting as tracked changes on or off. Picture effects (shadow, glow, soft edge, reflection) are kept in .hwp and HWPX; dropPictureEffects is still accepted from older callers and drops nothing (droppedPictureEffects 0). Combo box items (form objects) have no place in .hwp (Hangul keeps them in the document script, which HwpCraft does not write): a .hwp save that would lose them is refused unless dropComboItems is true, which saves without them, removes them from the open document too and answers droppedComboItems (how many combo boxes). HWPX keeps them; items the document script already fills are kept in .hwp.",
             object(
-                json!({"path":text,"acceptTrackChanges":boolean,"dropPictureEffects":boolean}),
+                json!({"path":text,"acceptTrackChanges":boolean,"dropPictureEffects":boolean,"dropComboItems":boolean}),
                 &[]
             ),
             false
@@ -83,7 +83,7 @@ pub fn tool_definitions() -> Value {
             "select_text",
             "Select the nth non-overlapping, case-sensitive match within a body/table-cell paragraph; occurrence is 1-based. Unicode scalar offsets.",
             object(
-                json!({"text":text,"occurrence":{"type":"integer","minimum":1,"default":1}}),
+                json!({"text":text,"occurrence":{"type":"integer","minimum":1,"maximum":MAX_SAFE_INTEGER,"default":1}}),
                 &["text"]
             ),
             false
@@ -119,7 +119,7 @@ pub fn tool_definitions() -> Value {
             "render_page",
             "Return a page as inline PNG, with no temporary file. Page is 1-based. Scale is pixels per SVG unit, 0.25–2.0.",
             object(
-                json!({"page":{"type":"integer","minimum":1,"default":1},"scale":{"type":"number","minimum":0.25,"maximum":2.0,"default":1.0}}),
+                json!({"page":{"type":"integer","minimum":1,"maximum":u32::MAX,"default":1},"scale":{"type":"number","minimum":0.25,"maximum":2.0,"default":1.0}}),
                 &[]
             ),
             true
@@ -129,6 +129,28 @@ pub fn tool_definitions() -> Value {
 /// Internal key carrying a result's value next to its text, so the MCP response
 /// does not parse back the JSON it was just written from. Never sent to clients.
 pub(crate) const PARSED: &str = "hwpcraft/parsed";
+
+/// Results a batch keeps in full, in serialized bytes; later ones are listed without
+/// their result. A response carries every result twice (text and structured), and
+/// the stdio transport refuses a message over 32 MiB.
+pub(crate) const MAX_BATCH_RESULT_BYTES: usize = 8 << 20;
+
+/// Serialized size of `value` without building the string.
+pub(crate) fn json_size(value: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
 
 pub(crate) fn result(value: Value, is_error: bool) -> Value {
     let text = value.to_string();
@@ -157,7 +179,28 @@ pub(crate) fn call(backend: &mut Headless, name: &str, args: Value) -> Value {
         Err(e) => json!({"content":[{"type":"text","text":format!("{e:#}")}],"isError":true}),
     }
 }
-fn answer(b: &mut Headless, name: &str, args: Value) -> Result<Value> {
+/// Largest integer every JSON number reader keeps exactly (2^53 - 1).
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+/// JSON Schema's "integer" accepts 1.0; the typed readers below do not. Turn a
+/// top-level integral float into the integer it names before reading arguments.
+fn integral_numbers(args: &mut Value) {
+    if let Some(object) = args.as_object_mut() {
+        for value in object.values_mut() {
+            if let Some(f) = value
+                .as_f64()
+                .filter(|_| !value.is_i64() && !value.is_u64())
+                && f.fract() == 0.0
+                && (0.0..=MAX_SAFE_INTEGER as f64).contains(&f)
+            {
+                *value = json!(f as u64);
+            }
+        }
+    }
+}
+
+fn answer(b: &mut Headless, name: &str, mut args: Value) -> Result<Value> {
+    integral_numbers(&mut args);
     let value = match name {
         "list_commands" => {
             #[derive(Deserialize)]
@@ -236,10 +279,20 @@ fn answer(b: &mut Headless, name: &str, args: Value) -> Result<Value> {
             let _no_writes = p.atomic.then(hwpcraft_formats::file_access::forbid_writes);
             let mut results = Vec::new();
             let mut failed = false;
+            let mut kept = 0;
             for c in p.commands {
                 match b.execute(&c.command, c.params) {
                     Ok(value) => {
-                        results.push(json!({"command":c.command,"ok":true,"result":value}))
+                        let size = json_size(&value);
+                        if kept + size > MAX_BATCH_RESULT_BYTES {
+                            // The command ran; only its result is left out, so a
+                            // thousand large reads cannot exhaust memory.
+                            results.push(json!({"command":c.command,"ok":true,
+                                "resultOmitted":true,"resultBytes":size}));
+                        } else {
+                            kept += size;
+                            results.push(json!({"command":c.command,"ok":true,"result":value}));
+                        }
                     }
                     Err(e) => {
                         failed = true;

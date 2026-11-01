@@ -1,0 +1,132 @@
+diff --git a/src/parser/body_text.rs b/src/parser/body_text.rs
+index 685636a..bc72f6a 100644
+--- a/src/parser/body_text.rs
++++ b/src/parser/body_text.rs
+@@ -1205,7 +1205,7 @@ fn parse_page_def(data: &[u8]) -> PageDef {
+ ///
+ /// 스펙 문서는 26바이트로 기술하지만, 실제 레코드는 28바이트.
+ /// note_spacing과 separator_line_type 사이에 미문서화된 2바이트 필드가 있음.
+-fn parse_footnote_shape_record(data: &[u8]) -> FootnoteShape {
++pub(crate) fn parse_footnote_shape_record(data: &[u8]) -> FootnoteShape {
+     let mut fs = FootnoteShape::default();
+     let mut r = ByteReader::new(data);
+ 
+@@ -1218,8 +1218,11 @@ fn parse_footnote_shape_record(data: &[u8]) -> FootnoteShape {
+     fs.prefix_char = char::from_u32(r.read_u16().unwrap_or(0) as u32).unwrap_or('\0');
+     fs.suffix_char = char::from_u32(r.read_u16().unwrap_or(0) as u32).unwrap_or('\0');
+     fs.start_number = r.read_u16().unwrap_or(1);
+-    fs.separator_length = r.read_i16().unwrap_or(0) as i32;
+-    fs.separator_margin_top = r.read_i16().unwrap_or(0);
++    // 구분선 길이는 4바이트다. 한/글은 `FF FF FF FF` 를 −1(5 cm), `F8 2F E0 00` 을
++    // 미주 기본값 14692344(단 너비), `FF FF 52 03` 을 0x0352FFFF(단 너비로 잘림)로 읽는다.
++    // 두 i16 으로 나눠 읽으면 아래 워드만 길이가 되어 마지막 둘을 짧게 그렸다.
++    // `separator_margin_top` 은 HWPX aboveLine 슬롯이라 HWP5 에서는 비워 둔다.
++    fs.separator_length = r.read_u32().unwrap_or(0) as i32;
+     // HWP5 실파일에서는 이 슬롯이 한컴 UI "구분선 위" 값으로 쓰이는 사례가 있다.
+     // HWPX aboveLine 은 separator_margin_top 에 들어오므로 정규화 접근자에서 합친다.
+     fs.separator_margin_bottom = r.read_i16().unwrap_or(0);
+diff --git a/src/parser/hwp3/mod.rs b/src/parser/hwp3/mod.rs
+index daa452e..daf9535 100644
+--- a/src/parser/hwp3/mod.rs
++++ b/src/parser/hwp3/mod.rs
+@@ -944,13 +944,10 @@ fn hwp3_footnote_separator_length(footnote_line_width: u8, column_width_hu: i32)
+ /// OWPML `noteLine length` 의 5cm sentinel.
+ const HWP3_SEPARATOR_LENGTH_5CM: i32 = -1;
+ 
+-/// HWP5 `FOOTNOTE_SHAPE` 의 구분선 길이는 **4바이트**다 — 우리 IR 은 그것을
+-/// `separator_length`(하위 워드)와 `separator_margin_top`(상위 워드) 두 i16 슬롯으로
+-/// 나눠 읽고 그대로 되쓴다(`parse_footnote_shape_record` · `serialize_footnote_shape`).
+-/// 그래서 음수 sentinel 은 두 슬롯을 **함께** 채워야 한/글이 `-1` 로 읽는다. 한 쪽만
+-/// `-1` 로 두면 바이트가 `FF FF 00 00` = 65535 가 되어 5cm 대신 폭 전체로 잘린다.
+-///
+-/// 양수 길이는 상위 워드가 0 이므로 종전대로 `separator_length` 만 채운다.
++/// HWP5 `FOOTNOTE_SHAPE` 의 구분선 길이는 **4바이트**다. 지금은 `separator_length`
++/// 하나로 읽고 쓰지만(`parse_footnote_shape_record` · `serialize_footnote_shape`),
++/// 예전 IR 은 위 워드를 `separator_margin_top` 에 두었으므로 음수 sentinel 일 때 그
++/// 슬롯도 −1 로 채워 둔다(HWP5 저장은 양수일 때만 그 슬롯을 "구분선 위"로 쓴다).
+ fn hwp3_apply_separator_length(shape: &mut crate::model::footnote::FootnoteShape, length: i32) {
+     shape.separator_length = length;
+     shape.separator_margin_top = if length < 0 { -1 } else { 0 };
+diff --git a/src/renderer/layout/tests.rs b/src/renderer/layout/tests.rs
+index 183873b..bbfef9c 100644
+--- a/src/renderer/layout/tests.rs
++++ b/src/renderer/layout/tests.rs
+@@ -109,6 +109,8 @@ fn note_separator_length_resolves_schema_sentinels_and_absolute_hwpunit() {
+     assert!((note_separator_length_px(-3, width, dpi) - 200.0).abs() < 1e-9);
+     assert!((note_separator_length_px(-4, width, dpi) - width).abs() < 1e-9);
+     assert!((note_separator_length_px(7_200, width, dpi) - 96.0).abs() < 1e-9);
++    // HWP5 의 4바이트 길이: 한/글은 `FF FF 52 03`(0x0352FFFF)을 단 너비로 그린다.
++    assert!((footnote_separator_length_px(0x0352_FFFF, width, dpi) - width).abs() < 1e-9);
+     assert!((note_separator_length_px(72_000, width, dpi) - width).abs() < 1e-9);
+     assert_eq!(note_separator_length_px(0, width, dpi), 0.0);
+ 
+diff --git a/src/serializer/control.rs b/src/serializer/control.rs
+index 6df0e74..6481c47 100644
+--- a/src/serializer/control.rs
++++ b/src/serializer/control.rs
+@@ -505,11 +505,16 @@ fn serialize_footnote_shape(fs: &FootnoteShape) -> Vec<u8> {
+     w.write_u16(char_to_wchar(fs.prefix_char)).unwrap();
+     w.write_u16(char_to_wchar(fs.suffix_char)).unwrap();
+     w.write_u16(fs.start_number).unwrap();
+-    // HWP5 노트 구분선 길이는 i16 슬롯. 한컴 전폭 sentinel(14692344)은 i16을 넘지만
+-    // HWP5 포맷 한계상 하위 16비트로 기록한다(HWPX 경로는 i32 원본을 보존).
+-    w.write_i16(fs.separator_length as i16).unwrap();
+-    w.write_i16(fs.separator_margin_top).unwrap();
+-    w.write_i16(fs.separator_margin_bottom).unwrap();
++    // HWP5 노트 구분선 길이는 4바이트(i32)다(`parse_footnote_shape_record`). 다음
++    // 슬롯이 "구분선 위"인데, HWPX 에서 온 모양은 그 값을 `separator_margin_top` 에 둔다.
++    // 종전처럼 그 값을 길이의 위 워드로 쓰면 한/글은 −1(5 cm)을 단 너비로 그렸다.
++    w.write_i32(fs.separator_length).unwrap();
++    w.write_i16(if fs.separator_margin_top > 0 {
++        fs.separator_margin_top
++    } else {
++        fs.separator_margin_bottom
++    })
++    .unwrap();
+     w.write_i16(fs.note_spacing).unwrap();
+     // 미문서화 2바이트 (원본 보존)
+     w.write_u16(fs.raw_unknown).unwrap();
+diff --git a/src/serializer/control/tests.rs b/src/serializer/control/tests.rs
+index d6ca637..c54590e 100644
+--- a/src/serializer/control/tests.rs
++++ b/src/serializer/control/tests.rs
+@@ -6,6 +6,39 @@ use crate::model::shape::{GroupShape, RectangleShape};
+ use crate::parser::body_text::parse_body_text_section;
+ use crate::serializer::body_text::serialize_section;
+ 
++/// HWP5 FOOTNOTE_SHAPE: the separator length is one four-byte field, then the space
++/// above the line. Hangul reads `FF FF 52 03` as 0x0352FFFF (a column-wide line), so
++/// a 5 cm line (−1) from HWPX with `aboveLine` 850 must not put 850 into the length.
++#[test]
++fn note_separator_length_is_one_four_byte_field() {
++    use crate::model::footnote::FootnoteShape;
++    use crate::parser::body_text::parse_footnote_shape_record;
++    let from_hwpx = FootnoteShape {
++        separator_length: -1,
++        separator_margin_top: 850,
++        note_spacing: 567,
++        ..Default::default()
++    };
++    let bytes = serialize_footnote_shape(&from_hwpx);
++    assert_eq!(bytes.len(), 28);
++    assert_eq!(bytes[12..16], (-1i32).to_le_bytes());
++    assert_eq!(bytes[16..18], 850i16.to_le_bytes());
++    assert_eq!(bytes[18..20], 567i16.to_le_bytes());
++    let back = parse_footnote_shape_record(&bytes);
++    assert_eq!(back.separator_length, -1);
++    assert_eq!(back.separator_above_margin_hu(), 850);
++    // What an HWP5 file holds reads as one length and writes the same bytes back.
++    for length in [-1i32, 0x0352_FFFF, 14_692_344, 5_669, 0] {
++        let mut record = vec![0u8; 28];
++        record[12..16].copy_from_slice(&length.to_le_bytes());
++        record[16..18].copy_from_slice(&852i16.to_le_bytes());
++        let shape = parse_footnote_shape_record(&record);
++        assert_eq!(shape.separator_length, length);
++        assert_eq!(shape.separator_above_margin_hu(), 852);
++        assert_eq!(serialize_footnote_shape(&shape), record, "{length:#x}");
++    }
++}
++
+ /// SectionDef 라운드트립
+ #[test]
+ fn test_roundtrip_section_def() {

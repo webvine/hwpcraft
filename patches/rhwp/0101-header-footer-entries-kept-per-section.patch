@@ -1,0 +1,179 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 37c955e50..0cb554ba2 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -340,6 +340,7 @@ impl DocumentCore {
+             overflow_links_cache: RefCell::new(HashMap::new()),
+             snapshot_store: Vec::new(),
+             model_stamps: crate::document_core::ModelStamps::default(),
++            header_footer_entries: Vec::new(),
+             model_stamp_clock: 0,
+             untracked_model_edit: false,
+             typeset_reuse: Vec::new(),
+diff --git a/src/document_core/mod.rs b/src/document_core/mod.rs
+index d1f6908ec..f821141ea 100644
+--- a/src/document_core/mod.rs
++++ b/src/document_core/mod.rs
+@@ -302,6 +302,11 @@ pub struct DocumentCore {
+     )>,
+     /// 현재 구역·DocInfo 내용의 판 표식 (스냅샷 복원의 구역 재사용 판단).
+     pub(crate) model_stamps: ModelStamps,
++    /// [HwpCraft 0101] 구역마다 머리말·꼬리말 컨트롤 목록(쪽 나누기의 홀짝 carry 입력)과 그것을
++    /// 모은 문단 목록의 (주소, 길이). 다시 쪽을 나누는 구역은 늘 새로 모으고, 그대로 둔 구역은
++    /// 문단 목록이 같으면 이것을 쓴다(입력마다 모든 구역의 표 셀까지 훑지 않는다).
++    pub(crate) header_footer_entries:
++        Vec<Option<crate::document_core::queries::rendering::HeaderFooterEntries>>,
+     /// 판 표식 발급 카운터.
+     pub(crate) model_stamp_clock: u64,
+     /// `document_mut` 로 표식 없이 모델이 바뀌었다. 다음 전체 재구성까지 구역을 재사용하지 않는다.
+@@ -636,6 +641,7 @@ impl DocumentCore {
+             overflow_links_cache: RefCell::new(HashMap::new()),
+             snapshot_store: Vec::new(),
+             model_stamps: ModelStamps::default(),
++            header_footer_entries: Vec::new(),
+             model_stamp_clock: 0,
+             untracked_model_edit: false,
+             typeset_reuse: Vec::new(),
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index cc9a62a63..bd31d029e 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -1063,6 +1063,43 @@ fn optional_master_page_number(
+ /// one kept from the previous pass must hand on the same carry, or the next section
+ /// shows another header on its odd or even pages (the kept one used to read the carry
+ /// off its own pages, missing a parity its pages did not show).
++/// [HwpCraft 0101] 한 구역의 머리말·꼬리말 컨트롤 (문단, 참조, 머리말인가, 적용 쪽)과, 그것을 모은
++/// 문단 목록의 (주소, 길이).
++#[derive(Clone)]
++pub(crate) struct HeaderFooterEntries {
++    paragraphs: (usize, usize),
++    entries: Vec<(
++        usize,
++        crate::renderer::pagination::HeaderFooterRef,
++        bool,
++        crate::model::header_footer::HeaderFooterApply,
++    )>,
++}
++
++/// [HwpCraft 0101] `section` 의 머리말·꼬리말 목록: `cache` 가 같은 문단 목록에서 모은 것이면
++/// 그것을, 아니면 새로 모아 `cache` 에 둔다. `fresh` 면 늘 새로 모은다(다시 쪽을 나누는 구역).
++fn header_footer_entries_cached<'a>(
++    idx: usize,
++    section: &Section,
++    cache: &'a mut Option<HeaderFooterEntries>,
++    fresh: bool,
++) -> &'a HeaderFooterEntries {
++    let key = (
++        section.paragraphs.as_ptr() as usize,
++        section.paragraphs.len(),
++    );
++    if fresh || cache.as_ref().is_none_or(|c| c.paragraphs != key) {
++        *cache = Some(HeaderFooterEntries {
++            paragraphs: key,
++            entries: collect_header_footer_entries(idx, section),
++        });
++    }
++    cache.get_or_insert_with(|| HeaderFooterEntries {
++        paragraphs: key,
++        entries: Vec::new(),
++    })
++}
++
+ fn carry_header_footer_from_section(
+     idx: usize,
+     section: &Section,
+@@ -1071,6 +1108,24 @@ fn carry_header_footer_from_section(
+     carry_footer_odd: &mut Option<crate::renderer::pagination::HeaderFooterRef>,
+     carry_footer_even: &mut Option<crate::renderer::pagination::HeaderFooterRef>,
+ ) {
++    apply_header_footer_entries(
++        collect_header_footer_entries(idx, section),
++        carry_header_odd,
++        carry_header_even,
++        carry_footer_odd,
++        carry_footer_even,
++    );
++}
++
++fn collect_header_footer_entries(
++    idx: usize,
++    section: &Section,
++) -> Vec<(
++    usize,
++    crate::renderer::pagination::HeaderFooterRef,
++    bool,
++    crate::model::header_footer::HeaderFooterApply,
++)> {
+     use crate::model::header_footer::HeaderFooterApply as HFA;
+     use crate::renderer::pagination::HeaderFooterRef;
+     let mut entries: Vec<(usize, HeaderFooterRef, bool, HFA)> = Vec::new();
+@@ -1117,7 +1172,22 @@ fn carry_header_footer_from_section(
+             }
+         }
+     }
++    entries
++}
+ 
++fn apply_header_footer_entries(
++    entries: Vec<(
++        usize,
++        crate::renderer::pagination::HeaderFooterRef,
++        bool,
++        crate::model::header_footer::HeaderFooterApply,
++    )>,
++    carry_header_odd: &mut Option<crate::renderer::pagination::HeaderFooterRef>,
++    carry_header_even: &mut Option<crate::renderer::pagination::HeaderFooterRef>,
++    carry_footer_odd: &mut Option<crate::renderer::pagination::HeaderFooterRef>,
++    carry_footer_even: &mut Option<crate::renderer::pagination::HeaderFooterRef>,
++) {
++    use crate::model::header_footer::HeaderFooterApply as HFA;
+     for (_, reference, is_header, apply_to) in entries {
+         let (odd, even) = if is_header {
+             (&mut *carry_header_odd, &mut *carry_header_even)
+@@ -5588,10 +5658,22 @@ impl DocumentCore {
+                         carry_last_page_number = last.page_number;
+                     }
+                 }
+-                // [HwpCraft] The same header/footer carry as a section paginated again.
+-                carry_header_footer_from_section(
++                // [HwpCraft] The same header/footer carry as a section paginated again
++                // (0101: from the entries kept for its unchanged paragraphs).
++                if self.header_footer_entries.len() < self.document.sections.len() {
++                    self.header_footer_entries
++                        .resize(self.document.sections.len(), None);
++                }
++                let entries = header_footer_entries_cached(
+                     idx,
+                     section,
++                    &mut self.header_footer_entries[idx],
++                    false,
++                )
++                .entries
++                .clone();
++                apply_header_footer_entries(
++                    entries,
+                     &mut carry_header_odd,
+                     &mut carry_header_even,
+                     &mut carry_footer_odd,
+@@ -5950,9 +6032,20 @@ impl DocumentCore {
+             // 머리말/꼬리말 carry 업데이트:
+             // 페이지 active_header뿐 아니라 구역에 정의된 머리말 컨트롤도 carry에 반영
+             // (짝수 페이지가 없어도 Even 머리말이 다음 구역에 상속되어야 함)
+-            carry_header_footer_from_section(
++            if self.header_footer_entries.len() < self.document.sections.len() {
++                self.header_footer_entries
++                    .resize(self.document.sections.len(), None);
++            }
++            let entries = header_footer_entries_cached(
+                 idx,
+                 section,
++                &mut self.header_footer_entries[idx],
++                true,
++            )
++            .entries
++            .clone();
++            apply_header_footer_entries(
++                entries,
+                 &mut carry_header_odd,
+                 &mut carry_header_even,
+                 &mut carry_footer_odd,

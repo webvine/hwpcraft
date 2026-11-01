@@ -1,0 +1,114 @@
+diff --git a/src/document_core/commands/object_ops/table.rs b/src/document_core/commands/object_ops/table.rs
+index 9c0b24d8a..063bdabca 100644
+--- a/src/document_core/commands/object_ops/table.rs
++++ b/src/document_core/commands/object_ops/table.rs
+@@ -415,6 +415,16 @@ impl DocumentCore {
+                 row_count, col_count
+             )));
+         }
++        // [HwpCraft 0098] 셀 문단 모양 번호는 문서를 바꾸기 전에 확인한다.
++        if let Some(id) = options.cell_para_shape_id {
++            if usize::from(id) >= self.document.doc_info.para_shapes.len() {
++                return Err(HwpError::RenderError(format!(
++                    "셀 문단 모양 ID {} 범위 초과 (총 {}개)",
++                    id,
++                    self.document.doc_info.para_shapes.len()
++                )));
++            }
++        }
+ 
+         let instance_id = super::super::clone_identity::next_instance_id(&self.document)?;
+ 
+@@ -483,14 +493,16 @@ impl DocumentCore {
+         let current_para = &self.document.sections[section_idx].paragraphs[para_idx];
+         let default_char_shape_id: u32 = current_para.char_shape_id_at(char_offset).unwrap_or(0);
+         let default_para_shape_id: u16 = current_para.para_shape_id;
++        // [HwpCraft 0098] 셀 문단 모양을 호출자가 정할 수 있다(없으면 커서 문단 상속).
++        let cell_para_shape_id = options.cell_para_shape_id.unwrap_or(default_para_shape_id);
+         let para_shape_ids: Vec<u16> = (0..col_count)
+             .map(|col| {
+                 options
+                     .column_alignments
+                     .as_ref()
+-                    .map_or(default_para_shape_id, |alignments| {
++                    .map_or(cell_para_shape_id, |alignments| {
+                         self.document.find_or_create_para_shape(
+-                            default_para_shape_id,
++                            cell_para_shape_id,
+                             &crate::model::style::ParaShapeMods {
+                                 alignment: Some(alignments[usize::from(col)]),
+                                 ..Default::default()
+@@ -1703,6 +1715,58 @@ mod tests {
+         assert_cells_inherit_shape(table_of(&core));
+     }
+ 
++    /// [HwpCraft 0098] 셀 문단 모양을 정해 만들면 모든 셀이 그 모양이고, 표를 담은 문단은
++    /// 종전처럼 커서 문단의 모양이다. 범위 밖 번호는 문서를 바꾸지 않고 거절한다.
++    #[test]
++    fn a_cell_para_shape_option_sets_every_cell_and_keeps_the_host() {
++        use crate::document_core::TableCreationOptions;
++        let mut core = core_with_shaped_paragraph();
++        let options = TableCreationOptions {
++            cell_para_shape_id: Some(0),
++            ..Default::default()
++        };
++        core.create_table_with_options_native(0, 0, 0, 2, 3, &options)
++            .unwrap();
++        let table = table_of(&core);
++        for cell in &table.cells {
++            assert_eq!(
++                cell.paragraphs[0].para_shape_id, 0,
++                "셀 ({},{})",
++                cell.row, cell.col
++            );
++            assert_eq!(
++                cell.paragraphs[0]
++                    .char_shapes
++                    .first()
++                    .map(|cs| cs.char_shape_id),
++                Some(7)
++            );
++        }
++        let host = core.document.sections[0]
++            .paragraphs
++            .iter()
++            .find(|p| p.controls.iter().any(|c| matches!(c, Control::Table(_))))
++            .unwrap();
++        assert_eq!(host.para_shape_id, 12, "표를 담은 문단은 커서 문단 상속");
++
++        let mut core = core_with_shaped_paragraph();
++        let before = core.document.sections[0].paragraphs.len();
++        let fills = core.document.doc_info.border_fills.len();
++        let options = TableCreationOptions {
++            cell_para_shape_id: Some(u16::MAX),
++            ..Default::default()
++        };
++        assert!(core
++            .create_table_with_options_native(0, 0, 0, 2, 3, &options)
++            .is_err());
++        assert_eq!(core.document.sections[0].paragraphs.len(), before);
++        assert_eq!(
++            core.document.doc_info.border_fills.len(),
++            fills,
++            "DocInfo 그대로"
++        );
++    }
++
+     #[test]
+     fn create_table_ex_native_cells_inherit_char_shape() {
+         let mut core = core_with_shaped_paragraph();
+diff --git a/src/document_core/commands/object_ops/table_creation.rs b/src/document_core/commands/object_ops/table_creation.rs
+index 2ef8f96b6..471a7b230 100644
+--- a/src/document_core/commands/object_ops/table_creation.rs
++++ b/src/document_core/commands/object_ops/table_creation.rs
+@@ -16,6 +16,10 @@ pub struct TableCreationOptions {
+     pub column_alignments: Option<Vec<Alignment>>,
+     /// None이면 기존 코어 생성 기본값을 보존한다.
+     pub repeat_header: Option<bool>,
++    /// [HwpCraft 0098] 셀 문단의 문단 모양. None이면 커서 위치 문단의 값을 상속한다(종전).
++    /// 표를 만든 뒤 셀마다 문단 모양을 바꾸면 셀 재조판마다 스타일을 다시 해석해 큰 문서에서
++    /// 표 하나에 수백 ms가 든다.
++    pub cell_para_shape_id: Option<u16>,
+ }
+ 
+ impl TableCreationOptions {

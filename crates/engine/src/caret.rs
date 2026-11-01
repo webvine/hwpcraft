@@ -184,7 +184,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "document.statistics",
-        "매개 변수 없음. characters, charactersNoSpaces, words, lines, paragraphs, pages, sections, tables, pictures, shapes, equations, footnotes, endnotes, memos.",
+        "매개 변수 없음. characters, charactersNoSpaces, words, lines, paragraphs, pages, sections, tables, pictures, shapes, equations, footnotes, endnotes, memos(메모), hiddenComments(숨은 설명).",
         "{}",
     ),
     (
@@ -282,6 +282,7 @@ struct Stats {
     footnotes: usize,
     endnotes: usize,
     memos: usize,
+    hidden_comments: usize,
 }
 impl Stats {
     fn paragraph(&mut self, p: &DocParagraph) {
@@ -312,7 +313,9 @@ impl Stats {
                 Control::Equation(_) => self.equations += 1,
                 Control::Footnote(_) => self.footnotes += 1,
                 Control::Endnote(_) => self.endnotes += 1,
-                Control::HiddenComment(_) => self.memos += 1,
+                // Memos are memo fields; Hangul's hidden comments (숨은 설명) are separate.
+                Control::Field(f) if crate::comments::is_memo(f) => self.memos += 1,
+                Control::HiddenComment(_) => self.hidden_comments += 1,
                 _ => {}
             }
         }
@@ -1076,8 +1079,59 @@ impl Session {
             "sections": doc.sections.len(), "tables": st.tables, "pictures": st.pictures,
             "shapes": st.shapes, "equations": st.equations, "footnotes": st.footnotes,
             "endnotes": st.endnotes, "memos": st.memos,
+            "hiddenComments": st.hidden_comments,
         })
     }
+
+    /// The body columns laid out on `page` (zero-based) as `(column index, [x, y,
+    /// width, height])` in page pixels, in drawing order. A page with a column
+    /// break between layouts lists each zone's columns, numbered from 0 again.
+    pub fn page_columns(&self, page: u32) -> Result<Vec<(u16, [f64; 4])>> {
+        fn visit(node: &hwpcraft_doc::RenderNode, out: &mut Vec<(u16, [f64; 4])>) {
+            if let hwpcraft_doc::RenderNodeType::Column(index) = node.node_type {
+                let b = &node.bbox;
+                out.push((index, [b.x, b.y, b.width, b.height]));
+                return;
+            }
+            for child in &node.children {
+                visit(child, out);
+            }
+        }
+        let tree = self.core.build_page_render_tree(page).map_err(err)?;
+        let mut out = Vec::new();
+        visit(&tree.root, &mut out);
+        Ok(out)
+    }
+
+    /// The one-based body column holding the point (`x`, `y`) of `page`: the column
+    /// whose box holds it, else the nearest column across. 1 when the page has no
+    /// columns (an empty page or a layout error).
+    pub fn column_at(&self, page: u32, x: f64, y: f64) -> usize {
+        let columns = self.page_columns(page).unwrap_or_default();
+        column_number(&columns, x, y)
+    }
+}
+
+/// See [`Session::column_at`]; `columns` as [`Session::page_columns`] lists them.
+pub fn column_number(columns: &[(u16, [f64; 4])], x: f64, y: f64) -> usize {
+    let within = |a: f64, from: f64, len: f64| from <= a && a <= from + len;
+    let distance = |[cx, _, w, _]: [f64; 4]| {
+        if x < cx {
+            cx - x
+        } else {
+            (x - cx - w).max(0.0)
+        }
+    };
+    columns
+        .iter()
+        .filter(|(_, b)| within(y, b[1], b[3]))
+        .min_by(|a, b| distance(a.1).total_cmp(&distance(b.1)))
+        .or_else(|| {
+            columns
+                .iter()
+                .min_by(|a, b| distance(a.1).total_cmp(&distance(b.1)))
+        })
+        .map_or(1, |(index, _)| usize::from(*index) + 1)
 }
 
 /// Local date/time text with Korean weekday and AM/PM names.

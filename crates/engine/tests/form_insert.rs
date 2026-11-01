@@ -80,9 +80,15 @@ fn every_kind_goes_in_at_the_caret_and_survives_both_formats() -> anyhow::Result
     let svg = s.render_page_svg(0)?;
     assert_ne!(svg, blank);
     assert_eq!(svg, s.render_page_svg(0)?, "deterministic");
-    for ext in ["hwp", "hwpx"] {
+    for ext in ["hwpx", "hwp"] {
         let path = dir.path().join(format!("forms.{ext}"));
-        s.save(&path)?;
+        if ext == "hwp" {
+            // HWP cannot hold the combo box items (see tests/form_properties.rs).
+            assert!(s.save(&path).is_err());
+            assert_eq!(s.save_dropping_combo_items(&path, false)?, 1);
+        } else {
+            s.save(&path)?;
+        }
         let mut r = Session::new()?;
         r.open(&path)?;
         assert_eq!(summary(&list(&mut r)?), got, "{ext}");

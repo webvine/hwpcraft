@@ -158,6 +158,21 @@ pub fn validate_format(value: &Value, character: bool) -> Result<()> {
     }
     Ok(())
 }
+/// Drop the read-only fields of a `format.character.get` / `format.paragraph.get`
+/// result (shape ids and the section's tab spacing) so it can be applied as a patch:
+/// the border, fill and other values beside them describe the shape already.
+pub(crate) fn without_read_only(value: &mut Value, character: bool) {
+    let read_only: &[&str] = if character {
+        &["charShapeId", "borderFillId"]
+    } else {
+        &["paraShapeId", "borderFillId", "defaultTabSpacing"]
+    };
+    if let Some(fields) = value.as_object_mut() {
+        for key in read_only {
+            fields.remove(*key);
+        }
+    }
+}
 /// Border sides as RHWP's character / paragraph border-fill JSON names them.
 const BORDER_KEYS: [&str; 4] = ["borderLeft", "borderRight", "borderTop", "borderBottom"];
 /// Keys that make RHWP create a new BorderFill; a partial set would reset the
@@ -308,6 +323,11 @@ impl Session {
             if changed {
                 self.core.document_mut().doc_info.font_faces = faces;
                 self.core.document_mut().doc_info.raw_stream_dirty = true;
+                // Inside a transaction the edit records the change; a pending caret
+                // format registers the font with no undo step, so count it here.
+                if self.transaction_depth == 0 {
+                    self.mark_changed();
+                }
             }
             value["fontIds"] = json!(ids);
         }
@@ -317,13 +337,16 @@ impl Session {
     /// but paragraph margins/indent use 200 units/pt and spacing uses 100 units/pt.
     pub fn paragraph_format(&self) -> Result<Value> {
         let mut value = self.paragraph_properties()?;
-        let para = self.paragraph(self.cursor)?;
+        let id = match self.nested_para_shape_id()? {
+            Some((_, id)) => id,
+            None => self.paragraph(self.cursor)?.para_shape_id,
+        };
         let shape = self
             .core
             .document()
             .doc_info
             .para_shapes
-            .get(para.para_shape_id as usize)
+            .get(id as usize)
             .ok_or_else(|| anyhow!("문단 서식을 찾을 수 없습니다."))?;
         for (key, raw) in [
             ("marginLeft", shape.margin_left),

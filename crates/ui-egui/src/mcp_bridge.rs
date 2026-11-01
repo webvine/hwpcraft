@@ -3,7 +3,9 @@
 //!
 //! Turning it on starts `hwpcraft_mcp::desktop_bridge` on 127.0.0.1:7083 with the
 //! bearer token in the settings folder; requests run between frames on this
-//! window's session, so every edit shows at once and takes part in undo.
+//! window's session, so every edit shows at once and takes part in undo. Every
+//! HwpCraft window is its own process, so a second window connected at the same time
+//! takes the next free port (7084, 7085 … up to 7099) and shows it in 연결 정보.
 use super::*;
 use crate::ext_shell::{dialog, group, notice};
 use hwpcraft_mcp::desktop_bridge::{DEFAULT_LISTEN, DesktopBridge};
@@ -16,6 +18,16 @@ pub(crate) struct State {
 
 /// Time per frame the window gives MCP requests before drawing again.
 const SERVE_BUDGET: Duration = Duration::from_millis(30);
+/// Ports tried after the default one, for other windows connected at the same time.
+const MORE_PORTS: u16 = 16;
+
+/// The first address from `first` on (the same host, `count` ports) nothing listens on.
+fn free_listen(first: std::net::SocketAddr, count: u16) -> Option<std::net::SocketAddr> {
+    (0..count)
+        .filter_map(|n| first.port().checked_add(n))
+        .map(|port| std::net::SocketAddr::new(first.ip(), port))
+        .find(|addr| std::net::TcpListener::bind(addr).is_ok())
+}
 
 impl HwpApp {
     pub(crate) fn mcp_ext_enabled(&self, id: &str) -> Option<bool> {
@@ -58,7 +70,16 @@ impl HwpApp {
             let ctx = ctx.clone();
             move || ctx.request_repaint()
         };
-        let listen = DEFAULT_LISTEN.parse().map_err(anyhow::Error::from);
+        let listen = DEFAULT_LISTEN
+            .parse()
+            .map_err(anyhow::Error::from)
+            .and_then(|first| {
+                free_listen(first, MORE_PORTS).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{first}부터 {MORE_PORTS}개 포트를 모두 다른 프로그램이나 HwpCraft 창이 쓰고 있습니다. 다른 창의 MCP 연결을 끄고 다시 켜세요."
+                    )
+                })
+            });
         let started =
             listen.and_then(|listen| DesktopBridge::start(listen, None, &self.session, wake));
         if let Some(bridge) = self.result(started) {
@@ -110,8 +131,16 @@ impl HwpApp {
         let url = bridge.url().to_owned();
         let token = bridge.token_file().display().to_string();
         let id = bridge.document_id().to_owned();
+        // A window on another port gets its own server name, so two can be registered.
+        let name = match url
+            .rsplit_once(':')
+            .and_then(|(_, rest)| rest.split('/').next())
+        {
+            Some(port) if port != "7083" => format!("hwpcraft-desktop-{port}"),
+            _ => "hwpcraft-desktop".to_owned(),
+        };
         let config = format!(
-            "{{\n  \"mcpServers\": {{\n    \"hwpcraft-desktop\": {{\n      \"type\": \"http\",\n      \"url\": \"{url}\",\n      \"headers\": {{ \"Authorization\": \"Bearer <토큰 파일의 내용>\" }}\n    }}\n  }}\n}}"
+            "{{\n  \"mcpServers\": {{\n    \"{name}\": {{\n      \"type\": \"http\",\n      \"url\": \"{url}\",\n      \"headers\": {{ \"Authorization\": \"Bearer <토큰 파일의 내용>\" }}\n    }}\n  }}\n}}"
         );
         let mut copy = None;
         let mut stop = false;
@@ -148,7 +177,9 @@ impl HwpApp {
                 "이 컴퓨터(127.0.0.1)에서 토큰을 가진 클라이언트만 연결할 수 있습니다. \
                  클라이언트는 list_documents로 이 창의 문서를 찾고, 그 document_id로 편집합니다. \
                  고친 내용은 바로 화면에 보이고 실행 취소로 되돌릴 수 있습니다. \
-                 MCP로 새로 만든 문서는 이 창과 따로 열립니다. 창을 닫으면 연결도 끝납니다.",
+                 MCP로 새로 만든 문서는 이 창과 따로 열립니다. 창을 닫으면 연결도 끝납니다. \
+                 HwpCraft 창마다 따로 연결할 수 있고, 먼저 켠 창부터 7083, 7084 … 포트를 씁니다. \
+                 클라이언트에는 창마다 다른 이름(예: hwpcraft-desktop-7084)으로 그 주소를 등록하세요.",
             );
             ui.add_space(6.0);
             stop = ui.button("연결 끄기").clicked();
@@ -162,5 +193,23 @@ impl HwpApp {
         } else if clicked.is_some() {
             self.ext.mcp.show_info = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A second window connected at the same time takes the next free port.
+    #[test]
+    fn a_busy_port_moves_the_connection_to_the_next_one() -> anyhow::Result<()> {
+        // A port the OS just handed out, held as another window would hold 7083.
+        let held = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let first = held.local_addr()?;
+        let next = free_listen(first, 4).expect("a free port after the held one");
+        assert!(next.port() > first.port(), "{next} after {first}");
+        assert_eq!(next.ip(), first.ip());
+        assert_eq!(free_listen(first, 1), None, "only the held port to try");
+        Ok(())
     }
 }

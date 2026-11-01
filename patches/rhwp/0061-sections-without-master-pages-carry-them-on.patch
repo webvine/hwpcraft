@@ -1,0 +1,90 @@
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 9dc6477..fb99977 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -893,6 +893,19 @@ fn assign_master_pages_for_section(
+ 
+     let mps = &section.section_def.master_pages;
+     if mps.is_empty() {
++        // 바탕쪽이 없는 구역은 앞 구역의 양쪽·홀수·짝수 바탕쪽을 이어 쓴다. 한글은 구역을
++        // 나누면 새 구역에 바탕쪽을 두지 않고 앞 구역 것을 그대로 보이며, 그 바탕쪽을
++        // 고치면 두 구역이 함께 바뀐다(HwpCraft 패치 0061). 첫 쪽 감추기는 따른다.
++        for (page_idx, page) in result.pages.iter_mut().enumerate() {
++            if page_idx == 0 && section.section_def.hide_master_page {
++                continue;
++            }
++            page.active_master_page = if page.page_number % 2 == 1 {
++                carry_master_odd.clone()
++            } else {
++                carry_master_even.clone()
++            };
++        }
+         return;
+     }
+ 
+@@ -5043,7 +5056,24 @@ impl DocumentCore {
+                 };
+             };
+             apply_page_number_layouts_for_section(&mut result, section);
+-            assign_master_pages_for_section(&mut result, section_index, section, &None, &None);
++            // 지연 조판은 구역 하나뿐인 문서에서만 시작하지만(begin_deferred_pagination),
++            // 앞 구역 바탕쪽 이어 쓰기를 접어 넘겨 둔다(HwpCraft 패치 0061).
++            let (mut carry_odd, mut carry_even) = (None, None);
++            for (idx, earlier) in self.document.sections[..section_index].iter().enumerate() {
++                update_master_page_carry_from_section(
++                    idx,
++                    earlier,
++                    &mut carry_odd,
++                    &mut carry_even,
++                );
++            }
++            assign_master_pages_for_section(
++                &mut result,
++                section_index,
++                section,
++                &carry_odd,
++                &carry_even,
++            );
+             result
+         };
+         let completed_page_count = result.pages.len() as u32;
+@@ -10838,6 +10868,39 @@ fn doc_info_shapes_share_prefix(
+         && a.hwpx_head_tail == b.hwpx_head_tail
+ }
+ 
++#[cfg(test)]
++mod master_page_carry_tests {
++    use crate::document_core::DocumentCore;
++    use crate::model::header_footer::{HeaderFooterApply, MasterPage};
++
++    /// 바탕쪽이 없는 뒤 구역은 앞 구역의 바탕쪽을 쓴다(HwpCraft 패치 0061).
++    #[test]
++    fn a_section_without_master_pages_carries_the_previous_ones_on() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        let mut doc = core.document().clone();
++        let mut first = doc.sections[0].clone();
++        let second = first.clone();
++        first.section_def.master_pages = vec![MasterPage {
++            apply_to: HeaderFooterApply::Both,
++            ..Default::default()
++        }];
++        doc.sections = vec![first, second];
++        core.set_document(doc);
++        let refs: Vec<Option<(usize, usize)>> = core
++            .pagination
++            .iter()
++            .flat_map(|r| r.pages.iter())
++            .map(|p| {
++                p.active_master_page
++                    .as_ref()
++                    .map(|m| (m.section_index, m.master_page_index))
++            })
++            .collect();
++        assert_eq!(refs, [Some((0, 0)), Some((0, 0))]);
++    }
++}
++
+ #[cfg(test)]
+ mod section_start_page_number_tests {
+     use crate::document_core::DocumentCore;

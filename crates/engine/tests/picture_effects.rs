@@ -1,5 +1,5 @@
 //! Picture effects (그림자·네온·부드러운 가장자리·반사): set through the command,
-//! drawn deterministically, kept through an HWPX save and undo, refused for HWP.
+//! drawn deterministically, kept through HWP and HWPX saves and undo.
 use hwpcraft_engine::{ObjectAddress, Session};
 use serde_json::{Value, json};
 
@@ -147,49 +147,24 @@ fn bad_requests_change_nothing() -> anyhow::Result<()> {
 }
 
 #[test]
-fn hwp_save_refuses_effects_it_cannot_write_and_keeps_the_file() -> anyhow::Result<()> {
+fn hwp_saves_keep_every_picture_effect() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut s = Session::new()?;
     let a = picture(&mut s, dir.path())?;
     s.run(
         "picture.effects",
-        json!({"address": a, "glow": {}, "shadow": {}}),
+        json!({"address": a, "glow": {"color": "#ff8000"}, "shadow": {}, "soft_edge": {}, "reflection": {}}),
     )?;
     let path = dir.path().join("out.hwp");
-    std::fs::write(&path, b"existing")?;
-    assert_eq!(s.picture_effects_blocking_save(&path), 2);
-    assert_eq!(
-        s.picture_effects_blocking_save(&dir.path().join("out.hwpx")),
-        0
-    );
-    let error = s.save(&path).expect_err("HWP cannot hold the effects yet");
-    assert!(error.to_string().contains("dropPictureEffects"), "{error}");
-    assert_eq!(std::fs::read(&path)?, b"existing");
-
-    // A drop that cannot be written puts the effects back.
-    let folder = dir.path().join("folder.hwp");
-    std::fs::create_dir(&folder)?;
-    assert!(s.save_dropping_picture_effects(&folder, false).is_err());
-    assert!(effects(&mut s, a)?["glow"].is_object());
-
-    assert_eq!(s.save_dropping_picture_effects(&path, false)?, 2);
-    assert!(
-        effects(&mut s, a)?["glow"].is_null(),
-        "dropped from the document too"
-    );
+    assert_eq!(s.picture_effects_blocking_save(&path), 0);
+    let before = effects(&mut s, a)?;
+    s.save(&path)?;
     let mut reopened = Session::new()?;
     reopened.open(&path)?;
-    assert_eq!(reopened.picture_effects_blocking_save(&path), 0);
-    s.execute(hwpcraft_engine::Command::Undo)?;
-    assert!(
-        effects(&mut s, a)?["glow"].is_object(),
-        "dropping is one undo step"
-    );
-    // Nothing to drop: a plain save, also to HWPX.
-    assert_eq!(
-        s.save_dropping_picture_effects(&dir.path().join("keep.hwpx"), false)?,
-        0
-    );
+    let back = effects(&mut reopened, a)?;
+    assert_eq!(back, before, "HWP keeps all four effects");
+    // A caller that still asks to drop effects gets a plain save.
+    assert_eq!(s.save_dropping_picture_effects(&path, false)?, 0);
     assert!(effects(&mut s, a)?["glow"].is_object());
     Ok(())
 }
@@ -265,13 +240,10 @@ fn hangul_saved_shadow_round_trips_and_draws() -> anyhow::Result<()> {
     assert_eq!(shadows(&reopened), before);
 
     let hwp = dir.path().join("aift.hwp");
-    assert!(
-        s.save(&hwp).is_err(),
-        "the Hangul shadow is not dropped silently"
-    );
-    assert_eq!(s.save_dropping_picture_effects(&hwp, false)?, 1);
+    s.save(&hwp)?;
     let mut converted = Session::new()?;
     converted.open(&hwp)?;
     assert_eq!(converted.page_count()?, s.page_count()?);
+    assert_eq!(shadows(&converted), before, "HWP keeps the Hangul shadow");
     Ok(())
 }

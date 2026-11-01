@@ -9,12 +9,14 @@ mod page_number_formats;
 pub mod pdf_compact;
 mod table_repair;
 mod textbox_formats;
-use anyhow::{Context, Result, bail};
+mod tracked_formats;
+use anyhow::{Result, bail};
 use hwpcraft_doc::DocumentCore;
 use std::{
     io::{Read, Write},
     path::Path,
 };
+pub use tracked_formats::save_tracked_hwp;
 
 pub const MAX_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -35,6 +37,13 @@ pub fn open_with_password(path: &Path, password: &str) -> Result<DocumentCore> {
 
 fn open_inner(path: &Path, password: Option<&[u8]>) -> Result<DocumentCore> {
     file_access::check_read(&path.to_string_lossy()).map_err(anyhow::Error::msg)?;
+    // Windows answers "access denied" for a folder; say what is wrong.
+    if path.is_dir() {
+        bail!(
+            "파일이 아니라 폴더입니다. 문서 파일을 지정하세요: {}",
+            path.display()
+        );
+    }
     let file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -96,19 +105,51 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(bytes)?;
-    file.as_file().sync_all()?;
-    // Last point before the existing file is replaced; the temporary file is
-    // removed when it drops.
-    if file_access::cancelled() {
-        bail!("요청이 취소되어 파일을 저장하지 않았습니다. 기존 파일은 그대로입니다.");
+    // Missing folders are made, and taken away again when the write fails: a
+    // failed save leaves nothing behind.
+    let mut missing: Vec<&Path> = parent.ancestors().take_while(|p| !p.exists()).collect();
+    missing.retain(|p| !p.as_os_str().is_empty());
+    let written = (|| -> Result<()> {
+        std::fs::create_dir_all(parent).map_err(|e| unwritable(e, path))?;
+        let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|e| unwritable(e, path))?;
+        file.write_all(bytes)?;
+        file.as_file().sync_all()?;
+        // Last point before the existing file is replaced; the temporary file is
+        // removed when it drops.
+        if file_access::cancelled() {
+            bail!("요청이 취소되어 파일을 저장하지 않았습니다. 기존 파일은 그대로입니다.");
+        }
+        file.persist(path).map_err(|e| unwritable(e.error, path))?;
+        Ok(())
+    })();
+    if written.is_err() {
+        // Innermost first; a folder something else wrote into is kept.
+        for folder in &missing {
+            let _ = std::fs::remove_dir(folder);
+        }
     }
-    file.persist(path)
-        .map_err(|e| e.error)
-        .context("파일을 교체하지 못했습니다. 다른 프로그램에서 열려 있는지 확인하세요.")?;
-    Ok(())
+    written
+}
+
+/// Why `path` could not be written, in words the user can act on.
+fn unwritable(error: std::io::Error, path: &Path) -> anyhow::Error {
+    // ERROR_INVALID_NAME (123) / ERROR_DIRECTORY (267) on Windows.
+    let bad_name = error.kind() == std::io::ErrorKind::InvalidFilename
+        || matches!(error.raw_os_error(), Some(123 | 267));
+    let message = if bad_name {
+        format!(
+            "파일 이름이나 경로에 쓸 수 없는 문자가 있습니다: {}",
+            path.display()
+        )
+    } else if error.kind() == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "이 위치에 쓸 권한이 없거나 다른 프로그램에서 파일을 열고 있습니다: {}",
+            path.display()
+        )
+    } else {
+        "파일을 교체하지 못했습니다. 다른 프로그램에서 열려 있는지 확인하세요.".to_owned()
+    };
+    anyhow::Error::new(error).context(message)
 }
 
 pub fn save(core: &DocumentCore, path: &Path) -> Result<()> {
@@ -124,7 +165,23 @@ pub fn save_with_password(core: &DocumentCore, path: &Path, password: &str) -> R
     save_inner(core, path, Some(password.as_bytes()))
 }
 
+/// The HWP file of `core`: numbering formats prepared, memos written, text boxes repaired.
+fn hwp_bytes(core: &DocumentCore, password: Option<&[u8]>) -> Result<Vec<u8>> {
+    let prepared = auto_number_formats::prepare_hwp(core)?;
+    let baseline = memo_formats::export_hwp(prepared.as_ref().unwrap_or(core), password)?;
+    textbox_formats::repair_hwp(baseline, password)
+}
+
 fn save_inner(core: &DocumentCore, path: &Path, password: Option<&[u8]>) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        bail!("저장할 파일 경로가 비어 있습니다.");
+    }
+    if path.is_dir() {
+        bail!(
+            "저장할 경로가 파일이 아니라 폴더입니다. 파일 이름까지 넣으세요: {}",
+            path.display()
+        );
+    }
     file_access::check_write(&path.to_string_lossy()).map_err(anyhow::Error::msg)?;
     let extension = path
         .extension()
@@ -135,11 +192,7 @@ fn save_inner(core: &DocumentCore, path: &Path, password: Option<&[u8]>) -> Resu
         bail!("문서 암호는 HWP, HWPX 저장에만 적용됩니다.");
     }
     let bytes = match (extension.as_str(), password) {
-        ("hwp", password) => {
-            let prepared = auto_number_formats::prepare_hwp(core)?;
-            let baseline = memo_formats::export_hwp(prepared.as_ref().unwrap_or(core), password)?;
-            textbox_formats::repair_hwp(baseline, password)?
-        }
+        ("hwp", password) => hwp_bytes(core, password)?,
         ("hwpx", password) => page_number_formats::export(core, password)?,
         ("pdf", _) => {
             let options = pdf_options();

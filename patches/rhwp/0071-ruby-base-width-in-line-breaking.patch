@@ -1,0 +1,120 @@
+diff --git a/src/renderer/composer/line_breaking.rs b/src/renderer/composer/line_breaking.rs
+index a88c847..2ebb8ea 100644
+--- a/src/renderer/composer/line_breaking.rs
++++ b/src/renderer/composer/line_breaking.rs
+@@ -10,7 +10,7 @@ use crate::model::paragraph::{CharShapeRef, ColumnBreakType, LineSeg, Paragraph,
+ use crate::model::style::{Alignment, HeadType, LineSpacingType};
+ use crate::renderer::layout::{
+     estimate_text_width, estimate_text_width_unrounded, hancom_regenerated_space_width,
+-    is_cjk_char, kopub_space_advance_em, resolved_letter_spacing,
++    is_cjk_char, kopub_space_advance_em, resolved_letter_spacing, ruby_text_styles,
+ };
+ use crate::renderer::layout_frame::{FrameRowMetrics, LayoutFrame, ParagraphBox, RowSegment};
+ use crate::renderer::style_resolver::{detect_lang_category, ResolvedParaStyle, ResolvedStyleSet};
+@@ -1084,7 +1084,7 @@ pub(super) fn compose_horizontal_shaping_handoff(
+     }
+ 
+     let text_chars = para.text.chars().collect::<Vec<_>>();
+-    let inline_controls = flow_inline_controls(para);
++    let inline_controls = flow_inline_controls(para, styles);
+     let projection = prepare_paragraph_projection(
+         para,
+         &text_chars,
+@@ -2738,9 +2738,12 @@ fn inline_control_occupied_size_hwp(
+ /// 일반 경로는 표를 `control 배치 경로`에 두려고 제외하지만(#3211), 저장 줄이 없는 host 는
+ /// 이 채움이 줄 경계의 유일한 소유자다. 표 폭을 안 실으면 줄에 남은 폭보다 넓은 표가
+ /// 줄바꿈 없이 앞 글자 뒤에 붙는다(`distribution_doc.hwpx` 3쪽 — 표가 본문 오른쪽 밖으로 나간다).
+-fn flow_inline_controls_with_tac_tables(para: &Paragraph) -> Vec<FlowInlineControl> {
++fn flow_inline_controls_with_tac_tables(
++    para: &Paragraph,
++    styles: &ResolvedStyleSet,
++) -> Vec<FlowInlineControl> {
+     let text_len = para.text.chars().count();
+-    let mut controls = flow_inline_controls(para);
++    let mut controls = flow_inline_controls(para, styles);
+     for (control, char_position) in para.controls.iter().zip(para.control_text_positions()) {
+         let Control::Table(table) = control else {
+             continue;
+@@ -2762,12 +2765,31 @@ fn flow_inline_controls_with_tac_tables(para: &Paragraph) -> Vec<FlowInlineContr
+     controls
+ }
+ 
+-fn flow_inline_controls(para: &Paragraph) -> Vec<FlowInlineControl> {
++fn flow_inline_controls(para: &Paragraph, styles: &ResolvedStyleSet) -> Vec<FlowInlineControl> {
+     let text_len = para.text.chars().count();
+     para.controls
+         .iter()
++        .enumerate()
+         .zip(para.control_text_positions())
+-        .filter_map(|(control, char_position)| {
++        .filter_map(|((control_index, control), char_position)| {
++            // 덧말(HwpCraft 패치 0071): 기준 글자는 문단 글이 아니라 컨트롤에 들어 있어,
++            // 배치(`paragraph_layout`)가 그 폭만큼 자리를 잡아 그리는데도 줄 나누기는 폭
++            // 0 으로 셌다. 배치와 같은 글자 모양으로 기준 글자 폭을 잰다. 덧말 글은 한글처럼
++            // 기준 글자 밖으로 삐져나올 수 있어 폭에 넣지 않는다.
++            if let Control::Ruby(ruby) = control {
++                if ruby.main_text.is_empty() || char_position >= text_len {
++                    return None;
++                }
++                let (main, _) = ruby_text_styles(para, control_index, ruby, styles);
++                let width_px = estimate_text_width(&ruby.main_text, &main);
++                return (width_px > 0.0).then(|| FlowInlineControl {
++                    char_position,
++                    // `inline_width_px_at` 이 75 로 나눠 px 로 되돌린다.
++                    width_hwp: (width_px * 75.0).round() as i32,
++                    height_hwp: 0,
++                    baseline_distance_hwp: None,
++                });
++            }
+             // 글자처럼 취급되는 표는 renderer가 control 위치를 기준으로 별도
+             // TextRun/Table 경계를 만든다. 보이지 않는 PARA_TEXT 위치의 다음
+             // 글자 폭에 표 전체 폭을 더하면 HML의 `abc + table + efg`처럼
+@@ -3273,9 +3295,9 @@ fn layout_paragraph_in_frame_impl(
+     let inline_controls =
+         if para.line_segs.is_empty() && supports_tac_table_band_frame_controls(para) {
+             // [#7160] 저장 줄이 없는 TAC 표 host 는 표 폭까지 줄 경계 판정에 넣는다.
+-            flow_inline_controls_with_tac_tables(para)
++            flow_inline_controls_with_tac_tables(para, styles)
+         } else {
+-            flow_inline_controls(para)
++            flow_inline_controls(para, styles)
+         };
+     // [#3128] 프레임이 들여쓰기 추적을 잃던 자리. 종전에는 여기서 `false` 를 박아
+     // 두어, 저장 `LINE_SEG` 가 없는 들여쓴 셀 문단도 글꼴 고유 공백 폭으로 쟀다.
+@@ -4511,7 +4533,7 @@ fn reflow_line_segs_impl(
+ 
+     let text_chars: Vec<char> = para.text.chars().collect();
+     let text_len = text_chars.len();
+-    let inline_controls = flow_inline_controls(para);
++    let inline_controls = flow_inline_controls(para, styles);
+ 
+     // 문단 스타일에서 들여쓰기 및 줄 나눔 설정 조회 (들여쓰기는 목록 마커를 얹은 값)
+     let para_style = styles.para_styles.get(para.para_shape_id as usize);
+diff --git a/src/renderer/layout/paragraph_layout.rs b/src/renderer/layout/paragraph_layout.rs
+index ef45de8..74ccc68 100644
+--- a/src/renderer/layout/paragraph_layout.rs
++++ b/src/renderer/layout/paragraph_layout.rs
+@@ -575,8 +575,9 @@ fn inline_table_stored_line_top_offset_px(
+ }
+ 
+ /// 덧말의 기준 글자와 덧말 글자 모양: 컨트롤 자리의 글자 모양, 덧말은 크기 비율
+-/// (`szRatio`, 기본 50 %)만큼 줄인다.
+-fn ruby_text_styles(
++/// (`szRatio`, 기본 50 %)만큼 줄인다. 줄 나누기(`composer::line_breaking`)도 같은 모양으로
++/// 기준 글자 폭을 잰다 (HwpCraft 패치 0071).
++pub(crate) fn ruby_text_styles(
+     para: &Paragraph,
+     control_index: usize,
+     ruby: &crate::model::control::Ruby,
+diff --git a/src/renderer/layout.rs b/src/renderer/layout.rs
+index 803dbfb..665ded5 100644
+--- a/src/renderer/layout.rs
++++ b/src/renderer/layout.rs
+@@ -3711,6 +3711,7 @@ mod text_measurement;
+ mod utils;
+ 
+ pub(crate) use paragraph_layout::ensure_min_baseline;
++pub(crate) use paragraph_layout::ruby_text_styles;
+ pub(crate) use paragraph_layout::{assign_numbering_markers, list_marker_geometry};
+ pub(crate) use table_layout::border_style_has_diagonal;
+ // [#4149] 셀 커서 fast path 프로브 (document_core::queries::cursor_rect 전용)

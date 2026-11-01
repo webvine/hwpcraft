@@ -18,6 +18,12 @@ pub struct HighlightRect {
     pub height: f64,
     /// `#rrggbb` as stored by RHWP.
     pub color: String,
+    /// Drawn opaque: a change-tracking mark line (`track_changes`), not a markpen run.
+    #[serde(skip)]
+    pub(crate) solid: bool,
+    /// Runs down a column of a vertical section (세로쓰기): `width` is the column.
+    #[serde(skip)]
+    pub(crate) vertical: bool,
 }
 
 /// Highlighted scalar ranges of one paragraph: an opening mark (with a colour)
@@ -144,6 +150,8 @@ fn scalar_rect(
                 width: bounds.width,
                 height: bounds.height,
                 color: color.to_owned(),
+                solid: false,
+                vertical: false,
             })
         }
         _ => {
@@ -167,33 +175,95 @@ fn scalar_rect(
                 offset: cursor.offset + 1,
                 ..cursor
             })?;
-            let page = a["pageIndex"].as_u64()? as u32;
-            let x = a["x"].as_f64()?;
-            let y = a["y"].as_f64()?;
-            let height = a["height"].as_f64().unwrap_or(16.0);
-            let same_line = (b["y"].as_f64()? - y).abs() < 1.0
-                && b["pageIndex"].as_u64() == Some(u64::from(page));
-            let width = if same_line {
-                (b["x"].as_f64()? - x).max(2.0)
-            } else {
-                height * 0.6
-            };
-            Some(HighlightRect {
-                page,
-                x,
-                y,
-                width,
-                height,
-                color: color.to_owned(),
-            })
+            between(&a, &b, color)
+        }
+    }
+}
+
+/// The highlight of one scalar from the caret rectangles before (`a`) and after (`b`)
+/// it; a scalar ending its line gets a narrow box.
+fn between(a: &Value, b: &Value, color: &str) -> Option<HighlightRect> {
+    let page = a["pageIndex"].as_u64()? as u32;
+    let x = a["x"].as_f64()?;
+    let y = a["y"].as_f64()?;
+    // In a vertical section a caret lies across its column: the run goes down it.
+    if a["vertical"] == true {
+        let width = a["width"].as_f64().unwrap_or(16.0);
+        let same_column =
+            (b["x"].as_f64()? - x).abs() < 1.0 && b["pageIndex"].as_u64() == Some(u64::from(page));
+        let height = if same_column {
+            (b["y"].as_f64()? - y).max(2.0)
+        } else {
+            width * 0.8
+        };
+        return Some(HighlightRect {
+            page,
+            x,
+            y,
+            width,
+            height,
+            color: color.to_owned(),
+            solid: false,
+            vertical: true,
+        });
+    }
+    let height = a["height"].as_f64().unwrap_or(16.0);
+    let same_line =
+        (b["y"].as_f64()? - y).abs() < 1.0 && b["pageIndex"].as_u64() == Some(u64::from(page));
+    let width = if same_line {
+        (b["x"].as_f64()? - x).max(2.0)
+    } else {
+        height * 0.6
+    };
+    Some(HighlightRect {
+        page,
+        x,
+        y,
+        width,
+        height,
+        color: color.to_owned(),
+        solid: false,
+        vertical: false,
+    })
+}
+
+/// Add `next` to the run being built, or close that run and start a new one: runs on
+/// one line are merged.
+fn merge(current: &mut Option<HighlightRect>, next: HighlightRect, out: &mut Vec<HighlightRect>) {
+    match current.as_mut() {
+        Some(r)
+            if r.vertical
+                && next.vertical
+                && r.page == next.page
+                && (r.x - next.x).abs() < 1.0
+                && (r.y + r.height - next.y).abs() < 1.5 =>
+        {
+            r.height = next.y + next.height - r.y;
+            r.width = r.width.max(next.width);
+        }
+        Some(r)
+            if !r.vertical
+                && !next.vertical
+                && r.page == next.page
+                && (r.y - next.y).abs() < 1.0
+                && (r.x + r.width - next.x).abs() < 1.5 =>
+        {
+            r.width = next.x + next.width - r.x;
+            r.height = r.height.max(next.height);
+        }
+        _ => {
+            out.extend(current.take());
+            *current = Some(next);
         }
     }
 }
 
 impl Session {
-    /// Every markpen run in the document body and first-level table cells, as
-    /// page rectangles. Runs on one line are merged; a run across lines yields
-    /// one rectangle per line. Geometry failures skip the character, never fail.
+    /// Every markpen run in the document, as page rectangles: the body and table
+    /// cells, and headers, footers, notes, text boxes and nested cells (a header's or
+    /// footer's on every page it is drawn on). Runs on one line are merged; a run
+    /// across lines yields one rectangle per line. Geometry failures skip the
+    /// character, never fail.
     pub fn highlight_rects(&self) -> Vec<HighlightRect> {
         self.highlight_rects_with_limit(MAX_PROBES)
     }
@@ -204,9 +274,77 @@ impl Session {
         {
             return rects.clone();
         }
-        let rects = self.highlight_rects_with_limit(usize::MAX);
+        let mut rects = self.highlight_rects_with_limit(usize::MAX);
+        rects.extend(self.track_mark_rects());
         *self.render_highlights.borrow_mut() = Some((self.generation, rects.clone()));
         rects
+    }
+
+    /// Line rectangles of body scalar ranges, one per line run, from RHWP's caret
+    /// rectangles (about 0.3 ms each, without building page geometry). A range on
+    /// one line takes the carets at its two ends; others are walked character by
+    /// character. Stops after `limit` carets.
+    pub(crate) fn body_range_rects(
+        &self,
+        ranges: &[(Cursor, Range<usize>, &str)],
+        limit: usize,
+    ) -> Vec<HighlightRect> {
+        let mut out = Vec::new();
+        let Ok(layout) = self.page_field_layout() else {
+            return out;
+        };
+        let core = layout.as_ref().map_or(&self.core, |layout| &layout.core);
+        let carets = std::cell::Cell::new(0usize);
+        for (cursor, range, color) in ranges {
+            if range.is_empty() {
+                continue;
+            }
+            let caret = |offset: usize| -> Option<Value> {
+                carets.set(carets.get() + 1);
+                let raw = match cursor.cell {
+                    Some(c) => core.get_cursor_rect_in_cell_native(
+                        cursor.section,
+                        cursor.paragraph,
+                        c.control,
+                        c.index,
+                        c.paragraph,
+                        offset,
+                    ),
+                    None => core.get_cursor_rect_native(cursor.section, cursor.paragraph, offset),
+                }
+                .ok()?;
+                serde_json::from_str(&raw).ok()
+            };
+            let (Some(first), Some(last)) = (caret(range.start), caret(range.end)) else {
+                continue;
+            };
+            let one_line = first["pageIndex"] == last["pageIndex"]
+                && (first["y"].as_f64().unwrap_or(0.0) - last["y"].as_f64().unwrap_or(1.0)).abs()
+                    < 1.0;
+            if one_line {
+                out.extend(between(&first, &last, color));
+                continue;
+            }
+            let mut current: Option<HighlightRect> = None;
+            let mut previous = first;
+            for offset in range.clone() {
+                if carets.get() > limit {
+                    break;
+                }
+                let Some(next) = caret(offset + 1) else {
+                    break;
+                };
+                if let Some(rect) = between(&previous, &next, color) {
+                    merge(&mut current, rect, &mut out);
+                }
+                previous = next;
+            }
+            out.extend(current.take());
+            if carets.get() > limit {
+                break;
+            }
+        }
+        out
     }
 
     fn highlight_rects_with_limit(&self, limit: usize) -> Vec<HighlightRect> {
@@ -246,28 +384,95 @@ impl Session {
                     ) else {
                         continue;
                     };
-                    match current.as_mut() {
-                        Some(r)
-                            if r.page == next.page
-                                && (r.y - next.y).abs() < 1.0
-                                && (r.x + r.width - next.x).abs() < 1.5 =>
-                        {
-                            r.width = next.x + next.width - r.x;
-                            r.height = r.height.max(next.height);
-                        }
-                        _ => {
-                            if let Some(r) = current.take() {
-                                out.push(r);
-                            }
-                            current = Some(next);
-                        }
-                    }
+                    merge(&mut current, next, &mut out);
                 }
                 if let Some(r) = current.take() {
                     out.push(r);
                 }
             }
         }
+        let nested =
+            context_walk::nested_paragraphs(self.core.document(), &|p| !p.markpen_marks.is_empty());
+        for address in nested {
+            let Ok(paragraph) = self.context_v2_paragraph(&address) else {
+                continue;
+            };
+            let mut runs = Vec::new();
+            for (range, color) in markpen_ranges(paragraph) {
+                let mut current: Option<HighlightRect> = None;
+                for offset in range {
+                    probes += 1;
+                    if probes > limit {
+                        runs.extend(current.take());
+                        break;
+                    }
+                    let rect = |o| context_walk::caret_rect(core, &address, o);
+                    let Some(next) = rect(offset)
+                        .zip(rect(offset + 1))
+                        .and_then(|(a, b)| between(&a, &b, &color))
+                    else {
+                        continue;
+                    };
+                    merge(&mut current, next, &mut runs);
+                }
+                runs.extend(current.take());
+            }
+            // RHWP places a header or footer caret on its first page; it is drawn
+            // the same on every page it applies to.
+            let pages = context_walk::header_footer_pages(core, &address);
+            for run in runs {
+                if pages.is_empty() {
+                    out.push(run);
+                } else {
+                    out.extend(pages.iter().map(|&page| HighlightRect {
+                        page,
+                        ..run.clone()
+                    }));
+                }
+            }
+            if probes > limit {
+                return out;
+            }
+        }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// In a vertical section (세로쓰기) a run goes down its column and pieces in one
+    /// column join; across columns they stay apart.
+    #[test]
+    fn vertical_runs_go_down_their_column() -> anyhow::Result<()> {
+        let caret = |x: f64, y: f64| json!({"pageIndex": 0, "x": x, "y": y, "height": 1.0, "width": 13.3, "vertical": true});
+        let a = between(&caret(500.0, 100.0), &caret(500.0, 130.0), "#ffff00")
+            .ok_or_else(|| anyhow::anyhow!("a run"))?;
+        assert!(a.vertical);
+        assert_eq!((a.x, a.y, a.width, a.height), (500.0, 100.0, 13.3, 30.0));
+        let b = between(&caret(500.0, 130.0), &caret(500.0, 145.0), "#ffff00")
+            .ok_or_else(|| anyhow::anyhow!("a run"))?;
+        let c = between(&caret(480.0, 100.0), &caret(480.0, 120.0), "#ffff00")
+            .ok_or_else(|| anyhow::anyhow!("a run"))?;
+        let mut out = Vec::new();
+        let mut current = None;
+        for r in [a, b, c] {
+            merge(&mut current, r, &mut out);
+        }
+        out.extend(current);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!((out[0].y, out[0].height), (100.0, 45.0));
+        // Horizontal carets keep the old run.
+        let h = between(
+            &json!({"pageIndex": 0, "x": 10.0, "y": 50.0, "height": 16.0}),
+            &json!({"pageIndex": 0, "x": 40.0, "y": 50.0, "height": 16.0}),
+            "#ffff00",
+        )
+        .ok_or_else(|| anyhow::anyhow!("a run"))?;
+        assert!(!h.vertical);
+        assert_eq!((h.width, h.height), (30.0, 16.0));
+        Ok(())
     }
 }

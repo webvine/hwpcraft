@@ -217,6 +217,13 @@ pub fn korean_font_face() -> Option<(std::path::PathBuf, u32)> {
     })
 }
 impl Renderer {
+    /// Drop the kept rasters (and their memory) while keeping the font database.
+    /// For callers that render a page once, such as MCP's `render_page`.
+    pub fn forget_rasters(&self) {
+        if let Ok(mut recent) = self.recent.lock() {
+            recent.clear();
+        }
+    }
     /// Installed font families for font pickers: every localized name, sorted with
     /// Korean (Hangul) names first, then the rest alphabetically, without duplicates.
     pub fn font_families(&self) -> Vec<String> {

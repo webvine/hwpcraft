@@ -644,7 +644,7 @@ pub(super) fn palette(
     let mut c = rgb(color.unwrap_or("#000000"));
     ui.horizontal(|ui| {
         ui.label("다른 색");
-        if ui.color_edit_button_srgba(&mut c).changed() {
+        if chrome::color_button(ui, &mut c).changed() {
             out = Some(Some(hex(c)));
         }
     });

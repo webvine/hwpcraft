@@ -1,0 +1,649 @@
+diff --git a/src/model/mod.rs b/src/model/mod.rs
+index 2e7e625..56af06c 100644
+--- a/src/model/mod.rs
++++ b/src/model/mod.rs
+@@ -14,6 +14,7 @@ pub mod hyperlink;
+ pub mod hyperlink_format;
+ pub(crate) mod identity;
+ pub mod image;
++pub mod picture_effects_hwp5;
+ pub mod page;
+ pub mod paragraph;
+ pub mod path;
+diff --git a/src/model/picture_effects_hwp5.rs b/src/model/picture_effects_hwp5.rs
+new file mode 100644
+index 0000000..44c646c
+--- /dev/null
++++ b/src/model/picture_effects_hwp5.rs
+@@ -0,0 +1,542 @@
++//! HWP5 그림 효과 정보 (한글문서파일형식 5.0 표 108–115)와 [`PictureEffects`] 사이 변환.
++//!
++//! `SHAPE_COMPONENT_PICTURE` 의 instance ID 뒤에 온다: UINT32 효과 비트(1 그림자, 2 네온,
++//! 4 부드러운 가장자리, 8 반사) 다음에 있는 효과만 그 순서로 이어진다. 색상은 종류(INT32)
++//! 다음 값 하나(RGB 0x00rrggbb 또는 CMYK)와 색상 효과 수·(종류, 값) 목록이다. 한글 저장본
++//! (aift.hwp 그림자)의 바이트로 확인한 것은 그림자와 RGB 색이고, 네온·부드러운 가장자리·
++//! 반사는 명세의 필드 순서를 따른다. 반사는 명세 표의 필드 14개(56바이트)로 쓴다.
++
++use super::image::{
++    EffectColor, EffectColorTransform, EffectPoint, EffectRange, EffectRgb, PictureEffects,
++    PictureGlow, PictureReflection, PictureShadow, PictureSoftEdge,
++};
++
++const SHADOW: u32 = 1;
++const GLOW: u32 = 2;
++const SOFT_EDGE: u32 = 4;
++const REFLECTION: u32 = 8;
++
++const ALIGN_STYLES: [&str; 9] = [
++    "TOP_LEFT",
++    "TOP",
++    "TOP_RIGHT",
++    "LEFT",
++    "CENTER",
++    "RIGHT",
++    "BOTTOM_LEFT",
++    "BOTTOM",
++    "BOTTOM_RIGHT",
++];
++
++/// HWPX 색상 효과 종류 ↔ HWP5 표 115 값.
++const COLOR_EFFECTS: [(&str, i32); 6] = [
++    ("ALPHA", 0),
++    ("GRAY", 23),
++    ("COMP", 24),
++    ("GAMMA", 25),
++    ("INV_GAMMA", 26),
++    ("INV", 27),
++];
++
++fn float(value: &Option<String>, default: f32) -> f32 {
++    value
++        .as_deref()
++        .and_then(|v| v.trim().parse::<f32>().ok())
++        .unwrap_or(default)
++}
++
++fn flag(value: &Option<String>) -> i32 {
++    matches!(value.as_deref().map(str::trim), Some("1" | "true")) as i32
++}
++
++fn align(value: &Option<String>) -> i32 {
++    value
++        .as_deref()
++        .and_then(|v| ALIGN_STYLES.iter().position(|s| *s == v))
++        .unwrap_or(0) as i32
++}
++
++fn text(value: f32) -> Option<String> {
++    Some(value.to_string())
++}
++
++/// HSL(0–255 범위)을 RGB 로.
++fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
++    let (h, s, l) = (h / 255.0 * 360.0, s / 255.0, l / 255.0);
++    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
++    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
++    let m = l - c / 2.0;
++    let (r, g, b) = match (h / 60.0) as u32 {
++        0 => (c, x, 0.0),
++        1 => (x, c, 0.0),
++        2 => (0.0, c, x),
++        3 => (0.0, x, c),
++        4 => (x, 0.0, c),
++        _ => (c, 0.0, x),
++    };
++    let byte = |v: f32| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
++    (byte(r), byte(g), byte(b))
++}
++
++fn push_color(out: &mut Vec<u8>, color: Option<&EffectColor>) {
++    let channel = |v: &Option<String>| {
++        v.as_deref()
++            .and_then(|v| v.trim().parse::<f32>().ok())
++            .unwrap_or(0.0)
++    };
++    let rgb = color.and_then(|c| c.rgb.as_ref());
++    let (r, g, b) = match (color.and_then(|c| c.color_type.as_deref()), rgb) {
++        // SYSTEM 색은 h·s·l 을 r·g·b 칸에 담아 읽는다(`hp:system`).
++        (Some("SYSTEM"), Some(v)) => hsl_to_rgb(channel(&v.r), channel(&v.g), channel(&v.b)),
++        (_, Some(v)) => (
++            channel(&v.r).clamp(0.0, 255.0) as u8,
++            channel(&v.g).clamp(0.0, 255.0) as u8,
++            channel(&v.b).clamp(0.0, 255.0) as u8,
++        ),
++        _ => (0, 0, 0),
++    };
++    // RGB 만 쓴다: SCHEME·SYSTEM 은 그 값을 RGB 로 바꾼 것이다.
++    out.extend_from_slice(&0i32.to_le_bytes());
++    let value = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
++    out.extend_from_slice(&value.to_le_bytes());
++    let effects: Vec<(i32, f32)> = color
++        .map(|c| {
++            c.transforms
++                .iter()
++                .filter_map(|t| {
++                    let kind = COLOR_EFFECTS.iter().find(|(name, _)| *name == t.kind)?.1;
++                    Some((kind, t.value.trim().parse::<f32>().unwrap_or(0.0)))
++                })
++                .collect()
++        })
++        .unwrap_or_default();
++    out.extend_from_slice(&(effects.len() as u32).to_le_bytes());
++    for (kind, value) in effects {
++        out.extend_from_slice(&kind.to_le_bytes());
++        out.extend_from_slice(&value.to_le_bytes());
++    }
++}
++
++/// [`PictureEffects`] 를 HWP5 그림 효과 정보로. 효과가 없으면 효과 비트 0 하나(4바이트).
++pub fn encode(effects: &PictureEffects) -> Vec<u8> {
++    let mut bits = 0u32;
++    let mut body = Vec::new();
++    let f = |out: &mut Vec<u8>, v: f32| out.extend_from_slice(&v.to_le_bytes());
++    let i = |out: &mut Vec<u8>, v: i32| out.extend_from_slice(&v.to_le_bytes());
++    if let Some(s) = &effects.shadow {
++        bits |= SHADOW;
++        i(&mut body, (s.style.as_deref() == Some("INSIDE")) as i32);
++        f(&mut body, float(&s.alpha, 0.0));
++        f(&mut body, float(&s.radius, 0.0));
++        f(&mut body, float(&s.direction, 0.0));
++        f(&mut body, float(&s.distance, 0.0));
++        i(&mut body, align(&s.align_style));
++        let skew = s.skew.clone().unwrap_or_default();
++        f(&mut body, float(&skew.x, 0.0));
++        f(&mut body, float(&skew.y, 0.0));
++        let scale = s.scale.clone().unwrap_or_default();
++        f(&mut body, float(&scale.x, 1.0));
++        f(&mut body, float(&scale.y, 1.0));
++        i(&mut body, flag(&s.rotation_style));
++        push_color(&mut body, s.color.as_ref());
++    }
++    if let Some(g) = &effects.glow {
++        bits |= GLOW;
++        f(&mut body, float(&g.alpha, 0.0));
++        f(&mut body, float(&g.radius, 0.0));
++        push_color(&mut body, g.color.as_ref());
++    }
++    if let Some(e) = &effects.soft_edge {
++        bits |= SOFT_EDGE;
++        f(&mut body, float(&e.radius, 0.0));
++    }
++    if let Some(r) = &effects.reflection {
++        bits |= REFLECTION;
++        i(&mut body, align(&r.align_style));
++        f(&mut body, float(&r.radius, 0.0));
++        f(&mut body, float(&r.direction, 0.0));
++        f(&mut body, float(&r.distance, 0.0));
++        let skew = r.skew.clone().unwrap_or_default();
++        f(&mut body, float(&skew.x, 0.0));
++        f(&mut body, float(&skew.y, 0.0));
++        let scale = r.scale.clone().unwrap_or_default();
++        f(&mut body, float(&scale.x, 1.0));
++        f(&mut body, float(&scale.y, 1.0));
++        i(&mut body, flag(&r.rotation_style));
++        let alpha = r.alpha.clone().unwrap_or_default();
++        let pos = r.pos.clone().unwrap_or_default();
++        f(&mut body, float(&alpha.start, 0.0));
++        f(&mut body, float(&pos.start, 0.0));
++        f(&mut body, float(&alpha.end, 0.0));
++        f(&mut body, float(&pos.end, 0.0));
++        f(&mut body, float(&r.fade_direction, 0.0));
++    }
++    let mut out = bits.to_le_bytes().to_vec();
++    out.extend_from_slice(&body);
++    out
++}
++
++struct Reader<'a> {
++    bytes: &'a [u8],
++    at: usize,
++}
++
++impl Reader<'_> {
++    fn u32(&mut self) -> Option<u32> {
++        let v = self.bytes.get(self.at..self.at + 4)?;
++        self.at += 4;
++        Some(u32::from_le_bytes(v.try_into().ok()?))
++    }
++    fn i32(&mut self) -> Option<i32> {
++        self.u32().map(|v| v as i32)
++    }
++    fn f32(&mut self) -> Option<f32> {
++        self.u32().map(f32::from_bits)
++    }
++    fn color(&mut self) -> Option<EffectColor> {
++        // RGB(0)·CMYK(1) 밖의 색상 종류는 값의 길이를 확인하지 못했다.
++        let kind = self.i32()?;
++        let value = self.u32()?;
++        let count = self.u32()?;
++        if !(0..=1).contains(&kind) || count > 64 {
++            return None;
++        }
++        let mut transforms = Vec::new();
++        for _ in 0..count {
++            let k = self.i32()?;
++            let v = self.f32()?;
++            let name = COLOR_EFFECTS.iter().find(|(_, n)| *n == k)?.0;
++            transforms.push(EffectColorTransform {
++                kind: name.to_owned(),
++                value: v.to_string(),
++            });
++        }
++        if kind == 1 {
++            return None;
++        }
++        Some(EffectColor {
++            color_type: Some("RGB".to_owned()),
++            scheme_idx: Some("-1".to_owned()),
++            system_idx: Some("-1".to_owned()),
++            preset_idx: Some("-1".to_owned()),
++            rgb: Some(EffectRgb {
++                r: Some(((value >> 16) & 0xff).to_string()),
++                g: Some(((value >> 8) & 0xff).to_string()),
++                b: Some((value & 0xff).to_string()),
++            }),
++            transforms,
++        })
++    }
++}
++
++/// HWP5 그림 효과 정보를 읽는다. (효과, 읽은 바이트 수). 모르는 효과 비트나 색상 종류가
++/// 있으면 `None`: 호출자는 원본 바이트를 그대로 둔다.
++pub fn decode(bytes: &[u8]) -> Option<(PictureEffects, usize)> {
++    let mut r = Reader { bytes, at: 0 };
++    let bits = r.u32()?;
++    if bits & !(SHADOW | GLOW | SOFT_EDGE | REFLECTION) != 0 {
++        return None;
++    }
++    let mut effects = PictureEffects::default();
++    let align_name = |v: i32| ALIGN_STYLES.get(v as usize).map(|s| (*s).to_owned());
++    if bits & SHADOW != 0 {
++        let style = r.i32()?;
++        let alpha = r.f32()?;
++        let radius = r.f32()?;
++        let direction = r.f32()?;
++        let distance = r.f32()?;
++        let align_style = r.i32()?;
++        let (skew_x, skew_y, scale_x, scale_y) = (r.f32()?, r.f32()?, r.f32()?, r.f32()?);
++        let rotation = r.i32()?;
++        let color = r.color()?;
++        effects.shadow = Some(PictureShadow {
++            style: Some(if style == 1 { "INSIDE" } else { "OUTSIDE" }.to_owned()),
++            alpha: text(alpha),
++            radius: text(radius),
++            direction: text(direction),
++            distance: text(distance),
++            align_style: align_name(align_style),
++            rotation_style: Some(rotation.to_string()),
++            skew: Some(EffectPoint {
++                x: text(skew_x),
++                y: text(skew_y),
++            }),
++            scale: Some(EffectPoint {
++                x: text(scale_x),
++                y: text(scale_y),
++            }),
++            color: Some(color),
++        });
++    }
++    if bits & GLOW != 0 {
++        let alpha = r.f32()?;
++        let radius = r.f32()?;
++        let color = r.color()?;
++        effects.glow = Some(PictureGlow {
++            alpha: text(alpha),
++            radius: text(radius),
++            color: Some(color),
++        });
++    }
++    if bits & SOFT_EDGE != 0 {
++        effects.soft_edge = Some(PictureSoftEdge {
++            radius: text(r.f32()?),
++        });
++    }
++    if bits & REFLECTION != 0 {
++        let align_style = r.i32()?;
++        let (radius, direction, distance) = (r.f32()?, r.f32()?, r.f32()?);
++        let (skew_x, skew_y, scale_x, scale_y) = (r.f32()?, r.f32()?, r.f32()?, r.f32()?);
++        let rotation = r.i32()?;
++        let (alpha_start, pos_start, alpha_end, pos_end) = (r.f32()?, r.f32()?, r.f32()?, r.f32()?);
++        let fade = r.f32()?;
++        effects.reflection = Some(PictureReflection {
++            align_style: align_name(align_style),
++            radius: text(radius),
++            direction: text(direction),
++            distance: text(distance),
++            rotation_style: Some(rotation.to_string()),
++            fade_direction: text(fade),
++            skew: Some(EffectPoint {
++                x: text(skew_x),
++                y: text(skew_y),
++            }),
++            scale: Some(EffectPoint {
++                x: text(scale_x),
++                y: text(scale_y),
++            }),
++            alpha: Some(EffectRange {
++                start: text(alpha_start),
++                end: text(alpha_end),
++            }),
++            pos: Some(EffectRange {
++                start: text(pos_start),
++                end: text(pos_end),
++            }),
++        });
++    }
++    Some((effects, r.at))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// aift.hwp 그림의 효과 정보(한글 저장본): 그림자 OUTSIDE, alpha 0.8, radius 400,
++    /// direction 45, distance 1000, TOP_LEFT, 검정 RGB.
++    const AIFT: &str = "0100000000000000cdcc4c3f0000c8430000344200007a440000000000000000000000000000803f0000803f00000000000000000000000000000000";
++
++    fn hex(s: &str) -> Vec<u8> {
++        (0..s.len())
++            .step_by(2)
++            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
++            .collect()
++    }
++
++    #[test]
++    fn a_hangul_shadow_reads_and_writes_back_byte_for_byte() {
++        let bytes = hex(AIFT);
++        let (effects, used) = decode(&bytes).expect("decode");
++        assert_eq!(used, bytes.len());
++        let shadow = effects.shadow.as_ref().unwrap();
++        assert_eq!(shadow.alpha.as_deref(), Some("0.8"));
++        assert_eq!(shadow.radius.as_deref(), Some("400"));
++        assert_eq!(shadow.align_style.as_deref(), Some("TOP_LEFT"));
++        assert_eq!(encode(&effects), bytes);
++    }
++
++    #[test]
++    fn every_effect_with_colours_round_trips() {
++        let color = |r: &str, g: &str, b: &str| EffectColor {
++            color_type: Some("RGB".into()),
++            scheme_idx: Some("-1".into()),
++            system_idx: Some("-1".into()),
++            preset_idx: Some("-1".into()),
++            rgb: Some(EffectRgb {
++                r: Some(r.into()),
++                g: Some(g.into()),
++                b: Some(b.into()),
++            }),
++            transforms: Vec::new(),
++        };
++        let mut glow_color = color("255", "0", "0");
++        glow_color.transforms.push(EffectColorTransform {
++            kind: "ALPHA".into(),
++            value: "0.5".into(),
++        });
++        let effects = PictureEffects {
++            shadow: Some(PictureShadow {
++                style: Some("INSIDE".into()),
++                alpha: Some("0.3".into()),
++                radius: Some("100".into()),
++                direction: Some("90".into()),
++                distance: Some("200".into()),
++                align_style: Some("CENTER".into()),
++                rotation_style: Some("1".into()),
++                skew: None,
++                scale: None,
++                color: Some(color("0", "128", "255")),
++            }),
++            glow: Some(PictureGlow {
++                alpha: Some("0.5".into()),
++                radius: Some("500".into()),
++                color: Some(glow_color),
++            }),
++            soft_edge: Some(PictureSoftEdge {
++                radius: Some("300".into()),
++            }),
++            reflection: Some(PictureReflection {
++                align_style: Some("BOTTOM_LEFT".into()),
++                radius: Some("50".into()),
++                direction: Some("90".into()),
++                distance: Some("0".into()),
++                rotation_style: Some("0".into()),
++                fade_direction: Some("90".into()),
++                skew: None,
++                scale: None,
++                alpha: Some(EffectRange {
++                    start: Some("0.5".into()),
++                    end: Some("1".into()),
++                }),
++                pos: Some(EffectRange {
++                    start: Some("0".into()),
++                    end: Some("0.5".into()),
++                }),
++            }),
++        };
++        let bytes = encode(&effects);
++        assert_eq!(bytes.len(), 4 + (44 + 12) + (8 + 12 + 8) + 4 + 56);
++        let (back, used) = decode(&bytes).expect("decode");
++        assert_eq!(used, bytes.len());
++        assert_eq!(encode(&back), bytes);
++        let rgb = back.shadow.unwrap().color.unwrap().rgb.unwrap();
++        assert_eq!(
++            (rgb.r.as_deref(), rgb.g.as_deref(), rgb.b.as_deref()),
++            (Some("0"), Some("128"), Some("255"))
++        );
++        assert_eq!(
++            back.glow.unwrap().color.unwrap().transforms[0].kind,
++            "ALPHA"
++        );
++    }
++
++    fn pictures(doc: &crate::model::document::Document) -> Vec<&crate::model::image::Picture> {
++        use crate::model::control::Control;
++        use crate::model::paragraph::Paragraph;
++        use crate::model::shape::ShapeObject;
++        fn shape<'a>(s: &'a ShapeObject, out: &mut Vec<&'a crate::model::image::Picture>) {
++            match s {
++                ShapeObject::Picture(p) => out.push(p),
++                ShapeObject::Group(g) => g.children.iter().for_each(|c| shape(c, out)),
++                _ => {}
++            }
++        }
++        fn walk<'a>(ps: &'a [Paragraph], out: &mut Vec<&'a crate::model::image::Picture>) {
++            for p in ps {
++                for c in &p.controls {
++                    match c {
++                        Control::Picture(pic) => out.push(pic),
++                        Control::Shape(s) => shape(s, out),
++                        Control::Table(t) => t.cells.iter().for_each(|c| walk(&c.paragraphs, out)),
++                        _ => {}
++                    }
++                }
++            }
++        }
++        let mut out = Vec::new();
++        for s in &doc.sections {
++            walk(&s.paragraphs, &mut out);
++        }
++        out
++    }
++
++    /// 한글이 저장한 aift.hwp 그림자가 모델로 읽히고, HWP 저장·재열기 뒤 같은 바이트로 남는다.
++    /// 모델에 넣은 네 효과도 HWP 저장·재열기로 그대로 돌아온다.
++    #[test]
++    fn hwp_saves_keep_picture_effects() {
++        use crate::document_core::DocumentCore;
++        let bytes = std::fs::read("samples/aift.hwp").expect("samples/aift.hwp");
++        let mut core = DocumentCore::from_bytes(&bytes).expect("open");
++        let tails: Vec<Vec<u8>> = pictures(core.document())
++            .iter()
++            .map(|p| p.raw_picture_extra.clone())
++            .collect();
++        let shadowed = pictures(core.document())
++            .iter()
++            .filter(|p| p.effects.shadow.is_some())
++            .count();
++        assert!(shadowed > 0);
++        let saved = core.export_hwp_native().expect("save");
++        let back = DocumentCore::from_bytes(&saved).expect("reopen");
++        let again: Vec<Vec<u8>> = pictures(back.document())
++            .iter()
++            .map(|p| p.raw_picture_extra.clone())
++            .collect();
++        assert_eq!(again, tails, "unchanged effects keep their bytes");
++
++        let full = {
++            let mut glow = super::super::image::PictureGlow::default();
++            glow.alpha = Some("0.5".into());
++            glow.radius = Some("500".into());
++            glow.color = Some(EffectColor {
++                color_type: Some("RGB".into()),
++                rgb: Some(EffectRgb {
++                    r: Some("255".into()),
++                    g: Some("200".into()),
++                    b: Some("0".into()),
++                }),
++                ..Default::default()
++            });
++            PictureEffects {
++                glow: Some(glow),
++                soft_edge: Some(PictureSoftEdge {
++                    radius: Some("300".into()),
++                }),
++                ..Default::default()
++            }
++        };
++        let expected = encode(&full);
++        {
++            use crate::model::control::Control;
++            use crate::model::paragraph::Paragraph;
++            use crate::model::shape::ShapeObject;
++            fn first(ps: &mut [Paragraph]) -> Option<&mut crate::model::image::Picture> {
++                for p in ps {
++                    for c in &mut p.controls {
++                        let found = match c {
++                            Control::Picture(pic) => Some(pic.as_mut()),
++                            Control::Shape(s) => match s.as_mut() {
++                                ShapeObject::Picture(pic) => Some(pic.as_mut()),
++                                _ => None,
++                            },
++                            Control::Table(t) => {
++                                t.cells.iter_mut().find_map(|c| first(&mut c.paragraphs))
++                            }
++                            _ => None,
++                        };
++                        if found.is_some() {
++                            return found;
++                        }
++                    }
++                }
++                None
++            }
++            let doc = core.document_mut();
++            let pic = doc
++                .sections
++                .iter_mut()
++                .find_map(|s| first(&mut s.paragraphs))
++                .expect("a picture");
++            pic.effects = full;
++        }
++        let saved = core.export_hwp_native().expect("save with effects");
++        let back = DocumentCore::from_bytes(&saved).expect("reopen with effects");
++        assert_eq!(encode(&pictures(back.document())[0].effects), expected);
++    }
++
++    #[test]
++    fn no_effect_is_a_zero_word() {
++        assert_eq!(encode(&PictureEffects::default()), vec![0, 0, 0, 0]);
++        assert_eq!(decode(&[0, 0, 0, 0]).map(|(_, n)| n), Some(4));
++    }
++}
+diff --git a/src/parser/control/shape.rs b/src/parser/control/shape.rs
+index 5d00569..6f0d53b 100644
+--- a/src/parser/control/shape.rs
++++ b/src/parser/control/shape.rs
+@@ -968,7 +968,20 @@ fn parse_picture(common: CommonObjAttr, shape_attr: ShapeComponentAttr, data: &[
+                 pic.raw_picture_extra[4],
+             ]);
+         }
+-        if pic.raw_picture_extra.len() >= 18 {
++        // 그림 효과 정보(표 108) 뒤에 원본 이미지 크기(8)와 투명도(1)가 온다. 효과가
++        // 없으면 효과 비트 4바이트뿐이다.
++        let decoded = pic
++            .raw_picture_extra
++            .get(5..)
++            .and_then(crate::model::picture_effects_hwp5::decode);
++        let dim_at = match decoded {
++            Some((effects, used)) => {
++                pic.effects = effects;
++                5 + used
++            }
++            None => 9,
++        };
++        if pic.raw_picture_extra.len() >= dim_at + 9 {
+             if let Some(&alpha) = pic.raw_picture_extra.last() {
+                 pic.image_attr.transparency =
+                     crate::model::image::alpha_byte_to_transparency_percent(alpha);
+@@ -978,11 +991,11 @@ fn parse_picture(common: CommonObjAttr, shape_attr: ShapeComponentAttr, data: &[
+         // 적재 — HWPX `hp:imgDim` 대응 필드. 종전에는 HWP5 파스가 이를 읽지 않아
+         // HWPX→HWP5 왕복에서 imgDim 이 (0,0) 으로 소실됐다 (직렬화기 non-raw
+         // 경로가 기록해도 재파스가 버림).
+-        if pic.raw_picture_extra.len() >= 17 {
+-            let e = &pic.raw_picture_extra;
++        if pic.raw_picture_extra.len() >= dim_at + 8 {
++            let e = &pic.raw_picture_extra[dim_at..];
+             pic.img_dim = (
+-                u32::from_le_bytes([e[9], e[10], e[11], e[12]]),
+-                u32::from_le_bytes([e[13], e[14], e[15], e[16]]),
++                u32::from_le_bytes([e[0], e[1], e[2], e[3]]),
++                u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+             );
+         }
+     }
+diff --git a/src/serializer/control.rs b/src/serializer/control.rs
+index bf142fe..6df0e74 100644
+--- a/src/serializer/control.rs
++++ b/src/serializer/control.rs
+@@ -1281,7 +1281,9 @@ fn serialize_picture_data(pic: &Picture) -> Vec<u8> {
+         // border_opacity(1) + instance_id(4) + image_effect(4) = 9바이트
+         w.write_u8(pic.border_opacity).unwrap();
+         w.write_u32(pic.instance_id).unwrap();
+-        w.write_u32(0).unwrap(); // image_effect_extra
++        // 그림 효과 정보(효과가 없으면 0 하나)
++        w.write_bytes(&crate::model::picture_effects_hwp5::encode(&pic.effects))
++            .unwrap();
+                                  // 원본 이미지 크기(HWPUNIT) + 플래그(1): 한컴 호환 추가 9바이트
+                                  // [#1929] IR img_dim(HWPX hp:imgDim 대응)이 있으면 우선 기록 —
+                                  // 종전 crop 폴백만으로는 HWPX→HWP5 왕복에서 imgDim 소실.
+@@ -1302,7 +1304,30 @@ fn serialize_picture_data(pic: &Picture) -> Vec<u8> {
+ fn picture_raw_extra_with_transparency(pic: &Picture) -> Vec<u8> {
+     let transparency = pic.image_attr.transparency_alpha_byte();
+     let mut extra = pic.raw_picture_extra.clone();
+-    if extra.len() >= 18 {
++    // 그림 효과 정보를 모델 값으로 바꿔 쓴다. 원본의 효과를 읽지 못했으면 원본 바이트를
++    // 그대로 둔다(모델에 효과가 없을 때만).
++    let decoded = extra
++        .get(5..)
++        .and_then(crate::model::picture_effects_hwp5::decode);
++    let mut dim_at = 9;
++    match decoded {
++        Some((_, used)) => {
++            let effects = crate::model::picture_effects_hwp5::encode(&pic.effects);
++            dim_at = 5 + effects.len();
++            extra.splice(5..5 + used, effects);
++        }
++        None if !pic.effects.is_empty() && extra.len() >= 5 => {
++            // 읽지 못한 원본 효과 대신 모델의 효과를 쓰고, 그 뒤 칸은 모델 값으로 다시 쓴다.
++            extra.truncate(5);
++            extra.extend_from_slice(&crate::model::picture_effects_hwp5::encode(&pic.effects));
++            extra.extend_from_slice(&pic.img_dim.0.to_le_bytes());
++            extra.extend_from_slice(&pic.img_dim.1.to_le_bytes());
++            extra.push(transparency);
++            return extra;
++        }
++        None => {}
++    }
++    if extra.len() >= dim_at + 9 {
+         if let Some(last) = extra.last_mut() {
+             *last = transparency;
+         }

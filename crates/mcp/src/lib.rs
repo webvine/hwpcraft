@@ -2,6 +2,7 @@
 //! Each document operation carries an explicit handle; no desktop is required.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod admission;
 mod atomic_batch;
 mod catalog;
 pub mod desktop_bridge;
@@ -34,6 +35,8 @@ pub struct Headless {
     pub(crate) session: Session,
     roots: Option<Arc<AutomationRoots>>,
     renderer: Option<hwpcraft_render::Renderer>,
+    /// The desktop window's document: a client edits it but cannot swap in another.
+    pub(crate) window: bool,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +63,9 @@ struct Save {
     /// Save as .hwp anyway, removing the picture effects HWP cannot hold yet.
     #[serde(default, rename = "dropPictureEffects")]
     drop_picture_effects: bool,
+    /// Save as .hwp anyway, without the combo box items HWP cannot hold.
+    #[serde(default, rename = "dropComboItems")]
+    drop_combo_items: bool,
 }
 
 impl Headless {
@@ -69,6 +75,7 @@ impl Headless {
             session: Session::new()?,
             roots,
             renderer: None,
+            window: false,
         })
     }
 
@@ -85,8 +92,16 @@ impl Headless {
         if !params.is_object() {
             bail!("params는 JSON 객체여야 합니다.");
         }
+        if self.window && matches!(command, "file.new" | "file.open" | "file.open_protected") {
+            // Replacing it would drop the user's document, unsaved work and undo
+            // history without asking. Clients make documents of their own instead.
+            bail!(
+                "데스크톱 창의 문서는 MCP로 새 문서나 다른 파일로 바꿀 수 없습니다. document_id 없이 new_document·open_document를 불러 MCP 문서를 따로 만드세요."
+            );
+        }
         let roots = self.roots.clone();
         file_access::confine(roots.as_ref(), || {
+            let track_changes_kept: Option<bool>;
             match command {
                 "file.new" => {
                     let p: New = serde_json::from_value(params)?;
@@ -134,6 +149,14 @@ impl Headless {
                         info["omitted"] = json!(omitted);
                         return Ok(info);
                     }
+                    if p.drop_combo_items {
+                        let dropped = self
+                            .session
+                            .save_dropping_combo_items(&path, p.accept_track_changes)?;
+                        let mut info = self.session.info();
+                        info["droppedComboItems"] = json!(dropped);
+                        return Ok(info);
+                    }
                     if p.drop_picture_effects {
                         let dropped = self
                             .session
@@ -142,6 +165,10 @@ impl Headless {
                         info["droppedPictureEffects"] = json!(dropped);
                         return Ok(info);
                     }
+                    // Did this save keep the document's change tracking?
+                    track_changes_kept = Some(
+                        !p.accept_track_changes && self.session.save_keeps_track_changes(&path),
+                    );
                     if p.accept_track_changes {
                         self.session.save_accepting_track_changes(&path)?;
                     } else {
@@ -150,7 +177,11 @@ impl Headless {
                 }
                 _ => return self.session.run(command, params),
             }
-            Ok(self.session.info())
+            let mut info = self.session.info();
+            if let Some(kept) = track_changes_kept {
+                info["trackChangesKept"] = json!(kept);
+            }
+            Ok(info)
         })
     }
 
@@ -165,6 +196,9 @@ impl Headless {
         }
         let renderer = self.renderer.get_or_insert_with(Default::default);
         let image = renderer.svg(&self.session.render_page_svg(page - 1)?, scale)?;
+        // A page can be 24 Mpx; kept rasters of every open document would add up
+        // to gigabytes, and a client rarely asks for the same page twice.
+        renderer.forget_rasters();
         let png = page_png::encode(&image.rgba, image.width, image.height)?;
         Ok(json!({"content":[
             {"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(png)},

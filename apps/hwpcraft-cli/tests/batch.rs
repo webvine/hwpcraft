@@ -157,3 +157,90 @@ fn batch_page_break_and_replacement_survive_saved_document() {
     assert!(text.contains("첫 쪽"));
     assert!(text.contains("두 번째 쪽"));
 }
+
+/// convert refuses .hwp for combo box items HWP cannot hold, leaving no file, and
+/// --drop-combo-items saves without them.
+#[test]
+fn convert_refuses_hwp_for_combo_items_unless_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("combo.hwpx");
+    let mut session = hwpcraft_engine::Session::new().unwrap();
+    session
+        .run(
+            "form.insert",
+            json!({"kind": "combo_box", "items": ["봄", "여름"], "text": "봄"}),
+        )
+        .unwrap();
+    session.save(&source).unwrap();
+    let exe = env!("CARGO_BIN_EXE_hwpcraft-cli");
+    let hwp = dir.path().join("out.hwp");
+    let result = Command::new(exe)
+        .arg("convert")
+        .arg(&source)
+        .arg(&hwp)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("--drop-combo-items"), "{stderr}");
+    assert!(!hwp.exists());
+    let result = Command::new(exe)
+        .args(["--drop-combo-items", "convert"])
+        .arg(&source)
+        .arg(&hwp)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("콤보 상자 1개"));
+    let mut reopened = hwpcraft_engine::Session::new().unwrap();
+    reopened.open(&hwp).unwrap();
+    let forms = reopened.run("form.list", json!({})).unwrap();
+    assert_eq!(forms[0]["text"], "봄");
+}
+
+/// convert refuses .hwp for a document with an 임의 쪽 master page and leaves no file;
+/// .hwpx keeps it.
+#[test]
+fn convert_refuses_hwp_for_an_optional_master_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("optional.hwpx");
+    let mut session = hwpcraft_engine::Session::new().unwrap();
+    session
+        .run("page.master.set", json!({"text": "양쪽글"}))
+        .unwrap();
+    session
+        .run(
+            "page.master.set",
+            json!({"applyTo": "optional", "page": 1, "text": "첫쪽글"}),
+        )
+        .unwrap();
+    session.save(&source).unwrap();
+    let exe = env!("CARGO_BIN_EXE_hwpcraft-cli");
+    let hwp = dir.path().join("out.hwp");
+    let result = Command::new(exe)
+        .arg("convert")
+        .arg(&source)
+        .arg(&hwp)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("임의 쪽"), "{stderr}");
+    assert!(!hwp.exists());
+    let hwpx = dir.path().join("out.hwpx");
+    let result = Command::new(exe)
+        .arg("convert")
+        .arg(&source)
+        .arg(&hwpx)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}

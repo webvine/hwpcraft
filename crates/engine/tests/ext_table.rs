@@ -1098,3 +1098,71 @@ fn deferred_table_edits_leave_layout_matching_a_fresh_reopen() -> anyhow::Result
     assert_eq!(s.run("table.info", json!({}))?["rows"], 120);
     Ok(())
 }
+
+#[test]
+fn cell_shade_goes_one_step_from_the_first_colour() -> anyhow::Result<()> {
+    let mut s = new_table(2, 2)?;
+    let fill = |s: &mut Session, row: u16, col: u16| -> anyhow::Result<String> {
+        let v = s.run(
+            "table.cell_properties.get",
+            json!({"range":{"start_row":row,"start_col":col,"end_row":row,"end_col":col}}),
+        )?;
+        Ok(
+            match v["fillType"]
+                .as_str()
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("solid") => v["fillColor"].as_str().unwrap_or("").to_ascii_lowercase(),
+                _ => "none".into(),
+            },
+        )
+    };
+    let row = json!({"start_row":0,"start_col":0,"end_row":0,"end_col":1});
+    s.run(
+        "table.cell_properties",
+        json!({"range":row,"props":{"fillType":"solid","fillColor":"#dbe5f1"}}),
+    )?;
+    let shade = |s: &mut Session, range: &Value, darker: bool| -> anyhow::Result<u64> {
+        Ok(
+            s.run("table.cell_shade", json!({"range":range,"darker":darker}))?["cells"]
+                .as_u64()
+                .unwrap_or(0),
+        )
+    };
+    // 어둡게 twice: Hangul stops one step from the first colour.
+    assert_eq!(shade(&mut s, &row, true)?, 2);
+    assert_eq!(fill(&mut s, 0, 0)?, "#c8d7e9");
+    let generation = s.generation;
+    assert_eq!(shade(&mut s, &row, true)?, 0);
+    assert_eq!(fill(&mut s, 0, 1)?, "#c8d7e9");
+    assert_eq!(s.generation, generation, "nothing to undo");
+    // 밝게 goes back to the first colour, then one step lighter, and stops there.
+    assert_eq!(shade(&mut s, &row, false)?, 2);
+    assert_eq!(fill(&mut s, 0, 0)?, "#dbe5f1");
+    assert_eq!(shade(&mut s, &row, false)?, 2);
+    assert_eq!(fill(&mut s, 0, 1)?, "#ecf1f7");
+    assert_eq!(shade(&mut s, &row, false)?, 0);
+    assert_eq!(fill(&mut s, 0, 0)?, "#ecf1f7");
+    // One undo step per press.
+    s.execute(Command::Undo)?;
+    assert_eq!(fill(&mut s, 0, 0)?, "#dbe5f1");
+    // After another edit (the undo) the colour the cell has now is the new base.
+    assert_eq!(shade(&mut s, &row, false)?, 2);
+    assert_eq!(fill(&mut s, 0, 0)?, "#ecf1f7");
+    let one = json!({"start_row":0,"start_col":0,"end_row":0,"end_col":0});
+    assert_eq!(shade(&mut s, &one, false)?, 0);
+    // A white cell: one step darker, then back to no fill.
+    let white = json!({"start_row":1,"start_col":0,"end_row":1,"end_col":0});
+    assert_eq!(shade(&mut s, &white, true)?, 1);
+    assert_eq!(shade(&mut s, &white, true)?, 0);
+    assert_eq!(fill(&mut s, 1, 0)?, "#f2f2f2");
+    for ext in ["hwp", "hwpx"] {
+        let mut r = reopen(&mut s, ext)?;
+        assert_eq!(fill(&mut r, 0, 1)?, "#ecf1f7", "{ext}");
+        assert_eq!(fill(&mut r, 1, 0)?, "#f2f2f2", "{ext}");
+    }
+    assert_eq!(shade(&mut s, &white, false)?, 1);
+    assert_eq!(fill(&mut s, 1, 0)?, "none");
+    Ok(())
+}

@@ -21,6 +21,15 @@ use tokio_util::sync::CancellationToken;
 
 const DOCUMENT: &str = "document_id";
 const VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
+/// 2026-07-28 (stateless, per-request `_meta`) and the 2025 revisions that open with
+/// `initialize`, which Codex, Cursor, VS Code and Claude Desktop still use. The SDK
+/// answers an `initialize` with the client's version when it is listed here.
+const SUPPORTED: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
+    VERSION,
+];
 const DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 /// Application error code, outside the JSON-RPC reserved range (-32768..=-32000)
 /// as MCP 2026-07-28 requires for codes it does not define.
@@ -149,7 +158,13 @@ impl HwpService {
                 )
                 .await;
                 link.abort();
-                if outcome.is_err() && task.is_cancel_requested() {
+                // Opening or creating folds its failure into an error result; a
+                // failure after cancellation is still the cancellation.
+                let failed = match &outcome {
+                    Err(_) => true,
+                    Ok((_, value)) => value["isError"] == true,
+                };
+                if failed && task.is_cancel_requested() {
                     return Err(TaskExit::Cancelled);
                 }
                 let (id, value) = outcome.unwrap_or_else(|error| {
@@ -278,6 +293,10 @@ fn cursor(request: &Option<PaginatedRequestParams>) -> std::result::Result<(), M
     }
     Ok(())
 }
+/// Largest tool result sent, in bytes: below the stdio transport's 32 MiB message
+/// limit with room for the JSON-RPC envelope.
+const MAX_RESULT_BYTES: usize = 24 << 20;
+
 fn tool_result(
     mut value: Value,
     id: Option<&str>,
@@ -333,7 +352,29 @@ fn tool_result(
             .collect(),
         _ => Vec::new(),
     };
-    content.push(json!({"type":"text","text":structured.to_string()}));
+    let mut is_error = is_error;
+    let mut text = structured.to_string();
+    // The response carries the text twice (text block and structuredContent).
+    let bytes = 2 * text.len() + content.iter().map(tools::json_size).sum::<usize>();
+    if bytes > MAX_RESULT_BYTES {
+        // Over the limit stdio would drop the reply without a word and leave the
+        // client waiting; an error that says why is the answer instead.
+        let ran = if is_error {
+            ""
+        } else {
+            " 명령은 실행되었고 결과만 보내지 않았습니다."
+        };
+        structured = json!({"message": format!(
+            "도구 결과가 너무 큽니다({} MB, 한도 {} MB).{ran} get_text·inspect_document는 start·limit로 나눠 받고, render_page는 scale을 줄이고, batch는 명령을 나눠 보내세요.",
+            bytes >> 20, MAX_RESULT_BYTES >> 20), "resultBytes": bytes, "resultOmitted": true});
+        if let Some(id) = id {
+            structured[DOCUMENT] = json!(id);
+        }
+        is_error = true;
+        content.clear();
+        text = structured.to_string();
+    }
+    content.push(json!({"type":"text","text":text}));
     let mut result = serde_json::Map::new();
     result.insert("resultType".into(), json!("complete"));
     result.insert("content".into(), Value::Array(content));
@@ -344,6 +385,79 @@ fn tool_result(
 }
 
 impl ServerHandler for HwpService {
+    /// A 2025-era connection: answer with the negotiated version and only what that
+    /// lifecycle serves. Document updates are 2026's `subscriptions/listen`, not
+    /// `resources/subscribe`, and the Tasks extension is a 2026 extension.
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        context.peer.set_peer_info(request.clone());
+        let mut result = self.negotiate_initialize(&request)?;
+        if let Some(resources) = result.capabilities.resources.as_mut() {
+            resources.subscribe = None;
+        }
+        if let Some(extensions) = result.capabilities.extensions.as_mut() {
+            extensions.remove(TASKS_EXTENSION_ID);
+        }
+        if result
+            .capabilities
+            .extensions
+            .as_ref()
+            .is_some_and(|e| e.is_empty())
+        {
+            result.capabilities.extensions = None;
+        }
+        Ok(result)
+    }
+
+    /// A request the SDK could not decode as any known method lands here. For a
+    /// method MCP defines that means its params are malformed (an `arguments`
+    /// array, a missing `name`): say so with -32602 instead of the SDK's bare
+    /// -32601 "tools/call".
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, McpError> {
+        const KNOWN: &[&str] = &[
+            "initialize",
+            "ping",
+            "server/discover",
+            "tools/list",
+            "tools/call",
+            "resources/list",
+            "resources/templates/list",
+            "resources/read",
+            "resources/subscribe",
+            "resources/unsubscribe",
+            "prompts/list",
+            "prompts/get",
+            "completion/complete",
+            "logging/setLevel",
+            "subscriptions/listen",
+            "tasks/get",
+            "tasks/result",
+            "tasks/list",
+            "tasks/cancel",
+        ];
+        let method = request.method;
+        if KNOWN.contains(&method.as_str()) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "{method} 요청의 params 형식이 맞지 않습니다(필수 필드가 없거나 종류가 다름)."
+                ),
+                None,
+            ));
+        }
+        Err(McpError::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            format!("지원하지 않는 메서드입니다: {method}"),
+            None,
+        ))
+    }
+
     fn accepted_subscription_filter(
         &self,
         requested: &SubscriptionFilter,
@@ -367,12 +481,12 @@ impl ServerHandler for HwpService {
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Borrowed(&[VERSION])
+        Cow::Borrowed(SUPPORTED)
     }
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(self.capabilities.clone()).with_protocol_version(VERSION)
             .with_server_info(server_info())
-            .with_instructions("MCP 2026-07-28 authoring server. Every request supplies protocolVersion and clientCapabilities in protocol _meta. new_document/open_document/open_protected_document return document_id; pass it on EVERY document-scoped tool call. No implicit current document. Discover all engine commands through list_commands; use execute, batch and hwp_action to author. Cursor offsets are Unicode scalars; render_page and page.layout.get pages are one-based. Query caret.get for generation before selection.range or addressed edits. Use context.v2 for supported nested regions and tools.autotext.body for formatted snippets. Atomic batches restore document edits and reject persistent file/settings writes. Save HWP/HWPX explicitly, inspect/reopen and render PNG/PDF for verification. Close documents explicitly. Requests for one document run in order, so a long save or PDF export delays later calls on that document only; send progressToken to receive a heartbeat every 5 s. A save cancelled while running leaves the existing file unchanged. Clients that declare the io.modelcontextprotocol/tasks extension get a task for open/save/PDF tools (open_document, open_protected_document, save_document, execute file.*): poll tasks/get at pollIntervalMs; no task notifications are sent; tasks/cancel is cooperative and only prevents a file replacement that has not happened yet. Unsupported operations report errors; do not infer full Hancom feature parity from command registration.")
+            .with_instructions("MCP authoring server (2026-07-28; 2025-03-26, 2025-06-18 and 2025-11-25 clients open with initialize). On 2026-07-28 every request supplies protocolVersion and clientCapabilities in protocol _meta. new_document/open_document/open_protected_document return document_id; pass it on EVERY document-scoped tool call. No implicit current document. Discover all engine commands through list_commands; use execute, batch and hwp_action to author. Cursor offsets are Unicode scalars; render_page and page.layout.get pages are one-based. Query caret.get for generation before selection.range or addressed edits. Use context.v2 for supported nested regions and tools.autotext.body for formatted snippets. Atomic batches restore document edits and reject persistent file/settings writes. Save HWP/HWPX explicitly, inspect/reopen and render PNG/PDF for verification. Close documents explicitly. Requests for one document run one at a time, in the order received on a stdio connection (over HTTP, send an edit that depends on an earlier one after its answer, or use batch), so a long save or PDF export delays later calls on that document only; send progressToken to receive a heartbeat every 5 s. A save cancelled while running leaves the existing file unchanged. Clients that declare the io.modelcontextprotocol/tasks extension get a task for open/save/PDF tools (open_document, open_protected_document, save_document, execute file.*): poll tasks/get at pollIntervalMs; no task notifications are sent; tasks/cancel is cooperative and only prevents a file replacement that has not happened yet. Unsupported operations report errors; do not infer full Hancom feature parity from command registration.")
     }
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.tools.iter().find(|tool| tool.name == name).cloned()
@@ -414,6 +528,17 @@ impl ServerHandler for HwpService {
                 None,
             ));
         }
+        // Calls read from one stdio connection reach their queues in read order.
+        let arrival = context
+            .extensions
+            .get::<crate::admission::Arrival>()
+            .cloned();
+        let ticket = arrival
+            .as_ref()
+            .map(|a| crate::admission::Ticket::new(&a.admission, a.number));
+        if let Some(arrival) = &arrival {
+            arrival.admission.wait(arrival.number).await;
+        }
         let client_tasks = context
             .client_capabilities()
             .is_some_and(|capabilities| capabilities.supports_tasks());
@@ -425,7 +550,15 @@ impl ServerHandler for HwpService {
                 self.spawn_task(name.to_owned(), args),
             ));
         }
-        let work = self.dispatch(name, args, context.ct.clone());
+        let mut work = Box::pin(self.dispatch(name, args, context.ct.clone()));
+        // The first poll puts the call on its document's queue (nothing awaits
+        // before that); then the next call in read order may go.
+        let first = std::future::poll_fn(|cx| std::task::Poll::Ready(work.as_mut().poll(cx))).await;
+        drop(ticket);
+        let work: std::pin::Pin<Box<dyn Future<Output = _> + Send + '_>> = match first {
+            std::task::Poll::Ready(done) => Box::pin(std::future::ready(done)),
+            std::task::Poll::Pending => work,
+        };
         let outcome = match context.meta.get_progress_token() {
             Some(token) => {
                 let (peer, cancel) = (context.peer.clone(), context.ct.clone());
@@ -668,7 +801,7 @@ mod tests {
         assert!(!service.validators["new_document"].is_valid(&json!({"force":"yes"})));
         assert!(!service.validators["new_document"].is_valid(&json!({"unknown":true})));
         assert_eq!(service.get_info().protocol_version, VERSION);
-        assert_eq!(service.supported_protocol_versions().as_ref(), &[VERSION]);
+        assert_eq!(service.supported_protocol_versions().as_ref(), SUPPORTED);
         Ok(())
     }
 
@@ -695,6 +828,28 @@ mod tests {
         assert!(
             schema_validator(&json!({"$schema":DIALECT,"$ref":"file:///private-schema"})).is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_result_over_the_limit_becomes_an_error_that_says_why() -> Result<()> {
+        // 13 MiB of text: sent twice it would pass the stdio transport's 32 MiB,
+        // which used to drop the reply and leave the client waiting.
+        let big = "가".repeat((13 << 20) / 3);
+        let response = tool_result(tools::result(json!({"text": big}), false), Some("doc-id"))
+            .map_err(anyhow::Error::msg)?;
+        let value = serde_json::to_value(ServerResult::from(response))?;
+        assert_eq!(value["isError"], true);
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["resultOmitted"], true, "{structured}");
+        assert_eq!(structured["document_id"], "doc-id");
+        assert!(
+            structured["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("너무 큽니다")
+        );
+        assert!(value.to_string().len() < 4096, "the error is small");
         Ok(())
     }
 

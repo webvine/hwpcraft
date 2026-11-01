@@ -279,12 +279,31 @@ impl HwpApp {
         };
         let mut close = false;
         let mut insert: Option<String> = None;
+        // A narrow window gets fewer grid columns, so the buttons stay on screen: the
+        // list, the button column and the margins take about 490 px besides the grid.
+        let cols = (((ctx.content_rect().width() - 490.0) / CELL) as usize).clamp(8, COLS);
         chrome::modal("symbol-dialog").show(ctx, |ui| {
-            ui.set_width(COLS as f32 * CELL + 310.0);
+            ui.set_width(cols as f32 * CELL + 310.0);
             if chrome::title(ui, "문자표") {
                 close = true;
             }
             // Tabs (Hangul: 사용자 / 유니코드 / 한글(HNC) / 완성형(KS); HwpCraft adds three).
+            // A narrow window puts the search box on a row of its own under the tabs.
+            let narrow = cols < COLS;
+            let search = |ui: &mut egui::Ui, st: &mut State| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut st.search)
+                        .hint_text("검색: 이름·U+코드·키워드")
+                        .desired_width(190.0),
+                );
+                if r.changed() {
+                    st.result = hwpcraft_engine::symbol_search(&st.search);
+                    if !st.search.trim().is_empty() {
+                        st.tab = Tab::Search;
+                    }
+                    st.load_set();
+                }
+            };
             ui.horizontal(|ui| {
                 for tab in Tab::ALL {
                     if ui.selectable_label(st.tab == tab, tab.label()).clicked() && st.tab != tab {
@@ -292,21 +311,15 @@ impl HwpApp {
                         st.load_set();
                     }
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut st.search)
-                            .hint_text("검색: 이름·U+코드·키워드")
-                            .desired_width(190.0),
-                    );
-                    if r.changed() {
-                        st.result = hwpcraft_engine::symbol_search(&st.search);
-                        if !st.search.trim().is_empty() {
-                            st.tab = Tab::Search;
-                        }
-                        st.load_set();
-                    }
-                });
+                if !narrow {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        search(ui, &mut st)
+                    });
+                }
             });
+            if narrow {
+                search(ui, &mut st);
+            }
             ui.separator();
             ui.horizontal_top(|ui| {
                 // Left: 문자 영역 list.
@@ -362,7 +375,7 @@ impl HwpApp {
                         ui.label(egui::RichText::new(format!("{}자", st.chars.len())).weak());
                     });
                     let chars = st.visible_chars(ctx);
-                    let rows = chars.len().div_ceil(COLS);
+                    let rows = chars.len().div_ceil(cols);
                     let mut area = egui::ScrollArea::vertical()
                         .id_salt("symbol-grid")
                         .max_height(CELL * GRID_ROWS as f32)
@@ -376,7 +389,7 @@ impl HwpApp {
                         ui.spacing_mut().item_spacing = Vec2::ZERO;
                         for row in range {
                             ui.horizontal(|ui| {
-                                for c in chars.iter().skip(row * COLS).take(COLS) {
+                                for c in chars.iter().skip(row * cols).take(cols) {
                                     let ok = st.available(ctx, *c);
                                     let r = cell(ui, *c, st.selected == Some(*c), ok);
                                     if r.clicked() {
@@ -430,7 +443,7 @@ impl HwpApp {
                         ui.label("최근 사용");
                         ui.spacing_mut().item_spacing = Vec2::ZERO;
                         let recent = st.saved.recent.clone();
-                        for c in recent.iter().take(COLS) {
+                        for c in recent.iter().take(cols) {
                             let ok = st.available(ctx, *c);
                             let r = cell(ui, *c, false, ok);
                             if r.clicked() {

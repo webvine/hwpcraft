@@ -1,0 +1,805 @@
+diff --git a/src/diagnostics/ir_field_sweep.rs b/src/diagnostics/ir_field_sweep.rs
+index 987daa2..e0d8428 100644
+--- a/src/diagnostics/ir_field_sweep.rs
++++ b/src/diagnostics/ir_field_sweep.rs
+@@ -660,6 +660,7 @@ fn sweep_paragraph(base: &str, a: &Paragraph, b: &Paragraph, out: &mut Divergenc
+         // [#4677] 조판 전용 보강 줄 표식 — 파일에 실리지 않으므로 IR 비교 대상 아님.
+         layout_only_fill_lines: _,
+         cell_format_vpos_dirty: _,
++        edited_in_session: _,
+         cell_vpos_reset: _,
+         // 행 메트릭의 출처와 계산한 번호는 직렬화 원문에 없는 파생값이다.
+         layout_space_metrics: _,
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 39a65a6..381694c 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -2587,7 +2587,8 @@ impl DocumentCore {
+     /// [`DocumentCore::rebuild_derived_state`] 에 통째로 맡긴다. 종전에는 스타일·문단 구성·
+     /// dirty 표시만 다시 만들고 측정 캐시를 그대로 둬 새 문서의 문단이 **이전 문서의
+     /// 측정값**을 재사용했다.
+-    pub fn set_document(&mut self, doc: Document) {
++    pub fn set_document(&mut self, mut doc: Document) {
++        mark_paragraphs_changed_in_session(&self.document, &mut doc);
+         self.document = doc;
+         self.canvas_metrics = None;
+         self.render_normalization.text_reflowed_tables.clear();
+@@ -4306,3 +4307,214 @@ mod save_scoped_mutation_tests {
+         assert!(core.untracked_model_edit);
+     }
+ }
++
++/// [HwpCraft] A paragraph's text, shapes, rows and controls, with the paragraphs inside
++/// its tables, boxes, captions and notes: what tells a changed paragraph apart.
++fn paragraph_fingerprint(para: &Paragraph) -> u64 {
++    use std::hash::{Hash, Hasher};
++    fn list(paragraphs: &[Paragraph], h: &mut impl Hasher) {
++        paragraphs.len().hash(h);
++        for p in paragraphs {
++            one(p, h);
++        }
++    }
++    fn shape(s: &ShapeObject, h: &mut impl Hasher) {
++        let c = s.common();
++        (c.width, c.height, c.horizontal_offset, c.vertical_offset).hash(h);
++        if let ShapeObject::Group(g) = s {
++            for child in &g.children {
++                shape(child, h);
++            }
++        }
++        if let Some(d) = s.drawing() {
++            if let Some(t) = &d.text_box {
++                list(&t.paragraphs, h);
++            }
++            if let Some(c) = &d.caption {
++                list(&c.paragraphs, h);
++            }
++        }
++    }
++    fn one(p: &Paragraph, h: &mut impl Hasher) {
++        p.text.hash(h);
++        (p.para_shape_id, p.style_id).hash(h);
++        for r in &p.char_shapes {
++            (r.start_pos, r.char_shape_id).hash(h);
++        }
++        for l in &p.line_segs {
++            (
++                l.text_start,
++                l.vertical_pos,
++                l.line_height,
++                l.text_height,
++                l.baseline_distance,
++                l.line_spacing,
++                l.column_start,
++                l.segment_width,
++                l.tag,
++            )
++                .hash(h);
++        }
++        for c in &p.controls {
++            std::mem::discriminant(c).hash(h);
++            match c {
++                Control::Table(t) => {
++                    let m = &t.common;
++                    (m.width, m.height, m.horizontal_offset, m.vertical_offset).hash(h);
++                    (t.row_count, t.col_count, t.cells.len()).hash(h);
++                    for cell in &t.cells {
++                        (cell.width, cell.height).hash(h);
++                        list(&cell.paragraphs, h);
++                    }
++                    if let Some(c) = &t.caption {
++                        list(&c.paragraphs, h);
++                    }
++                }
++                Control::Picture(pic) => {
++                    let m = &pic.common;
++                    (m.width, m.height, m.horizontal_offset, m.vertical_offset).hash(h);
++                    if let Some(c) = &pic.caption {
++                        list(&c.paragraphs, h);
++                    }
++                }
++                Control::Shape(s) => shape(s, h),
++                Control::Footnote(n) => list(&n.paragraphs, h),
++                Control::Endnote(n) => list(&n.paragraphs, h),
++                Control::Header(n) => list(&n.paragraphs, h),
++                Control::Footer(n) => list(&n.paragraphs, h),
++                _ => {}
++            }
++        }
++    }
++    let mut h = std::collections::hash_map::DefaultHasher::new();
++    one(para, &mut h);
++    h.finish()
++}
++
++/// [HwpCraft] A caller that changed a copy of the document and hands it back
++/// (`set_document`) says nothing about what it changed. In each section of the same
++/// loaded document that the session edits, the paragraphs between the first and the
++/// last one that differ are marked `edited_in_session`, as the edit commands mark the
++/// paragraphs they lay out again. A fresh core holds no loaded document to compare.
++fn mark_paragraphs_changed_in_session(old: &Document, new: &mut Document) {
++    if old.sections.len() != new.sections.len() {
++        return;
++    }
++    for (before, after) in old.sections.iter().zip(new.sections.iter_mut()) {
++        if before.raw_provenance.is_none()
++            || after.raw_provenance.is_none()
++            || after.raw_stream.is_some()
++        {
++            continue;
++        }
++        let a: Vec<u64> = before.paragraphs.iter().map(paragraph_fingerprint).collect();
++        let b: Vec<u64> = after.paragraphs.iter().map(paragraph_fingerprint).collect();
++        let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
++        let room = a.len().min(b.len()) - prefix;
++        let suffix = a
++            .iter()
++            .rev()
++            .zip(b.iter().rev())
++            .take(room)
++            .take_while(|(x, y)| x == y)
++            .count();
++        if prefix == a.len() && prefix == b.len() {
++            continue;
++        }
++        // Removed paragraphs leave their neighbours meeting at `prefix`.
++        let end = (b.len() - suffix).max(prefix + 1).min(b.len());
++        for para in &mut after.paragraphs[prefix.min(b.len())..end] {
++            para.edited_in_session = true;
++        }
++    }
++}
++
++#[cfg(test)]
++mod hwpcraft_session_edit_scope_tests {
++    use super::DocumentCore;
++
++    fn pages(core: &DocumentCore) -> Vec<String> {
++        (0..core.page_count())
++            .map(|page| core.render_page_svg_native(page).expect("svg"))
++            .collect()
++    }
++
++    /// An edit lays out the pages before it as they were opened. One edited section
++    /// used to turn the stored-geometry rules off for the whole document: typing at
++    /// the end of this press release moved the head tables of page 1 by 8–14 px.
++    #[test]
++    fn an_edit_keeps_the_pages_before_it_as_opened() {
++        let mut core =
++            DocumentCore::from_bytes(include_bytes!("../../../samples/20250130-hongbo.hwp"))
++                .expect("open");
++        let opened = pages(&core);
++        let last = core.document().sections[0].paragraphs.len() - 1;
++        let end = core.document().sections[0].paragraphs[last]
++            .text
++            .chars()
++            .count();
++        core.insert_text_native(0, last, end, "x").expect("insert");
++        core.delete_text_native(0, last, end, 1).expect("delete");
++        assert!(core.document().layout_profile().session_edited());
++        assert_eq!(pages(&core), opened);
++        let profile = core.document().section_layout_profile(0);
++        assert!(!profile.at_paragraph(0).session_edited());
++        assert!(profile.at_paragraph(last).session_edited());
++
++        // A paragraph near the top: the rules apply from there on.
++        core.insert_text_native(0, 7, 0, "가").expect("insert");
++        let profile = core.document().section_layout_profile(0);
++        assert!(!profile.at_paragraph(6).session_edited());
++        assert!(profile.at_paragraph(7).session_edited());
++    }
++
++    /// A caller that changes a paragraph through `document_mut` and lays it out again
++    /// with `relayout_paragraph_native`, or hands back a changed copy with
++    /// `set_document`, marks it as the edit commands mark theirs, so the session-edit
++    /// rules cover it after an edit further down.
++    #[test]
++    fn paragraphs_changed_through_the_model_are_marked() {
++        let mut core =
++            DocumentCore::from_bytes(include_bytes!("../../../samples/20250130-hongbo.hwp"))
++                .expect("open");
++        let last = core.document().sections[0].paragraphs.len() - 1;
++        core.insert_text_native(0, last, 0, "x").expect("insert");
++        let shape = core.document().sections[0].paragraphs[7].para_shape_id;
++        core.document_mut().sections[0].paragraphs[9].para_shape_id = shape;
++        core.relayout_paragraph_native(0, 9, None).expect("relayout");
++        let edited = |core: &DocumentCore| -> Vec<usize> {
++            core.document().sections[0]
++                .paragraphs
++                .iter()
++                .enumerate()
++                .filter_map(|(i, p)| p.edited_in_session.then_some(i))
++                .collect()
++        };
++        assert_eq!(edited(&core), [9, last]);
++        let profile = core.document().section_layout_profile(0);
++        assert!(!profile.at_paragraph(8).session_edited());
++        assert!(profile.at_paragraph(9).session_edited());
++
++        let mut doc = core.document().clone();
++        doc.sections[0].paragraphs[3].para_shape_id = shape;
++        core.set_document(doc);
++        assert_eq!(edited(&core), [3, 9, last]);
++    }
++
++    /// A copy of the edited model lays out like the live core, and a section the edit
++    /// did not touch keeps the stored rules.
++    #[test]
++    fn a_copy_of_an_edited_model_keeps_the_edit_start() {
++        let mut core =
++            DocumentCore::from_bytes(include_bytes!("../../../samples/20250130-hongbo.hwp"))
++                .expect("open");
++        let last = core.document().sections[0].paragraphs.len() - 1;
++        core.insert_text_native(0, last, 0, "x").expect("insert");
++        let mut copy = DocumentCore::new_empty();
++        copy.set_document(core.document().clone());
++        assert_eq!(pages(&copy), pages(&core));
++        let mut untouched = core.document().clone();
++        untouched.sections[0].raw_stream = Some(Vec::new());
++        assert!(!untouched.section_layout_profile(0).session_edited());
++    }
++}
+diff --git a/src/document_core/commands/footnote_ops.rs b/src/document_core/commands/footnote_ops.rs
+index c72deb6..6be91e3 100644
+--- a/src/document_core/commands/footnote_ops.rs
++++ b/src/document_core/commands/footnote_ops.rs
+@@ -449,6 +449,8 @@ impl DocumentCore {
+         }
+ 
+         self.document.sections[section_idx].raw_stream = None;
++        // [HwpCraft] This body paragraph changed (`Paragraph::edited_in_session`).
++        self.mark_paragraph_edited_in_session(section_idx, para_idx);
+         self.rebuild_section(section_idx);
+         self.event_log.push(DocumentEvent::ParaFormatChanged {
+             section: section_idx,
+diff --git a/src/document_core/commands/formatting.rs b/src/document_core/commands/formatting.rs
+index 602c6a0..f796b88 100644
+--- a/src/document_core/commands/formatting.rs
++++ b/src/document_core/commands/formatting.rs
+@@ -1198,6 +1198,8 @@ impl DocumentCore {
+     /// `end_batch` 의 paginate 가 옛 런으로 재고 그린다. 배치 밖에서는 전체 rebuild 가
+     /// 구역을 다시 조합하므로 따로 할 일이 없다.
+     pub(crate) fn rebuild_paragraph_deferred_in_batch(&mut self, sec_idx: usize, para_idx: usize) {
++        // [HwpCraft] This body paragraph changed (`Paragraph::edited_in_session`).
++        self.mark_paragraph_edited_in_session(sec_idx, para_idx);
+         self.rebuild_section_deferred_in_batch(sec_idx);
+         if self.batch_mode {
+             self.recompose_paragraph(sec_idx, para_idx);
+@@ -1226,6 +1228,8 @@ impl DocumentCore {
+             )));
+         }
+         self.document.sections[sec_idx].raw_stream = None;
++        // [HwpCraft] The caller changed this paragraph (or a cell inside it).
++        self.mark_paragraph_edited_in_session(sec_idx, para_idx);
+         match cell {
+             Some(control_idx) => {
+                 self.mark_cell_control_dirty(sec_idx, para_idx, control_idx);
+@@ -1643,6 +1647,8 @@ impl DocumentCore {
+         }
+ 
+         self.document.sections[sec_idx].raw_stream = None;
++        // [HwpCraft] This body paragraph changed (`Paragraph::edited_in_session`).
++        self.mark_paragraph_edited_in_session(sec_idx, para_idx);
+         self.rebuild_section_recompose_deferred_in_batch(sec_idx);
+         self.event_log.push(DocumentEvent::ParaFormatChanged {
+             section: sec_idx,
+@@ -1721,6 +1727,8 @@ impl DocumentCore {
+         }
+ 
+         self.document.sections[sec_idx].raw_stream = None;
++        // [HwpCraft] This body paragraph changed (`Paragraph::edited_in_session`).
++        self.mark_paragraph_edited_in_session(sec_idx, para_idx);
+         self.rebuild_section(sec_idx);
+         self.event_log.push(DocumentEvent::ParaFormatChanged {
+             section: sec_idx,
+@@ -2077,6 +2085,7 @@ impl DocumentCore {
+             para.line_segs.clear();
+             reflow_line_segs(para, paragraph_box, &styles, self.dpi);
+         }
++        self.mark_paragraph_edited_in_session(sec_idx, para_idx);
+     }
+ 
+     /// 구역의 본문 문단 전부를 현재 용지/단 기준으로 다시 접는다 — 쪽 설정이 바뀌어 본문
+diff --git a/src/document_core/commands/text_editing.rs b/src/document_core/commands/text_editing.rs
+index 7b1df9b..88bd0fe 100644
+--- a/src/document_core/commands/text_editing.rs
++++ b/src/document_core/commands/text_editing.rs
+@@ -1762,6 +1762,7 @@ impl DocumentCore {
+             &self.styles,
+             self.dpi,
+         );
++        self.mark_paragraph_edited_in_session(section_idx, para_idx);
+     }
+ 
+     /// 표 셀 내부 문단에 텍스트 삽입 (네이티브)
+@@ -2838,6 +2839,7 @@ impl DocumentCore {
+     ) {
+         use crate::renderer::hwpunit_to_px;
+ 
++        self.mark_paragraph_edited_in_session(section_idx, parent_para_idx);
+         let styles = self.resolve_render_styles();
+         let cell_width_px = hwpunit_to_px(cell_width, self.dpi);
+         let pad_left_px = hwpunit_to_px(pad_left as i32, self.dpi);
+diff --git a/src/document_core/mod.rs b/src/document_core/mod.rs
+index 13eae6e..50b2b8d 100644
+--- a/src/document_core/mod.rs
++++ b/src/document_core/mod.rs
+@@ -504,6 +504,17 @@ impl DocumentCore {
+             .with_hangul2024_layout(self.hangul2024_compat)
+     }
+ 
++    /// [HwpCraft] [`Self::effective_layout_profile`] for laying out one section
++    /// (`Document::section_layout_profile`).
++    pub(crate) fn section_effective_layout_profile(
++        &self,
++        section_index: usize,
++    ) -> crate::model::provenance::LayoutCompatibilityProfile {
++        self.document
++            .section_layout_profile(section_index)
++            .with_hangul2024_layout(self.hangul2024_compat)
++    }
++
+     /// Rebuild the resolved-style aggregate with the document format's style
+     /// normalization. Layout provenance remains in `Document::layout_profile`
+     /// and is passed separately to cache-admission consumers.
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 0c8625b..0cb3285 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -4290,8 +4290,22 @@ impl DocumentCore {
+             self.render_normalization.section_revisions[section_idx].wrapping_add(1);
+     }
+ 
++    /// [HwpCraft] Record that an edit laid body paragraph `para_idx` (or something
++    /// inside it) out again; see `Paragraph::edited_in_session`.
++    pub(crate) fn mark_paragraph_edited_in_session(&mut self, section_idx: usize, para_idx: usize) {
++        if let Some(para) = self
++            .document
++            .sections
++            .get_mut(section_idx)
++            .and_then(|section| section.paragraphs.get_mut(para_idx))
++        {
++            para.edited_in_session = true;
++        }
++    }
++
+     /// 문단 dirty 비트 설정
+     pub(crate) fn mark_paragraph_dirty(&mut self, section_idx: usize, para_idx: usize) {
++        self.mark_paragraph_edited_in_session(section_idx, para_idx);
+         if section_idx >= self.dirty_paragraphs.len() {
+             return;
+         }
+@@ -4337,6 +4351,7 @@ impl DocumentCore {
+         let para = &self.document.sections[section_idx].paragraphs[para_idx];
+         let composed = compose_paragraph_with_horizontal_shaping(para, &self.styles);
+         self.composed[section_idx].insert(para_idx, composed);
++        self.mark_paragraph_edited_in_session(section_idx, para_idx);
+         self.mark_section_dirty(section_idx);
+         self.count_typeset_structural_change(section_idx);
+         // measured_sections: 인덱스 조정으로 기존 측정값 재사용 (전체 재측정 회피)
+@@ -4372,6 +4387,9 @@ impl DocumentCore {
+         if para_idx < self.composed[section_idx].len() {
+             self.composed[section_idx].remove(para_idx);
+         }
++        // The paragraphs on both sides of the removed one now meet.
++        self.mark_paragraph_edited_in_session(section_idx, para_idx.saturating_sub(1));
++        self.mark_paragraph_edited_in_session(section_idx, para_idx);
+         self.mark_section_dirty(section_idx);
+         self.count_typeset_structural_change(section_idx);
+         // measured_sections: 인덱스 조정으로 기존 측정값 재사용
+@@ -4862,7 +4880,7 @@ impl DocumentCore {
+                 }
+             },
+         };
+-        let profile = self.effective_layout_profile();
++        let profile = self.section_effective_layout_profile(section_index);
+         let hwp3_origin_flow_spacing_before = uses_hwp3_origin_flow_spacing_before(&self.document);
+         let measurer = HeightMeasurer::new(self.dpi)
+             .with_hwp3_variant(profile.hwp3_layout())
+@@ -4871,6 +4889,7 @@ impl DocumentCore {
+             .with_hwpx_stored_layout(profile.hwpx_stored_layout())
+             .with_session_edited(profile.session_edited())
+             .with_hwp3_origin_flow_spacing_before(hwp3_origin_flow_spacing_before);
++        measurer.set_section_profile(profile);
+         let column_def = Self::find_initial_column_def(paragraphs);
+         let layout =
+             PageLayoutInfo::from_page_def(&section.section_def.page_def, &column_def, self.dpi);
+@@ -5434,6 +5453,11 @@ impl DocumentCore {
+                 }
+             };
+ 
++            // [HwpCraft] This section's profile: the session-edit rules start at its
++            // first paragraph an edit laid out again (`Document::section_layout_profile`).
++            let section_profile = self.section_effective_layout_profile(idx);
++            measurer.set_section_profile(section_profile);
++
+             // 증분 측정: 이전 측정 데이터가 있으면 문단/표 수준 선택적 캐싱
+             let issue2424_measure_started = issue2424_profile_enabled.then(std::time::Instant::now);
+             let measured = if !self.measured_sections[idx].fallback_paragraphs.is_empty() {
+@@ -5498,7 +5522,7 @@ impl DocumentCore {
+                         doc_has_endnotes,
+                         section,
+                         &column_def,
+-                        self.document.layout_profile(),
++                        section_profile,
+                         hwp3_origin_flow_spacing_before,
+                         hwp3_origin_page_tolerance,
+                         force_breaks.get(idx),
+@@ -5539,7 +5563,7 @@ impl DocumentCore {
+             let mut result = if let Some(raw) = reused {
+                 raw
+             } else if use_paginator {
+-                let profile = self.document.layout_profile();
++                let profile = section_profile;
+                 paginator.paginate_with_measured_profile(
+                     para_src,
+                     &measured,
+@@ -5629,7 +5653,7 @@ impl DocumentCore {
+                     idx,
+                     &measured.tables,
+                     section.section_def.hide_empty_line,
+-                    profile,
++                    section_profile,
+                     hwp3_origin_flow_spacing_before,
+                     hwp3_origin_page_tolerance,
+                     Some(&section.section_def.footnote_shape),
+@@ -7987,6 +8011,9 @@ impl DocumentCore {
+         // (이전 구역 + 현재 구역의 이전 페이지 모두 포함하여 구역 간 번호 연속 지원)
+         self.layout_engine.reset_numbering_state();
+         let sec_idx = page_content.section_index;
++        // [HwpCraft] The page's section profile (`Document::section_layout_profile`).
++        self.layout_engine
++            .set_section_layout_profile(self.section_effective_layout_profile(sec_idx));
+         let sec_page_offset: usize = self
+             .pagination
+             .iter()
+diff --git a/src/model/document.rs b/src/model/document.rs
+index 78a908f..5e6dda2 100644
+--- a/src/model/document.rs
++++ b/src/model/document.rs
+@@ -434,6 +434,39 @@ impl Document {
+         )
+     }
+ 
++    /// [HwpCraft] [`Self::layout_profile`] for laying out section `section_index`.
++    ///
++    /// The session-edit rules (`session_edited`) exist because an edit leaves stored
++    /// coordinates stale. Before this, one edited section turned them off for the whole
++    /// document, so typing one character anywhere moved unedited earlier pages (a page
++    /// head table by 8–14 px in about a third of the HWP samples) and a saved HWP opened
++    /// as it did before the edit. They now apply only to an edited section, from its
++    /// first body paragraph an edit laid out again (`Paragraph::edited_in_session`,
++    /// [`LayoutCompatibilityProfile::at_paragraph`]). An edited section without such a
++    /// paragraph (an edit that laid no paragraph out again, or one undone) keeps the
++    /// rules throughout, as before.
++    pub fn section_layout_profile(
++        &self,
++        section_index: usize,
++    ) -> crate::model::provenance::LayoutCompatibilityProfile {
++        let profile = self.layout_profile();
++        if !profile.session_edited() {
++            return profile;
++        }
++        let Some(section) = self.sections.get(section_index) else {
++            return profile;
++        };
++        if section.raw_provenance.is_none() || section.raw_stream.is_some() {
++            return profile.with_session_edited(false);
++        }
++        let start = section
++            .paragraphs
++            .iter()
++            .position(|p| p.edited_in_session)
++            .unwrap_or(0);
++        profile.with_session_edit_start(start)
++    }
++
+     /// 외부 이미지 binDataId가 이미 로드되었는지 확인한다.
+     ///
+     /// 렌더러는 `bin_data_id - 1` 인덱스를 먼저 조회하므로, 저장소 엔트리의
+diff --git a/src/model/paragraph.rs b/src/model/paragraph.rs
+index a5eb15a..eefe35a 100644
+--- a/src/model/paragraph.rs
++++ b/src/model/paragraph.rs
+@@ -143,6 +143,13 @@ pub struct Paragraph {
+     /// never serialized, and flushed before saving an undo snapshot.
+     #[serde(skip_serializing)]
+     pub cell_format_vpos_dirty: bool,
++    /// [HwpCraft] An edit in this session laid this paragraph, or something inside
++    /// it, out again (`DocumentCore::mark_paragraph_edited_in_session`). Never
++    /// serialized: a saved file opens with every paragraph as stored. The
++    /// session-edit layout rules start at the first such paragraph of a section
++    /// (`Document::section_layout_profile`).
++    #[serde(skip_serializing)]
++    pub edited_in_session: bool,
+     /// Stored cell fragment boundary, captured before the first formatting vpos update.
+     /// False also records that later growth must not invent a reset. Snapshots retain it;
+     /// splitting starts a continuation, and width reflow discards the old frames.
+@@ -1976,6 +1983,7 @@ impl Paragraph {
+             numbering_restart: None,
+             stored_text_partition_dirty: false,
+             cell_format_vpos_dirty: self.cell_format_vpos_dirty,
++            edited_in_session: true,
+             cell_vpos_reset: Some(false),
+             // 번호는 문서 순서로 다시 계산해야 하는 파생값이다 (#7436).
+             numbering_marker: NumberingMarker::Unresolved,
+diff --git a/src/model/provenance.rs b/src/model/provenance.rs
+index 89c5d5b..5659fe4 100644
+--- a/src/model/provenance.rs
++++ b/src/model/provenance.rs
+@@ -63,6 +63,11 @@ pub struct LayoutCompatibilityProfile {
+     /// 저장 시점 형상 전용 보정(선언 높이 fit-down 등)은 편집 문서에서 꺼야 한다 —
+     /// 한글 편집기도 편집 중에는 측정 기반으로 재조판한다.
+     session_edited: bool,
++    /// [HwpCraft] The first body paragraph of the section an edit laid out again
++    /// (`Document::section_layout_profile`). The paragraphs before it hold the rows
++    /// and geometry they were stored with, so the stored-geometry rules still apply
++    /// to them; see [`Self::at_paragraph`]. `None` for a whole-document profile.
++    session_edit_start: Option<usize>,
+ }
+ 
+ impl LayoutCompatibilityProfile {
+@@ -84,6 +89,7 @@ impl LayoutCompatibilityProfile {
+             native_hwp5_layout,
+             hangul2024_layout: false,
+             session_edited: false,
++            session_edit_start: None,
+         }
+     }
+ 
+@@ -99,6 +105,23 @@ impl LayoutCompatibilityProfile {
+         self.session_edited
+     }
+ 
++    /// [HwpCraft] An edited section's profile: edits begin at body paragraph `start`.
++    pub(crate) fn with_session_edit_start(mut self, start: usize) -> Self {
++        self.session_edited = true;
++        self.session_edit_start = Some(start);
++        self
++    }
++
++    /// [HwpCraft] The profile for body paragraph `para_index` of the section: the
++    /// session-edit rules apply from the first paragraph an edit laid out again. A
++    /// profile without an edit start is returned as it is.
++    pub(crate) fn at_paragraph(mut self, para_index: usize) -> Self {
++        if let Some(start) = self.session_edit_start {
++            self.session_edited = para_index >= start;
++        }
++        self
++    }
++
+     /// HWP3 계보 레이아웃 보정(ParaShape 단위 정규화 등) 적용 여부 —
+     /// 기존 `is_hwp3_variant` 분기 동치 (HWP3→HWP5 변환본 휴리스틱).
+     pub fn hwp3_layout(&self) -> bool {
+diff --git a/src/renderer/height_measurer.rs b/src/renderer/height_measurer.rs
+index 26ed3c7..5766908 100644
+--- a/src/renderer/height_measurer.rs
++++ b/src/renderer/height_measurer.rs
+@@ -1551,7 +1551,10 @@ pub struct HeightMeasurer {
+     legacy_hwp3_stored_geometry: bool,
+     is_native_hwp5: bool,
+     hwpx_stored_layout: bool,
+-    session_edited: bool,
++    /// The session-edit rules for the paragraph being measured; see `enter_paragraph`.
++    session_edited: std::cell::Cell<bool>,
++    /// [HwpCraft] The section's profile, which says from which paragraph they apply.
++    session_profile: std::cell::Cell<Option<crate::model::provenance::LayoutCompatibilityProfile>>,
+     use_hwp3_origin_flow_spacing_before: bool,
+     render_normalization:
+         std::sync::Arc<crate::renderer::render_normalization::RenderNormalizationOverlay>,
+@@ -1654,7 +1657,8 @@ impl HeightMeasurer {
+             legacy_hwp3_stored_geometry: false,
+             is_native_hwp5: false,
+             hwpx_stored_layout: false,
+-            session_edited: false,
++            session_edited: std::cell::Cell::new(false),
++            session_profile: std::cell::Cell::new(None),
+             use_hwp3_origin_flow_spacing_before: false,
+             render_normalization: std::sync::Arc::new(
+                 crate::renderer::render_normalization::RenderNormalizationOverlay::default(),
+@@ -1699,11 +1703,30 @@ impl HeightMeasurer {
+ 
+     /// 편집 세션(native HWP5 편집 명령 후) — 재측정 행 높이에 로드 시점 배분을
+     /// 하한으로 적용해, 편집한 행만 성장하고 다른 행의 저장 배분이 보존되게 한다.
+-    pub fn with_session_edited(mut self, enabled: bool) -> Self {
+-        self.session_edited = enabled;
++    pub fn with_session_edited(self, enabled: bool) -> Self {
++        self.session_edited.set(enabled);
+         self
+     }
+ 
++    /// [HwpCraft] Measure the next section with its own profile: the session-edit
++    /// rules start at its first paragraph an edit laid out again
++    /// (`Document::section_layout_profile`).
++    pub(crate) fn set_section_profile(
++        &self,
++        profile: crate::model::provenance::LayoutCompatibilityProfile,
++    ) {
++        self.session_profile.set(Some(profile));
++        self.session_edited.set(profile.session_edited());
++    }
++
++    /// [HwpCraft] The session-edit rules for body paragraph `para_index`.
++    fn enter_paragraph(&self, para_index: usize) {
++        if let Some(profile) = self.session_profile.get() {
++            self.session_edited
++                .set(profile.at_paragraph(para_index).session_edited());
++        }
++    }
++
+     pub fn with_hwp3_origin_flow_spacing_before(mut self, enabled: bool) -> Self {
+         self.use_hwp3_origin_flow_spacing_before = enabled;
+         self
+@@ -1880,6 +1903,7 @@ impl HeightMeasurer {
+         let mut measured_tables = Vec::new();
+ 
+         for (para_idx, para) in paragraphs.iter().enumerate() {
++            self.enter_paragraph(para_idx);
+             let comp = composed.get(para_idx);
+ 
+             // 블록 표 컨트롤 감지 (일반 표 + treat_as_char 블록형)
+@@ -3582,7 +3606,7 @@ impl HeightMeasurer {
+ 
+                 // 닫힌 원본 프레임의 빈 마지막 줄은 그림 띠와 별도의 실제 공간이다.
+                 let text_height = if self.is_native_hwp5
+-                    && !self.session_edited
++                    && !self.session_edited.get()
+                     && !self.render_normalization.table_text_reflowed(table)
+                 {
+                     crate::renderer::float_placement::stored_empty_picture_cell_frame(cell, table)
+@@ -3632,7 +3656,7 @@ impl HeightMeasurer {
+                         table,
+                         self.dpi,
+                         self.hwpx_stored_layout,
+-                        self.session_edited,
++                        self.session_edited.get(),
+                         self.render_normalization.table_text_reflowed(table),
+                         relaxed_pad_mirror,
+                     );
+@@ -4244,7 +4268,7 @@ impl HeightMeasurer {
+                         table,
+                         self.dpi,
+                         self.hwpx_stored_layout,
+-                        self.session_edited,
++                        self.session_edited.get(),
+                         self.render_normalization.table_text_reflowed(table),
+                         relaxed_pad_mirror,
+                     )
+@@ -4298,7 +4322,7 @@ impl HeightMeasurer {
+         // (셀 Enter 재현: 표가 선언 높이에 고정된 채 행 경계만 위로 밀림).
+         // 편집 세션은 실측을 신뢰한다.
+         let table_height = if table.common.treat_as_char
+-            && !self.session_edited
++            && !self.session_edited.get()
+             && common_h > 0.0
+             && raw_table_height > common_h + shrink_threshold
+             && raw_table_height <= common_h * TAC_SHRINK_MAX_OVERFLOW_RATIO
+@@ -4915,6 +4939,7 @@ impl HeightMeasurer {
+         let mut measured_tables = Vec::new();
+ 
+         for (para_idx, para) in paragraphs.iter().enumerate() {
++            self.enter_paragraph(para_idx);
+             let comp = composed.get(para_idx);
+ 
+             // 블록 표 컨트롤 감지 (일반 표 + treat_as_char 블록형)
+@@ -4931,7 +4956,7 @@ impl HeightMeasurer {
+                 if let Control::Table(table) = ctrl {
+                     let mut measured_table = self.measure_table(table, para_idx, ctrl_idx, styles);
+                     // 편집 세션 재측정: 로드 시점 행 배분을 하한으로 유지한다.
+-                    if self.session_edited {
++                    if self.session_edited.get() {
+                         if let Some(prev) = prev_measured.get_measured_table(para_idx, ctrl_idx) {
+                             let cs = hwpunit_to_px(table.cell_spacing as i32, self.dpi);
+                             Self::floor_rows_to_prev(&mut measured_table, prev, cs);
+@@ -4978,6 +5003,7 @@ impl HeightMeasurer {
+         let mut measured_tables = Vec::new();
+ 
+         for (para_idx, para) in paragraphs.iter().enumerate() {
++            self.enter_paragraph(para_idx);
+             let is_dirty = dirty_bits.get(para_idx).copied().unwrap_or(true);
+ 
+             if !is_dirty {
+@@ -5018,7 +5044,7 @@ impl HeightMeasurer {
+                 if let Control::Table(table) = ctrl {
+                     let mut mt = self.measure_table(table, para_idx, ctrl_idx, styles);
+                     // 편집 세션 재측정: 로드 시점 행 배분을 하한으로 유지한다.
+-                    if self.session_edited {
++                    if self.session_edited.get() {
+                         if let Some(prev) = prev_measured.get_measured_table(para_idx, ctrl_idx) {
+                             let cs = hwpunit_to_px(table.cell_spacing as i32, self.dpi);
+                             Self::floor_rows_to_prev(&mut mt, prev, cs);
+diff --git a/src/renderer/layout.rs b/src/renderer/layout.rs
+index ba4d5a2..2550324 100644
+--- a/src/renderer/layout.rs
++++ b/src/renderer/layout.rs
+@@ -3632,6 +3632,9 @@ pub struct LayoutEngine {
+     /// [#2403] 소스분기 질의 표면 — set_layout_profile 로 배선 (종전 hwp3_variant/
+     /// hwpx_source Cell 2개 통합).
+     profile: std::cell::Cell<crate::model::provenance::LayoutCompatibilityProfile>,
++    /// [HwpCraft] The profile of the section being laid out; `profile` is set from it
++    /// for each body item (`LayoutCompatibilityProfile::at_paragraph`).
++    section_profile: std::cell::Cell<crate::model::provenance::LayoutCompatibilityProfile>,
+     /// HWP3 원본 및 HWP3-origin HWP5 변환본의 본문 흐름 spacing_before 보정 여부.
+     use_hwp3_origin_flow_spacing_before: std::cell::Cell<bool>,
+     /// [#2308] Source IR로부터 재생성되는 render-only width/TAC projection.
+@@ -3804,6 +3807,7 @@ impl LayoutEngine {
+             current_page_height: std::cell::Cell::new(0.0),
+             overflow_cell_lines: std::cell::Cell::new(0),
+             profile: std::cell::Cell::new(Default::default()),
++            section_profile: std::cell::Cell::new(Default::default()),
+             use_hwp3_origin_flow_spacing_before: std::cell::Cell::new(false),
+             render_normalization: std::cell::RefCell::new(std::sync::Arc::new(
+                 crate::renderer::render_normalization::RenderNormalizationOverlay::default(),
+@@ -4394,10 +4398,22 @@ impl LayoutEngine {
+         profile: crate::model::provenance::LayoutCompatibilityProfile,
+     ) {
+         self.profile.set(profile);
++        self.section_profile.set(profile);
+         self.use_hwp3_origin_flow_spacing_before
+             .set(profile.hwp3_layout());
+     }
+ 
++    /// [HwpCraft] Lay out a page of a section with its own profile
++    /// (`Document::section_layout_profile`): the session-edit rules start at the
++    /// section's first paragraph an edit laid out again.
++    pub(crate) fn set_section_layout_profile(
++        &self,
++        profile: crate::model::provenance::LayoutCompatibilityProfile,
++    ) {
++        self.profile.set(profile);
++        self.section_profile.set(profile);
++    }
++
+     pub fn set_hwp3_origin_flow_spacing_before(&self, enabled: bool) {
+         self.use_hwp3_origin_flow_spacing_before.set(enabled);
+     }
+@@ -8044,6 +8060,13 @@ impl LayoutEngine {
+                     continue;
+                 }
+             };
++            // [HwpCraft] The session-edit rules start at the section's first paragraph an
++            // edit laid out again (`LayoutCompatibilityProfile::at_paragraph`).
++            if !col_content.endnote_flow {
++                let profile = self.section_profile.get().at_paragraph(item_para);
++                self.profile.set(profile);
++                hcursor.session_edited = profile.session_edited();
++            }
+             // [#2813] 공백-only host 앵커 줄은 표 스택의 문서순을 보존하는 PageItem일
+             // 뿐, 표를 측정한 뒤 다시 그 높이를 소비하는 flow 요소가 아니다. 이 줄을
+             // 일반 paragraph로 layout하면 본문 하단 밖에 빈 줄을 재배치해
+diff --git a/src/renderer/typeset/section.rs b/src/renderer/typeset/section.rs
+index 76646ee..754ee49 100644
+--- a/src/renderer/typeset/section.rs
++++ b/src/renderer/typeset/section.rs
+@@ -172,7 +172,13 @@ impl TypesetEngine {
+         }
+         let issue2424_loop_started = issue2424_ts_enabled.then(std::time::Instant::now);
+ 
++        let section_profile = profile;
+         for (para_idx, para) in paragraphs.iter().enumerate() {
++            // [HwpCraft] The session-edit rules start at the first paragraph an edit
++            // laid out again (`LayoutCompatibilityProfile::at_paragraph`).
++            let profile = section_profile.at_paragraph(para_idx);
++            self.profile.set(profile);
++            st.set_paragraph_profile(profile);
+             // [Task #1753] 지연 이월 표 직전에 선행 채움(prefill)으로 이미 배치된 문단 스킵.
+             if st.prefilled_paras.contains(&para_idx) {
+                 continue;
+diff --git a/src/renderer/typeset/state/commands.rs b/src/renderer/typeset/state/commands.rs
+index 6888aa2..1ed953e 100644
+--- a/src/renderer/typeset/state/commands.rs
++++ b/src/renderer/typeset/state/commands.rs
+@@ -294,6 +294,13 @@ impl TypesetState {
+         self.data.has_stored_line_segs = has_stored_line_segs;
+         self.data.skip_spacing_before_prededuct = skip_spacing_before_prededuct;
+     }
++    /// [HwpCraft] The profile of the paragraph being laid out (see `at_paragraph`).
++    pub(in crate::renderer::typeset) fn set_paragraph_profile(
++        &mut self,
++        profile: crate::model::provenance::LayoutCompatibilityProfile,
++    ) {
++        self.data.profile = profile;
++    }
+     pub(in crate::renderer::typeset) fn classify_omitted_spacing(&mut self, omitted: bool) {
+         self.data.omit_fresh_recalc_doc = omitted;
+     }

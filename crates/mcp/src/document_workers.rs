@@ -340,6 +340,19 @@ impl DocumentWorkers {
         result
     }
 
+    /// Queue a job that panics on `id`'s engine (tests of panic containment).
+    #[cfg(test)]
+    pub(crate) fn queue_panic(&self, id: &str) -> Result<()> {
+        let (reply, _) = oneshot::channel();
+        self.lookup(id)?
+            .sender
+            .try_send(Job {
+                operation: Operation::Panic,
+                cancel: CancellationToken::new(),
+                reply,
+            })
+            .map_err(|_| anyhow!("queue full"))
+    }
     fn lookup(&self, id: &str) -> Result<Worker> {
         let mut registry = self
             .registry
@@ -489,6 +502,7 @@ impl DocumentWorkers {
         Ok(ExternalDocument {
             id,
             receiver,
+            pdf: None,
             info: worker.external.clone().unwrap_or_default(),
             state: worker.state,
             activity: worker.activity,
@@ -499,9 +513,22 @@ impl DocumentWorkers {
 }
 
 /// A document served on its owner's thread; see [`DocumentWorkers::attach_external`].
+/// A PDF export of the window's document in progress: its pages are prepared a
+/// few per frame on the window thread, then turned into PDF and written on a
+/// thread of its own, so a long document does not freeze the window (MCP 2nd
+/// review B-D2: the handbook took 25-30 s in one frame).
+struct PendingPdf {
+    job: Job,
+    prep: hwpcraft_engine::PdfPrep,
+    path: std::path::PathBuf,
+    /// What `file.save` answers for an export: the document info, unchanged by it.
+    info: Value,
+}
+
 pub(crate) struct ExternalDocument {
     id: String,
     receiver: mpsc::Receiver<Job>,
+    pdf: Option<PendingPdf>,
     info: Arc<Mutex<ExternalInfo>>,
     state: Arc<AtomicU8>,
     activity: Arc<Activity>,
@@ -526,23 +553,176 @@ impl ExternalDocument {
     pub(crate) fn serve(&mut self, backend: &mut Headless, budget: Duration) -> usize {
         let started = Instant::now();
         let mut served = 0;
-        while let Ok(job) = self.receiver.try_recv() {
-            served += 1;
-            process(
-                backend,
-                job,
-                &self.state,
-                &self.subscriptions,
-                &self.id,
-                &self.activity,
-                true,
-            );
-            if started.elapsed() >= budget {
+        loop {
+            // A PDF export holds the queue, so later requests keep their order.
+            if let Some(pending) = self.pdf.take() {
+                let left = budget.saturating_sub(started.elapsed());
+                self.pdf = self.step_pdf(backend, pending, left);
+                if self.pdf.is_some() {
+                    return served.max(1);
+                }
+            }
+            if served > 0 && started.elapsed() >= budget {
                 break;
+            }
+            let Ok(job) = self.receiver.try_recv() else {
+                break;
+            };
+            served += 1;
+            match window_pdf_path(&job) {
+                Some(path) if self.state.load(Ordering::Acquire) != CLOSED => {
+                    self.pdf = self.start_pdf(backend, job, path);
+                }
+                _ => {
+                    process(
+                        backend,
+                        job,
+                        &self.state,
+                        &self.subscriptions,
+                        &self.id,
+                        &self.activity,
+                        true,
+                    );
+                }
             }
         }
         served
     }
+
+    /// Begin a window PDF export, or answer at once when it cannot start.
+    fn start_pdf(
+        &self,
+        backend: &mut Headless,
+        job: Job,
+        path: std::path::PathBuf,
+    ) -> Option<PendingPdf> {
+        if job.cancel.is_cancelled() {
+            self.finish_pdf(job, Err(cancelled()));
+            return None;
+        }
+        let begun = (|| -> Result<(hwpcraft_engine::PdfPrep, Value)> {
+            hwpcraft_formats::file_access::confine(backend.roots.as_ref(), || {
+                hwpcraft_formats::file_access::check_write(&path.to_string_lossy())
+            })
+            .map_err(anyhow::Error::msg)?;
+            let pages: Vec<u32> = (0..backend.session.page_count()?).collect();
+            Ok((backend.session.pdf_prepare(&pages)?, backend.session.info()))
+        })();
+        match begun {
+            Ok((prep, info)) => Some(PendingPdf {
+                job,
+                prep,
+                path,
+                info,
+            }),
+            Err(error) => {
+                self.finish_pdf(job, Ok(tool_error(&error)));
+                None
+            }
+        }
+    }
+
+    /// Prepare more pages within `budget`; once all are ready, convert and write
+    /// on another thread. `Some` while pages remain.
+    fn step_pdf(
+        &self,
+        backend: &mut Headless,
+        mut pending: PendingPdf,
+        budget: Duration,
+    ) -> Option<PendingPdf> {
+        if pending.job.cancel.is_cancelled() {
+            self.finish_pdf(pending.job, Err(cancelled()));
+            return None;
+        }
+        // At least one page per frame, however little of the frame is left.
+        let budget = budget.max(Duration::from_millis(1));
+        match backend.session.pdf_prepare_step(&mut pending.prep, budget) {
+            Ok(false) => Some(pending),
+            Ok(true) => {
+                let PendingPdf {
+                    job,
+                    prep,
+                    path,
+                    info,
+                } = pending;
+                match backend.session.pdf_finish(prep) {
+                    Ok(pdf) => {
+                        let roots = backend.roots.clone();
+                        let activity = self.activity.clone();
+                        std::thread::spawn(move || {
+                            let token = job.cancel.clone();
+                            let written = hwpcraft_formats::file_access::confine(
+                                roots.as_ref(),
+                                || -> Result<()> {
+                                    let _scope =
+                                        hwpcraft_formats::file_access::cancel_scope(move || {
+                                            token.is_cancelled()
+                                        });
+                                    let bytes = pdf.convert()?;
+                                    hwpcraft_formats::atomic_write(&path, &bytes)
+                                },
+                            );
+                            let _done = JobDone {
+                                activity: &activity,
+                                touch: true,
+                            };
+                            let reply = match written {
+                                _ if job.cancel.is_cancelled() => Err(cancelled()),
+                                Ok(()) => Ok(tools::result(info, false)),
+                                Err(error) => Ok(tool_error(&error)),
+                            };
+                            let _ = job.reply.send(reply);
+                        });
+                    }
+                    Err(error) => self.finish_pdf(job, Ok(tool_error(&error))),
+                }
+                None
+            }
+            // The user edited the document while pages were prepared.
+            Err(error) => {
+                self.finish_pdf(pending.job, Ok(tool_error(&error)));
+                None
+            }
+        }
+    }
+
+    fn finish_pdf(&self, job: Job, reply: Result<Value>) {
+        let _done = JobDone {
+            activity: &self.activity,
+            touch: true,
+        };
+        let _ = job.reply.send(reply);
+    }
+}
+
+/// The path of a request that exports the document as PDF (`save_document` or
+/// `execute file.save`/`file.save_as`/`file.pdf` to a `.pdf` path), if it is one.
+fn window_pdf_path(job: &Job) -> Option<std::path::PathBuf> {
+    let Operation::Call { tool, args } = &job.operation else {
+        return None;
+    };
+    let path = match tool.as_str() {
+        "save_document" => args.get("path"),
+        "execute"
+            if matches!(
+                args["command"].as_str(),
+                Some("file.save" | "file.save_as" | "file.pdf")
+            ) =>
+        {
+            args.get("params").and_then(|params| params.get("path"))
+        }
+        _ => None,
+    }?
+    .as_str()
+    .map(std::path::PathBuf::from)?;
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        .then_some(path)
+}
+
+/// A failed tool call, shaped as `tools::call` reports one.
+fn tool_error(error: &anyhow::Error) -> Value {
+    json!({"content":[{"type":"text","text":format!("{error:#}")}],"isError":true})
 }
 
 impl Drop for ExternalDocument {

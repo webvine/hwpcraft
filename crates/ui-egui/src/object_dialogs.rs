@@ -304,6 +304,10 @@ impl HwpApp {
                 self.open_form_editor();
                 return false;
             }
+            "form_properties" => {
+                self.open_form_properties(json!(address));
+                return false;
+            }
             "delete" => {
                 // The list stays open and shows the remaining objects.
                 self.run("object.delete", json!(address));
@@ -380,7 +384,11 @@ fn object_actions(kind: &str) -> &'static [(&'static str, &'static str)] {
             ("지우기", "delete"),
         ],
         "group" => &[("풀기", "ungroup"), ("지우기", "delete")],
-        "form" => &[("값 고치기", "form"), ("지우기", "delete")],
+        "form" => &[
+            ("속성", "form_properties"),
+            ("값 고치기", "form"),
+            ("지우기", "delete"),
+        ],
         "table" => &[("지우기", "delete")],
         _ => &[("내용 고치기", "edit"), ("지우기", "delete")],
     }

@@ -309,14 +309,14 @@ struct Outline {
 #[derive(Clone, Deserialize)]
 pub(crate) struct Heading {
     pub(crate) level: u8,
-    number: String,
+    pub(crate) number: String,
     pub(crate) title: String,
     pub(crate) page: u32,
     /// Where the heading is (the table's paragraph for a heading in a cell).
     #[serde(default)]
-    section: usize,
+    pub(crate) section: usize,
     #[serde(default)]
-    paragraph: usize,
+    pub(crate) paragraph: usize,
 }
 
 /// One paragraph of text: tabs and line breaks would change the table's shape.
@@ -859,7 +859,7 @@ impl Session {
                     .insert_hyperlink_native(&target, 0, end, super::cross_ref::SCAFFOLD_URI)
                     .map_err(err)?;
                 let command = format!("?{name};0;0;0;");
-                s.set_field_identity(block.section, entry, field_id, |f| {
+                s.set_field_identity(block.section, entry, None, field_id, |f| {
                     f.parameters = bookmark_link_parameters(&command);
                     f.command = command.clone();
                     f.hyperlink_format = None;

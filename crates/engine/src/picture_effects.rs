@@ -7,13 +7,10 @@
 
 use anyhow::{Result, anyhow, bail, ensure};
 use hwpcraft_doc::model::control::Control;
-use hwpcraft_doc::model::document::Document;
 use hwpcraft_doc::model::image::{
     EffectColor, EffectPoint, EffectRange, EffectRgb, PictureEffects, PictureGlow,
     PictureReflection, PictureShadow, PictureSoftEdge,
 };
-use hwpcraft_doc::model::paragraph::Paragraph;
-use hwpcraft_doc::model::shape::ShapeObject;
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
@@ -292,149 +289,27 @@ fn apply_request(effects: &mut PictureEffects, params: &Map<String, Value>) -> R
     Ok(())
 }
 
-pub const PICTURE_EFFECTS_REFUSED: &str = "그림 효과(그림자·네온·부드러운 가장자리·반사)는 아직 HWP(.hwp)로 저장할 수 없습니다. HWPX로 저장하거나, 효과를 빼고 저장하세요(MCP save_document dropPictureEffects:true, CLI --drop-picture-effects, 데스크톱 확인 창).";
-
-fn effect_count(e: &PictureEffects) -> usize {
-    usize::from(e.shadow.is_some())
-        + usize::from(e.glow.is_some())
-        + usize::from(e.soft_edge.is_some())
-        + usize::from(e.reflection.is_some())
-}
-
-/// Modelled effects on every picture (body, table cell, group, text box).
-/// Effects of pictures read from .hwp stay raw bytes and are not counted.
-pub(crate) fn count_picture_effects(document: &Document) -> usize {
-    fn paragraphs(list: &[Paragraph]) -> usize {
-        list.iter().flat_map(|p| &p.controls).map(control).sum()
-    }
-    fn shape(s: &ShapeObject) -> usize {
-        match s {
-            ShapeObject::Picture(p) => effect_count(&p.effects),
-            ShapeObject::Group(g) => g.children.iter().map(shape).sum(),
-            other => other
-                .drawing()
-                .and_then(|d| d.text_box.as_ref())
-                .map_or(0, |t| paragraphs(&t.paragraphs)),
-        }
-    }
-    fn control(c: &Control) -> usize {
-        match c {
-            Control::Picture(p) => effect_count(&p.effects),
-            Control::Table(t) => t
-                .cells
-                .iter()
-                .map(|cell| paragraphs(&cell.paragraphs))
-                .sum(),
-            Control::Shape(s) => shape(s),
-            _ => 0,
-        }
-    }
-    document
-        .sections
-        .iter()
-        .map(|section| paragraphs(&section.paragraphs))
-        .sum()
-}
-
-/// Remove every modelled picture effect; returns how many were removed.
-fn strip_picture_effects(document: &mut Document) -> usize {
-    fn take(e: &mut PictureEffects) -> usize {
-        let n = effect_count(e);
-        *e = PictureEffects::default();
-        n
-    }
-    fn paragraphs(list: &mut [Paragraph]) -> usize {
-        list.iter_mut()
-            .flat_map(|p| &mut p.controls)
-            .map(control)
-            .sum()
-    }
-    fn shape(s: &mut ShapeObject) -> usize {
-        match s {
-            ShapeObject::Picture(p) => take(&mut p.effects),
-            ShapeObject::Group(g) => g.children.iter_mut().map(shape).sum(),
-            other => other
-                .drawing_mut()
-                .and_then(|d| d.text_box.as_mut())
-                .map_or(0, |t| paragraphs(&mut t.paragraphs)),
-        }
-    }
-    fn control(c: &mut Control) -> usize {
-        match c {
-            Control::Picture(p) => take(&mut p.effects),
-            Control::Table(t) => t
-                .cells
-                .iter_mut()
-                .map(|cell| paragraphs(&mut cell.paragraphs))
-                .sum(),
-            Control::Shape(s) => shape(s),
-            _ => 0,
-        }
-    }
-    let mut total = 0;
-    for section in &mut document.sections {
-        let n = paragraphs(&mut section.paragraphs);
-        if n > 0 {
-            section.raw_stream = None;
-        }
-        total += n;
-    }
-    total
-}
-
-fn is_hwp5(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("hwp"))
-}
-
 impl Session {
-    /// How many picture effects a save to `path` would have to drop: HWP5
-    /// picture-effect fields are not written yet, HWPX keeps them.
-    pub fn picture_effects_blocking_save(&self, path: &Path) -> usize {
-        if is_hwp5(path) {
-            count_picture_effects(self.core.document())
-        } else {
-            0
-        }
+    /// How many picture effects a save to `path` would have to drop. None: HWPX and,
+    /// since RHWP patch 0054, HWP keep every effect. Kept for callers that ask first.
+    pub fn picture_effects_blocking_save(&self, _path: &Path) -> usize {
+        0
     }
 
-    /// Refuse an .hwp save that would silently drop picture effects.
-    pub(crate) fn refuse_picture_effects_save(&self, path: &Path) -> Result<()> {
-        if self.picture_effects_blocking_save(path) > 0 {
-            bail!(PICTURE_EFFECTS_REFUSED);
-        }
-        Ok(())
-    }
-
-    /// Save, first removing the picture effects an .hwp file cannot hold (one undo
-    /// step); returns how many were removed. A failed save puts them back.
+    /// A plain save that drops nothing (see [`Self::picture_effects_blocking_save`]);
+    /// returns 0. Kept for callers that asked to drop effects HWP could not hold.
     /// `accept_track_changes` merges tracked changes as `save_accepting_track_changes`.
     pub fn save_dropping_picture_effects(
         &mut self,
         path: &Path,
         accept_track_changes: bool,
     ) -> Result<usize> {
-        let save = |s: &mut Self| {
-            if accept_track_changes {
-                s.save_accepting_track_changes(path)
-            } else {
-                s.save(path)
-            }
-        };
-        if self.picture_effects_blocking_save(path) == 0 {
-            return save(self).map(|()| 0);
+        if accept_track_changes {
+            self.save_accepting_track_changes(path)?;
+        } else {
+            self.save(path)?;
         }
-        self.guard_protected()?;
-        let mut dropped = 0;
-        self.transaction(|s| {
-            dropped = strip_picture_effects(s.core.document_mut());
-            s.refresh_layout()
-        })?;
-        if let Err(e) = save(self) {
-            self.execute(crate::Command::Undo)?;
-            return Err(e);
-        }
-        Ok(dropped)
+        Ok(0)
     }
 
     fn picture_effects_at(&self, a: ObjectAddress) -> Result<&PictureEffects> {
@@ -457,6 +332,7 @@ impl Session {
         let mut effects = self.picture_effects_at(a)?.clone();
         apply_request(&mut effects, params)?;
         self.guard_protected()?;
+        self.guard_object_lock(a)?;
         self.transaction(|s| {
             let section = &mut s.core.document_mut().sections[a.section];
             section.raw_stream = None;

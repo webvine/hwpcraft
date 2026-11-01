@@ -273,10 +273,12 @@ fn shapes_of_every_kind_with_line_fill_rotation_and_textbox_paragraphs() -> anyh
         s.run("textbox.paragraphs", json!({"address":tb,"paragraphs":[]}))
             .is_err()
     );
+    // Tabs are text box text like body text (their width is laid out on save);
+    // other control characters are refused.
     assert!(
         s.run(
             "textbox.paragraphs",
-            json!({"address":tb,"paragraphs":["a\tb"]})
+            json!({"address":tb,"paragraphs":["a\u{7}b"]})
         )
         .is_err()
     );

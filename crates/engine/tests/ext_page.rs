@@ -320,6 +320,93 @@ fn view_marks_change_the_screen_but_not_the_document() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 머리말·꼬리말 날짜 필드: Hangul's 날짜 코드 typed in a header is the body's 문서 요약
+/// field ($createtime / $modifiedtime). It shows the document's time, is listed as a
+/// field, and stays a field through HWP and HWPX saves.
+#[test]
+fn a_header_date_field_shows_the_time_and_roundtrips() -> anyhow::Result<()> {
+    use hwpcraft_doc::model::control::FieldType;
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("본문".into()))?;
+    assert!(
+        s.run(
+            "page.header_footer.text",
+            json!({"header": true, "text": "", "fields": [{"offset": 0, "kind": "date_saved"}]}),
+        )
+        .is_err(),
+        "a document never saved has no save time"
+    );
+    let r = s.run(
+        "page.header_footer.text",
+        json!({"header": true, "text": "작성 쪽", "fields": [
+            {"offset": 3, "kind": "date_created"},
+            {"offset": 4, "kind": "page_number"}
+        ]}),
+    )?;
+    assert_eq!(r["text"], "작성 쪽");
+    assert_eq!(
+        r["fields"],
+        json!([{"offset": 3, "kind": "date_created"}, {"offset": 4, "kind": "page_number"}])
+    );
+    let shown = header_text(&s).unwrap_or_default();
+    assert!(
+        shown.starts_with("작성 ") && shown.contains("년 "),
+        "{shown:?}"
+    );
+    assert!(drawn(&s)?.contains("작성"), "the header is drawn");
+    let header_field = |s: &Session| -> Option<(String, FieldType)> {
+        s.core.document().sections[0]
+            .paragraphs
+            .iter()
+            .flat_map(|p| &p.controls)
+            .find_map(|c| match c {
+                Control::Header(h) => h.paragraphs.first(),
+                _ => None,
+            })
+            .and_then(|p| {
+                p.controls.iter().find_map(|c| match c {
+                    Control::Field(f) => Some((f.command.clone(), f.field_type)),
+                    _ => None,
+                })
+            })
+    };
+    assert_eq!(
+        header_field(&s),
+        Some(("$createtime".to_owned(), FieldType::Summary))
+    );
+    let temp = tempfile::tempdir()?;
+    for ext in ["hwp", "hwpx"] {
+        let path = temp.path().join(format!("hf-date.{ext}"));
+        s.save(&path)?;
+        let mut r = Session::new()?;
+        r.open(&path)?;
+        let v = r.run("page.header_footer.text.get", json!({"header": true}))?;
+        assert_eq!(v["text"], "작성 쪽", "{ext}");
+        let kinds: Vec<&str> = v["fields"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|f| f["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, ["date_created", "page_number"], "{ext}");
+        assert_eq!(
+            header_field(&r).map(|(command, _)| command).as_deref(),
+            Some("$createtime"),
+            "{ext}"
+        );
+    }
+    // Saved now: the save time can be shown too.
+    s.run(
+        "page.header_footer.text",
+        json!({"header": true, "text": "", "fields": [{"offset": 0, "kind": "date_saved"}]}),
+    )?;
+    assert_eq!(
+        header_field(&s).map(|(command, _)| command).as_deref(),
+        Some("$modifiedtime")
+    );
+    Ok(())
+}
+
 #[test]
 fn header_footer_text_with_fields_roundtrips_and_undoes() -> anyhow::Result<()> {
     let mut s = Session::new()?;
@@ -967,20 +1054,21 @@ fn master_pages_that_would_lose_content_are_refused() -> anyhow::Result<()> {
     use hwpcraft_doc::model::header_footer::{HeaderFooterApply, MasterPage};
     let mut s = Session::new()?;
     assert!(
-        s.run("page.master.set", json!({"applyTo": "last", "text": "x"}))
+        s.run("page.master.set", json!({"applyTo": "first", "text": "x"}))
             .is_err()
     );
     assert!(
         s.run("page.master.set", json!({"text": "a\u{1}b"}))
             .is_err()
     );
-    // A section that already has a last-page master page stays as it is.
+    // A section that already has an arbitrary-page (임의 쪽) master page stays as it is.
     s.core.document_mut().sections[0]
         .section_def
         .master_pages
         .push(MasterPage {
             apply_to: HeaderFooterApply::Both,
             is_extension: true,
+            ext_flags: 0x07,
             ..Default::default()
         });
     let list = s.run("page.master.list", json!({}))?;
@@ -988,12 +1076,79 @@ fn master_pages_that_would_lose_content_are_refused() -> anyhow::Result<()> {
     assert!(
         list["reason"]
             .as_str()
-            .is_some_and(|r| r.contains("마지막"))
+            .is_some_and(|r| r.contains("임의 쪽"))
     );
     assert!(s.run("page.master.set", json!({"text": "x"})).is_err());
     assert_eq!(
         s.core.document().sections[0].section_def.master_pages.len(),
         1
+    );
+    Ok(())
+}
+
+/// 마지막 쪽 바탕쪽: drawn on the section's last page in place of the 양쪽 one, kept
+/// through HWP and HWPX saves, and deleted on its own.
+#[test]
+fn a_last_page_master_page_replaces_the_base_one_on_the_last_page() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("일".into()))?;
+    s.run("insert.page_break", json!({}))?;
+    s.execute(Command::Insert("이".into()))?;
+    s.run("page.master.set", json!({"text": "양쪽글"}))?;
+    let v = s.run(
+        "page.master.set",
+        json!({"applyTo": "last", "text": "끝쪽글"}),
+    )?;
+    assert_eq!(
+        (v["applyTo"].as_str(), v["exists"].as_bool()),
+        (Some("last"), Some(true))
+    );
+    let page = |s: &Session, i: u32| -> anyhow::Result<String> {
+        let svg = s
+            .core
+            .render_page_svg_native(i)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(svg
+            .split("</text>")
+            .filter_map(|part| part.rsplit('>').next())
+            .collect())
+    };
+    let check = |s: &Session, label: &str| -> anyhow::Result<()> {
+        let (first, last) = (page(s, 0)?, page(s, 1)?);
+        assert!(
+            first.contains("양쪽글") && !first.contains("끝쪽글"),
+            "{label} page 1: {first}"
+        );
+        assert!(
+            last.contains("끝쪽글") && !last.contains("양쪽글"),
+            "{label} page 2: {last}"
+        );
+        Ok(())
+    };
+    check(&s, "edited")?;
+    let list = s.run("page.master.list", json!({}))?;
+    assert_eq!(
+        list["editable"], true,
+        "a last-page master page stays editable"
+    );
+    let temp = tempfile::tempdir()?;
+    for ext in ["hwp", "hwpx"] {
+        let path = temp.path().join(format!("last.{ext}"));
+        s.save(&path)?;
+        let mut r = Session::new()?;
+        r.open(&path)?;
+        let back = r.run("page.master.get", json!({"applyTo": "last"}))?;
+        assert_eq!(back["text"], "끝쪽글", "{ext}");
+        check(&r, ext)?;
+    }
+    s.run("page.master.delete", json!({"applyTo": "last"}))?;
+    assert_eq!(
+        s.run("page.master.get", json!({"applyTo": "last"}))?["exists"],
+        false
+    );
+    assert!(
+        page(&s, 1)?.contains("양쪽글"),
+        "the base page is back on the last page"
     );
     Ok(())
 }
@@ -1203,6 +1358,63 @@ fn a_label_sheet_is_one_borderless_table_on_a_new_a4_page() -> anyhow::Result<()
     Ok(())
 }
 
+/// 라벨 새 쪽 추가하기: a second page with an empty copy of the label table, in one undo
+/// step; a document without a table is refused.
+#[test]
+fn a_label_page_is_added_with_the_same_empty_table() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    assert!(
+        s.run("page.label.add_page", json!({})).is_err(),
+        "no label table"
+    );
+    s.run(
+        "page.label",
+        json!({"rows": 8, "columns": 2, "labelWidthMm": 99.1, "labelHeightMm": 34.0, "gapXMm": 2.5}),
+    )?;
+    s.execute(Command::Insert("첫 라벨".into()))?;
+    let v = s.run("page.label.add_page", json!({}))?;
+    assert_eq!(v["pages"].as_u64(), Some(2));
+    // (rows, columns, first-row widths in 1/72 inch, all cells empty) per table.
+    let tables = |s: &Session| -> Vec<(u16, u16, Vec<u32>, bool)> {
+        s.core
+            .document()
+            .sections
+            .iter()
+            .flat_map(|sec| &sec.paragraphs)
+            .flat_map(|p| &p.controls)
+            .filter_map(|c| match c {
+                Control::Table(t) => Some((
+                    t.row_count,
+                    t.col_count,
+                    t.cells
+                        .iter()
+                        .filter(|c| c.row == 0)
+                        .map(|c| c.width / 100)
+                        .collect(),
+                    t.cells
+                        .iter()
+                        .all(|c| c.paragraphs.iter().all(|p| p.text.is_empty())),
+                )),
+                _ => None,
+            })
+            .collect()
+    };
+    let all = tables(&s);
+    assert_eq!(all.len(), 2);
+    let (a, b) = (&all[0], &all[1]);
+    assert_eq!(
+        (b.0, b.1, &b.2),
+        (a.0, a.1, &a.2),
+        "same rows, columns and widths"
+    );
+    assert!(!a.3, "the first page keeps its text");
+    assert!(b.3, "the new labels are empty");
+    s.execute(Command::Undo)?;
+    assert_eq!(tables(&s).len(), 1, "one undo step");
+    assert_eq!(s.page_count()?, 1);
+    Ok(())
+}
+
 #[test]
 fn a_column_definition_break_starts_new_columns_and_roundtrips() -> anyhow::Result<()> {
     use hwpcraft_doc::model::paragraph::ColumnBreakType;
@@ -1295,7 +1507,8 @@ fn a_section_break_starts_a_section_with_the_same_page_setup() -> anyhow::Result
             (b.page_def.width, b.page_def.height, b.page_def.landscape),
             (a.page_def.width, a.page_def.height, a.page_def.landscape)
         );
-        assert_eq!(b.master_pages.len(), 1, "master page carried on");
+        // Hangul leaves the new section without master pages; the first one's carry on.
+        assert!(b.master_pages.is_empty(), "no copied master page");
         let head = &doc.sections[1].paragraphs[0];
         assert_eq!(head.column_type, ColumnBreakType::Section);
         assert!(matches!(
@@ -1354,6 +1567,67 @@ fn a_section_break_starts_a_section_with_the_same_page_setup() -> anyhow::Result
     Ok(())
 }
 
+/// 구역 나누기 leaves the new section without master pages, as Hangul does: the first
+/// section's master page carries on, so changing it changes the second section's pages
+/// too, also after an HWP or HWPX save.
+#[test]
+fn a_new_section_carries_the_master_page_on() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.run("page.master.set", json!({"text": "옛바탕"}))?;
+    s.execute(Command::Insert("앞\n뒤".into()))?;
+    s.select(
+        hwpcraft_doc::Cursor {
+            section: 0,
+            paragraph: 1,
+            offset: 0,
+            ..s.cursor
+        },
+        false,
+    )?;
+    s.run("page.section_break", json!({}))?;
+    assert!(
+        s.core.document().sections[1]
+            .section_def
+            .master_pages
+            .is_empty()
+    );
+    s.select(hwpcraft_doc::Cursor::default(), false)?;
+    s.run("page.master.set", json!({"text": "새바탕"}))?;
+    let last_page = |s: &Session| -> anyhow::Result<String> {
+        let n = s.page_count()?;
+        let svg = s
+            .core
+            .render_page_svg_native(n - 1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(svg
+            .split("</text>")
+            .filter_map(|part| part.rsplit('>').next())
+            .collect())
+    };
+    let shown = last_page(&s)?;
+    assert!(
+        shown.contains("새바탕") && !shown.contains("옛바탕"),
+        "{shown}"
+    );
+    let temp = tempfile::tempdir()?;
+    for ext in ["hwp", "hwpx"] {
+        let path = temp.path().join(format!("carry.{ext}"));
+        s.save(&path)?;
+        let mut r = Session::new()?;
+        r.open(&path)?;
+        assert_eq!(r.core.document().sections.len(), 2, "{ext}");
+        assert!(
+            r.core.document().sections[1]
+                .section_def
+                .master_pages
+                .is_empty(),
+            "{ext}"
+        );
+        assert!(last_page(&r)?.contains("새바탕"), "{ext}");
+    }
+    Ok(())
+}
+
 #[test]
 fn backspace_at_a_section_start_joins_the_sections() -> anyhow::Result<()> {
     use hwpcraft_doc::model::paragraph::ColumnBreakType;
@@ -1375,7 +1649,7 @@ fn backspace_at_a_section_start_joins_the_sections() -> anyhow::Result<()> {
         let doc = s.core.document();
         assert_eq!(doc.sections.len(), 2);
         assert!(doc.sections[1].section_def.page_def.landscape);
-        assert_eq!(doc.sections[1].section_def.master_pages.len(), 1);
+        assert!(doc.sections[1].section_def.master_pages.is_empty());
     };
     split(&s);
     let joined = |s: &Session| -> anyhow::Result<()> {
@@ -1384,7 +1658,7 @@ fn backspace_at_a_section_start_joins_the_sections() -> anyhow::Result<()> {
         let sec = &doc.sections[0];
         let texts: Vec<&str> = sec.paragraphs.iter().map(|p| p.text.as_str()).collect();
         assert_eq!(texts, ["앞 문단", "뒤 문단"]);
-        // The first section's definition wins; the copied master page of the second goes.
+        // The first section's definition wins, with its master page.
         assert!(!sec.section_def.page_def.landscape);
         assert_eq!(sec.section_def.master_pages.len(), 1);
         let second = &sec.paragraphs[1];
@@ -1481,5 +1755,332 @@ fn a_page_inside_a_long_paragraph_is_copied_and_deleted_by_its_text() -> anyhow:
     assert_eq!((s.cursor.paragraph, s.cursor.offset), (0, p2));
     s.execute(Command::Undo)?;
     assert_eq!(s.core.document().sections[0].paragraphs[0].text, words);
+    Ok(())
+}
+
+/// A three-page section with a 양쪽 master page and an 임의 쪽 one on page 2.
+fn optional_master_session() -> anyhow::Result<Session> {
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("일".into()))?;
+    s.run("insert.page_break", json!({}))?;
+    s.execute(Command::Insert("이".into()))?;
+    s.run("insert.page_break", json!({}))?;
+    s.execute(Command::Insert("삼".into()))?;
+    s.run("page.master.set", json!({"text": "양쪽글"}))?;
+    let v = s.run(
+        "page.master.set",
+        json!({"applyTo": "optional", "page": 2, "text": "둘째쪽글"}),
+    )?;
+    assert_eq!(
+        (
+            v["applyTo"].as_str(),
+            v["page"].as_u64(),
+            v["exists"].as_bool()
+        ),
+        (Some("optional"), Some(2), Some(true))
+    );
+    Ok(s)
+}
+
+/// 임의 쪽 바탕쪽: made for one page of the section, kept by HWPX (pageNumber) and
+/// refused for .hwp, which has no place for the page, with the reason and the way out.
+#[test]
+fn an_optional_master_page_keeps_its_page_in_hwpx_and_refuses_hwp() -> anyhow::Result<()> {
+    let mut s = optional_master_session()?;
+    assert!(
+        s.run(
+            "page.master.set",
+            json!({"applyTo": "optional", "text": "x"})
+        )
+        .is_err(),
+        "optional needs a page"
+    );
+    let list = s.run("page.master.list", json!({}))?;
+    assert_eq!(list["editable"], true);
+    let optional: Vec<&serde_json::Value> = list["masterPages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["kind"] == "optional")
+        .collect();
+    assert_eq!(optional.len(), 1);
+    assert_eq!(optional[0]["page"], 2);
+    let temp = tempfile::tempdir()?;
+    let hwp = temp.path().join("optional.hwp");
+    let refused = s.save(&hwp).expect_err("an .hwp save is refused");
+    let why = refused.to_string();
+    assert!(
+        why.contains("임의 쪽") && why.contains(".hwpx") && why.contains("지우고"),
+        "{why}"
+    );
+    assert!(!hwp.exists(), "nothing written");
+    let hwpx = temp.path().join("optional.hwpx");
+    s.save(&hwpx)?;
+    let mut r = Session::new()?;
+    r.open(&hwpx)?;
+    let back = r.run("page.master.get", json!({"applyTo": "optional", "page": 2}))?;
+    assert_eq!(back["text"], "둘째쪽글");
+    assert_eq!(
+        r.run("page.master.get", json!({"applyTo": "optional", "page": 3}))?["exists"],
+        false
+    );
+    // Without it the .hwp save goes through.
+    s.run(
+        "page.master.delete",
+        json!({"applyTo": "optional", "page": 2}),
+    )?;
+    s.save(&hwp)?;
+    assert!(hwp.exists());
+    Ok(())
+}
+
+/// The 임의 쪽 master page is drawn on its page in place of the 양쪽 one, and not on
+/// the section's last page.
+#[test]
+fn an_optional_master_page_is_drawn_on_its_page() -> anyhow::Result<()> {
+    let s = optional_master_session()?;
+    let page = |s: &Session, i: u32| -> anyhow::Result<String> {
+        let svg = s
+            .core
+            .render_page_svg_native(i)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(svg
+            .split("</text>")
+            .filter_map(|part| part.rsplit('>').next())
+            .collect())
+    };
+    let drawn = |s: &Session, label: &str| -> anyhow::Result<()> {
+        let pages = [page(s, 0)?, page(s, 1)?, page(s, 2)?];
+        assert!(
+            pages[0].contains("양쪽글") && !pages[0].contains("둘째쪽글"),
+            "{label} 1: {}",
+            pages[0]
+        );
+        assert!(
+            pages[1].contains("둘째쪽글") && !pages[1].contains("양쪽글"),
+            "{label} 2: {}",
+            pages[1]
+        );
+        assert!(
+            pages[2].contains("양쪽글") && !pages[2].contains("둘째쪽글"),
+            "{label} 3: {}",
+            pages[2]
+        );
+        Ok(())
+    };
+    drawn(&s, "edited")?;
+    let temp = tempfile::tempdir()?;
+    let hwpx = temp.path().join("optional.hwpx");
+    let mut s = s;
+    s.save(&hwpx)?;
+    let mut r = Session::new()?;
+    r.open(&hwpx)?;
+    drawn(&r, "hwpx")?;
+    Ok(())
+}
+
+/// 글자 방향: 지금 구역을 세로쓰기(영문 눕힘·세움)로 바꾸고 한 번에 되돌린다.
+#[test]
+fn text_direction_sets_the_section_and_undoes() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    assert_eq!(
+        s.run("page.section.get", json!({}))?["textDirection"],
+        "horizontal"
+    );
+    for direction in ["vertical", "vertical_all"] {
+        let v = s.run("page.text_direction", json!({"direction": direction}))?;
+        assert_eq!(v["direction"], direction);
+        assert_eq!(
+            s.run("page.section.get", json!({}))?["textDirection"],
+            direction
+        );
+    }
+    assert!(
+        s.run("page.text_direction", json!({"direction": "diagonal"}))
+            .is_err()
+    );
+    s.run("edit.undo", json!({}))?;
+    assert_eq!(
+        s.run("page.section.get", json!({}))?["textDirection"],
+        "vertical"
+    );
+    Ok(())
+}
+
+/// 세로쓰기 구역이 HWP와 HWPX 저장을 지난다(영문 세움 포함).
+#[test]
+fn text_direction_survives_hwp_and_hwpx() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    for direction in ["vertical", "vertical_all"] {
+        let mut s = Session::new()?;
+        s.run("page.text_direction", json!({"direction": direction}))?;
+        for ext in ["hwp", "hwpx"] {
+            let path = temp.path().join(format!("{direction}.{ext}"));
+            s.save(&path)?;
+            let mut r = Session::new()?;
+            r.open(&path)?;
+            assert_eq!(
+                r.run("page.section.get", json!({}))?["textDirection"],
+                direction,
+                "{ext}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 원고지: 새 문서의 구역에 칸·줄 격자와 원고지 정서법을 켜고, 칸 표를 양쪽 바탕쪽에
+/// 두며, fill이면 지금 문서의 글을 옮긴다. 저장하지 않은 변경은 force 없이 버리지 않는다.
+#[test]
+fn manuscript_makes_a_grid_section_with_its_paper() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("옮길 글".into()))?;
+    assert!(
+        s.run("page.manuscript", json!({})).is_err(),
+        "unsaved changes are kept"
+    );
+    assert!(
+        s.run("page.manuscript", json!({"chars": 300, "force": true}))
+            .is_err()
+    );
+    let v = s.run(
+        "page.manuscript",
+        json!({"chars": 400, "fill": true, "force": true}),
+    )?;
+    assert_eq!(
+        (v["columns"].as_u64(), v["rows"].as_u64()),
+        (Some(20), Some(20))
+    );
+    assert!(!s.dirty(), "a new document");
+    let section = s.run("page.section.get", json!({}))?;
+    assert_eq!(section["manuscript"], true);
+    assert!(section["charGrid"].as_i64().unwrap_or(0) > 0);
+    assert!(section["lineGrid"].as_i64() > section["charGrid"].as_i64());
+    let sec = &s.core.document().sections[0];
+    let paper = sec.section_def.master_pages.first().and_then(|m| {
+        m.paragraphs
+            .iter()
+            .flat_map(|p| &p.controls)
+            .find_map(|c| match c {
+                hwpcraft_doc::model::control::Control::Table(t) => Some(t),
+                _ => None,
+            })
+    });
+    let paper = paper.ok_or_else(|| anyhow::anyhow!("no paper table"))?;
+    assert_eq!((paper.row_count, paper.col_count), (40, 20));
+    assert!(
+        sec.paragraphs.iter().any(|p| p.text.contains("옮길 글")),
+        "fill carried the text"
+    );
+    // 200자: A4 가로, 20칸 10줄.
+    let v = s.run("page.manuscript", json!({"chars": 200, "force": true}))?;
+    assert_eq!(v["rows"], 10);
+    let pd = &s.core.document().sections[0].section_def.page_def;
+    assert!(pd.width > pd.height, "landscape");
+    Ok(())
+}
+
+/// 원고지 구역은 HWP·HWPX 저장 뒤에도 격자와 원고지 정서법을 지닌다.
+#[test]
+fn manuscript_survives_hwp_and_hwpx() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut s = Session::new()?;
+    s.run("page.manuscript", json!({}))?;
+    let before = s.run("page.section.get", json!({}))?;
+    for ext in ["hwp", "hwpx"] {
+        let path = temp.path().join(format!("manuscript.{ext}"));
+        s.save(&path)?;
+        let mut r = Session::new()?;
+        r.open(&path)?;
+        let back = r.run("page.section.get", json!({}))?;
+        for key in ["manuscript", "charGrid", "lineGrid"] {
+            assert_eq!(back[key], before[key], "{ext} {key}");
+        }
+    }
+    Ok(())
+}
+
+/// 원고지에 쓴 글은 칸 수로 줄을 나눈다(한글 2024 실측: 반각 영문·숫자 두 자 한 칸,
+/// 줄 끝 공백은 매달림 — 25·21·3 글자).
+#[test]
+fn manuscript_text_breaks_by_cells() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.run("page.manuscript", json!({}))?;
+    s.execute(Command::Insert(
+        "원고지에 글을 씁니다. Hello 2026년 10월, 칸마다 한 글자씩 들어가야 합니다.".into(),
+    ))?;
+    let para = s.core.document().sections[0]
+        .paragraphs
+        .iter()
+        .find(|p| p.text.starts_with("원고지"))
+        .ok_or_else(|| anyhow::anyhow!("no text"))?;
+    let starts: Vec<usize> = para
+        .line_segs
+        .iter()
+        .map(|line| {
+            para.char_offsets
+                .iter()
+                .position(|&offset| offset >= line.text_start)
+                .unwrap_or(0)
+        })
+        .collect();
+    assert_eq!(starts, [0, 25, 46]);
+    Ok(())
+}
+
+/// 세로쓰기 구역: 캐럿이 열을 가로지르고, ↑↓는 열 안 글자를, ←→는 왼쪽·오른쪽 열로 간다.
+#[test]
+fn vertical_section_arrows_follow_the_columns() -> anyhow::Result<()> {
+    use hwpcraft_engine::{Cursor, Motion};
+    let mut s = Session::new()?;
+    s.run("page.text_direction", json!({"direction": "vertical"}))?;
+    s.execute(Command::Insert("가".repeat(60)))?;
+    let start = Cursor {
+        section: 0,
+        paragraph: 0,
+        offset: 0,
+        cell: None,
+    };
+    s.select(start, false)?;
+    assert_eq!(s.caret()?["vertical"], true);
+    s.move_caret(Motion::Down, false)?;
+    assert_eq!(s.cursor.offset, 1, "down: the next character");
+    s.move_caret(Motion::Left, false)?;
+    assert_eq!(s.cursor.offset, 59, "left: the next column, same place");
+    s.move_caret(Motion::Right, false)?;
+    assert_eq!(s.cursor.offset, 1, "right: back");
+    s.move_caret(Motion::Up, false)?;
+    assert_eq!(s.cursor.offset, 0);
+    Ok(())
+}
+
+/// 세로쓰기 구역의 가운데·오른쪽 정렬 문단은 열 가운데·아래 끝에서 시작하고, 캐럿도 그 글자에
+/// 섭니다(RHWP 0099).
+#[test]
+fn vertical_section_alignment_moves_the_caret_down_the_column() -> anyhow::Result<()> {
+    use hwpcraft_engine::Cursor;
+    let mut s = Session::new()?;
+    s.run("page.text_direction", json!({"direction": "vertical"}))?;
+    s.execute(Command::Insert("가나다".into()))?;
+    let start = Cursor {
+        section: 0,
+        paragraph: 0,
+        offset: 0,
+        cell: None,
+    };
+    let caret_y = |s: &mut Session| -> anyhow::Result<f64> {
+        s.select(start, false)?;
+        let caret = s.caret()?;
+        caret["y"]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("no caret y: {caret}"))
+    };
+    let top = caret_y(&mut s)?;
+    s.run("format.paragraph", json!({"alignment": "center"}))?;
+    let centred = caret_y(&mut s)?;
+    s.run("format.paragraph", json!({"alignment": "right"}))?;
+    let right = caret_y(&mut s)?;
+    assert!(centred > top + 300.0, "{top} {centred}");
+    assert!(right > centred + 300.0, "{centred} {right}");
     Ok(())
 }

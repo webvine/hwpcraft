@@ -50,7 +50,7 @@ New-Item -ItemType Directory -Force -Path $Stage, (Join-Path $Stage 'samples') |
 foreach ($name in @('hwpcraft.exe','hwpcraft-cli.exe')) {
     Copy-Item -LiteralPath (Join-Path $Target "release/$name") -Destination $Stage
 }
-foreach ($name in @('README.md','LICENSE','THIRD-PARTY-NOTICES.txt','THIRD-PARTY-DEPENDENCIES.md','VERSION')) {
+foreach ($name in @('README.md','README.en.md','LICENSE','THIRD-PARTY-NOTICES.txt','THIRD-PARTY-DEPENDENCIES.md','VERSION')) {
     Copy-Item -LiteralPath (Join-Path $Project $name) -Destination $Stage
 }
 Get-ChildItem -LiteralPath (Join-Path $Project 'assets/licenses') -Filter '*.txt' | Copy-Item -Destination $Stage

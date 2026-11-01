@@ -55,6 +55,14 @@ pub enum ContextStep {
         shape_path: Vec<usize>,
         paragraph: usize,
     },
+    /// 바탕쪽, only as the first step: `control` is the section-definition control of
+    /// the addressed paragraph and `master` indexes the section's master pages in
+    /// `page.master.list` order.
+    MasterPage {
+        control: usize,
+        master: usize,
+        paragraph: usize,
+    },
 }
 
 impl ContextStep {
@@ -65,7 +73,8 @@ impl ContextStep {
             | Self::Footer { control, .. }
             | Self::Footnote { control, .. }
             | Self::Endnote { control, .. }
-            | Self::TextBox { control, .. } => *control,
+            | Self::TextBox { control, .. }
+            | Self::MasterPage { control, .. } => *control,
         }
     }
     pub(crate) fn paragraph(&self) -> usize {
@@ -75,7 +84,8 @@ impl ContextStep {
             | Self::Footer { paragraph, .. }
             | Self::Footnote { paragraph, .. }
             | Self::Endnote { paragraph, .. }
-            | Self::TextBox { paragraph, .. } => *paragraph,
+            | Self::TextBox { paragraph, .. }
+            | Self::MasterPage { paragraph, .. } => *paragraph,
         }
     }
     fn set_paragraph(&mut self, index: usize) {
@@ -85,7 +95,8 @@ impl ContextStep {
             | Self::Footer { paragraph, .. }
             | Self::Footnote { paragraph, .. }
             | Self::Endnote { paragraph, .. }
-            | Self::TextBox { paragraph, .. } => *paragraph = index,
+            | Self::TextBox { paragraph, .. }
+            | Self::MasterPage { paragraph, .. } => *paragraph = index,
         }
     }
     fn kind(&self) -> &'static str {
@@ -96,6 +107,7 @@ impl ContextStep {
             Self::Footnote { .. } => "footnote",
             Self::Endnote { .. } => "endnote",
             Self::TextBox { .. } => "textbox",
+            Self::MasterPage { .. } => "master_page",
         }
     }
 }
@@ -188,7 +200,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "context.v2.list",
-        "start, limit 1..1000, include(선택 종류: body/table_cell/header/footer/textbox/footnote/endnote). 종류가 붙은 버전 2 주소와 generation을 돌려줍니다.",
+        "start, limit 1..1000, include(선택 종류: body/table_cell/header/footer/textbox/footnote/endnote/master_page). 종류가 붙은 버전 2 주소와 generation을 돌려줍니다. 바탕쪽 문단과 그 안의 표 셀·글상자는 include에 master_page가 있을 때만 나옵니다(주소 path 첫 단계 {kind:master_page, control, master, paragraph}).",
         r#"{"limit":100}"#,
     ),
     (
@@ -341,7 +353,7 @@ fn resolve<'a>(doc: &'a Document, address: &ContextAddress) -> Result<Resolved<'
         readonly: vec![],
     };
     let mut index = address.paragraph;
-    for step in &address.path {
+    for (depth, step) in address.path.iter().enumerate() {
         let para = result
             .paragraphs
             .get(index)
@@ -351,6 +363,26 @@ fn resolve<'a>(doc: &'a Document, address: &ContextAddress) -> Result<Resolved<'
             .get(step.control())
             .ok_or_else(|| anyhow!("문맥 컨트롤이 없습니다."))?;
         result.paragraphs = match (step, control) {
+            // The section's own copy is the one drawn and saved (`sync_master_pages`).
+            (ContextStep::MasterPage { master, .. }, Control::SectionDef(_)) if depth == 0 => {
+                let master = section
+                    .section_def
+                    .master_pages
+                    .get(*master)
+                    .ok_or_else(|| anyhow!("바탕쪽 주소가 범위를 벗어났습니다."))?;
+                if crate::ext_page::master_edit_block(section).is_some() {
+                    result.readonly.push("master_page_not_editable");
+                }
+                if master.text_direction != 0 {
+                    result.readonly.push("vertical_master_page_not_validated");
+                }
+                result.width = if master.text_width > 0 {
+                    master.text_width
+                } else {
+                    body
+                };
+                &master.paragraphs
+            }
             (ContextStep::TableCell { cell, .. }, Control::Table(table)) => {
                 let cell = table
                     .cells
@@ -504,7 +536,40 @@ fn container_mut<'a>(
         .sections
         .get_mut(address.section)
         .ok_or_else(|| anyhow!("구역이 없습니다."))?;
+    if let Some((
+        ContextStep::MasterPage {
+            control,
+            master,
+            paragraph,
+        },
+        rest,
+    )) = address.path.split_first()
+    {
+        if !matches!(
+            section
+                .paragraphs
+                .get(address.paragraph)
+                .and_then(|p| p.controls.get(*control)),
+            Some(Control::SectionDef(_))
+        ) {
+            bail!("바탕쪽 주소의 구역 정의 컨트롤이 없습니다.");
+        }
+        let master = section
+            .section_def
+            .master_pages
+            .get_mut(*master)
+            .ok_or_else(|| anyhow!("바탕쪽이 없습니다."))?;
+        return descend(&mut master.paragraphs, *paragraph, rest);
+    }
     descend(&mut section.paragraphs, address.paragraph, &address.path)
+}
+/// After `container_mut` wrote into a master page, the rest of the section follows.
+fn master_written(doc: &mut Document, address: &ContextAddress) {
+    if let Some(ContextStep::MasterPage { .. }) = address.path.first()
+        && let Some(section) = doc.sections.get_mut(address.section)
+    {
+        crate::master_objects::sync_master_pages(section);
+    }
 }
 impl Session {
     pub(crate) fn run_context_v2_ext(&mut self, id: &str, params: &Value) -> Option<Result<Value>> {
@@ -578,6 +643,7 @@ impl Session {
             para.invalidate_layout_inputs();
         }
         *container_mut(self.core.document_mut(), address)? = paragraphs;
+        master_written(self.core.document_mut(), address);
         self.core.document_mut().doc_info = projection.document().doc_info.clone();
         self.core.document_mut().sections[address.section].raw_stream = None;
         self.core.set_document(self.core.document().clone());
@@ -685,6 +751,19 @@ impl Session {
             .get(address.index())
             .ok_or_else(|| anyhow!("문맥 문단 주소가 범위를 벗어났습니다."))
     }
+    /// The paragraph at a context address, to change in place for a change that is not a
+    /// layout input or is put back before the next layout (tab widths written only while
+    /// saving): snapshot and typeset reuse stay on (RHWP 0055).
+    pub(crate) fn context_v2_paragraph_mut_keeping_layout(
+        &mut self,
+        address: &ContextAddress,
+    ) -> Result<&mut Paragraph> {
+        check_address(address)?;
+        let index = address.index();
+        container_mut(self.core.document_mut_keeping_layout(), address)?
+            .get_mut(index)
+            .ok_or_else(|| anyhow!("문맥 문단 주소가 범위를 벗어났습니다."))
+    }
     /// Replace each scalar range with `text` (모두 바꾸기 across contexts). Each
     /// container is projected once, with only its own section, and edited from its
     /// last range back; the document is laid out once at the end. A projection of the
@@ -762,6 +841,7 @@ impl Session {
             let doc_info = projection.document().doc_info.clone();
             let document = self.core.document_mut();
             *container_mut(document, &key)? = paragraphs;
+            master_written(document, &key);
             document.doc_info = doc_info;
             document.sections[key.section].raw_stream = None;
         }
@@ -781,6 +861,7 @@ impl Session {
                 "textbox",
                 "footnote",
                 "endnote",
+                "master_page",
             ]
             .contains(&kind.as_str())
             {
@@ -827,6 +908,25 @@ impl Session {
                     Control::Header(value) => {
                         for paragraph in 0..value.paragraphs.len() {
                             children.push(ContextStep::Header { control, paragraph });
+                        }
+                    }
+                    // Master pages only when asked for: find and replace over every
+                    // kind (`include` empty) leave them alone, as Hangul does.
+                    Control::SectionDef(_)
+                        if address.path.is_empty()
+                            && include.iter().any(|kind| kind == "master_page") =>
+                    {
+                        let masters = &session.core.document().sections[address.section]
+                            .section_def
+                            .master_pages;
+                        for (master, value) in masters.iter().enumerate() {
+                            for paragraph in 0..value.paragraphs.len() {
+                                children.push(ContextStep::MasterPage {
+                                    control,
+                                    master,
+                                    paragraph,
+                                });
+                            }
                         }
                     }
                     Control::Footer(value) => {

@@ -1,0 +1,95 @@
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 528b569..d30db13 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -979,13 +979,24 @@ fn assign_master_pages_for_section(
+         };
+         page.active_master_page = selected;
+ 
+-        if is_last && !ext_mp_indices.is_empty() {
+-            let replace_exts: Vec<usize> = ext_mp_indices
++        // 임의 쪽 바탕쪽은 HWPX pageNumber가 가리키는 구역 안 n번째 쪽에 쓴다(한글: exam_kor.hwpx
++        // pageNumber=4 가 셋째 구역의 넷째 쪽에 보임). 마지막 쪽 바탕쪽과 번호 없는 임의 쪽
++        // 바탕쪽(HWP5)은 그대로 구역 마지막 쪽에 쓴다(HwpCraft 패치 0081).
++        let page_exts: Vec<usize> = ext_mp_indices
++            .iter()
++            .copied()
++            .filter(|&i| match optional_master_page_number(&mps[i]) {
++                Some(n) => n == page_idx_in_section + 1,
++                None => is_last,
++            })
++            .collect();
++        if !page_exts.is_empty() {
++            let replace_exts: Vec<usize> = page_exts
+                 .iter()
+                 .filter(|&&i| !mps[i].overlap || mps[i].replace_base)
+                 .copied()
+                 .collect();
+-            let overlap_exts: Vec<usize> = ext_mp_indices
++            let overlap_exts: Vec<usize> = page_exts
+                 .iter()
+                 .filter(|&&i| mps[i].overlap && !mps[i].replace_base)
+                 .copied()
+@@ -1033,6 +1044,20 @@ fn assign_master_pages_for_section(
+     }
+ }
+ 
++/// 임의 쪽 바탕쪽(확장 플래그 0x04)이 적용될 구역 안 쪽 순서(1부터). HWPX `pageNumber`만
++/// 담고, HWP5 바탕쪽 목록 머리에는 그 자리가 없다.
++fn optional_master_page_number(
++    master_page: &crate::model::header_footer::MasterPage,
++) -> Option<usize> {
++    if master_page.ext_flags & 0x04 == 0 {
++        return None;
++    }
++    master_page
++        .hwpx_page_number
++        .filter(|&n| n > 0)
++        .map(usize::from)
++}
++
+ fn update_master_page_carry_from_section(
+     section_index: usize,
+     section: &Section,
+@@ -11360,3 +11385,41 @@ fn document_end_endnote_signature(
+     });
+     (signature, with_objects)
+ }
++
++#[cfg(test)]
++mod optional_master_page_tests {
++    use crate::document_core::DocumentCore;
++    use crate::model::header_footer::{HeaderFooterApply, MasterPage};
++
++    /// 임의 쪽 바탕쪽은 pageNumber 번째 쪽에만 쓰고, 마지막 쪽에는 쓰지 않는다(HwpCraft 패치 0081).
++    #[test]
++    fn an_optional_master_page_goes_on_its_numbered_page() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        core.insert_page_break_native(0, 0, 0).unwrap();
++        core.insert_page_break_native(0, 1, 0).unwrap();
++        let mut doc = core.document().clone();
++        doc.sections[0].section_def.master_pages = vec![
++            MasterPage {
++                apply_to: HeaderFooterApply::Both,
++                ..Default::default()
++            },
++            MasterPage {
++                apply_to: HeaderFooterApply::Both,
++                is_extension: true,
++                overlap: true,
++                replace_base: true,
++                ext_flags: 0x07,
++                hwpx_page_number: Some(2),
++                ..Default::default()
++            },
++        ];
++        core.set_document(doc);
++        let refs: Vec<Option<usize>> = core.pagination[0]
++            .pages
++            .iter()
++            .map(|p| p.active_master_page.as_ref().map(|m| m.master_page_index))
++            .collect();
++        assert_eq!(refs, [Some(0), Some(1), Some(0)]);
++    }
++}

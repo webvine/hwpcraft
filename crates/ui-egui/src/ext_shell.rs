@@ -11,6 +11,7 @@ mod links;
 pub(crate) use bench::Laps;
 mod hanja_view;
 mod macros;
+mod move_guides;
 mod raster;
 mod settings;
 mod windows;
@@ -110,6 +111,8 @@ pub(crate) enum Dialog {
     },
     MasterPage {
         kind: usize,
+        /// The section page (1-based) of the 임의 쪽 kind.
+        page: u16,
         list: serde_json::Value,
         /// 양쪽 바탕쪽 글 being edited.
         text: String,
@@ -159,6 +162,8 @@ pub(crate) enum Dialog {
     Section {
         /// 쪽·그림·표·수식 start numbers (0 = 앞 구역에 이어서).
         numbers: [u16; 4],
+        /// 구역 시작 쪽 번호 종류: 0 그대로 이어서, 1 홀수로, 2 짝수로 (pageNumType).
+        page_kind: u8,
         tab_mm: f64,
         hide: [bool; 6],
         whole_document: bool,
@@ -193,17 +198,23 @@ pub(crate) enum Dialog {
         height: f64,
         gap: f64,
     },
+    /// 원고지: 400자(true) or 200자, and whether the current document's text is carried.
+    Manuscript {
+        four_hundred: bool,
+        fill: bool,
+    },
     /// 개인 정보 바꾸기: the name being edited.
     UserInfo(String),
     /// 빠른 교정: the list being edited.
     AutoCorrect(Box<autocorrect::AutoCorrectDraft>),
-    /// 변경 추적 문서 저장 / 그림 효과가 있는 문서 저장: the file the user asked to save,
-    /// whether Hangul track changes would be merged, and how many picture effects an
-    /// .hwp save would drop.
+    /// 변경 추적 문서 저장 / 그림 효과·콤보 상자 목록이 있는 문서 저장: the file the user
+    /// asked to save, whether Hangul track changes would be merged, and how many picture
+    /// effects and combo box lists an .hwp save would drop.
     TrackedSave {
         path: PathBuf,
         tracked: bool,
         effects: usize,
+        combos: usize,
     },
     /// 단 정의 나누기: columns from the caret on.
     ColumnBreak {
@@ -319,6 +330,19 @@ pub(crate) struct State {
     pub chords_record_only: bool,
     /// `--view tooltip-<command id>`: keep that ribbon command's tooltip open (captures).
     pub pinned_tip: Option<String>,
+    /// `--view context-menu`: right-click the window centre once the page is laid out.
+    view_context_menu: bool,
+    /// 보기 ▸ 안내선 ▸ 개체 이동 안내선 (on by default).
+    object_guides: bool,
+    /// `document.track_changes` for a document generation (검토 명령, 상태 표시줄).
+    track_state: Option<(u64, serde_json::Value)>,
+    /// The 개체 이동 안내선 matching the object being dragged: (vertical, page px).
+    move_guides: Vec<(bool, f32)>,
+    /// The dragged object's page, the document generation and that page's snap lines.
+    move_targets: Option<(u32, u64, move_guides::Targets)>,
+    move_layout: Option<crate::ext_table::PageLayouts>,
+    /// The document whose pictures were last sent to be converted ahead.
+    prewarmed_serial: u64,
     /// `--view bench`: scripted scroll/zoom/resize run that logs frame times.
     bench: Option<bench::Bench>,
     /// Page rasterizations since the bench last looked (full pages and bands).
@@ -432,6 +456,11 @@ pub(crate) struct State {
     caret_page: Option<(u64, u32)>,
     /// Print request waiting for its background PDF: file, copies, page count.
     print_after: Option<(PathBuf, u32, usize)>,
+    /// The OS printers once listed (default first), and the list on its way.
+    printers: Option<Vec<crate::platform::Printer>>,
+    printers_rx: Option<std::sync::mpsc::Receiver<Vec<crate::platform::Printer>>>,
+    /// The printer chosen in 인쇄 (`None`: the OS default one).
+    printer: Option<String>,
     /// 인쇄 상세 for the next PDF preparation started by the print dialog.
     next_print_layout: Option<hwpcraft_engine::PrintLayout>,
     /// A PDF whose pages are being prepared a slice per frame.
@@ -452,6 +481,13 @@ impl Default for State {
             last_chord: None,
             chords_record_only: false,
             pinned_tip: None,
+            view_context_menu: false,
+            object_guides: true,
+            track_state: None,
+            move_guides: Vec::new(),
+            move_targets: None,
+            move_layout: None,
+            prewarmed_serial: u64::MAX,
             bench: None,
             uploaded: 0,
             laps: [0.0; 8],
@@ -510,6 +546,9 @@ impl Default for State {
             requested: (u64::MAX, Default::default(), Default::default()),
             caret_page: None,
             print_after: None,
+            printers: None,
+            printers_rx: None,
+            printer: None,
             next_print_layout: None,
             pdf_preparing: None,
             pdf_budget: PDF_PREPARE_BUDGET,
@@ -553,17 +592,41 @@ impl HwpApp {
             | "view.arrange"
             | "view.arrange.side"
             | "view.arrange.stacked"
+            | "view.arrange.minimize"
             | "view.switch_window"
             | "review.history"
             | "view.hanja_pronounce"
             | "view.guides"
+            | "view.guides.object"
             | "view.guides.add"
             | "file.template"
             | "tools.options"
             | "tools.user_info"
             | "tools.autocorrect"
             | "tools.customize"
-            | "page.label" => true,
+            | "page.label"
+            | "page.manuscript" => true,
+            "review.accept" | "review.accept_all" | "review.reject" | "review.reject_all"
+            | "review.prev" | "review.next" => self.session.has_unkept_track_changes(),
+            "review.track_changes" => true,
+            "page.text_direction.horizontal"
+            | "page.text_direction.vertical"
+            | "page.text_direction.vertical_all" => body,
+            // A label document: the body holds a table (`page.label` makes one).
+            "page.label.add_page" => {
+                self.session
+                    .core
+                    .document()
+                    .sections
+                    .first()
+                    .is_some_and(|s| {
+                        s.paragraphs.iter().any(|p| {
+                            p.controls.iter().any(|c| {
+                                matches!(c, hwpcraft_doc::model::control::Control::Table(_))
+                            })
+                        })
+                    })
+            }
             "page.column_def_break" | "page.section_break" => body,
             "view.guides.clear" => !self.ext.shell.guides.is_empty(),
             "view.split.none" => self.split.is_some(),
@@ -621,6 +684,8 @@ impl HwpApp {
             "page.line_numbers.skip_paragraph" => self.line_number_skipped(),
             "view.page_outline" => self.ext.shell.page_outline,
             "view.guides" => self.ext.shell.show_guides,
+            "review.track_changes" => self.session.track_recording(),
+            "view.guides.object" => self.ext.shell.object_guides,
             "view.split" => self.split.as_ref().is_some_and(|s| !s.side_by_side),
             "view.split.side" => self.split.as_ref().is_some_and(|s| s.side_by_side),
             "view.mirror_pages" => self.ext.shell.mirror_pages,
@@ -661,6 +726,52 @@ impl HwpApp {
             "view.zoom_out" => self.set_zoom(self.zoom - 0.1),
             "view.status_bar" => self.ext.shell.show_status_bar ^= true,
             "view.guides" => self.ext.shell.show_guides ^= true,
+            "view.guides.object" => {
+                self.ext.shell.object_guides ^= true;
+                self.message = if self.ext.shell.object_guides {
+                    "개체를 끌면 쪽·본문·다른 개체의 가장자리와 가운데에 맞춥니다(Alt를 누르면 맞추지 않음)."
+                } else {
+                    "개체 이동 안내선을 껐습니다."
+                }
+                .into();
+            }
+            "page.text_direction.horizontal"
+            | "page.text_direction.vertical"
+            | "page.text_direction.vertical_all" => {
+                // 쪽 ▸ 글자 방향: the caret's section.
+                let direction = id.trim_start_matches("page.text_direction.");
+                let r = self
+                    .session
+                    .run("page.text_direction", json!({ "direction": direction }));
+                if self.result(r).is_some() {
+                    self.message = match direction {
+                        "horizontal" => "현재 구역을 가로쓰기로 바꿨습니다.",
+                        "vertical" => "현재 구역을 세로쓰기(영문 눕힘)로 바꿨습니다.",
+                        _ => "현재 구역을 세로쓰기(영문 세움)로 바꿨습니다.",
+                    }
+                    .into();
+                }
+            }
+            "review.accept" | "review.accept_all" | "review.reject" | "review.reject_all" => {
+                self.review_change(id);
+            }
+            "review.prev" | "review.next" => self.review_step(id == "review.next"),
+            "review.track_changes" => {
+                // 검토 ▸ 변경 추적: record typing and deleting as tracked changes.
+                let on = !self.session.track_recording();
+                let r = self
+                    .session
+                    .run("document.track_changes.record", json!({ "on": on }));
+                if self.result(r).is_some() {
+                    self.message = if on {
+                        "변경 추적을 켰습니다. 입력·지우기·문단 나누기와 합치기가 변경 내용으로 \
+                         기록되고, 다른 편집은 끌 때까지 할 수 없습니다."
+                            .into()
+                    } else {
+                        "변경 추적을 껐습니다.".into()
+                    };
+                }
+            }
             "view.guides.clear" => {
                 self.ext.shell.guides.clear();
                 self.message = "안내선을 모두 지웠습니다.".into();
@@ -671,6 +782,17 @@ impl HwpApp {
             "view.arrange" => self.arrange_windows(ctx, windows::Arrangement::Cascade),
             "view.arrange.side" => self.arrange_windows(ctx, windows::Arrangement::SideBySide),
             "view.arrange.stacked" => self.arrange_windows(ctx, windows::Arrangement::Stacked),
+            "page.label.add_page" => {
+                let r = self.session.run("page.label.add_page", json!({}));
+                if let Some(v) = self.result(r) {
+                    self.page = v["pages"]
+                        .as_u64()
+                        .map_or(0, |n| n.saturating_sub(1) as u32);
+                    self.scroll_to_caret = true;
+                    self.message = format!("라벨 쪽을 하나 더했습니다({}쪽).", v["pages"]);
+                }
+            }
+            "view.arrange.minimize" => self.minimize_windows(ctx),
             "view.hanja_pronounce" => {
                 self.ext.shell.hanja_readings = !self.ext.shell.hanja_readings;
                 self.restyle_pages();
@@ -882,6 +1004,7 @@ impl HwpApp {
                     .unwrap_or_default();
                 Dialog::MasterPage {
                     kind: 0,
+                    page: 1,
                     list: self
                         .session
                         .run("page.master.list", json!({}))
@@ -894,14 +1017,17 @@ impl HwpApp {
                     object: MasterObject::default(),
                 }
             }
-            "file.print" => Dialog::Print {
-                range: 0,
-                pages: String::new(),
-                copies: 1,
-                to_file: false,
-                layout: Default::default(),
-                watermark: String::new(),
-            },
+            "file.print" => {
+                self.list_printers();
+                Dialog::Print {
+                    range: 0,
+                    pages: String::new(),
+                    copies: 1,
+                    to_file: false,
+                    layout: Default::default(),
+                    watermark: String::new(),
+                }
+            }
             "file.doc_info" => Dialog::DocInfo {
                 tab: 2,
                 info: self.session.run("file.doc_info", json!({})).ok()?,
@@ -944,6 +1070,10 @@ impl HwpApp {
                     gap,
                 }
             }
+            "page.manuscript" => Dialog::Manuscript {
+                four_hundred: true,
+                fill: false,
+            },
             "view.guides.add" => Dialog::Guide {
                 vertical: true,
                 mm: 30.0,
@@ -1000,6 +1130,7 @@ impl HwpApp {
                         n("tableNum"),
                         n("equationNum"),
                     ],
+                    page_kind: v["pageNumType"].as_u64().filter(|k| *k <= 2).unwrap_or(0) as u8,
                     tab_mm: v["defaultTabSpacingMm"].as_f64().unwrap_or(40.0),
                     hide: [
                         b("hideHeader"),
@@ -1039,6 +1170,11 @@ impl HwpApp {
     /// Called every frame after the built-in dialogs.
     pub(crate) fn shell_ext_dialogs(&mut self, ctx: &egui::Context) {
         self.shell_ext_frame();
+        // A newly opened document: convert its pictures on another thread (RHWP 0059).
+        if self.ext.shell.prewarmed_serial != self.session.document_serial {
+            self.ext.shell.prewarmed_serial = self.session.document_serial;
+            self.session.prewarm_pictures();
+        }
         self.prefetch_pages(ctx);
         // Captures and benchmarks run on a fixed script: no recovery prompt or copies.
         if self.screenshot.is_some() || self.ext.shell.bench.is_some() {
@@ -1062,11 +1198,19 @@ impl HwpApp {
             Dialog::Preview(preview) => self.preview_dialog(ctx, preview),
             Dialog::Section {
                 numbers,
+                page_kind,
                 tab_mm,
                 hide,
                 whole_document,
                 line_numbers,
-            } => self.section_dialog(ctx, numbers, tab_mm, hide, whole_document, line_numbers),
+            } => self.section_dialog(
+                ctx,
+                (numbers, page_kind),
+                tab_mm,
+                hide,
+                whole_document,
+                line_numbers,
+            ),
             Dialog::LineNumbers(settings) => self.line_numbers_dialog(ctx, settings),
             Dialog::History(list) => self.history_dialog(ctx, list),
             Dialog::SwitchWindow { peers, selected } => {
@@ -1091,11 +1235,12 @@ impl HwpApp {
             Dialog::BorderFill { .. } => self.border_fill_dialog(ctx, &mut dialog),
             Dialog::MasterPage {
                 kind,
+                page,
                 list,
                 text,
                 objects,
                 object,
-            } => self.master_page_dialog(ctx, kind, list, text, objects, object),
+            } => self.master_page_dialog(ctx, kind, page, list, text, objects, object),
             Dialog::Print {
                 range,
                 pages,
@@ -1122,7 +1267,8 @@ impl HwpApp {
                 path,
                 tracked,
                 effects,
-            } => self.tracked_save_dialog(ctx, path, *tracked, *effects),
+                combos,
+            } => self.tracked_save_dialog(ctx, path, *tracked, *effects, *combos),
             Dialog::ColumnBreak { count, spacing } => {
                 let button = self::dialog(
                     ctx,
@@ -1168,6 +1314,9 @@ impl HwpApp {
                 height,
                 gap,
             } => self.label_dialog(ctx, preset, rows, columns, width, height, gap),
+            Dialog::Manuscript { four_hundred, fill } => {
+                self.manuscript_dialog(ctx, four_hundred, fill)
+            }
             Dialog::Shortcuts(draft) => self.shortcuts_dialog(ctx, draft),
             Dialog::Templates {
                 list,
@@ -1303,6 +1452,18 @@ impl HwpApp {
             self.ext.shell.pinned_tip = Some(id.to_owned());
             return true;
         }
+        if name == "context-menu" {
+            self.ext.shell.view_context_menu = true;
+            return true;
+        }
+        // run-<command id>: run a ribbon command on its tab, e.g. its dialog (captures).
+        if let Some(id) = name.strip_prefix("run-") {
+            if let Some(tab) = self.ribbon_tab_of(id) {
+                self.tab = tab;
+            }
+            let ctx = self.ctx.clone();
+            return self.run_ribbon_command(id, &ctx);
+        }
         // 매크로 captures: recording (status chip), and the name dialog after one step.
         if name == "macro-record" || name == "macro-name" {
             self.tab = 8;
@@ -1434,6 +1595,18 @@ impl HwpApp {
                     split.set_other_page(2);
                 }
                 return true;
+            }
+            // 콤보 상자 목록이 있는 문서 저장 확인 창 (.hwp).
+            "combo-save" => {
+                let made = self.session.run(
+                    "form.insert",
+                    json!({"kind": "combo_box", "items": ["봄", "여름", "가을"], "text": "봄"}),
+                );
+                if let Err(e) = made {
+                    self.error = Some(e.to_string());
+                }
+                let path = std::env::temp_dir().join("hwpcraft-combo-save.hwp");
+                return self.confirm_tracked_save(&path);
             }
             // 변경 추적 문서 저장 확인 창 (the document needs Hangul track changes).
             "tracked-save" => {
@@ -1829,7 +2002,7 @@ impl HwpApp {
                         if ui.radio(on, "색").clicked() {
                             on = true;
                         }
-                        ui.add_enabled_ui(on, |ui| ui.color_edit_button_srgba(&mut color));
+                        ui.add_enabled_ui(on, |ui| chrome::color_button(ui, &mut color));
                     });
                     *fill = on.then_some(color);
                     group(ui, "채울 영역");
@@ -1894,16 +2067,58 @@ impl HwpApp {
         watermark: &mut String,
     ) -> bool {
         let count = self.layout_page_count();
+        if let Some(list) = self
+            .ext
+            .shell
+            .printers_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.ext.shell.printers = Some(list);
+            self.ext.shell.printers_rx = None;
+        } else if self.ext.shell.printers_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        let printers = self.ext.shell.printers.clone();
+        let chosen = &mut self.ext.shell.printer;
         let button = dialog(ctx, "인쇄", 600.0, &["인쇄(D)", "취소"], |ui| {
             chrome::tabs(ui, &mut 0, &["기본"]);
             ui.label("프린터 선택");
             ui.horizontal(|ui| {
-                ui.radio_value(to_file, false, "Windows 기본 프린터");
+                ui.radio_value(to_file, false, "프린터");
+                ui.add_enabled_ui(!*to_file, |ui| {
+                    let shown = match (chosen.as_deref(), &printers) {
+                        (Some(name), _) => name.to_owned(),
+                        (None, None) => "기본 프린터 (목록을 읽는 중…)".to_owned(),
+                        (None, Some(list)) => list
+                            .iter()
+                            .find(|p| p.default)
+                            .map_or("기본 프린터".to_owned(), |p| {
+                                format!("{} (기본)", p.name)
+                            }),
+                    };
+                    egui::ComboBox::from_id_salt("print-printer")
+                        .width(250.0)
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            for p in printers.iter().flatten() {
+                                let label = if p.default {
+                                    format!("{} (기본)", p.name)
+                                } else {
+                                    p.name.clone()
+                                };
+                                // The default printer is kept as `None`, so a changed
+                                // default in the OS is followed.
+                                let value = (!p.default).then(|| p.name.clone());
+                                ui.selectable_value(chosen, value, label);
+                            }
+                        });
+                });
                 ui.radio_value(to_file, true, "PDF 저장");
             });
             note(
                 ui,
-                "선택한 쪽을 PDF로 만든 뒤 Windows 인쇄로 보냅니다. 프린터는 Windows 기본 프린터를 씁니다.",
+                "선택한 쪽을 PDF로 만든 뒤 고른 프린터로 보냅니다(Windows는 PDF 프로그램의 인쇄 기능을 씀). 그 프로그램이 인쇄를 받지 않으면 PDF를 열어 줍니다.",
             );
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
@@ -2059,6 +2274,23 @@ impl HwpApp {
         let pages = PdfPages::Print(range.to_owned(), self.page);
         self.begin_pdf_prepare(pages, target, (!to_file).then_some(copies))
     }
+    /// Start listing the OS printers in the background, once per run.
+    fn list_printers(&mut self) {
+        if self.ext.shell.printers.is_some() || self.ext.shell.printers_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("hwpcraft-printers".into())
+            .spawn(move || {
+                let _ = tx.send(crate::platform::printers());
+            });
+        if spawned.is_ok() {
+            self.ext.shell.printers_rx = Some(rx);
+        } else {
+            self.ext.shell.printers = Some(Vec::new());
+        }
+    }
     /// After the background PDF for a print request is written, hand it to the printer.
     fn shell_print_when_ready(&mut self) {
         if self.pdf.busy() {
@@ -2071,9 +2303,11 @@ impl HwpApp {
             // The PDF slot has already reported why the file was not written.
             return;
         }
-        match crate::platform::print_pdf(&target, copies) {
+        let printer = self.ext.shell.printer.clone();
+        match crate::platform::print_pdf(&target, copies, printer.as_deref()) {
             crate::platform::PrintOutcome::Printed => {
-                self.message = format!("{count}쪽을 {copies}부 기본 프린터로 보냈습니다.");
+                let to = printer.map_or("기본 프린터".to_owned(), |p| format!("[{p}]"));
+                self.message = format!("{count}쪽을 {copies}부 {to}로 보냈습니다.");
             }
             crate::platform::PrintOutcome::Opened => {
                 // The viewer prints one copy unless told otherwise there.
@@ -2175,6 +2409,10 @@ pub(crate) fn dialog_with(
     body: impl FnOnce(&mut egui::Ui),
 ) -> Option<usize> {
     let mut clicked = None;
+    // In a window narrower than the dialog the body scrolls sideways, so the command
+    // buttons on the right stay in reach.
+    let wanted = width;
+    let width = width.min(ctx.content_rect().width() - 42.0).max(320.0);
     let site = std::panic::Location::caller();
     let id = (
         "hwp-shell-dialog",
@@ -2212,7 +2450,11 @@ pub(crate) fn dialog_with(
                 .inner_margin(egui::Margin::symmetric(14, 8))
                 .show(ui, |ui| {
                     ui.set_width(width - 24.0 - 120.0 - (label_width - 80.0));
-                    ui.vertical(body);
+                    if width < wanted {
+                        egui::ScrollArea::horizontal().show(ui, |ui| ui.vertical(body));
+                    } else {
+                        ui.vertical(body);
+                    }
                 });
             ui.add_space(10.0);
             ui.vertical(|ui| {
@@ -2316,20 +2558,44 @@ fn template_list(ui: &mut egui::Ui, template: &mut usize) {
             ui.painter()
                 .text(rect.center(), egui::Align2::CENTER_CENTER, *name, font, ink);
         } else {
+            // The name on top, then the header line as it will read: four entries show
+            // 쪽 번호 alone, and the 굵게·밑줄 ones looked the same as the plain ones.
+            ui.painter().text(
+                rect.left_top() + Vec2::new(8.0, 4.0),
+                egui::Align2::LEFT_TOP,
+                *name,
+                egui::FontId::proportional(11.0),
+                Color32::from_gray(120),
+            );
+            let strong = name.contains("굵게");
+            let y = rect.top() + 30.0;
             for (text, align, x) in [
                 (*l, egui::Align2::LEFT_CENTER, rect.left() + 12.0),
                 (*c, egui::Align2::CENTER_CENTER, rect.center().x),
                 (*r, egui::Align2::RIGHT_CENTER, rect.right() - 12.0),
             ] {
                 let text = if text == "1" { "쪽 번호" } else { text };
-                ui.painter().text(
-                    Pos2::new(x, rect.center().y),
+                let at = ui.painter().text(
+                    Pos2::new(x, y),
                     align,
                     text,
                     font.clone(),
-                    ink,
+                    if strong { Color32::BLACK } else { ink },
                 );
+                if strong && !text.is_empty() {
+                    ui.painter().line_segment(
+                        [at.left_bottom(), at.right_bottom()],
+                        Stroke::new(1.0, Color32::BLACK),
+                    );
+                }
             }
+            ui.painter().line_segment(
+                [
+                    Pos2::new(rect.left() + 8.0, rect.bottom() - 3.0),
+                    Pos2::new(rect.right() - 8.0, rect.bottom() - 3.0),
+                ],
+                Stroke::new(1.0, Color32::from_gray(225)),
+            );
         }
         if resp.on_hover_text(*name).clicked() {
             *template = i;
@@ -2416,7 +2682,7 @@ fn border_tab(
                         });
                     ui.end_row();
                     ui.label("색");
-                    ui.color_edit_button_srgba(&mut pen.color);
+                    chrome::color_button(ui, &mut pen.color);
                     ui.end_row();
                 });
             let mut none = sides.iter().all(|s| s.kind == 0);
@@ -2567,6 +2833,9 @@ pub(crate) struct MasterObject {
     height_mm: f64,
     /// 글 앞 (otherwise 글 뒤, like the master page's text).
     front: bool,
+    /// The listed object 고치기 loaded into the fields instead (its
+    /// `page.master.object.list` row); 바꾸기 then changes it in place.
+    editing: Option<serde_json::Value>,
 }
 
 impl Default for MasterObject {
@@ -2579,6 +2848,7 @@ impl Default for MasterObject {
             width_mm: 40.0,
             height_mm: 20.0,
             front: false,
+            editing: None,
         }
     }
 }
@@ -2602,39 +2872,93 @@ impl MasterObject {
         }
         params
     }
+
+    /// Fill the fields from a `page.master.object.list` row to change that object.
+    fn load(&mut self, row: &serde_json::Value) {
+        let mm = |key: &str| row[key].as_f64().unwrap_or(0.0);
+        (self.x_mm, self.y_mm) = (mm("x_mm"), mm("y_mm"));
+        (self.width_mm, self.height_mm) = (mm("width_mm"), mm("height_mm"));
+        self.front = row["wrap"] == "front";
+        self.editing = Some(row.clone());
+    }
+
+    /// `object.properties` parameters that give the loaded object the fields' place
+    /// and size (paper units); the wrap only when it was changed.
+    fn edit_params(&self) -> Option<serde_json::Value> {
+        let row = self.editing.as_ref()?;
+        let hu = |mm: f64| (mm * 7200.0 / 25.4).round() as i64;
+        let (width, height) = if row["kind"] == "table" {
+            ("tableWidth", "tableHeight")
+        } else {
+            ("width", "height")
+        };
+        let mut props = json!({
+            "horzOffset": hu(self.x_mm),
+            "vertOffset": hu(self.y_mm),
+            width: hu(self.width_mm),
+            height: hu(self.height_mm),
+        });
+        if self.front != (row["wrap"] == "front") {
+            props["textWrap"] = json!(if self.front {
+                "InFrontOfText"
+            } else {
+                "BehindText"
+            });
+        }
+        Some(json!({"address": row["address"], "props": props}))
+    }
 }
 
 impl HwpApp {
-    /// 바탕쪽: 양쪽·홀수·짝수 바탕쪽의 글을 만들고 고치거나 지우고, 그림·도형을 넣고
-    /// 지운다. Other kinds stay as they are (the reason is shown).
+    /// 바탕쪽: 양쪽·홀수·짝수·마지막 쪽·임의 쪽 바탕쪽의 글을 만들고 고치거나 지우고,
+    /// 그림·도형을 넣고 지운다. Other kinds stay as they are (the reason is shown).
+    #[allow(clippy::too_many_arguments)]
     fn master_page_dialog(
         &mut self,
         ctx: &egui::Context,
         kind: &mut usize,
+        page: &mut u16,
         list: &mut serde_json::Value,
         text: &mut String,
         objects: &mut serde_json::Value,
         object: &mut MasterObject,
     ) -> bool {
-        // The kinds HwpCraft edits, by radio index: (applyTo, model name).
-        const KINDS: [(&str, &str); 3] = [("both", "Both"), ("odd", "Odd"), ("even", "Even")];
-        let page_of = |kind: usize| {
-            let (_, model) = KINDS.get(kind)?;
+        // The kinds HwpCraft edits, by radio index: (applyTo, model name); "last" is the
+        // section's 마지막 쪽 바탕쪽 and "optional" its 임의 쪽 one on page `page`
+        // (extension master pages; the second is kept by HWPX only).
+        const KINDS: [(&str, &str); 5] = [
+            ("both", "Both"),
+            ("odd", "Odd"),
+            ("even", "Even"),
+            ("last", "Both"),
+            ("optional", "Both"),
+        ];
+        let page_of = |kind: usize, page: u16| {
+            let (name, model) = KINDS.get(kind)?;
             list["masterPages"]
                 .as_array()?
                 .iter()
-                .find(|m| m["applyTo"] == *model && m["extension"] == false)
+                .find(|m| match *name {
+                    "last" => m["kind"] == "last",
+                    "optional" => m["kind"] == "optional" && m["page"] == page,
+                    _ => m["applyTo"] == *model && m["extension"] == false,
+                })
                 .cloned()
         };
-        let exists = page_of(*kind).is_some();
+        let exists = page_of(*kind, *page).is_some();
         let blocked = list["reason"].as_str();
-        let why = if *kind >= KINDS.len() {
-            Some(
-                "마지막 쪽·임의 쪽 바탕쪽은 아직 만들 수 없습니다. 양쪽·홀수 쪽·짝수 쪽 중에서 고르세요.",
-            )
-        } else {
-            blocked
-        };
+        let objects_why = blocked;
+        // The slot's text may be kept from a whole-text edit while its objects are not.
+        let text_reason =
+            page_of(*kind, *page).and_then(|m| m["textReason"].as_str().map(str::to_owned));
+        let why = objects_why.or(text_reason.as_deref());
+        // Extension master pages take text only.
+        let last = KINDS
+            .get(*kind)
+            .is_some_and(|(name, _)| matches!(*name, "last" | "optional"));
+        let optional = KINDS
+            .get(*kind)
+            .is_some_and(|(name, _)| *name == "optional");
         let delete_why = if !exists {
             Some("이 구역에는 지울 그 종류의 바탕쪽이 없습니다.")
         } else {
@@ -2661,21 +2985,22 @@ impl HwpApp {
             ],
             |ui| {
                 group(ui, "종류");
-                let before = *kind;
-                for (i, label) in [
-                    "양쪽",
-                    "홀수 쪽",
-                    "짝수 쪽",
-                    "현재 구역의 마지막 쪽",
-                    "현재 구역 안 임의 쪽",
-                ]
-                .iter()
-                .enumerate()
+                let before = (*kind, *page);
+                for (i, label) in ["양쪽", "홀수 쪽", "짝수 쪽", "현재 구역의 마지막 쪽"]
+                    .iter()
+                    .enumerate()
                 {
                     ui.radio_value(kind, i, *label);
                 }
-                if *kind != before {
-                    *text = page_of(*kind)
+                ui.horizontal(|ui| {
+                    ui.radio_value(kind, 4, "현재 구역 안 임의 쪽");
+                    ui.add_enabled(
+                        *kind == 4,
+                        egui::DragValue::new(page).range(1..=9999).suffix(" 쪽"),
+                    );
+                });
+                if (*kind, *page) != before {
+                    *text = page_of(*kind, *page)
                         .and_then(|m| m["text"].as_str().map(str::to_owned))
                         .unwrap_or_default();
                 }
@@ -2701,10 +3026,11 @@ impl HwpApp {
                     };
                     ui.label(format!(
                         "{kind}{} · {}",
-                        if m["extension"] == true {
-                            " (확장)"
-                        } else {
-                            ""
+                        match (m["kind"].as_str(), m["page"].as_u64()) {
+                            (Some("last"), _) => " (마지막 쪽)".to_owned(),
+                            (Some("optional"), Some(n)) => format!(" (임의 쪽 {n}쪽)"),
+                            (Some("optional"), None) => " (임의 쪽)".to_owned(),
+                            _ => String::new(),
                         },
                         m["text"]
                             .as_str()
@@ -2720,17 +3046,27 @@ impl HwpApp {
                     .as_array()
                     .map(|all| all.iter().filter(|o| o["applyTo"] == apply_to).collect())
                     .unwrap_or_default();
-                if mine.is_empty() || why.is_some() {
+                if last {
+                    note(
+                        ui,
+                        "마지막 쪽·임의 쪽 바탕쪽에는 아직 글만 넣을 수 있습니다.",
+                    );
+                } else if mine.is_empty() || objects_why.is_some() {
                     ui.label("없음");
                 }
-                for o in mine.into_iter().filter(|_| why.is_none()) {
+                for o in mine.into_iter().filter(|_| objects_why.is_none() && !last) {
+                    let chosen = object
+                        .editing
+                        .as_ref()
+                        .is_some_and(|row| row["address"] == o["address"]);
                     ui.horizontal(|ui| {
                         ui.label(format!(
-                            "{} · 자리 {}×{} mm · 크기 {}×{} mm · {}",
-                            if o["kind"] == "picture" {
-                                "그림"
-                            } else {
-                                "도형"
+                            "{}{} · 자리 {}×{} mm · 크기 {}×{} mm · {}",
+                            if chosen { "▶ " } else { "" },
+                            match o["kind"].as_str() {
+                                Some("picture") => "그림",
+                                Some("table") => "표",
+                                _ => "도형",
                             },
                             mm(&o["x_mm"]),
                             mm(&o["y_mm"]),
@@ -2742,7 +3078,11 @@ impl HwpApp {
                                 "글 뒤"
                             }
                         ));
+                        if ui.small_button("고치기").clicked() {
+                            object.load(o);
+                        }
                         if ui.small_button("지우기").clicked() {
+                            object.editing = None;
                             request = Some((
                                 "page.master.object.delete",
                                 json!({"applyTo": apply_to, "index": o["index"]}),
@@ -2750,21 +3090,39 @@ impl HwpApp {
                         }
                     });
                 }
-                ui.add_enabled_ui(why.is_none(), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("종류");
-                        egui::ComboBox::from_id_salt("master-object-kind")
-                            .width(91.0)
-                            .selected_text(MASTER_OBJECT_KINDS[object.kind].1)
-                            .show_ui(ui, |ui| {
-                                for (i, (_, label)) in MASTER_OBJECT_KINDS.iter().enumerate() {
-                                    ui.selectable_value(&mut object.kind, i, *label);
-                                }
-                            });
-                        ui.radio_value(&mut object.front, false, "글 뒤");
-                        ui.radio_value(&mut object.front, true, "글 앞");
-                    });
-                    if object.kind == 0 {
+                if object.editing.as_ref().is_some_and(|row| {
+                    row["applyTo"] != apply_to
+                        || !objects["objects"]
+                            .as_array()
+                            .is_some_and(|all| all.iter().any(|o| o["address"] == row["address"]))
+                }) {
+                    object.editing = None;
+                }
+                let editing = object.editing.is_some();
+                ui.add_enabled_ui(objects_why.is_none() && !last, |ui| {
+                    if !editing {
+                        ui.horizontal(|ui| {
+                            ui.label("종류");
+                            egui::ComboBox::from_id_salt("master-object-kind")
+                                .width(91.0)
+                                .selected_text(MASTER_OBJECT_KINDS[object.kind].1)
+                                .show_ui(ui, |ui| {
+                                    for (i, (_, label)) in MASTER_OBJECT_KINDS.iter().enumerate() {
+                                        ui.selectable_value(&mut object.kind, i, *label);
+                                    }
+                                });
+                            ui.radio_value(&mut object.front, false, "글 뒤");
+                            ui.radio_value(&mut object.front, true, "글 앞");
+                        });
+                    }
+                    if editing {
+                        ui.horizontal(|ui| {
+                            ui.label("고칠 개체의 자리·크기");
+                            ui.radio_value(&mut object.front, false, "글 뒤");
+                            ui.radio_value(&mut object.front, true, "글 앞");
+                        });
+                    }
+                    if object.kind == 0 && !editing {
                         ui.horizontal(|ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut object.path)
@@ -2795,25 +3153,43 @@ impl HwpApp {
                     ui.horizontal(|ui| {
                         ui.label("너비");
                         ui.add(length(&mut object.width_mm, 1.0));
-                        if object.kind == 0 {
+                        if object.kind == 0 && !editing {
                             ui.label("(높이는 그림 비율대로)");
                         } else {
                             ui.label("높이");
                             ui.add(length(&mut object.height_mm, 1.0));
                         }
                     });
-                    let ready = object.kind != 0 || !object.path.trim().is_empty();
-                    if ui.add_enabled(ready, egui::Button::new("넣기")).clicked() {
-                        request = Some(("page.master.object.insert", object.params(apply_to)));
+                    if let Some(params) = object.edit_params() {
+                        ui.horizontal(|ui| {
+                            if ui.button("바꾸기").clicked() {
+                                request = Some(("object.properties", params));
+                            }
+                            if ui.button("새로 넣기").clicked() {
+                                object.editing = None;
+                            }
+                        });
+                    } else {
+                        let ready = object.kind != 0 || !object.path.trim().is_empty();
+                        if ui.add_enabled(ready, egui::Button::new("넣기")).clicked() {
+                            request = Some(("page.master.object.insert", object.params(apply_to)));
+                        }
                     }
                 });
+                if optional {
+                    note(
+                        ui,
+                        "임의 쪽 바탕쪽은 구역 안 그 쪽에서 다른 바탕쪽 대신 쓰입니다. \
+                         HWPX에만 저장되고, .hwp로는 저장할 수 없습니다(쪽 번호를 담을 자리가 없음).",
+                    );
+                }
                 notice(
                     ui,
-                    &match blocked {
+                    &match blocked.or(text_reason.as_deref()) {
                         Some(reason) => reason.to_owned(),
                         None => "바탕쪽 글은 쪽의 본문 뒤에 깔립니다. 각 줄이 한 문단이 됩니다. \
                                  홀수 쪽·짝수 쪽 바탕쪽은 그 쪽에서 양쪽 바탕쪽 대신 쓰입니다. \
-                                 그림·도형은 종이 왼쪽 위에서 잰 자리에 놓이고, 넣기·지우기는 \
+                                 그림·도형은 종이 왼쪽 위에서 잰 자리에 놓이고, 넣기·고치기·지우기는 \
                                  바로 문서에 들어갑니다(실행 취소로 되돌림)."
                             .to_owned(),
                     },
@@ -2827,9 +3203,12 @@ impl HwpApp {
         let (id, params) = match button {
             Some(0) => (
                 "page.master.set",
-                json!({ "applyTo": apply_to, "text": text.as_str() }),
+                json!({ "applyTo": apply_to, "page": *page, "text": text.as_str() }),
             ),
-            Some(1) => ("page.master.delete", json!({ "applyTo": apply_to })),
+            Some(1) => (
+                "page.master.delete",
+                json!({ "applyTo": apply_to, "page": *page }),
+            ),
             Some(_) => return false,
             None => return true,
         };
@@ -2858,6 +3237,8 @@ impl HwpApp {
         if self.result(r).is_some() {
             self.message = if id == "page.master.object.delete" {
                 "바탕쪽 그림·도형을 지웠습니다. 실행 취소로 되돌릴 수 있습니다.".into()
+            } else if id == "object.properties" {
+                "바탕쪽 개체의 자리·크기를 바꿨습니다. 실행 취소로 되돌릴 수 있습니다.".into()
             } else {
                 "바탕쪽에 그림·도형을 넣었습니다. 실행 취소로 되돌릴 수 있습니다.".into()
             };
@@ -2996,6 +3377,8 @@ pub(crate) const HF_TOKENS: &[(&str, &str)] = &[
     ("[쪽 번호]", "page_number"),
     ("[전체 쪽수]", "total_pages"),
     ("[파일 이름]", "file_name"),
+    ("[만든 날짜]", "date_created"),
+    ("[저장한 날짜]", "date_saved"),
 ];
 
 /// Split editor text with `HF_TOKENS` into plain text and `(offset, kind)` fields.
@@ -3078,8 +3461,13 @@ const CHORDS: &[(char, egui::Key, &str)] = {
 
 /// Settings folder shared with the engine (`hwpcraft_engine::config_dir`: Windows
 /// `%APPDATA%`, macOS `~/Library/Application Support`, Linux `$XDG_CONFIG_HOME`).
-/// `None` means settings are not persisted.
+/// `None` means settings are not persisted. Tests get a folder of their own so they
+/// never write the user's recent documents, view settings, symbols or window state.
 pub(crate) fn config_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        let name = format!("hwpcraft-ui-test-config-{}", std::process::id());
+        return Some(std::env::temp_dir().join(name));
+    }
     hwpcraft_engine::config_dir()
 }
 fn recent_file() -> Option<PathBuf> {
@@ -3261,7 +3649,7 @@ pub(crate) const ALT_KEYS: &[(usize, char, &str)] = &[
     (5, 'O', "page.portrait"),
     (5, 'Y', "page.landscape"),
     (5, 'Z', "menu:쪽 여백"),
-    (5, 'C', "page.text_direction"),
+    (5, 'C', "menu:글자 방향"),
     (5, 'F', "page.master"),
     (5, 'H', "page.header"),
     (5, 'T', "page.footer"),
@@ -3277,7 +3665,7 @@ pub(crate) const ALT_KEYS: &[(usize, char, &str)] = &[
     (5, 'N', "page.column_def_break"),
     (5, 'E', "page.section_dialog"),
     (5, 'S', "page.section_break"),
-    (5, 'L', "page.label"),
+    (5, 'L', "menu:라벨"),
     (5, 'A', "page.manuscript"),
     (6, 'W', "security.password"),
     (6, 'R', "security.password_change"),
@@ -3299,8 +3687,8 @@ pub(crate) const ALT_KEYS: &[(usize, char, &str)] = &[
     (7, 'U', "review.view_original_marked"),
     (7, 'I', "review.view_final_marked"),
     (7, 'F', "review.view_final"),
-    (7, 'A', "review.accept"),
-    (7, 'J', "review.reject"),
+    (7, 'A', "menu:적용"),
+    (7, 'J', "menu:적용 안 함"),
     (7, 'P', "review.prev"),
     (7, 'N', "review.next"),
     (7, 'M', "insert.memo"),
@@ -3490,7 +3878,9 @@ impl HwpApp {
             self.ext.shell.last_path = self.session.path.clone();
             if let Some(path) = self.session.path.clone() {
                 push_recent(&mut self.ext.shell.recent, &path);
-                if let Some(file) = recent_file() {
+                // Captures and benchmarks stay out of the user's recent documents.
+                let measured = self.screenshot.is_some() || self.ext.shell.bench.is_some();
+                if let Some(file) = recent_file().filter(|_| !measured) {
                     if let Some(dir) = file.parent() {
                         let _ = std::fs::create_dir_all(dir);
                     }
@@ -3604,22 +3994,256 @@ impl HwpApp {
         }
     }
 
-    /// Saving a document that holds Hangul track changes (as HWP, HWPX or DOCX) or picture
-    /// effects (as HWP) opens [`Dialog::TrackedSave`] instead; true when it did. One
-    /// window asks about both when both apply.
+    /// The document's tracked changes (`document.track_changes`), kept for the current
+    /// document generation: the status bar asks every frame.
+    pub(crate) fn track_state(&mut self) -> serde_json::Value {
+        let generation = self.session.generation;
+        if let Some((g, v)) = &self.ext.shell.track_state
+            && *g == generation
+        {
+            return v.clone();
+        }
+        let v = self.session.track_changes();
+        self.ext.shell.track_state = Some((generation, v.clone()));
+        v
+    }
+
+    /// The status bar's change-tracking cell (label, tooltip). Turning recording on
+    /// marks the document as tracked before anything is recorded, so it reads
+    /// "기록 중" until the first change is in the list.
+    pub(crate) fn track_status(&mut self) -> Option<(&'static str, &'static str)> {
+        let recording = self.session.track_recording();
+        let tracked = self.session.has_unkept_track_changes();
+        let state = self.track_state();
+        let listed = state["list"].as_array().is_some_and(|l| !l.is_empty());
+        if recording && !listed {
+            return Some((
+                "변경 추적 기록 중",
+                "입력·지우기·문단 나누기와 합치기가 변경 내용으로 기록됩니다. \
+                 [검토 → 변경 추적]으로 끕니다.",
+            ));
+        }
+        if !tracked {
+            return None;
+        }
+        Some(if recording {
+            (
+                "변경 추적 기록 있음 · 기록 중",
+                "이 문서의 변경 추적 기록에 지금 입력·지우기가 더해집니다. \
+                 HWP·HWPX로 저장하면 기록이 그대로 남습니다. [검토 → 변경 \
+                 추적]으로 끕니다.",
+            )
+        } else if state["keptOnHwpSave"] == true {
+            (
+                "변경 추적 기록 있음",
+                "이 문서에는 한글의 변경 추적 기록이 있습니다. HWP·HWPX로 \
+                 저장하면 기록이 그대로 남습니다. DOCX로 내보내면 확인 뒤 모든 \
+                 변경을 적용한 결과본으로 씁니다. [검토 → 적용]으로 변경을 \
+                 하나씩 적용하거나 되돌릴 수 있습니다.",
+            )
+        } else {
+            (
+                "변경 추적 기록 있음(저장 시 결과본)",
+                "이 문서에는 한글의 변경 추적 기록이 있습니다. HWP/HWPX로 저장하면 \
+                 확인 뒤 모든 변경을 적용한 결과본(지운 글은 없애고 넣은 글은 \
+                 남김)으로 저장하고 변경 기록은 지웁니다. [검토 → 적용]으로 \
+                 변경을 하나씩 적용하거나 되돌릴 수 있습니다.",
+            )
+        })
+    }
+
+    /// 검토 ▸ 적용 / 적용 안 함: the tracked change at the caret (`review.accept`,
+    /// `review.reject`) or all of them (`…_all`), in one undo step.
+    fn review_change(&mut self, id: &str) {
+        let accept = id.starts_with("review.accept");
+        let command = if accept {
+            "document.track_changes.accept"
+        } else {
+            "document.track_changes.reject"
+        };
+        let params = if id.ends_with("_all") {
+            json!({ "all": true })
+        } else {
+            let c = self.session.cursor;
+            let state = self.track_state();
+            let at = state["list"].as_array().and_then(|list| {
+                list.iter().find(|m| {
+                    change_cell(m) == c.cell
+                        && m["section"].as_u64() == Some(c.section as u64)
+                        && m["paragraph"].as_u64() == Some(c.paragraph as u64)
+                        && m["start"].as_u64().is_some_and(|s| s as usize <= c.offset)
+                        && m["end"].as_u64().is_some_and(|e| c.offset <= e as usize)
+                })
+            });
+            match at {
+                Some(m) => json!({ "change": m["change"] }),
+                None => {
+                    self.message = "커서 위치에 변경 내용이 없습니다. [이전]·[다음]으로 변경 \
+                                    내용으로 가거나 [모든 변경 내용 …]을 고르세요."
+                        .into();
+                    return;
+                }
+            }
+        };
+        let r = self.session.run(command, params);
+        if let Some(v) = self.result(r) {
+            let skipped = v["unsupported"].as_u64().unwrap_or(0);
+            self.message = match (accept, skipped) {
+                (true, _) => "변경 내용을 적용했습니다. 실행 취소로 되돌릴 수 있습니다.".into(),
+                (false, 0) => {
+                    "변경 내용을 적용하지 않고 되돌렸습니다. 실행 취소로 되돌릴 수 있습니다.".into()
+                }
+                (false, n) => format!(
+                    "변경 내용을 되돌렸습니다. 서식 변경 {n}개는 되돌리지 못해 그대로 둡니다."
+                ),
+            };
+        }
+    }
+
+    /// 검토 ▸ 이전 / 다음: the caret goes to the start of the tracked change before or
+    /// after it in the body.
+    fn review_step(&mut self, forward: bool) {
+        let c = self.session.cursor;
+        let here = (c.section, c.paragraph, c.offset);
+        let state = self.track_state();
+        // A change in a table cell is placed at its table's paragraph, then by cell.
+        let key =
+            |section: usize, paragraph: usize, cell: Option<hwpcraft_engine::Cell>, offset| {
+                (
+                    section,
+                    paragraph,
+                    cell.map(|c| (c.control, c.index, c.paragraph)),
+                    offset,
+                )
+            };
+        let here = key(here.0, here.1, c.cell, here.2);
+        let mut starts: Vec<_> = state["list"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| {
+                Some(key(
+                    m["section"].as_u64()? as usize,
+                    m["paragraph"].as_u64()? as usize,
+                    change_cell(m),
+                    m["start"].as_u64()? as usize,
+                ))
+            })
+            .collect();
+        starts.sort();
+        let target = if forward {
+            starts.into_iter().find(|s| *s > here)
+        } else {
+            starts.into_iter().rev().find(|s| *s < here)
+        };
+        let Some((section, paragraph, cell, offset)) = target else {
+            self.message = if forward {
+                "뒤에 변경 내용이 더 없습니다.".into()
+            } else {
+                "앞에 변경 내용이 더 없습니다.".into()
+            };
+            return;
+        };
+        let r = self.session.select(
+            hwpcraft_engine::Cursor {
+                section,
+                paragraph,
+                offset,
+                cell: cell.map(|(control, index, paragraph)| hwpcraft_engine::Cell {
+                    control,
+                    index,
+                    paragraph,
+                }),
+            },
+            false,
+        );
+        if self.result(r).is_some() {
+            self.follow_cursor();
+        }
+    }
+
+    /// 원고지: a new manuscript document (`page.manuscript`), 400자 or 200자, optionally
+    /// with the current document's text. Like 라벨, it replaces a saved document only.
+    fn manuscript_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        four_hundred: &mut bool,
+        fill: &mut bool,
+    ) -> bool {
+        let why = self
+            .session
+            .dirty()
+            .then_some("저장하지 않은 변경 내용이 있습니다. 먼저 저장하거나 [새 창]에서 만드세요.");
+        let button = dialog_with(
+            ctx,
+            "원고지",
+            420.0,
+            &[("만들기(D)", why), ("취소", None)],
+            |ui| {
+                group(ui, "원고지 종류");
+                ui.radio_value(four_hundred, true, "400자 원고지 (A4 세로, 20칸 × 20줄)");
+                ui.radio_value(four_hundred, false, "200자 원고지 (A4 가로, 20칸 × 10줄)");
+                group(ui, "내용");
+                ui.checkbox(fill, "현재 문서에서 내용을 가져다 채움");
+                notice(
+                    ui,
+                    "새 문서의 바탕쪽에 원고지 칸을 그리고, 글자를 칸마다 한 자씩 놓습니다. \
+                     영문·숫자는 두 자가 한 칸에 들어갑니다(원고지 정서법).",
+                );
+            },
+        );
+        match button {
+            Some(0) => {
+                let chars = if *four_hundred { 400 } else { 200 };
+                let r = self
+                    .session
+                    .run("page.manuscript", json!({"chars": chars, "fill": *fill}));
+                if self.result(r).is_some() {
+                    self.page = 0;
+                    self.message = format!("{chars}자 원고지 새 문서를 만들었습니다.");
+                    false
+                } else {
+                    true
+                }
+            }
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    /// Saving a document that holds Hangul track changes (as HWP, HWPX or DOCX), or picture
+    /// effects or combo box items (as HWP), opens [`Dialog::TrackedSave`] instead; true
+    /// when it did. One window asks about all that apply.
     pub(crate) fn confirm_tracked_save(&mut self, path: &std::path::Path) -> bool {
         let editable = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
             ["hwp", "hwpx", "docx"]
                 .iter()
                 .any(|x| e.eq_ignore_ascii_case(x))
         });
-        let tracked = editable && self.session.has_unkept_track_changes();
+        // HWP and HWPX keep the records unless the engine says not (a password
+        // document); DOCX and other cases merge them, which is what the window asks.
+        let kept = {
+            let state = self.track_state();
+            match path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("hwp") => state["keptOnHwpSave"] == true,
+                Some("hwpx") => state["keptOnHwpxSave"] == true,
+                _ => false,
+            }
+        };
+        let tracked = editable && self.session.has_unkept_track_changes() && !kept;
         let effects = self.session.picture_effects_blocking_save(path);
-        if tracked || effects > 0 {
+        let combos = self.session.combo_items_blocking_save(path);
+        if tracked || effects > 0 || combos > 0 {
             self.ext.shell.dialog = Some(Dialog::TrackedSave {
                 path: path.to_owned(),
                 tracked,
                 effects,
+                combos,
             });
             return true;
         }
@@ -3632,16 +4256,22 @@ impl HwpApp {
         path: &std::path::Path,
         tracked: bool,
         effects: usize,
+        combos: usize,
     ) -> bool {
-        let (title, accept) = match (tracked, effects > 0) {
-            (true, true) => (
+        let (title, accept) = match (tracked, effects > 0, combos > 0) {
+            (true, true, _) => (
                 "변경 추적·그림 효과가 있는 문서 저장",
                 "결과본·효과 빼고 저장(D)",
             ),
-            (false, true) => ("그림 효과가 있는 문서 저장", "효과 빼고 저장(D)"),
+            (false, true, _) => ("그림 효과가 있는 문서 저장", "효과 빼고 저장(D)"),
+            (true, false, true) => (
+                "변경 추적·콤보 상자 목록이 있는 문서 저장",
+                "결과본·목록 빼고 저장(D)",
+            ),
+            (false, false, true) => ("콤보 상자 목록이 있는 문서 저장", "목록 빼고 저장(D)"),
             _ => ("변경 추적 문서 저장", "결과본으로 저장(D)"),
         };
-        let other = if effects > 0 {
+        let other = if effects > 0 || combos > 0 {
             "HWPX로 저장…"
         } else {
             "다른 이름으로 저장…"
@@ -3649,9 +4279,10 @@ impl HwpApp {
         let button = dialog(ctx, title, 480.0, &[accept, other, "취소"], |ui| {
             if tracked {
                 ui.label(
-                    "이 문서에는 한글의 변경 추적 기록이 있습니다. HwpCraft는 변경 추적 기록을 \
-                     보존하지 못합니다. 저장하면 변경 내용이 지금 보이는 결과본으로 합쳐지고 \
-                     변경 기록은 사라집니다. 원본을 남기려면 다른 이름으로 저장하세요.",
+                    "이 문서에는 한글의 변경 추적 기록이 있습니다. HwpCraft는 고친 문서의 변경 \
+                     추적 기록을 보존하지 못합니다. 저장하면 모든 변경을 적용한 결과본(지운 글은 \
+                     없애고 넣은 글은 남김)이 되고 변경 기록은 사라집니다. 원본을 남기려면 다른 \
+                     이름으로 저장하세요.",
                 );
             }
             if effects > 0 {
@@ -3664,6 +4295,17 @@ impl HwpApp {
                      HWPX로 저장하세요."
                 ));
             }
+            if combos > 0 {
+                if tracked || effects > 0 {
+                    ui.add_space(6.0);
+                }
+                ui.label(format!(
+                    "이 문서의 콤보 상자 {combos}개의 목록 항목은 HWP(.hwp)로 저장할 수 없습니다. \
+                     한글은 HWP에서 목록을 문서 스크립트에 두는데, HwpCraft는 스크립트를 쓰지 \
+                     않습니다. 목록을 빼고 저장하거나(문서에서도 빠집니다), 목록을 남기려면 \
+                     HWPX로 저장하세요."
+                ));
+            }
             ui.add_space(6.0);
             ui.label(
                 RichText::new(format!("저장할 파일: {}", path.display()))
@@ -3671,6 +4313,17 @@ impl HwpApp {
             );
         });
         match button {
+            Some(0) if combos > 0 => {
+                self.ext.shell.dialog = None;
+                let r = self.session.save_dropping_combo_items(path, tracked);
+                if let Some(n) = self.result(r) {
+                    self.message = format!(
+                        "콤보 상자 {n}개의 목록을 빼고 저장 완료 · {}",
+                        path.display()
+                    );
+                }
+                false
+            }
             Some(0) if effects > 0 => {
                 self.ext.shell.dialog = None;
                 let r = self.session.save_dropping_picture_effects(path, tracked);
@@ -3696,9 +4349,10 @@ impl HwpApp {
                 false
             }
             Some(1) => {
-                // A new name keeps the original file; HWPX keeps the picture effects.
+                // A new name keeps the original file; HWPX keeps the picture effects and
+                // combo box items.
                 self.ext.shell.dialog = None;
-                self.save(true, (effects > 0).then_some("hwpx"));
+                self.save(true, (effects > 0 || combos > 0).then_some("hwpx"));
                 false
             }
             Some(_) => false,
@@ -3997,6 +4651,17 @@ impl HwpApp {
             && let Some(popup) = self.ext.shell.view_popup.take()
         {
             egui::Popup::open_id(ctx, popup);
+        }
+        if self.frames >= 2 && std::mem::take(&mut self.ext.shell.view_context_menu) {
+            let at = ctx.content_rect().center();
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            self.ext.shell.bench_events =
+                vec![egui::Event::PointerMoved(at), button(true), button(false)];
         }
         let tab_keys: [(Key, usize); 9] = [
             (Key::F, 0),
@@ -4547,7 +5212,10 @@ impl HwpApp {
                             }
                         }
                     });
-                ui.checkbox(&mut preview.layout.reverse, "역순");
+                ui.checkbox(&mut preview.layout.reverse, "역순")
+                    .on_hover_text("역순으로 찍기: 마지막 쪽부터 찍습니다.");
+                // A rule keeps 역순 and 워터마크 from reading as one setting.
+                ui.separator();
                 ui.label("워터마크");
                 ui.add(
                     egui::TextEdit::singleline(&mut preview.watermark)
@@ -4602,7 +5270,7 @@ impl HwpApp {
     fn section_dialog(
         &mut self,
         ctx: &egui::Context,
-        numbers: &mut [u16; 4],
+        (numbers, page_kind): (&mut [u16; 4], &mut u8),
         tab_mm: &mut f64,
         hide: &mut [bool; 6],
         whole_document: &mut bool,
@@ -4637,6 +5305,21 @@ impl HwpApp {
                         });
                         ui.end_row();
                     }
+                    // As Hangul: an odd or even start skips one number when the page that
+                    // continues the count has the other parity; no blank page is added.
+                    ui.label("");
+                    ui.add_enabled_ui(numbers[0] == 0, |ui| {
+                        ui.horizontal(|ui| {
+                            for (kind, label) in [(0, "그대로"), (1, "홀수로"), (2, "짝수로")] {
+                                ui.radio_value(page_kind, kind, label);
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "앞 구역에 이어지는 쪽 번호가 홀수나 짝수가 되도록 하나 건너뜁니다(빈 쪽은 넣지 않음).",
+                        );
+                    });
+                    ui.end_row();
                 });
             group(ui, "기본 탭 간격");
             ui.horizontal(|ui| {
@@ -4687,7 +5370,8 @@ impl HwpApp {
                 let applied = self.run(
                     "page.section",
                     json!({
-                        "pageNum": numbers[0], "pictureNum": numbers[1],
+                        "pageNum": numbers[0], "pageNumType": *page_kind,
+                        "pictureNum": numbers[1],
                         "tableNum": numbers[2], "equationNum": numbers[3],
                         "defaultTabSpacingMm": *tab_mm,
                         "hideHeader": hide[0], "hideFooter": hide[1], "hideMasterPage": hide[2],
@@ -5513,10 +6197,10 @@ impl HwpApp {
                 group(ui, "화면 색");
                 ui.horizontal(|ui| {
                     ui.label("바탕 색");
-                    ui.color_edit_button_srgba(paper);
+                    chrome::color_button(ui, paper);
                     ui.add_space(16.0);
                     ui.label("글자 색");
-                    ui.color_edit_button_srgba(text);
+                    chrome::color_button(ui, text);
                 });
                 note(
                     ui,
@@ -5716,6 +6400,19 @@ struct Probe {
     x: f32,
     y: f32,
     height: f32,
+    /// A caret across a column of a vertical section (세로쓰기): `width` is the column.
+    vertical: bool,
+    width: f32,
+}
+
+/// The table cell of a tracked change (`document.track_changes` list `cell`), if any.
+fn change_cell(change: &serde_json::Value) -> Option<hwpcraft_engine::Cell> {
+    let cell = change.get("cell").filter(|c| c.is_object())?;
+    Some(hwpcraft_engine::Cell {
+        control: cell["control"].as_u64()? as usize,
+        index: cell["index"].as_u64()? as usize,
+        paragraph: cell["paragraph"].as_u64()? as usize,
+    })
 }
 
 fn probe(session: &Session, at: Cursor, offset: usize) -> Option<Probe> {
@@ -5725,6 +6422,8 @@ fn probe(session: &Session, at: Cursor, offset: usize) -> Option<Probe> {
         x: v["x"].as_f64()? as f32,
         y: v["y"].as_f64()? as f32,
         height: v["height"].as_f64().unwrap_or(16.0) as f32,
+        vertical: v["vertical"] == true,
+        width: v["width"].as_f64().unwrap_or(0.0) as f32,
     })
 }
 
@@ -5761,7 +6460,22 @@ fn paragraph_selection_rects(
         let (Some(a), b) = (caret(s, budget), caret(e, budget)) else {
             continue;
         };
+        // A vertical section's line is a column: the span runs down it.
         if let Some(b) = b
+            && a.vertical
+            && a.page == b.page
+            && (b.x - a.x).abs() < 1.0
+        {
+            if a.page == page {
+                out.push(Rect::from_min_size(
+                    Pos2::new(a.x, a.y),
+                    Vec2::new(a.width, (b.y - a.y).max(2.0)),
+                ));
+            }
+            continue;
+        }
+        if let Some(b) = b
+            && !a.vertical
             && a.page == b.page
             && (b.y - a.y).abs() < 1.0
         {
@@ -5775,10 +6489,12 @@ fn paragraph_selection_rects(
         }
         if e - s == 1 {
             if a.page == page {
-                out.push(Rect::from_min_size(
-                    Pos2::new(a.x, a.y),
-                    Vec2::new(a.height * 0.6, a.height),
-                ));
+                let size = if a.vertical {
+                    Vec2::new(a.width, a.width * 0.8)
+                } else {
+                    Vec2::new(a.height * 0.6, a.height)
+                };
+                out.push(Rect::from_min_size(Pos2::new(a.x, a.y), size));
             }
             continue;
         }
@@ -7327,11 +8043,25 @@ mod dialog_tests {
         }
         let dir = std::env::temp_dir().join(format!("hwpcraft-tracked-{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
-        let target = dir.join("result.hwpx");
+        // HWP and HWPX keep the tracking records (when the engine says so); DOCX merges
+        // them into the result, which the window asks first.
+        let target = dir.join("result.docx");
         assert!(
             !a.confirm_tracked_save(&dir.join("out.pdf")),
             "PDF is not asked"
         );
+        let state = a.track_state();
+        for (name, key) in [
+            ("kept.hwp", "keptOnHwpSave"),
+            ("kept.hwpx", "keptOnHwpxSave"),
+        ] {
+            assert_eq!(
+                a.confirm_tracked_save(&dir.join(name)),
+                state[key] != true,
+                "{name}: {state}"
+            );
+            a.ext.shell.dialog = None;
+        }
         assert!(a.confirm_tracked_save(&target));
         let ctx = a.ctx.clone();
         let mut output = ctx.run_ui(
@@ -7374,9 +8104,8 @@ mod dialog_tests {
     }
 
     #[test]
-    fn an_hwp_save_with_picture_effects_asks_and_drops_them() -> anyhow::Result<()> {
+    fn an_hwp_save_with_picture_effects_saves_them_without_asking() -> anyhow::Result<()> {
         let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
-        let ctx = a.ctx.clone();
         let dir = std::env::temp_dir().join(format!("hwpcraft-effects-{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
         let png = dir.join("p.png");
@@ -7389,39 +8118,51 @@ mod dialog_tests {
             "picture.effects",
             json!({"address": v["address"], "glow": {}}),
         )?;
+        // HWP and HWPX both keep the effects: no question before either save.
+        let out = dir.join("out.hwp");
+        assert!(!a.confirm_tracked_save(&out));
+        assert!(!a.confirm_tracked_save(&dir.join("out.hwpx")));
+        assert!(a.ext.shell.dialog.is_none());
+        a.session.save(&out)?;
+        let mut reopened = hwpcraft_engine::Session::new()?;
+        reopened.open(&out)?;
+        let kept = reopened.run("picture.effects.get", json!({"address": v["address"]}))?;
+        assert!(kept["effects"]["glow"].is_object(), "{kept}");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// An .hwp save of combo box items asks first; 목록 빼고 저장 saves without them and
+    /// HWPX needs no question.
+    #[test]
+    fn an_hwp_save_with_combo_items_asks_and_saves_without_them() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let dir = std::env::temp_dir().join(format!("hwpcraft-combo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        a.session.run(
+            "form.insert",
+            json!({"kind": "combo_box", "items": ["봄", "여름"], "text": "봄"}),
+        )?;
+        assert!(!a.confirm_tracked_save(&dir.join("out.hwpx")));
         let out = dir.join("out.hwp");
         assert!(a.confirm_tracked_save(&out));
         assert!(matches!(
             a.ext.shell.dialog,
-            Some(Dialog::TrackedSave {
-                tracked: false,
-                effects: 1,
-                ..
-            })
+            Some(Dialog::TrackedSave { combos: 1, .. })
         ));
-        // HWPX keeps the effects: no question there.
-        assert_eq!(
-            a.session
-                .picture_effects_blocking_save(&dir.join("out.hwpx")),
-            0
+        let ctx = a.ctx.clone();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![key(egui::Key::Enter)],
+                ..Default::default()
+            },
+            |_| a.shell_ext_dialogs(&ctx),
         );
-        for events in [vec![], vec![key(egui::Key::Enter)]] {
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    events,
-                    ..Default::default()
-                },
-                |_| a.shell_ext_dialogs(&ctx),
-            );
-            output.textures_delta.clear();
-        }
-        assert!(a.ext.shell.dialog.is_none(), "{}", a.message);
-        assert!(out.exists());
-        assert!(
-            a.message.starts_with("그림 효과 1개를 빼고 저장 완료"),
-            "{}",
-            a.message
-        );
+        output.textures_delta.clear();
+        assert!(out.is_file(), "{}", a.message);
+        assert!(a.ext.shell.dialog.is_none());
+        assert!(a.message.contains("콤보 상자 1개"), "{}", a.message);
+        assert!(!a.confirm_tracked_save(&out), "nothing left to drop");
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
@@ -7447,6 +8188,182 @@ mod dialog_tests {
             a.message.starts_with("DOCX로 내보냈습니다"),
             "{}",
             a.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// 검토 ▸ 다음은 첫 변경 내용으로 가고, 적용은 그 변경 하나를, 모두 적용은 나머지를
+    /// 적용합니다.
+    #[test]
+    fn review_menu_steps_to_and_accepts_tracked_changes() -> anyhow::Result<()> {
+        let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../rhwp/samples/issue5169_viewtext_changetracking.hwp");
+        if !sample.exists() {
+            return Ok(());
+        }
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        a.session.open(&sample)?;
+        let count = |a: &mut HwpApp| a.track_state()["list"].as_array().map_or(0, Vec::len);
+        let before = count(&mut a);
+        assert!(before > 1, "the sample has tracked changes");
+        assert_eq!(a.shell_ext_enabled("review.accept"), Some(true));
+        a.shell_ext_dispatch("review.next", &ctx.clone());
+        // The earliest change in the body.
+        let earliest = a.track_state()["list"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| {
+                Some((
+                    m["paragraph"].as_u64()? as usize,
+                    m["start"].as_u64()? as usize,
+                ))
+            })
+            .min();
+        assert_eq!(
+            Some((a.session.cursor.paragraph, a.session.cursor.offset)),
+            earliest
+        );
+        a.shell_ext_dispatch("review.accept", &ctx.clone());
+        let after = count(&mut a);
+        assert!(after < before, "{after} of {before}: {}", a.message);
+        a.shell_ext_dispatch("review.accept_all", &ctx.clone());
+        assert_eq!(count(&mut a), 0, "{}", a.message);
+        assert_eq!(a.shell_ext_enabled("review.accept"), Some(false));
+        Ok(())
+    }
+
+    /// 검토 ▸ 변경 추적: 켜면 입력이 변경 내용으로 기록되고(단추가 눌린 상태), 끄면 멈춥니다.
+    #[test]
+    fn track_changes_toggle_records_typing() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        assert!(!a.shell_ext_checked("review.track_changes"));
+        a.shell_ext_dispatch("review.track_changes", &ctx.clone());
+        assert!(a.shell_ext_checked("review.track_changes"), "{}", a.message);
+        a.session
+            .execute(hwpcraft_engine::Command::Insert("기록할 글".into()))?;
+        let state = a.track_state();
+        assert_eq!(state["recording"], true, "{state}");
+        assert!(
+            state["list"].as_array().is_some_and(|l| !l.is_empty()),
+            "{state}"
+        );
+        a.shell_ext_dispatch("review.track_changes", &ctx.clone());
+        assert!(!a.shell_ext_checked("review.track_changes"));
+        Ok(())
+    }
+
+    /// 상태 표시줄: 변경 추적을 켜기만 하면 "기록 중", 첫 변경이 기록되면 "기록 있음 · 기록 중".
+    #[test]
+    fn track_status_reads_recording_until_a_change_is_listed() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        assert_eq!(a.track_status(), None);
+        a.shell_ext_dispatch("review.track_changes", &ctx.clone());
+        assert_eq!(a.track_status().map(|s| s.0), Some("변경 추적 기록 중"));
+        a.session
+            .execute(hwpcraft_engine::Command::Insert("기록할 글".into()))?;
+        assert_eq!(
+            a.track_status().map(|s| s.0),
+            Some("변경 추적 기록 있음 · 기록 중")
+        );
+        Ok(())
+    }
+
+    /// 시험은 사용자 설정 폴더(최근 문서·보기 설정 등)를 건드리지 않고 자기 폴더에 씁니다.
+    #[test]
+    fn tests_keep_out_of_the_user_settings_folder() -> anyhow::Result<()> {
+        let own = config_dir().ok_or_else(|| anyhow::anyhow!("no settings folder"))?;
+        assert!(own.starts_with(std::env::temp_dir()), "{}", own.display());
+        assert_ne!(Some(own.clone()), hwpcraft_engine::config_dir());
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let dir = std::env::temp_dir().join(format!("hwpcraft-recent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("recent.hwpx");
+        a.session.save(&path)?;
+        a.shell_ext_frame();
+        let recent = std::fs::read_to_string(own.join("recent.txt"))?;
+        assert!(recent.contains("recent.hwpx"), "{recent}");
+        // A screen capture run does not add its document.
+        let mut b = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        b.screenshot = Some(dir.join("shot.png"));
+        b.session.save(&dir.join("captured.hwpx"))?;
+        b.shell_ext_frame();
+        let recent = std::fs::read_to_string(own.join("recent.txt"))?;
+        assert!(!recent.contains("captured.hwpx"), "{recent}");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// 쪽 ▸ 글자 방향: 세 항목이 지금 구역의 글자 방향을 바꾸고, 표 안에서는 쓸 수 없습니다.
+    #[test]
+    fn text_direction_menu_sets_the_section() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        for (id, expected) in [
+            ("page.text_direction.vertical", "vertical"),
+            ("page.text_direction.vertical_all", "vertical_all"),
+            ("page.text_direction.horizontal", "horizontal"),
+        ] {
+            assert_eq!(a.shell_ext_enabled(id), Some(true));
+            a.shell_ext_dispatch(id, &ctx.clone());
+            assert_eq!(
+                a.session.run("page.section.get", json!({}))?["textDirection"],
+                expected,
+                "{}",
+                a.message
+            );
+        }
+        Ok(())
+    }
+
+    /// 원고지 창: 200자를 고르고 글을 가져오면 그 글이 든 원고지 새 문서가 됩니다.
+    #[test]
+    fn manuscript_dialog_makes_a_manuscript_document() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        let frame = |a: &mut HwpApp, events: Vec<egui::Event>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |_| a.shell_ext_dialogs(&ctx),
+            );
+            output.textures_delta.clear();
+        };
+        let dir = std::env::temp_dir().join(format!("hwpcraft-manuscript-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        a.session
+            .execute(hwpcraft_engine::Command::Insert("가져올 글".into()))?;
+        a.session.save(&dir.join("saved.hwpx"))?;
+        a.shell_ext_dispatch("page.manuscript", &ctx.clone());
+        if let Some(Dialog::Manuscript { four_hundred, fill }) = a.ext.shell.dialog.as_mut() {
+            *four_hundred = false;
+            *fill = true;
+        }
+        frame(&mut a, vec![]);
+        frame(&mut a, vec![key(egui::Key::Enter)]);
+        assert!(
+            a.ext.shell.dialog.is_none(),
+            "made and closed: {}",
+            a.message
+        );
+        let section = a.session.run("page.section.get", json!({}))?;
+        assert_eq!(section["manuscript"], true);
+        let doc = a.session.core.document();
+        assert!(
+            doc.sections[0].section_def.page_def.width
+                > doc.sections[0].section_def.page_def.height
+        );
+        assert!(
+            doc.sections[0]
+                .paragraphs
+                .iter()
+                .any(|p| p.text.contains("가져올 글"))
         );
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
@@ -7506,6 +8423,27 @@ mod dialog_tests {
             a.session.run("page.master.get", json!({}))?["exists"],
             false
         );
+        // 임의 쪽 with a page number saves a master page for that page only.
+        a.shell_ext_dispatch("page.master", &ctx.clone());
+        if let Some(Dialog::MasterPage {
+            kind, page, text, ..
+        }) = a.ext.shell.dialog.as_mut()
+        {
+            *kind = 4;
+            *page = 2;
+            *text = "둘째".into();
+        }
+        frame(&mut a, vec![]);
+        frame(&mut a, vec![key(egui::Key::Enter)]);
+        assert!(a.ext.shell.dialog.is_none(), "saved and closed");
+        let mut optional = |page: u16| {
+            a.session.run(
+                "page.master.get",
+                json!({"applyTo": "optional", "page": page}),
+            )
+        };
+        assert_eq!(optional(2)?["text"], "둘째");
+        assert_eq!(optional(1)?["exists"], false);
         Ok(())
     }
 
@@ -7550,6 +8488,7 @@ mod dialog_tests {
         assert!(picture.params("odd").get("height_mm").is_none());
         a.ext.shell.dialog = Some(Dialog::MasterPage {
             kind: 0,
+            page: 1,
             list: list.clone(),
             text: String::new(),
             objects: objects.clone(),
@@ -7558,6 +8497,35 @@ mod dialog_tests {
         let mut output = ctx.run_ui(Default::default(), |_| a.shell_ext_dialogs(&ctx));
         output.textures_delta.clear();
         assert!(a.ext.shell.dialog.is_some(), "still open");
+        // 고치기 loads the listed rectangle; 바꾸기 moves and resizes it in place.
+        let mut edit = MasterObject::default();
+        edit.load(&shown[0]);
+        (edit.x_mm, edit.width_mm) = (35.0, 60.0);
+        let params = edit.edit_params().expect("editing");
+        assert_eq!(params["address"]["master"], "both");
+        assert!(params["props"].get("textWrap").is_none(), "wrap unchanged");
+        a.ext.shell.dialog = Some(Dialog::MasterPage {
+            kind: 0,
+            page: 1,
+            list: list.clone(),
+            text: String::new(),
+            objects: objects.clone(),
+            object: edit,
+        });
+        let mut output = ctx.run_ui(Default::default(), |_| a.shell_ext_dialogs(&ctx));
+        output.textures_delta.clear();
+        let Some(Dialog::MasterPage { object, .. }) = &a.ext.shell.dialog else {
+            panic!("dialog");
+        };
+        assert!(object.editing.is_some(), "the listed object stays chosen");
+        a.master_object_request("object.properties", params, &mut list, &mut objects);
+        assert!(a.error.is_none(), "{:?}", a.error);
+        let changed = &objects["objects"][0];
+        assert_eq!(
+            (&changed["x_mm"], &changed["width_mm"]),
+            (&json!(35.0), &json!(60.0))
+        );
+        assert_eq!(changed["y_mm"], 20.0);
         // 지우기 removes it again; one undo brings it back.
         a.master_object_request(
             "page.master.object.delete",
@@ -7716,5 +8684,94 @@ mod history_tests {
         assert_eq!(list["entries"].as_array().map(Vec::len), Some(4));
         assert_eq!(list["lastVersion"], true);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dialog_fit_tests {
+    use super::*;
+
+    /// 구역 설정 sends 이어지는 번호의 홀짝 (pageNumType): 홀수로 is stored as 1.
+    #[test]
+    fn the_section_dialog_sets_an_odd_or_even_start() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        a.shell_ext_dispatch("page.section_dialog", &ctx);
+        let Some(Dialog::Section { page_kind, .. }) = a.ext.shell.dialog.as_mut() else {
+            anyhow::bail!("구역 설정 did not open");
+        };
+        assert_eq!(*page_kind, 0, "a new document continues as is");
+        *page_kind = 1;
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [vec![], vec![enter]] {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| a.shell_ext_dialogs(ui.ctx()));
+            out.textures_delta.clear();
+        }
+        assert!(a.ext.shell.dialog.is_none(), "설정(D) closed it");
+        assert!(a.error.is_none(), "{:?}", a.error);
+        let v = a.session.run("page.section.get", json!({}))?;
+        assert_eq!(v["pageNumType"], 1);
+        Ok(())
+    }
+
+    /// A dialog taller and wider than an 800×600 window keeps its title and its command
+    /// buttons on screen: the body scrolls instead of pushing them out of the window.
+    #[test]
+    fn a_dialog_larger_than_the_window_keeps_title_and_buttons_on_screen() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let mut placed = Vec::new();
+        for i in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(f64::from(i)),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                dialog(
+                    ui.ctx(),
+                    "큰 대화상자",
+                    980.0,
+                    &["설정(D)", "취소"],
+                    |ui| {
+                        ui.allocate_space(Vec2::new(900.0, 1200.0));
+                    },
+                );
+            });
+            placed = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Text(t) => Some((
+                        t.galley.text().to_owned(),
+                        t.galley
+                            .rect
+                            .translate(t.pos.to_vec2())
+                            .intersect(c.clip_rect),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            out.textures_delta.clear();
+        }
+        for label in ["큰 대화상자", "설정(D)", "취소"] {
+            let Some((_, rect)) = placed.iter().find(|(t, _)| t == label) else {
+                panic!("{label} is not painted: {placed:?}");
+            };
+            assert!(
+                rect.width() > 1.0 && screen.contains_rect(*rect),
+                "{label} at {rect:?} is not wholly on the 800×600 screen"
+            );
+        }
     }
 }

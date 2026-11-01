@@ -123,6 +123,11 @@ fn table(value: &mut Table, depth: usize, repaired: &mut usize) {
         value.row_count = value.row_count.max(rows);
         value.col_count = value.col_count.max(cols);
         value.rebuild_grid();
+        // The HWP TABLE record writes one cell count per row: a list shorter than the
+        // new row count would shift every field after it.
+        value.row_sizes = (0..value.row_count)
+            .map(|r| value.cells.iter().filter(|c| c.row == r).count() as i16)
+            .collect();
         *repaired += 1;
     }
     caption(value.caption.as_mut(), depth, repaired);
@@ -179,5 +184,37 @@ fn shape(value: &mut ShapeObject, depth: usize, repaired: &mut usize) {
         ShapeObject::Chart(chart) => caption(chart.caption.as_mut(), depth, repaired),
         ShapeObject::Ole(ole) => caption(ole.caption.as_mut(), depth, repaired),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hwpcraft_doc::model::table::Cell;
+
+    #[test]
+    fn raised_row_count_gets_a_cell_count_for_every_row() {
+        let mut t = Table {
+            cells: (0..3)
+                .flat_map(|row| {
+                    (0..2).map(move |col| Cell {
+                        row,
+                        col,
+                        row_span: 1,
+                        col_span: 1,
+                        ..Cell::default()
+                    })
+                })
+                .collect(),
+            row_count: 1,
+            col_count: 2,
+            row_sizes: vec![2],
+            ..Table::default()
+        };
+        let mut repaired = 0;
+        table(&mut t, 0, &mut repaired);
+        assert_eq!(repaired, 1);
+        assert_eq!(t.row_count, 3);
+        assert_eq!(t.row_sizes, vec![2, 2, 2]);
     }
 }

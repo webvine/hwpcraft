@@ -1,0 +1,162 @@
+diff --git a/src/model/paragraph.rs b/src/model/paragraph.rs
+index b776c0f..a5eb15a 100644
+--- a/src/model/paragraph.rs
++++ b/src/model/paragraph.rs
+@@ -1372,6 +1372,14 @@ impl Paragraph {
+                 fr.end_char_idx += inserted_len;
+             }
+         }
++        // 5-2. 앞 문단에서 시작한 필드(여러 문단 누름틀·메모)의 끝 표식도 글자 축을
++        // 따라간다. 끝에 친 글자는 위 non-hyperlink 필드처럼 필드 안이다. 옮기지 않으면
++        // 끝 문단에서 친 글자만큼 필드 범위가 앞으로 밀려 잘린다.
++        for orphan in &mut self.orphan_field_ends {
++            if orphan.char_idx >= char_offset {
++                orphan.char_idx += inserted_len;
++            }
++        }
+ 
+         // 6. char_count 갱신
+         self.char_count += utf16_delta;
+@@ -1512,6 +1520,14 @@ impl Paragraph {
+                 fr.end_char_idx = char_offset;
+             }
+         }
++        // 5-2. 앞 문단에서 시작한 필드의 끝 표식: 지운 범위 뒤면 당기고, 안이면 시작에 둔다.
++        for orphan in &mut self.orphan_field_ends {
++            if orphan.char_idx >= del_end {
++                orphan.char_idx -= actual_count;
++            } else if orphan.char_idx > char_offset {
++                orphan.char_idx = char_offset;
++            }
++        }
+         // start > end (역전)인 경우만 제거. start == end (빈 필드)는 유효한 상태이므로 유지.
+         // IME 조합 중 delete→insert 사이클에서 필드가 일시적으로 비워질 수 있음.
+         self.field_ranges
+@@ -1625,6 +1641,17 @@ impl Paragraph {
+             })
+             .collect();
+         self.markpen_marks.retain(|m| m.char_idx < split_pos);
++        // 2-2. 앞 문단에서 시작한 필드의 끝 표식도 제목 차례 표시처럼 뒤 절반으로 옮긴다.
++        let new_orphan_field_ends: Vec<OrphanFieldEnd> = self
++            .orphan_field_ends
++            .iter()
++            .filter(|o| o.char_idx >= split_pos)
++            .map(|o| OrphanFieldEnd {
++                char_idx: o.char_idx - split_pos,
++                ..o.clone()
++            })
++            .collect();
++        self.orphan_field_ends.retain(|o| o.char_idx < split_pos);
+ 
+         // 3. char_shapes 분할
+         let mut new_char_shapes: Vec<CharShapeRef> = Vec::new();
+@@ -1890,7 +1917,11 @@ impl Paragraph {
+             + 1; // +1 for paragraph end marker
+         let new_char_count = new_text_code_units
+             + new_controls.len() as u32 * 8
+-            + hidden_slot_units(&new_field_ranges, 0, new_title_marks.len())
++            + hidden_slot_units(
++                &new_field_ranges,
++                new_orphan_field_ends.len(),
++                new_title_marks.len(),
++            )
+             + 1;
+ 
+         // 7. has_para_text: 빈 문단(텍스트 없고 컨트롤 없음)이면 PARA_TEXT 불필요
+@@ -1925,7 +1956,7 @@ impl Paragraph {
+             hwpx_axis_shift: 0,
+             range_tags: new_range_tags,
+             field_ranges: new_field_ranges, // 새 문단으로 이관된 필드 범위
+-            orphan_field_ends: Vec::new(),
++            orphan_field_ends: new_orphan_field_ends,
+             char_count: new_char_count,
+             para_shape_id: self.para_shape_id,
+             style_id: self.style_id,
+@@ -2000,6 +2031,11 @@ impl Paragraph {
+                 ignore: m.ignore,
+             });
+         }
++        self.orphan_field_ends
++            .extend(other.orphan_field_ends.iter().map(|o| OrphanFieldEnd {
++                char_idx: o.char_idx + self_text_len,
++                ..o.clone()
++            }));
+ 
+         // 3. char_shapes 결합 (other의 start_pos에 utf16_end 추가)
+         for cs in &other.char_shapes {
+diff --git a/src/model/paragraph/tests.rs b/src/model/paragraph/tests.rs
+index f83ab2d..615bd66 100644
+--- a/src/model/paragraph/tests.rs
++++ b/src/model/paragraph/tests.rs
+@@ -1598,3 +1598,71 @@ fn shift_for_inline_control_insert_leaves_earlier_lines_alone() {
+     assert_eq!(para.line_segs[1].text_start, 4);
+     assert_eq!(para.line_segs[2].text_start, 16);
+ }
++
++
++/// The end marker of a field that began in an earlier paragraph (a multi-paragraph
++/// 누름틀 or memo) follows text edits in its paragraph like a field range end.
++fn orphan_paragraph() -> Paragraph {
++    let text = "가나다라마";
++    Paragraph {
++        text: text.to_string(),
++        char_count: 5 + 8 + 1,
++        char_offsets: vec![0, 1, 2, 11, 12],
++        char_shapes: vec![CharShapeRef {
++            start_pos: 0,
++            char_shape_id: 1,
++        }],
++        orphan_field_ends: vec![OrphanFieldEnd {
++            char_idx: 3,
++            begin_id_ref: 7,
++            field_id: 7,
++            begin_ctrl_id: 0,
++        }],
++        has_para_text: true,
++        ..Default::default()
++    }
++}
++
++#[test]
++fn orphan_field_end_follows_inserted_and_deleted_text() {
++    let mut para = orphan_paragraph();
++    para.insert_text_at(1, "XY");
++    assert_eq!(para.orphan_field_ends[0].char_idx, 5, "text before the end moves it");
++    para.insert_text_at(5, "Z");
++    assert_eq!(para.orphan_field_ends[0].char_idx, 6, "text typed at the end joins the field");
++    para.insert_text_at(7, "W");
++    assert_eq!(para.orphan_field_ends[0].char_idx, 6, "text after the end leaves it");
++    para.delete_text_at(0, 2);
++    assert_eq!(para.orphan_field_ends[0].char_idx, 4);
++    para.delete_text_at(3, 3);
++    assert_eq!(para.orphan_field_ends[0].char_idx, 3, "a deleted end stays at the cut");
++}
++
++#[test]
++fn orphan_field_end_moves_with_split_and_merge() {
++    let mut para = orphan_paragraph();
++    let tail = para.split_at(2);
++    assert!(para.orphan_field_ends.is_empty());
++    assert_eq!(tail.orphan_field_ends.len(), 1);
++    assert_eq!(tail.orphan_field_ends[0].char_idx, 1);
++    assert_eq!(tail.orphan_field_ends[0].field_id, 7);
++
++    let mut para = orphan_paragraph();
++    let tail = para.split_at(4);
++    assert_eq!(para.orphan_field_ends[0].char_idx, 3, "an end before the split stays");
++    assert!(tail.orphan_field_ends.is_empty());
++    let len = para.merge_from(&tail);
++    assert_eq!(len, 4);
++    assert_eq!(para.orphan_field_ends.len(), 1);
++    assert_eq!(para.orphan_field_ends[0].char_idx, 3);
++
++    let mut head = Paragraph {
++        text: "앞".to_string(),
++        char_count: 2,
++        char_offsets: vec![0],
++        has_para_text: true,
++        ..Default::default()
++    };
++    head.merge_from(&orphan_paragraph());
++    assert_eq!(head.orphan_field_ends[0].char_idx, 4, "merged after one character");
++}

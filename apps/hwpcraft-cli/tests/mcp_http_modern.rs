@@ -62,6 +62,15 @@ impl HttpCli {
         let token = "http-cli-fixture-token-0123456789abcdef".to_owned();
         std::fs::create_dir_all(root.join("config"))?;
         std::fs::write(root.join("config").join("mcp-http-token"), &token)?;
+        // The server refuses a token file other users can read.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root.join("config").join("mcp-http-token"),
+                std::fs::Permissions::from_mode(0o600),
+            )?;
+        }
         // CLI has no listener-FD handoff. Reserve an OS-assigned port, release it,
         // then bound retries for the narrow bind race. Never use a fixed port.
         for _ in 0..3 {
@@ -108,7 +117,10 @@ impl HttpCli {
                 // A successful TCP connect alone is insufficient: verify the
                 // real MCP response and that our own child did not lose its bind.
                 if let Ok(value) = server.rpc("server/discover", json!({}))
-                    && value["supportedVersions"] == json!([VERSION])
+                    // 2026-07-28 and the 2025 revisions that open with initialize.
+                    && value["supportedVersions"]
+                        .as_array()
+                        .is_some_and(|versions| versions.iter().any(|v| v == VERSION))
                     && server.child.try_wait()?.is_none()
                 {
                     return Ok(server);
@@ -1002,9 +1014,10 @@ fn actual_http_subscriptions_ack_resync_change_close_and_disconnect_are_uri_scop
         -32602
     );
     // Service remains responsive after both stream completions and a disconnect.
-    assert_eq!(
-        server.rpc("server/discover", json!({}))?["supportedVersions"],
-        json!([VERSION])
+    assert!(
+        server.rpc("server/discover", json!({}))?["supportedVersions"]
+            .as_array()
+            .is_some_and(|versions| versions.iter().any(|v| v == VERSION))
     );
     let captures = json!([first.capture()?, second.capture()?, resumed.capture()?]);
     drop(first);

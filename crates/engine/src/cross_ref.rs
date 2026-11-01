@@ -18,13 +18,76 @@
 use super::*;
 use hwpcraft_doc::HyperlinkTarget;
 use hwpcraft_doc::model::control::{Field, FieldType, Parameter, ParameterList};
+use hwpcraft_doc::model::document::Document;
 use serde::Deserialize;
+
+/// The RHWP target of a generated text field's paragraph: a body paragraph, or a
+/// paragraph of one of its first-level table cells (where the body caret goes).
+pub(crate) fn field_target(
+    section: usize,
+    paragraph: usize,
+    cell: Option<Cell>,
+) -> HyperlinkTarget {
+    HyperlinkTarget {
+        section,
+        para: paragraph,
+        cell_path: cell
+            .map(|c| vec![(c.control, c.index, c.paragraph)])
+            .unwrap_or_default(),
+    }
+}
+
+fn field_paragraph_mut(
+    doc: &mut Document,
+    section: usize,
+    paragraph: usize,
+    cell: Option<Cell>,
+) -> Option<&mut Paragraph> {
+    let para = doc
+        .sections
+        .get_mut(section)?
+        .paragraphs
+        .get_mut(paragraph)?;
+    let Some(c) = cell else {
+        return Some(para);
+    };
+    match para.controls.get_mut(c.control)? {
+        Control::Table(t) => t.cells.get_mut(c.index)?.paragraphs.get_mut(c.paragraph),
+        _ => None,
+    }
+}
+
+/// Body paragraphs and the paragraphs of their first-level table cells, in document
+/// order: where generated text fields can be.
+pub(crate) fn field_paragraphs(doc: &Document) -> Vec<(usize, usize, Option<Cell>, &Paragraph)> {
+    let mut out = Vec::new();
+    for (s, section) in doc.sections.iter().enumerate() {
+        for (p, para) in section.paragraphs.iter().enumerate() {
+            out.push((s, p, None, para));
+            for (control, c) in para.controls.iter().enumerate() {
+                if let Control::Table(t) = c {
+                    for (index, cell) in t.cells.iter().enumerate() {
+                        for (k, inner) in cell.paragraphs.iter().enumerate() {
+                            let cell = Cell {
+                                control,
+                                index,
+                                paragraph: k,
+                            };
+                            out.push((s, p, Some(cell), inner));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
 
 /// (command id, Korean label, shortcut) shown in help and command search.
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     (
         "insert.cross_reference",
-        "상호 참조 넣기 (책갈피·개요·표·그림이 있는 쪽 번호, 표 캡션 번호·캡션)",
+        "상호 참조 넣기 (책갈피·개요·표·그림이 있는 쪽 번호, 표·그림 캡션 번호·캡션)",
         "",
     ),
     ("tools.cross_reference.update", "상호 참조 새로 고침", ""),
@@ -40,17 +103,17 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "insert.cross_reference",
-        "본문 캐럿 위치에 대상이 있는 쪽 번호를 상호 참조 필드로 넣습니다. target: {bookmark:\"이름\"} | {heading:\"개요 제목 글자\"} | {table:n} | {picture:n} (n: 문서 순서의 n번째 캡션 달린 표·그림, 1부터). 개요·표·그림은 그 문단에 책갈피(이름 hwpcraft-ref-…)를 달아 가리킵니다. show: page(기본, 쪽 번호) | number(표 캡션 번호, 한글처럼 숫자만: \"표 \"는 앞에 직접 입력) | caption(표 캡션 전체, 예: \"표 1 예산 집행\"); number·caption은 target이 table일 때만이며 표를 고유 개체 id(#id)로 가리킵니다. 넣을 문단에는 표·그림·책갈피 같은 개체가 없어야 합니다. 결과: field_id, text, page 참조는 bookmark·page, number·caption은 table(개체 id).",
+        "본문 캐럿 위치에 대상이 있는 쪽 번호를 상호 참조 필드로 넣습니다. target: {bookmark:\"이름\"} | {heading:\"개요 제목 글자\"} | {table:n} | {picture:n} (n: 문서 순서의 n번째 캡션 달린 표·그림, 1부터). 개요·표·그림은 그 문단에 책갈피(이름 hwpcraft-ref-…)를 달아 가리킵니다. show: page(기본, 쪽 번호) | number(캡션 번호, 한글처럼 숫자만: \"표 \"·\"그림 \"은 앞에 직접 입력. 개요는 보이는 번호 \"1.\") | caption(캡션 전체, 예: \"표 1 예산 집행\". 개요는 제목 글); number·caption은 target이 table·picture·heading일 때만이며 표·그림은 고유 개체 id, 개요는 그 문단의 id(#id)로 가리킵니다. 본문과 한 단계 표 셀 문단에 넣고, 표·그림·책갈피·각주 같은 개체 바로 뒤 자리에는 넣지 않습니다. 결과: field_id, text, page 참조는 bookmark·page, number·caption은 table·picture·heading(개체·문단 id).",
         r#"{"target":{"table":1},"show":"number"}"#,
     ),
     (
         "tools.cross_reference.update",
-        "매개 변수 없음. 본문의 모든 상호 참조(쪽 번호, 표 캡션 번호·캡션)를 지금 값으로 고칩니다(한 번 실행 취소). 결과: references, updated, missing(대상이 없는 참조의 책갈피 이름 또는 #표 id), skipped(참조가 든 문단에 표·그림·책갈피가 생겨 고치지 못한 field_id).",
+        "매개 변수 없음. 본문의 모든 상호 참조(쪽 번호, 표·그림 캡션 번호·캡션)를 지금 값으로 고칩니다(한 번 실행 취소). 결과: references, updated, missing(대상이 없는 참조의 책갈피 이름 또는 #개체 id), skipped(참조 끝에 표·그림·책갈피 같은 개체가 붙어 고치지 못한 field_id).",
         r#"{}"#,
     ),
     (
         "tools.cross_reference.list",
-        "매개 변수 없음. items[]: field_id, show(page|number|caption), text(지금 보이는 글), section, paragraph, 책갈피 참조는 bookmark·page(지금 계산한 쪽, 책갈피가 없으면 null), 표 참조는 table(개체 id)·expected(지금 보여야 할 글).",
+        "매개 변수 없음. items[]: field_id, show(page|number|caption), text(지금 보이는 글), section, paragraph, 책갈피 참조는 bookmark·page(지금 계산한 쪽, 책갈피가 없으면 null), 표·그림 참조는 table 또는 picture(개체 id)·expected(지금 보여야 할 글).",
         r#"{}"#,
     ),
     (
@@ -68,6 +131,13 @@ pub(crate) const SCAFFOLD_URI: &str = "https://hwpcraft.invalid/cross-reference"
 const PAGE_KIND: &str = "OBJECT_TYPE_PAGE";
 /// Object kinds and contents of the command, from Hancom's public ActionCrossRef table.
 const OBJ_TABLE: u8 = 0;
+const OBJ_PICTURE: u8 = 1;
+/// An outline heading, pointed at by its paragraph's instance id (Hangul 2024 probe:
+/// `?#<paragraph InstId>;5;1;0;0` shows "1.", `;5;2;` the heading text).
+const OBJ_OUTLINE: u8 = 5;
+/// Instance ids HwpCraft gives headings it references: below 2^31 like Hangul's
+/// outline paragraphs, and far above the small ids a save numbers paragraphs with.
+const HEADING_IDS: u32 = 0x4000_0000;
 const OBJ_BOOKMARK: u8 = 6;
 const SHOW_PAGE: u8 = 0;
 const SHOW_NUMBER: u8 = 1;
@@ -103,15 +173,16 @@ enum Show {
 #[derive(Clone, PartialEq)]
 enum Pointee {
     Bookmark(String),
-    /// An object by its instance id.
-    Object(u32),
+    /// A table or picture (`OBJ_TABLE`, `OBJ_PICTURE`) by its instance id.
+    Object(u8, u32),
 }
 
 /// A cross reference this module can keep current: a bookmark's page, or a
-/// table's page, caption number or caption.
+/// table's or picture's page, caption number or caption.
 struct Reference {
     section: usize,
     paragraph: usize,
+    cell: Option<Cell>,
     field_id: u32,
     pointee: Pointee,
     content: u8,
@@ -129,9 +200,46 @@ fn parse_command(field: &Field) -> Option<(Pointee, u8)> {
     let content: u8 = parts.next()?.parse().ok()?;
     match (target.strip_prefix('#'), kind, content) {
         (None, OBJ_BOOKMARK, SHOW_PAGE) => Some((Pointee::Bookmark(target.to_owned()), content)),
-        (Some(id), OBJ_TABLE, SHOW_PAGE | SHOW_NUMBER | SHOW_CONTENT) => {
-            Some((Pointee::Object(id.parse().ok()?), content))
-        }
+        (
+            Some(id),
+            OBJ_TABLE | OBJ_PICTURE | OBJ_OUTLINE,
+            SHOW_PAGE | SHOW_NUMBER | SHOW_CONTENT,
+        ) => Some((Pointee::Object(kind, id.parse().ok()?), content)),
+        _ => None,
+    }
+}
+
+/// "표", "그림" or "개요", for messages.
+fn object_name(kind: u8) -> &'static str {
+    match kind {
+        OBJ_PICTURE => "그림",
+        OBJ_OUTLINE => "개요",
+        _ => "표",
+    }
+}
+
+/// The result and list key that names the object: `table`, `picture` or `heading`.
+fn object_key(kind: u8) -> &'static str {
+    match kind {
+        OBJ_PICTURE => "picture",
+        OBJ_OUTLINE => "heading",
+        _ => "table",
+    }
+}
+
+/// A paragraph's instance id (HWP5 PARA_HEADER, HWPX `<hp:p id>`), 0 when it has none.
+fn paragraph_instance(para: &hwpcraft_doc::model::paragraph::Paragraph) -> u32 {
+    para.raw_header_extra
+        .get(6..10)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .unwrap_or(0)
+}
+
+/// The caption of a table or picture of this kind.
+fn object_caption(c: &Control, kind: u8) -> Option<&hwpcraft_doc::model::shape::Caption> {
+    match c {
+        Control::Table(t) if kind == OBJ_TABLE => t.caption.as_ref(),
+        Control::Picture(pic) if kind == OBJ_PICTURE => pic.caption.as_ref(),
         _ => None,
     }
 }
@@ -318,7 +426,7 @@ impl Session {
     /// Where a link inside the document leads in `core`'s layout: the 0-based page
     /// and the top left of the target's line in CSS px. `command` is a bookmark
     /// link's address (`?name`) or a cross reference's command (`?name;…` for a
-    /// bookmark, `?#id;…` for a table by instance id).
+    /// bookmark, `?#id;…` for a table or picture by instance id).
     pub(crate) fn internal_link_destination(
         &self,
         core: &hwpcraft_doc::DocumentCore,
@@ -329,7 +437,14 @@ impl Session {
         let target = address.strip_prefix('?')?;
         let (section, paragraph, offset) = match target.strip_prefix('#') {
             Some(id) => {
-                let (s, p, _) = self.table_by_instance(id.parse().ok()?)?;
+                let kind = command.split(';').nth(1).and_then(|k| k.parse().ok());
+                let id = id.parse().ok()?;
+                let (s, p) = if kind == Some(OBJ_OUTLINE) {
+                    self.paragraph_by_instance(id)?
+                } else {
+                    let (s, p, _) = self.object_by_instance(kind.unwrap_or(OBJ_TABLE), id)?;
+                    (s, p)
+                };
                 (s, p, 0)
             }
             None => *bookmarks.get(target)?,
@@ -369,24 +484,25 @@ impl Session {
 
     /// Why a cross reference cannot go at the caret, or `None` when it can.
     pub fn cross_reference_blocked(&self) -> Option<&'static str> {
-        if self.cursor.cell.is_some() {
-            return Some("상호 참조는 본문 문단에 넣습니다. 표 셀 밖에 커서를 놓으세요.");
-        }
         if self.has_selection() {
             return Some("선택을 해제하고 상호 참조를 넣을 위치에 커서를 놓으세요.");
         }
-        // RHWP edits field ranges only in paragraphs whose controls are fields.
+        // RHWP (0067) edits a field range beside other controls, but not with one on
+        // its boundary: the caret must not touch a table, picture, bookmark or note.
         let here = self.paragraph(self.cursor).ok()?;
+        let positions = here.control_text_positions();
         here.controls
             .iter()
-            .any(|c| {
-                !matches!(
-                    c,
-                    Control::SectionDef(_) | Control::ColumnDef(_) | Control::Field(_)
-                )
+            .zip(positions)
+            .any(|(c, at)| {
+                at == self.cursor.offset
+                    && !matches!(
+                        c,
+                        Control::SectionDef(_) | Control::ColumnDef(_) | Control::Field(_)
+                    )
             })
             .then_some(
-                "상호 참조는 표·그림·책갈피 같은 개체가 없는 본문 문단에 넣습니다. 새 문단에 넣어 주세요.",
+                "상호 참조 바로 앞에 표·그림·책갈피·각주 같은 개체가 붙어 있습니다. 글자 하나 떨어진 자리에 넣어 주세요.",
             )
     }
 
@@ -505,10 +621,12 @@ impl Session {
         Ok((name, section, paragraph, exists))
     }
 
-    /// (section, paragraph, control) of the n-th captioned table, as `{table: n}` counts.
-    fn captioned_table(&self, n: usize) -> Result<(usize, usize, usize)> {
+    /// (section, paragraph, control) of the n-th captioned table or picture (`kind`),
+    /// as `{table: n}` and `{picture: n}` count.
+    fn captioned_object(&self, kind: u8, n: usize) -> Result<(usize, usize, usize)> {
+        let name = object_name(kind);
         if n == 0 {
-            bail!("표 번호는 1부터 셉니다.");
+            bail!("{name} 번호는 1부터 셉니다.");
         }
         self.core
             .document()
@@ -523,17 +641,19 @@ impl Session {
                     .filter_map(move |(p, para)| {
                         para.controls
                             .iter()
-                            .position(|c| matches!(c, Control::Table(t) if t.caption.is_some()))
+                            .position(|c| object_caption(c, kind).is_some())
                             .map(|c| (s, p, c))
                     })
             })
             .nth(n - 1)
-            .ok_or_else(|| anyhow!("캡션 달린 표 {n}을(를) 찾지 못했습니다."))
+            .ok_or_else(|| anyhow!("캡션 달린 {name} {n}을(를) 찾지 못했습니다."))
     }
 
-    /// The table with this instance id: (section, paragraph, its caption).
-    fn table_by_instance(
+    /// The captioned table or picture (`kind`) with this instance id: (section,
+    /// paragraph, its caption).
+    fn object_by_instance(
         &self,
+        kind: u8,
         id: u32,
     ) -> Option<(usize, usize, &hwpcraft_doc::model::shape::Caption)> {
         self.core
@@ -543,19 +663,24 @@ impl Session {
             .enumerate()
             .find_map(|(s, section)| {
                 section.paragraphs.iter().enumerate().find_map(|(p, para)| {
-                    para.controls.iter().find_map(|c| match c {
-                        Control::Table(t) if t.common.instance_id == id => {
-                            t.caption.as_ref().map(|caption| (s, p, caption))
-                        }
-                        _ => None,
+                    para.controls.iter().find_map(|c| {
+                        let instance = match c {
+                            Control::Table(t) => t.common.instance_id,
+                            Control::Picture(pic) => pic.common.instance_id,
+                            _ => return None,
+                        };
+                        (instance == id)
+                            .then(|| object_caption(c, kind))
+                            .flatten()
+                            .map(|caption| (s, p, caption))
                     })
                 })
             })
     }
 
-    /// Give the table a nonzero instance id no other object in the document has,
-    /// keeping the one it has when it already is.
-    fn table_instance_id(&mut self, section: usize, paragraph: usize, control: usize) -> u32 {
+    /// Give the table or picture a nonzero instance id no other object in the
+    /// document has, keeping the one it has when it already is.
+    fn object_instance_id(&mut self, section: usize, paragraph: usize, control: usize) -> u32 {
         let mut used = std::collections::HashMap::<u32, usize>::new();
         for para in self
             .core
@@ -574,23 +699,34 @@ impl Session {
                 *used.entry(id).or_default() += 1;
             }
         }
+        let fresh = used.keys().max().map_or(1, |m| m.saturating_add(1)).max(1);
+        let unique = |current: u32| current != 0 && used.get(&current) == Some(&1);
         let doc = self.core.document_mut();
-        let Some(Control::Table(table)) = doc.sections[section].paragraphs[paragraph]
+        let id = match doc.sections[section].paragraphs[paragraph]
             .controls
             .get_mut(control)
-        else {
-            return 0;
+        {
+            Some(Control::Table(table)) => {
+                if unique(table.common.instance_id) {
+                    return table.common.instance_id;
+                }
+                table.common.instance_id = fresh;
+                // HWP writes a table's common attributes from these bytes when it has them.
+                if table.raw_ctrl_data.len() >= 36 {
+                    table.raw_ctrl_data[32..36].copy_from_slice(&fresh.to_le_bytes());
+                }
+                fresh
+            }
+            // A picture's common attributes are always written from the model.
+            Some(Control::Picture(pic)) => {
+                if unique(pic.common.instance_id) {
+                    return pic.common.instance_id;
+                }
+                pic.common.instance_id = fresh;
+                fresh
+            }
+            _ => return 0,
         };
-        let current = table.common.instance_id;
-        if current != 0 && used.get(&current) == Some(&1) {
-            return current;
-        }
-        let id = used.keys().max().map_or(1, |m| m.saturating_add(1)).max(1);
-        table.common.instance_id = id;
-        // HWP writes a table's common attributes from these bytes when it has them.
-        if table.raw_ctrl_data.len() >= 36 {
-            table.raw_ctrl_data[32..36].copy_from_slice(&id.to_le_bytes());
-        }
         doc.sections[section].raw_stream = None;
         id
     }
@@ -601,12 +737,15 @@ impl Session {
             bail!(why);
         }
         if p.show != Show::Page {
-            let Target::Table(n) = p.target else {
-                bail!(
-                    "번호·캡션 참조는 지금 표만 가리킵니다. 그림·개요·책갈피는 쪽 번호(show: page)로 넣으세요."
-                );
+            let (kind, n) = match p.target {
+                Target::Table(n) => (OBJ_TABLE, n),
+                Target::Picture(n) => (OBJ_PICTURE, n),
+                Target::Heading(title) => return self.insert_heading_reference(&title, p.show),
+                Target::Bookmark(_) => bail!(
+                    "번호·제목 참조는 표·그림·개요만 가리킵니다. 책갈피는 쪽 번호(show: page)로 넣으세요."
+                ),
             };
-            return self.insert_table_reference(n, p.show);
+            return self.insert_object_reference(kind, n, p.show);
         }
         let (bookmark, section, paragraph, exists) = self.cross_reference_target(&p.target)?;
         let mut out = Value::Null;
@@ -640,29 +779,126 @@ impl Session {
         Ok(out)
     }
 
-    /// A table's caption number or caption at the caret, pointing at the table itself.
-    fn insert_table_reference(&mut self, n: usize, show: Show) -> Result<Value> {
-        let (section, paragraph, control) = self.captioned_table(n)?;
+    /// The body paragraph with this instance id.
+    fn paragraph_by_instance(&self, id: u32) -> Option<(usize, usize)> {
+        if id == 0 {
+            return None;
+        }
+        self.core
+            .document()
+            .sections
+            .iter()
+            .enumerate()
+            .find_map(|(s, section)| {
+                section
+                    .paragraphs
+                    .iter()
+                    .position(|para| paragraph_instance(para) == id)
+                    .map(|p| (s, p))
+            })
+    }
+
+    /// The outline heading whose paragraph has this instance id.
+    fn heading_by_instance(&self, id: u32) -> Option<(usize, usize, super::toc::Heading)> {
+        let (s, p) = self.paragraph_by_instance(id)?;
+        let heading = self
+            .outline_headings(10)
+            .ok()?
+            .into_iter()
+            .find(|h| h.section == s && h.paragraph == p)?;
+        Some((s, p, heading))
+    }
+
+    /// Give body paragraph (`section`, `paragraph`) an instance id no other body
+    /// paragraph has, keeping the one it has when it already is.
+    fn heading_instance_id(&mut self, section: usize, paragraph: usize) -> u32 {
+        let mut used = std::collections::HashMap::<u32, usize>::new();
+        for para in self
+            .core
+            .document()
+            .sections
+            .iter()
+            .flat_map(|s| &s.paragraphs)
+        {
+            *used.entry(paragraph_instance(para)).or_default() += 1;
+        }
+        let doc = self.core.document_mut();
+        let para = &mut doc.sections[section].paragraphs[paragraph];
+        let current = paragraph_instance(para);
+        if current != 0 && used.get(&current) == Some(&1) {
+            return current;
+        }
+        let id = (HEADING_IDS..)
+            .find(|id| !used.contains_key(id))
+            .unwrap_or(HEADING_IDS);
+        if para.raw_header_extra.len() < 10 {
+            para.raw_header_extra.resize(10, 0);
+        }
+        para.raw_header_extra[6..10].copy_from_slice(&id.to_le_bytes());
+        doc.sections[section].raw_stream = None;
+        id
+    }
+
+    /// An outline heading's number ("1.") or text at the caret, pointing at the
+    /// heading paragraph by its instance id, as Hangul does.
+    fn insert_heading_reference(&mut self, title: &str, show: Show) -> Result<Value> {
+        let title = title.trim();
+        if title.is_empty() {
+            bail!("가리킬 개요 제목 글자를 적으세요.");
+        }
+        let headings = self.outline_headings(10)?;
+        let heading = headings
+            .iter()
+            .find(|h| super::toc::clean(&h.title) == title)
+            .or_else(|| headings.iter().find(|h| h.title.contains(title)))
+            .cloned()
+            .ok_or_else(|| anyhow!("개요 문단 '{title}'을(를) 찾지 못했습니다."))?;
         let mut out = Value::Null;
         self.transaction(|s| {
-            let id = s.table_instance_id(section, paragraph, control);
+            let id = s.heading_instance_id(heading.section, heading.paragraph);
+            let (content, text) = if show == Show::Number {
+                (SHOW_NUMBER, heading.number.clone())
+            } else {
+                (SHOW_CONTENT, super::toc::clean(&heading.title))
+            };
+            if text.is_empty() {
+                bail!("개요 '{title}'에 보일 번호나 글이 없습니다.");
+            }
+            let command = format!("?#{id};{OBJ_OUTLINE};{content};0;0");
+            let field_id =
+                s.write_cross_reference(&text, &command, object_reference_parameters(&command))?;
+            out = json!({"field_id": field_id, "heading": id, "text": text});
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// A table's or picture's caption number or caption at the caret, pointing at the
+    /// object itself.
+    fn insert_object_reference(&mut self, kind: u8, n: usize, show: Show) -> Result<Value> {
+        let (section, paragraph, control) = self.captioned_object(kind, n)?;
+        let name = object_name(kind);
+        let mut out = Value::Null;
+        self.transaction(|s| {
+            let id = s.object_instance_id(section, paragraph, control);
             let (_, _, caption) = s
-                .table_by_instance(id)
-                .ok_or_else(|| anyhow!("표 {n}의 캡션을 찾지 못했습니다."))?;
+                .object_by_instance(kind, id)
+                .ok_or_else(|| anyhow!("{name} {n}의 캡션을 찾지 못했습니다."))?;
             let (content, text) = if show == Show::Number {
                 let number = caption_number(caption)
-                    .ok_or_else(|| anyhow!("표 {n}의 캡션에 번호가 없습니다."))?;
+                    .ok_or_else(|| anyhow!("{name} {n}의 캡션에 번호가 없습니다."))?;
                 (SHOW_NUMBER, number)
             } else {
                 (SHOW_CONTENT, caption_text(caption))
             };
             if text.is_empty() {
-                bail!("표 {n}의 캡션이 비어 있습니다.");
+                bail!("{name} {n}의 캡션이 비어 있습니다.");
             }
-            let command = format!("?#{id};{OBJ_TABLE};{content};0;0");
+            let command = format!("?#{id};{kind};{content};0;0");
             let field_id =
                 s.write_cross_reference(&text, &command, object_reference_parameters(&command))?;
-            out = json!({"field_id": field_id, "table": id, "text": text});
+            let key = object_key(kind);
+            out = json!({"field_id": field_id, key: id, "text": text});
             Ok(())
         })?;
         Ok(out)
@@ -695,21 +931,32 @@ impl Session {
     ) -> Result<u32> {
         let c = self.cursor;
         // As links, neighbouring generated fields keep the new text out of their range.
-        let saved = self.text_fields_as_links(c.section, c.paragraph);
-        let inserted = self
-            .core
-            .insert_text_native(c.section, c.paragraph, c.offset, text)
-            .map_err(err);
-        let target = HyperlinkTarget::body(c.section, c.paragraph);
+        let saved = self.text_fields_as_links(c.section, c.paragraph, c.cell);
+        let inserted = match c.cell {
+            Some(t) => self.core.insert_text_in_cell_native(
+                c.section,
+                c.paragraph,
+                t.control,
+                t.index,
+                t.paragraph,
+                c.offset,
+                text,
+            ),
+            None => self
+                .core
+                .insert_text_native(c.section, c.paragraph, c.offset, text),
+        }
+        .map_err(err);
+        let target = field_target(c.section, c.paragraph, c.cell);
         let len = text.chars().count();
         let field_id = inserted.and_then(|_| {
             self.core
                 .insert_hyperlink_native(&target, c.offset, c.offset + len, SCAFFOLD_URI)
                 .map_err(err)
         });
-        self.restore_field_types(c.section, c.paragraph, &saved);
+        self.restore_field_types(c.section, c.paragraph, c.cell, &saved);
         let field_id = field_id?;
-        self.set_field_identity(c.section, c.paragraph, field_id, |f| {
+        self.set_field_identity(c.section, c.paragraph, c.cell, field_id, |f| {
             identity(f);
             f.hyperlink_format = None;
             f.raw_parameters_xml = None;
@@ -718,16 +965,19 @@ impl Session {
         Ok(field_id)
     }
 
-    /// Change one body field in place (RHWP has no API for it) and mark the section.
+    /// Change one field of a body or table cell paragraph in place (RHWP has no API
+    /// for it) and mark the section.
     pub(crate) fn set_field_identity(
         &mut self,
         section: usize,
         paragraph: usize,
+        cell: Option<Cell>,
         field_id: u32,
         change: impl FnOnce(&mut Field),
     ) -> Result<()> {
         let doc = self.core.document_mut();
-        let field = doc.sections[section].paragraphs[paragraph]
+        let field = field_paragraph_mut(doc, section, paragraph, cell)
+            .ok_or_else(|| anyhow!("필드 문단을 찾지 못했습니다."))?
             .controls
             .iter_mut()
             .find_map(|c| match c {
@@ -748,10 +998,14 @@ impl Session {
         &mut self,
         section: usize,
         paragraph: usize,
+        cell: Option<Cell>,
     ) -> Vec<(u32, FieldType)> {
         let doc = self.core.document_mut();
         let mut saved = Vec::new();
-        for c in &mut doc.sections[section].paragraphs[paragraph].controls {
+        let Some(para) = field_paragraph_mut(doc, section, paragraph, cell) else {
+            return saved;
+        };
+        for c in &mut para.controls {
             if let Control::Field(f) = c
                 && (f.ctrl_id == CROSS_REF_CTRL || f.ctrl_id == SUMMARY_CTRL)
             {
@@ -767,10 +1021,14 @@ impl Session {
         &mut self,
         section: usize,
         paragraph: usize,
+        cell: Option<Cell>,
         saved: &[(u32, FieldType)],
     ) {
         let doc = self.core.document_mut();
-        for c in &mut doc.sections[section].paragraphs[paragraph].controls {
+        let Some(para) = field_paragraph_mut(doc, section, paragraph, cell) else {
+            return;
+        };
+        for c in &mut para.controls {
             if let Control::Field(f) = c
                 && let Some((_, kind)) = saved.iter().find(|(id, _)| *id == f.field_id)
             {
@@ -780,33 +1038,33 @@ impl Session {
         doc.sections[section].raw_stream = None;
     }
 
-    /// Body cross references this module understands, in document order.
+    /// Cross references this module understands in the body and its table cells, in
+    /// document order.
     fn page_references(&self) -> Vec<Reference> {
         let mut out = Vec::new();
-        for (s, section) in self.core.document().sections.iter().enumerate() {
-            for (p, para) in section.paragraphs.iter().enumerate() {
-                for range in &para.field_ranges {
-                    let Some(Control::Field(field)) = para.controls.get(range.control_idx) else {
-                        continue;
-                    };
-                    let Some((pointee, content)) = parse_command(field) else {
-                        continue;
-                    };
-                    let text: String = para
-                        .text
-                        .chars()
-                        .skip(range.start_char_idx)
-                        .take(range.end_char_idx.saturating_sub(range.start_char_idx))
-                        .collect();
-                    out.push(Reference {
-                        section: s,
-                        paragraph: p,
-                        field_id: field.field_id,
-                        pointee,
-                        content,
-                        text,
-                    });
-                }
+        for (s, p, cell, para) in field_paragraphs(self.core.document()) {
+            for range in &para.field_ranges {
+                let Some(Control::Field(field)) = para.controls.get(range.control_idx) else {
+                    continue;
+                };
+                let Some((pointee, content)) = parse_command(field) else {
+                    continue;
+                };
+                let text: String = para
+                    .text
+                    .chars()
+                    .skip(range.start_char_idx)
+                    .take(range.end_char_idx.saturating_sub(range.start_char_idx))
+                    .collect();
+                out.push(Reference {
+                    section: s,
+                    paragraph: p,
+                    cell,
+                    field_id: field.field_id,
+                    pointee,
+                    content,
+                    text,
+                });
             }
         }
         out
@@ -820,8 +1078,18 @@ impl Session {
     ) -> Option<String> {
         match &r.pointee {
             Pointee::Bookmark(name) => pages.get(name).map(ToString::to_string),
-            Pointee::Object(id) => {
-                let (s, p, caption) = self.table_by_instance(*id)?;
+            Pointee::Object(OBJ_OUTLINE, id) => {
+                let (s, p, heading) = self.heading_by_instance(*id)?;
+                match r.content {
+                    SHOW_NUMBER => Some(heading.number).filter(|n| !n.is_empty()),
+                    SHOW_CONTENT => {
+                        Some(super::toc::clean(&heading.title)).filter(|t| !t.is_empty())
+                    }
+                    _ => self.physical_page(s, p, 0).map(|n| n.to_string()),
+                }
+            }
+            Pointee::Object(kind, id) => {
+                let (s, p, caption) = self.object_by_instance(*kind, *id)?;
                 match r.content {
                     SHOW_NUMBER => caption_number(caption),
                     SHOW_CONTENT => Some(caption_text(caption)).filter(|t| !t.is_empty()),
@@ -852,14 +1120,14 @@ impl Session {
             .map(|r| {
                 let show = ["page", "number", "caption"][usize::from(r.content).min(2)];
                 let mut item = json!({"field_id": r.field_id, "text": r.text, "show": show,
-                       "section": r.section, "paragraph": r.paragraph});
+                       "section": r.section, "paragraph": r.paragraph, "cell": r.cell});
                 match &r.pointee {
                     Pointee::Bookmark(name) => {
                         item["bookmark"] = json!(name);
                         item["page"] = json!(pages.get(name));
                     }
-                    Pointee::Object(id) => {
-                        item["table"] = json!(id);
+                    Pointee::Object(kind, id) => {
+                        item[object_key(*kind)] = json!(id);
                         item["expected"] = json!(self.reference_value(r, &pages));
                     }
                 }
@@ -884,7 +1152,7 @@ impl Session {
                     let Some(value) = s.reference_value(&r, &pages) else {
                         let name = match &r.pointee {
                             Pointee::Bookmark(name) => name.clone(),
-                            Pointee::Object(id) => format!("#{id}"),
+                            Pointee::Object(_, id) => format!("#{id}"),
                         };
                         if !missing.contains(&name) {
                             missing.push(name);
@@ -894,11 +1162,15 @@ impl Session {
                     if value == r.text {
                         continue;
                     }
-                    let (sec, para, id) = (r.section, r.paragraph, r.field_id);
-                    s.set_field_identity(sec, para, id, |f| f.field_type = FieldType::Hyperlink)?;
-                    let target = HyperlinkTarget::body(sec, para);
+                    let (sec, para, cell, id) = (r.section, r.paragraph, r.cell, r.field_id);
+                    s.set_field_identity(sec, para, cell, id, |f| {
+                        f.field_type = FieldType::Hyperlink
+                    })?;
+                    let target = field_target(sec, para, cell);
                     let result = s.core.replace_hyperlink_text_native(&target, id, &value);
-                    s.set_field_identity(sec, para, id, |f| f.field_type = FieldType::CrossRef)?;
+                    s.set_field_identity(sec, para, cell, id, |f| {
+                        f.field_type = FieldType::CrossRef
+                    })?;
                     // A paragraph that gained an object since cannot be edited this way.
                     if result.is_err() {
                         if !skipped.contains(&id) {

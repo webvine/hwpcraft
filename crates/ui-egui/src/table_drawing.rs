@@ -139,7 +139,7 @@ impl HwpApp {
                             ui.selectable_value(&mut self.ext.pen.width, i, *l);
                         }
                     });
-                ui.color_edit_button_srgb(&mut self.ext.pen.color);
+                chrome::color_button_rgb(ui, &mut self.ext.pen.color);
                 close = ui.button("끝내기 (Esc)").clicked();
             });
             ui.label(if mode == Mode::Draw {

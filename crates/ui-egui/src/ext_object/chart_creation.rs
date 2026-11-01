@@ -1,4 +1,4 @@
-//! Desktop authoring for the eleven editable chart kinds. Engine commands own all
+//! Desktop authoring for the fifteen editable chart kinds. Engine commands own all
 //! serialization, validation, resource allocation, and undo transactions.
 use super::*;
 use anyhow::{Context, Result, bail};
@@ -16,7 +16,18 @@ const KINDS: &[(&str, &str)] = &[
     ("column_3d", "입체 세로 막대"),
     ("bar_3d", "입체 가로 막대"),
     ("pie_3d", "입체 원형"),
+    ("combo", "혼합형 (막대+꺾은선)"),
+    ("area", "영역형"),
+    ("radar", "방사형"),
+    ("bubble", "거품형"),
 ];
+const RADAR_STYLES: &[(&str, &str)] = &[
+    ("standard", "선"),
+    ("marker", "선과 표식"),
+    ("filled", "채운 영역"),
+];
+/// Plot of one combo series.
+const PLOTS: &[(&str, &str)] = &[("column", "막대"), ("line", "꺾은선")];
 const SCATTER_STYLES: &[(&str, &str)] = &[
     ("marker", "표식"),
     ("line", "직선"),
@@ -30,7 +41,19 @@ const GROUPINGS: &[(&str, &str)] = &[
 ];
 /// Kinds whose plot takes a grouping.
 fn groups(kind: &str) -> bool {
-    matches!(kind, "column" | "bar" | "line")
+    matches!(kind, "column" | "bar" | "line" | "area")
+}
+/// Kinds with one shared numeric X column instead of categories.
+fn xy(kind: &str) -> bool {
+    matches!(kind, "scatter" | "bubble")
+}
+/// Engine order of combo series: columns, lines, then secondary-axis lines.
+fn combo_rank(series: &SeriesDraft) -> u8 {
+    match (series.plot.as_str(), series.secondary_axis) {
+        ("line", true) => 2,
+        ("line", false) => 1,
+        _ => 0,
+    }
 }
 fn stock_roles(kind: &str) -> &'static [&'static str] {
     match kind {
@@ -40,7 +63,10 @@ fn stock_roles(kind: &str) -> &'static [&'static str] {
     }
 }
 fn family(kind: &str) -> &str {
-    if matches!(kind, "scatter" | "stock_hlc" | "stock_ohlc") {
+    if xy(kind) {
+        // Scatter and bubble share the X column and Y values.
+        "xy"
+    } else if matches!(kind, "stock_hlc" | "stock_ohlc") {
         kind
     } else {
         "category"
@@ -52,6 +78,26 @@ struct SeriesDraft {
     name: String,
     values: Vec<String>,
     color: Option<String>,
+    /// Combo only: "column" or "line".
+    plot: String,
+    /// Combo only, line series: plotted against the right value axis.
+    secondary_axis: bool,
+    /// Bubble only; kept as long as `values` in every kind so a switch to bubble has sizes.
+    bubble_sizes: Vec<String>,
+}
+
+impl SeriesDraft {
+    fn new(name: String, values: Vec<String>) -> Self {
+        let points = values.len();
+        Self {
+            name,
+            values,
+            color: None,
+            plot: "column".into(),
+            secondary_axis: false,
+            bubble_sizes: vec!["1".into(); points],
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -66,6 +112,7 @@ struct Draft {
     x_values: Vec<String>,
     scatter_style: String,
     grouping: String,
+    radar_style: String,
     // UI-only backups preserve all draft input when switching data families.
     saved_data: std::collections::BTreeMap<String, DataDraft>,
 }
@@ -83,17 +130,17 @@ impl Default for Draft {
             kind: "column".into(),
             title: "차트 제목".into(),
             categories: vec!["항목 1".into(), "항목 2".into(), "항목 3".into()],
-            series: vec![SeriesDraft {
-                name: "계열 1".into(),
-                values: vec!["10".into(), "20".into(), "15".into()],
-                color: None,
-            }],
+            series: vec![SeriesDraft::new(
+                "계열 1".into(),
+                vec!["10".into(), "20".into(), "15".into()],
+            )],
             width_mm: 120.0,
             height_mm: 75.0,
             legend: true,
             x_values: vec!["1".into(), "2".into(), "3".into()],
             scatter_style: "marker".into(),
             grouping: "clustered".into(),
+            radar_style: "standard".into(),
             saved_data: Default::default(),
         }
     }
@@ -122,6 +169,7 @@ impl Draft {
             "legend",
             "scatter_style",
             "grouping",
+            "radar_style",
         ];
         if spec
             .as_object()
@@ -143,48 +191,97 @@ impl Draft {
                     .context("범주는 문자열이어야 합니다.")
             })
             .collect::<Result<Vec<_>>>()?;
+        let shared_x = xy(&kind);
+        let combo = kind == "combo";
+        let bubble = kind == "bubble";
+        let numbers = |value: &Value, what: &str| -> Result<Vec<String>> {
+            value
+                .as_array()
+                .with_context(|| format!("{what} 없음"))?
+                .iter()
+                .map(|v| {
+                    v.as_f64()
+                        .map(|n| n.to_string())
+                        .with_context(|| format!("숫자가 아닌 {what}"))
+                })
+                .collect()
+        };
         let series = spec["series"]
             .as_array()
             .context("차트 계열이 없습니다.")?
             .iter()
             .map(|s| {
-                if s.as_object()
-                    .context("계열 형식 오류")?
-                    .keys()
-                    .any(|key| !["name", "values", "color", "x_values"].contains(&key.as_str()))
-                {
+                if s.as_object().context("계열 형식 오류")?.keys().any(|key| {
+                    ![
+                        "name",
+                        "values",
+                        "color",
+                        "x_values",
+                        "plot",
+                        "secondary_axis",
+                        "bubble_sizes",
+                    ]
+                    .contains(&key.as_str())
+                }) {
                     bail!("이 화면에서 보존할 수 없는 계열 설정이 있습니다.");
                 }
+                let present = |key: &str| s.get(key).is_some_and(|v| !v.is_null());
+                let values = numbers(&s["values"], "계열 값")?;
+                let plot = if combo {
+                    s["plot"]
+                        .as_str()
+                        .context("혼합형 계열의 막대·꺾은선 구분이 없습니다.")?
+                        .to_owned()
+                } else if present("plot") {
+                    bail!(
+                        "혼합형이 아닌 차트에 계열 표시(plot) 설정이 있습니다. 삭제하지 않고 전체 구성을 거절합니다."
+                    );
+                } else {
+                    "column".to_owned()
+                };
+                let secondary_axis = s
+                    .get("secondary_axis")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.as_bool().context("보조 축 설정 형식 오류"))
+                    .transpose()?
+                    .unwrap_or(false);
+                if secondary_axis && !combo {
+                    bail!(
+                        "혼합형이 아닌 차트에 보조 축 설정이 있습니다. 삭제하지 않고 전체 구성을 거절합니다."
+                    );
+                }
+                let bubble_sizes = if bubble {
+                    numbers(&s["bubble_sizes"], "거품 크기")?
+                } else if present("bubble_sizes") {
+                    bail!(
+                        "거품형이 아닌 차트에 거품 크기 설정이 있습니다. 삭제하지 않고 전체 구성을 거절합니다."
+                    );
+                } else {
+                    vec!["1".into(); values.len()]
+                };
                 Ok(SeriesDraft {
                     name: s["name"].as_str().context("계열 이름 없음")?.into(),
-                    values: s["values"]
-                        .as_array()
-                        .context("계열 값 없음")?
-                        .iter()
-                        .map(|v| {
-                            v.as_f64()
-                                .map(|n| n.to_string())
-                                .context("숫자가 아닌 계열 값")
-                        })
-                        .collect::<Result<Vec<_>>>()?,
+                    values,
                     color: s
                         .get("color")
                         .filter(|v| !v.is_null())
                         .map(|v| v.as_str().map(str::to_owned).context("계열 색 형식 오류"))
                         .transpose()?,
+                    plot,
+                    secondary_axis,
+                    bubble_sizes,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let scatter = kind == "scatter";
-        if scatter && !categories.is_empty() {
-            bail!("분산형의 비어 있지 않은 범주를 삭제하지 않고 전체 구성을 거절합니다.");
+        if shared_x && !categories.is_empty() {
+            bail!("분산형·거품형의 비어 있지 않은 범주를 삭제하지 않고 전체 구성을 거절합니다.");
         }
         let mut x_values = None;
         for s in spec["series"].as_array().context("계열 없음")? {
-            if scatter {
+            if shared_x {
                 let values = s["x_values"]
                     .as_array()
-                    .context("분산형 X 좌표 없음")?
+                    .context("분산형·거품형 X 좌표 없음")?
                     .iter()
                     .map(|v| v.as_f64().context("숫자가 아닌 X 좌표"))
                     .collect::<Result<Vec<_>>>()?;
@@ -197,30 +294,40 @@ impl Draft {
                 x_values = Some(values);
             } else if s.get("x_values").is_some_and(|v| !v.is_null()) {
                 bail!(
-                    "분산형이 아닌 차트에 X 좌표 설정이 있습니다. 삭제하지 않고 전체 구성을 거절합니다."
+                    "분산형·거품형이 아닌 차트에 X 좌표 설정이 있습니다. 삭제하지 않고 전체 구성을 거절합니다."
                 );
             }
         }
-        let scatter_style = if scatter {
-            spec.get("scatter_style")
-                .filter(|v| !v.is_null())
-                .map(|v| v.as_str().context("분산형 표시 방식 오류"))
-                .transpose()?
-                .unwrap_or("marker")
-                .to_owned()
-        } else {
-            if spec.get("scatter_style").is_some_and(|v| !v.is_null()) {
-                bail!("분산형이 아닌 차트의 분산형 설정을 삭제하지 않고 전체 구성을 거절합니다.");
+        // A setting of another kind would be dropped by spec(): refuse it instead.
+        let option = |key: &str, owner: bool, default: &str, what: &str| -> Result<String> {
+            let value = spec.get(key).filter(|v| !v.is_null());
+            if !owner {
+                if value.is_some() {
+                    bail!(
+                        "이 종류에 맞지 않는 {what} 설정을 삭제하지 않고 전체 구성을 거절합니다."
+                    );
+                }
+                return Ok(default.into());
             }
-            "marker".into()
+            Ok(value
+                .map(|v| v.as_str().with_context(|| format!("{what} 형식 오류")))
+                .transpose()?
+                .unwrap_or(default)
+                .to_owned())
         };
-        let grouping = spec
-            .get("grouping")
-            .filter(|v| !v.is_null())
-            .map(|v| v.as_str().context("묶음 방식 오류"))
-            .transpose()?
-            .unwrap_or("clustered")
-            .to_owned();
+        let scatter_style = option(
+            "scatter_style",
+            kind == "scatter",
+            "marker",
+            "분산형 표시 방식",
+        )?;
+        let grouping = option("grouping", groups(&kind), "clustered", "묶음 방식")?;
+        let radar_style = option(
+            "radar_style",
+            kind == "radar",
+            "standard",
+            "방사형 표시 방식",
+        )?;
         let draft = Self {
             kind,
             title: text("title")?,
@@ -236,6 +343,7 @@ impl Draft {
                 .collect(),
             scatter_style,
             grouping,
+            radar_style,
             saved_data: Default::default(),
         };
         draft.spec()?;
@@ -246,7 +354,9 @@ impl Draft {
         if !KINDS.iter().any(|(kind, _)| *kind == self.kind) {
             bail!("전체 구성에서 지원하지 않는 차트 종류입니다.");
         }
-        let scatter = self.kind == "scatter";
+        let shared_x = xy(&self.kind);
+        let combo = self.kind == "combo";
+        let bubble = self.kind == "bubble";
         let points = self.points();
         if !(1..=1000).contains(&points)
             || !(1..=64).contains(&self.series.len())
@@ -276,10 +386,11 @@ impl Draft {
             }
             Ok(number)
         };
-        let x_values = if scatter {
-            if !SCATTER_STYLES
-                .iter()
-                .any(|(style, _)| *style == self.scatter_style)
+        let x_values = if shared_x {
+            if self.kind == "scatter"
+                && !SCATTER_STYLES
+                    .iter()
+                    .any(|(style, _)| *style == self.scatter_style)
             {
                 bail!("지원하지 않는 분산형 표시 방식입니다.");
             }
@@ -291,7 +402,12 @@ impl Draft {
         } else {
             Vec::new()
         };
-        for draft in &self.series {
+        // The engine stores combo series grouped; keep each group's own order.
+        let mut ordered: Vec<&SeriesDraft> = self.series.iter().collect();
+        if combo {
+            ordered.sort_by_key(|s| combo_rank(s));
+        }
+        for draft in ordered {
             if draft.name.trim().is_empty() || !names.insert(&draft.name) {
                 bail!("계열 이름은 비어 있지 않고 서로 달라야 합니다.");
             }
@@ -314,13 +430,50 @@ impl Draft {
                 );
             }
             let mut item = json!({"name":draft.name,"values":values});
-            if scatter {
+            if shared_x {
                 item["x_values"] = json!(x_values);
+            }
+            if bubble {
+                if draft.bubble_sizes.len() != points {
+                    bail!("{}: 거품 크기 개수가 값 개수와 다릅니다.", draft.name);
+                }
+                let label = format!("{} 크기", draft.name);
+                let sizes = draft
+                    .bubble_sizes
+                    .iter()
+                    .enumerate()
+                    .map(|(row, value)| {
+                        let size = parse_number(value, row, &label)?;
+                        if size < 0.0 {
+                            bail!("{label} / {}행: 거품 크기는 0 이상이어야 합니다.", row + 1);
+                        }
+                        Ok(size)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                item["bubble_sizes"] = json!(sizes);
+            }
+            if combo {
+                if !PLOTS.iter().any(|(plot, _)| *plot == draft.plot) {
+                    bail!("{}: 막대 또는 꺾은선을 고르세요.", draft.name);
+                }
+                if draft.secondary_axis && draft.plot != "line" {
+                    bail!("{}: 보조 축은 꺾은선 계열만 쓸 수 있습니다.", draft.name);
+                }
+                item["plot"] = json!(draft.plot);
+                if draft.secondary_axis {
+                    item["secondary_axis"] = json!(true);
+                }
             }
             if let Some(color) = &draft.color {
                 item["color"] = json!(color);
             }
             series.push(item);
+        }
+        if combo
+            && !(self.series.iter().any(|s| s.plot == "column")
+                && self.series.iter().any(|s| s.plot == "line"))
+        {
+            bail!("혼합형에는 막대 계열과 꺾은선 계열이 하나 이상씩 필요합니다.");
         }
         let roles = stock_roles(&self.kind);
         if !roles.is_empty() {
@@ -359,9 +512,9 @@ impl Draft {
             }
         }
         let mut spec = json!({"kind":self.kind,"title":self.title,
-            "categories":if scatter {Vec::new()} else {self.categories.clone()},
+            "categories":if shared_x {Vec::new()} else {self.categories.clone()},
             "series":series,"width_mm":self.width_mm,"height_mm":self.height_mm,"legend":self.legend});
-        if scatter {
+        if self.kind == "scatter" {
             spec["scatter_style"] = json!(self.scatter_style);
         }
         if !GROUPINGS.iter().any(|(id, _)| *id == self.grouping) {
@@ -370,11 +523,18 @@ impl Draft {
         if groups(&self.kind) && self.grouping != "clustered" {
             spec["grouping"] = json!(self.grouping);
         }
+        if self.kind == "radar" {
+            if !RADAR_STYLES.iter().any(|(id, _)| *id == self.radar_style) {
+                bail!("지원하지 않는 방사형 표시 방식입니다.");
+            }
+            // The engine reports the style even when it is the default.
+            spec["radar_style"] = json!(self.radar_style);
+        }
         Ok(spec)
     }
 
     fn points(&self) -> usize {
-        if self.kind == "scatter" {
+        if xy(&self.kind) {
             self.x_values.len()
         } else {
             self.categories.len()
@@ -409,11 +569,7 @@ impl Draft {
                 } else {
                     roles
                         .iter()
-                        .map(|role| SeriesDraft {
-                            name: (*role).into(),
-                            values: vec![String::new(); points],
-                            color: None,
-                        })
+                        .map(|role| SeriesDraft::new((*role).into(), vec![String::new(); points]))
                         .collect()
                 };
                 DataDraft {
@@ -427,6 +583,33 @@ impl Draft {
             self.x_values = next.x_values;
         }
         self.kind = kind.into();
+        if kind == "combo" {
+            self.prepare_combo();
+        }
+    }
+
+    /// Combo needs at least one column and one line series, stored in engine order.
+    fn prepare_combo(&mut self) {
+        if self.series.len() < 2 {
+            self.add_series();
+        }
+        if !self.series.iter().any(|s| s.plot == "line")
+            && let Some(last) = self.series.last_mut()
+        {
+            last.plot = "line".into();
+        }
+        if !self.series.iter().any(|s| s.plot == "column")
+            && let Some(first) = self.series.first_mut()
+        {
+            first.plot = "column".into();
+            first.secondary_axis = false;
+        }
+        self.sort_combo();
+    }
+
+    /// Stable: series keep their order inside the column, line and secondary-line groups.
+    fn sort_combo(&mut self) {
+        self.series.sort_by_key(combo_rank);
     }
 
     fn add_row(&mut self) {
@@ -435,6 +618,15 @@ impl Draft {
             .push(format!("항목 {}", self.categories.len() + 1));
         for series in &mut self.series {
             series.values.push("0".into());
+            series.bubble_sizes.push("1".into());
+        }
+    }
+    fn remove_row(&mut self) {
+        self.categories.pop();
+        self.x_values.pop();
+        for series in &mut self.series {
+            series.values.pop();
+            series.bubble_sizes.pop();
         }
     }
     fn add_series(&mut self) {
@@ -446,11 +638,16 @@ impl Draft {
         {
             number += 1;
         }
-        self.series.push(SeriesDraft {
-            name: format!("계열 {number}"),
-            values: vec!["0".into(); self.points()],
-            color: None,
-        });
+        let mut series =
+            SeriesDraft::new(format!("계열 {number}"), vec!["0".into(); self.points()]);
+        if self.kind == "combo" {
+            // A new combo series joins the primary lines, after the columns.
+            series.plot = "line".into();
+        }
+        self.series.push(series);
+        if self.kind == "combo" {
+            self.sort_combo();
+        }
     }
 }
 
@@ -562,7 +759,7 @@ impl Editor {
     fn apply(&self, session: &mut Session) -> Result<Value> {
         if session.generation != self.capture.generation {
             bail!(
-                "창을 연 뒤 문서가 변경됐습니다. 입력은 보존했습니다. 현재 문서 기준으로 갱신한 뒤 다시 적용하세요."
+                "창을 연 뒤 문서가 변경됐습니다. 입력은 보존했습니다. [갱신]으로 현재 문서에 맞춘 뒤 다시 적용하세요."
             );
         }
         let chart = self.draft.spec()?;
@@ -583,7 +780,7 @@ impl Editor {
                 || session.span_anchor != self.capture.span_anchor
             {
                 bail!(
-                    "차트를 넣을 위치나 선택 범위가 변경됐습니다. 현재 위치로 갱신한 뒤 다시 적용하세요."
+                    "차트를 넣을 위치나 선택 범위가 변경됐습니다. [갱신]으로 현재 위치에 맞춘 뒤 다시 적용하세요."
                 );
             }
             // Creation must not replace an unrelated selected text fragment.
@@ -709,16 +906,11 @@ impl Editor {
 
     fn contents(&mut self, ui: &mut egui::Ui) {
         let mut next_kind = self.draft.kind.clone();
+        // Kind first: the rows below depend on it.
         ui.horizontal(|ui| {
-            ui.label("제목");
-            let response =
-                ui.add(egui::TextEdit::singleline(&mut self.draft.title).desired_width(300.0));
-            #[cfg(test)]
-            self.record("title", ui, &response);
-            #[cfg(not(test))]
-            let _ = response;
             ui.label("종류");
             egui::ComboBox::from_id_salt("chart-create-kind")
+                .width(200.0)
                 .selected_text(
                     KINDS
                         .iter()
@@ -738,6 +930,16 @@ impl Editor {
             self.preview_stale = true;
             self.changed = true;
         }
+        ui.horizontal(|ui| {
+            ui.label("제목");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.draft.title).desired_width(f32::INFINITY),
+            );
+            #[cfg(test)]
+            self.record("title", ui, &response);
+            #[cfg(not(test))]
+            let _ = response;
+        });
         if self.draft.kind == "scatter" {
             ui.horizontal(|ui| {
                 ui.label("표시 방식");
@@ -758,6 +960,20 @@ impl Editor {
                         }
                     });
                 ui.label(RichText::new("모든 계열이 같은 X열을 사용합니다.").weak());
+            });
+        }
+        if self.draft.kind == "bubble" {
+            ui.label(
+                RichText::new("모든 계열이 같은 X열을 쓰고, 계열마다 거품 크기 열이 있습니다.")
+                    .weak(),
+            );
+        }
+        if self.draft.kind == "radar" {
+            ui.horizontal(|ui| {
+                ui.label("표시 방식");
+                for (id, label) in RADAR_STYLES {
+                    ui.selectable_value(&mut self.draft.radar_style, (*id).into(), *label);
+                }
             });
         }
         if groups(&self.draft.kind) {
@@ -806,11 +1022,7 @@ impl Editor {
                 .on_disabled_hover_text("항목이 하나뿐이라 지울 수 없습니다.")
                 .clicked()
             {
-                self.draft.categories.pop();
-                self.draft.x_values.pop();
-                for s in &mut self.draft.series {
-                    s.values.pop();
-                }
+                self.draft.remove_row();
             }
             if ui
                 .add_enabled(
@@ -843,6 +1055,10 @@ impl Editor {
                 self.draft.series.pop();
             }
         });
+        let shared_x = xy(&self.draft.kind);
+        let combo = self.draft.kind == "combo";
+        let bubble = self.draft.kind == "bubble";
+        let mut reorder = false;
         egui::ScrollArea::both()
             .id_salt("chart-authoring-grid-scroll")
             .max_height(240.0)
@@ -851,9 +1067,9 @@ impl Editor {
                     .striped(true)
                     .spacing([10.0, 6.0])
                     .show(ui, |ui| {
-                        let scatter = self.draft.kind == "scatter";
                         let roles = stock_roles(&self.draft.kind);
-                        ui.label(if scatter { "공통 X" } else { "범주" });
+                        let count = self.draft.series.len();
+                        ui.label(if shared_x { "공통 X" } else { "범주" });
                         for (index, series) in self.draft.series.iter_mut().enumerate() {
                             ui.vertical(|ui| {
                                 if let Some(role) = roles.get(index) {
@@ -864,13 +1080,66 @@ impl Editor {
                                     egui::TextEdit::singleline(&mut series.name)
                                         .background_color(HEADER_FILL),
                                 );
+                                if combo {
+                                    let before = (series.plot.clone(), series.secondary_axis);
+                                    egui::ComboBox::from_id_salt(("chart-combo-plot", index))
+                                        .width(VALUE_WIDTH)
+                                        .selected_text(
+                                            PLOTS
+                                                .iter()
+                                                .find(|(id, _)| *id == series.plot)
+                                                .map_or("지원되지 않음", |(_, label)| *label),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for (id, label) in PLOTS {
+                                                ui.selectable_value(
+                                                    &mut series.plot,
+                                                    (*id).into(),
+                                                    *label,
+                                                );
+                                            }
+                                        });
+                                    let line = series.plot == "line";
+                                    if !line {
+                                        series.secondary_axis = false;
+                                    }
+                                    let response = ui
+                                        .add_enabled(
+                                            line,
+                                            egui::Checkbox::new(
+                                                &mut series.secondary_axis,
+                                                "보조 축",
+                                            ),
+                                        )
+                                        .on_hover_text("오른쪽 값 축에 그립니다.")
+                                        .on_disabled_hover_text(
+                                            "보조 축은 꺾은선 계열만 쓸 수 있습니다.",
+                                        );
+                                    #[cfg(test)]
+                                    if index + 1 == count {
+                                        self.regions.insert(
+                                            "combo_secondary",
+                                            (response.rect, ui.clip_rect(), response.id),
+                                        );
+                                    }
+                                    #[cfg(not(test))]
+                                    let _ = (count, response);
+                                    reorder |=
+                                        (series.plot.clone(), series.secondary_axis) != before;
+                                }
                             });
+                            if bubble {
+                                ui.add_sized(
+                                    [VALUE_WIDTH, 22.0],
+                                    egui::Label::new(RichText::new("크기").weak()),
+                                );
+                            }
                         }
                         ui.end_row();
                         for row in 0..self.draft.points() {
                             let response = ui.add_sized(
                                 [LABEL_WIDTH, 22.0],
-                                egui::TextEdit::singleline(if scatter {
+                                egui::TextEdit::singleline(if shared_x {
                                     &mut self.draft.x_values[row]
                                 } else {
                                     &mut self.draft.categories[row]
@@ -878,7 +1147,7 @@ impl Editor {
                                 .background_color(HEADER_FILL),
                             );
                             #[cfg(test)]
-                            if scatter && row == 0 {
+                            if shared_x && row == 0 {
                                 self.record("scatter_x", ui, &response);
                             }
                             #[cfg(not(test))]
@@ -906,18 +1175,43 @@ impl Editor {
                                         );
                                     }
                                     #[cfg(not(test))]
-                                    let _ = (index, response);
+                                    let _ = response;
                                 }
+                                if bubble && let Some(size) = series.bubble_sizes.get_mut(row) {
+                                    let response = ui.add_sized(
+                                        [VALUE_WIDTH, 22.0],
+                                        egui::TextEdit::singleline(size),
+                                    );
+                                    #[cfg(test)]
+                                    if row == 0 && index == 0 {
+                                        self.regions.insert(
+                                            "bubble_size",
+                                            (response.rect, ui.clip_rect(), response.id),
+                                        );
+                                    }
+                                    #[cfg(not(test))]
+                                    let _ = response;
+                                }
+                                #[cfg(not(test))]
+                                let _ = index;
                             }
                             ui.end_row();
                         }
                     });
             });
+        if reorder {
+            // Show the order the engine stores, so the preview legend matches the grid.
+            self.draft.sort_combo();
+        }
         ui.label(
-            RichText::new(if stock_roles(&self.draft.kind).is_empty() {
-                "값을 고치면 잠시 뒤 오른쪽 미리 보기가 바뀝니다."
-            } else {
+            RichText::new(if !stock_roles(&self.draft.kind).is_empty() {
                 "주식형: 고가는 저가보다 크거나 같고, 시가·종가는 그 사이여야 합니다."
+            } else if combo {
+                "혼합형: 막대가 하나 이상, 꺾은선이 하나 이상 필요합니다. 계열은 막대, 꺾은선, 보조 축 꺾은선 순서로 정렬됩니다."
+            } else if bubble {
+                "거품형: 크기는 0 이상이며 거품 넓이가 크기에 비례합니다."
+            } else {
+                "값을 고치면 잠시 뒤 오른쪽 미리 보기가 바뀝니다."
             })
             .weak(),
         );
@@ -959,7 +1253,7 @@ impl HwpApp {
         let (mut apply, mut preview, mut refresh, mut close) = (false, false, false, false);
         let now = ctx.input(|i| i.time);
         let response = chrome::modal("ext-chart-authoring").show(ctx, |ui| {
-            ui.set_width(820.0);
+            ui.set_width(880.0);
             ui.set_max_height((ctx.content_rect().height() - 120.0).max(300.0));
             close = chrome::title(
                 ui,
@@ -971,10 +1265,10 @@ impl HwpApp {
             );
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
-                    ui.set_width(500.0);
+                    ui.set_width(460.0);
                     egui::ScrollArea::vertical()
                         .id_salt("chart-authoring-content")
-                        .max_height((ctx.content_rect().height() - 240.0).max(160.0))
+                        .max_height((ctx.content_rect().height() - 200.0).max(160.0))
                         .show(ui, |ui| {
                             editor.contents(ui);
                             if let Some(error) = &editor.error {
@@ -984,7 +1278,7 @@ impl HwpApp {
                 });
                 // Spacing, not a vertical separator: a separator here takes the full
                 // available height and stretches the dialog.
-                ui.add_space(16.0);
+                ui.add_space(12.0);
                 ui.vertical(|ui| {
                     ui.set_width(280.0);
                     chrome::section(ui, "미리 보기");
@@ -1025,44 +1319,53 @@ impl HwpApp {
                     #[cfg(test)]
                     editor.record("preview", ui, &r);
                 });
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                let r = ui
-                    .button("현재 문서 기준으로 갱신")
-                    .on_hover_text("창을 연 뒤 문서가 바뀌었으면 입력을 지금 문서에 맞춥니다.");
-                refresh = r.clicked();
-                #[cfg(test)]
-                editor.record("refresh", ui, &r);
-                // Same order as the other dialogs: main action first, cancel last,
-                // at the right edge; Enter applies, Esc cancels.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let r = ui.add(egui::Button::new("취소").min_size(Vec2::new(80.0, 28.0)));
-                    close |= r.clicked();
+                ui.add_space(8.0);
+                // Right-hand button column as in the other dialogs: the main action,
+                // 취소, then the extra command. Enter and Alt+D apply, Esc cancels.
+                ui.vertical(|ui| {
                     #[cfg(test)]
-                    editor.record("cancel", ui, &r);
-                    let r = ui.add(
-                        egui::Button::new(if editor.capture.target.is_some() {
-                            "구성 적용"
+                    let top = ui.cursor().min;
+                    let (a, c) = chrome::actions(
+                        ui,
+                        None,
+                        if editor.capture.target.is_some() {
+                            "설정(D)"
                         } else {
-                            "차트 넣기"
-                        })
-                        .fill(Color32::WHITE)
-                        .stroke(Stroke::new(1.5, chrome::Tokens::ACCENT))
-                        .min_size(Vec2::new(80.0, 28.0)),
+                            "넣기(D)"
+                        },
                     );
-                    apply = r.clicked();
+                    apply = a;
+                    close |= c;
                     #[cfg(test)]
-                    editor.record("apply", ui, &r);
+                    {
+                        // chrome::actions stacks the two buttons; recover their rects
+                        // from the space they took, for the click tests.
+                        let gap = ui.spacing().item_spacing.y;
+                        let height = (ui.cursor().min.y - top.y) / 2.0 - gap;
+                        let first = Rect::from_min_size(top, Vec2::new(80.0, height));
+                        let clip = ui.clip_rect();
+                        editor
+                            .regions
+                            .insert("apply", (first, clip, egui::Id::NULL));
+                        editor.regions.insert(
+                            "cancel",
+                            (
+                                first.translate(Vec2::new(0.0, height + gap)),
+                                clip,
+                                egui::Id::NULL,
+                            ),
+                        );
+                    }
+                    ui.add_space(12.0);
+                    let r = ui
+                        .add(egui::Button::new("갱신").min_size(Vec2::new(80.0, 28.0)))
+                        .on_hover_text("창을 연 뒤 문서가 바뀌었으면 입력을 지금 문서에 맞춥니다.");
+                    refresh = r.clicked();
+                    #[cfg(test)]
+                    editor.record("refresh", ui, &r);
                 });
             });
         });
-        if !apply
-            && !ctx.egui_wants_keyboard_input()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
-        {
-            apply = true;
-        }
         // Live preview: regenerate once the user has paused typing.
         if editor.changed {
             editor.changed = false;
@@ -1130,27 +1433,31 @@ mod tests {
                 series.values = vec![number.to_string(); draft.categories.len()];
             }
         }
-        if kind == "scatter" {
+        if xy(kind) {
             draft.x_values = vec!["-2".into(), "0".into(), "3".into()];
+        }
+        if kind == "bubble" {
+            draft.series[0].bubble_sizes = vec!["1".into(), "2.5".into(), "0".into()];
         }
         draft
     }
 
     #[test]
-    fn eleven_ui_definitions_create_configure_undo_and_roundtrip_without_dropping_fields()
+    fn fifteen_ui_definitions_create_configure_undo_and_roundtrip_without_dropping_fields()
     -> Result<()> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../output/implementation/0.17/ui-chart-eleven")
+            .join("../../output/implementation/0.17/ui-chart-fifteen")
             .join(format!("{}-{nonce}", std::process::id()));
         std::fs::create_dir_all(&root)?;
+        assert_eq!(KINDS.len(), 15);
         for (kind, _) in KINDS {
             let mut session = Session::new()?;
             session.execute(Command::Insert("차트 앞 본문 😀".into()))?;
             let mut editor = Editor::open(&mut session, None)?;
-            assert_eq!(editor.available_kinds.len(), 11);
+            assert_eq!(editor.available_kinds.len(), KINDS.len());
             editor.draft = draft_for_kind(kind);
             editor.draft.title = format!("UI {kind} 생성");
             let result = editor.apply(&mut session)?;
@@ -1164,9 +1471,23 @@ mod tests {
             );
             configured.draft.title = format!("UI {kind} 수정");
             configured.draft.legend = false;
-            if *kind == "scatter" {
-                configured.draft.scatter_style = "smooth_marker".into();
-                configured.draft.x_values[0] = "-7.25".into();
+            match *kind {
+                "scatter" => {
+                    configured.draft.scatter_style = "smooth_marker".into();
+                    configured.draft.x_values[0] = "-7.25".into();
+                }
+                "bubble" => {
+                    configured.draft.x_values[0] = "-7.25".into();
+                    configured.draft.series[0].bubble_sizes[2] = "4".into();
+                }
+                "combo" => {
+                    let last = configured.draft.series.last_mut().context("line")?;
+                    assert_eq!(last.plot, "line");
+                    last.secondary_axis = true;
+                }
+                "area" => configured.draft.grouping = "stacked".into(),
+                "radar" => configured.draft.radar_style = "filled".into(),
+                _ => {}
             }
             let before = format!("{:?}", session.core.document());
             configured.apply(&mut session)?;
@@ -1180,6 +1501,11 @@ mod tests {
             let expected =
                 session.run("chart.definition.get", json!({"index":0}))?["chart"].clone();
             assert_eq!(expected["legend"], false);
+            assert_eq!(
+                expected,
+                configured.draft.spec()?,
+                "{kind}: configured exactly as authored"
+            );
             for extension in ["hwp", "hwpx"] {
                 let path = root.join(format!("chart-{kind}.{extension}"));
                 session.save(&path)?;
@@ -1221,7 +1547,28 @@ mod tests {
         draft.select_kind("scatter");
         assert_eq!(draft.x_values[0], "작성 중인 X");
         assert_eq!(draft.scatter_style, "line_marker");
+        // Bubble shares scatter's X column and Y values, and keeps its sizes.
+        draft.select_kind("bubble");
+        assert_eq!(draft.x_values[0], "작성 중인 X");
+        draft.series[0].bubble_sizes[0] = "작성 중인 크기".into();
+        draft.select_kind("scatter");
+        draft.select_kind("bubble");
+        assert_eq!(draft.series[0].bubble_sizes[0], "작성 중인 크기");
         draft.select_kind("column_3d");
+        assert_eq!(draft.series[0].values[0], "작성 중인 값");
+        // Combo gets the line series it needs; the other category kinds ignore plots.
+        draft.select_kind("combo");
+        assert_eq!(draft.series.len(), 2);
+        assert_eq!(draft.series[0].values[0], "작성 중인 값");
+        assert_eq!(
+            draft
+                .series
+                .iter()
+                .map(|s| s.plot.as_str())
+                .collect::<Vec<_>>(),
+            ["column", "line"]
+        );
+        draft.select_kind("area");
         assert_eq!(draft.series[0].values[0], "작성 중인 값");
         for (style, _) in SCATTER_STYLES {
             let mut scatter = draft_for_kind("scatter");
@@ -1256,6 +1603,188 @@ mod tests {
             assert!(stock.spec().is_err());
             assert_eq!(stock.series[high].values[0], "5");
         }
+        Ok(())
+    }
+
+    /// The parts of a definition the dialog authors: the engine also assigns default
+    /// series colours and keeps the size in HWP units (75 mm reads 75.0006 mm).
+    fn authored(mut chart: Value) -> Value {
+        for key in ["width_mm", "height_mm"] {
+            chart[key] = json!((chart[key].as_f64().unwrap_or(f64::NAN) * 100.0).round() / 100.0);
+        }
+        for series in chart["series"].as_array_mut().into_iter().flatten() {
+            if let Some(series) = series.as_object_mut() {
+                series.remove("color");
+            }
+        }
+        chart
+    }
+
+    /// Combo, area, radar and bubble as the dialog writes them: created by the real
+    /// engine, read back unchanged, and removed again by one undo.
+    #[test]
+    fn combo_area_radar_bubble_create_roundtrip_and_undo_through_the_engine() -> Result<()> {
+        let mut combo = draft_for_kind("combo");
+        combo.add_series();
+        combo.add_series();
+        // Out of engine order on purpose: secondary line, column, line, column.
+        let plots = [
+            ("line", true),
+            ("column", false),
+            ("line", false),
+            ("column", false),
+        ];
+        for (series, (plot, secondary)) in combo.series.iter_mut().zip(plots) {
+            series.plot = plot.into();
+            series.secondary_axis = secondary;
+        }
+        let mut area = draft_for_kind("area");
+        area.add_series();
+        area.grouping = "percent_stacked".into();
+        let mut radar = draft_for_kind("radar");
+        radar.add_series();
+        radar.radar_style = "marker".into();
+        let mut bubble = draft_for_kind("bubble");
+        bubble.add_series();
+        bubble.series[1].bubble_sizes = vec!["0.5".into(), "3".into(), "12".into()];
+        for draft in [combo, area, radar, bubble] {
+            let kind = draft.kind.clone();
+            let mut session = Session::new()?;
+            session.execute(Command::Insert("새 차트 종류 본문".into()))?;
+            let original = format!("{:?}", session.core.document());
+            let mut editor = Editor::open(&mut session, None)?;
+            editor.draft = draft;
+            let spec = editor.draft.spec()?;
+            editor.apply(&mut session)?;
+            let stored = session.run("chart.definition.get", json!({"index":0}))?["chart"].clone();
+            assert_eq!(
+                authored(stored.clone()),
+                authored(spec),
+                "{kind}: stored as the dialog wrote it"
+            );
+            assert_eq!(
+                Draft::from_spec(&stored)?.spec()?,
+                stored,
+                "{kind}: roundtrip"
+            );
+            match kind.as_str() {
+                "combo" => {
+                    let order: Vec<_> = stored["series"]
+                        .as_array()
+                        .context("series")?
+                        .iter()
+                        .map(|s| {
+                            (
+                                s["name"].clone(),
+                                s["plot"].clone(),
+                                s["secondary_axis"].clone(),
+                            )
+                        })
+                        .collect();
+                    assert_eq!(
+                        order,
+                        [
+                            (json!("계열 2"), json!("column"), Value::Null),
+                            (json!("계열 4"), json!("column"), Value::Null),
+                            (json!("계열 3"), json!("line"), Value::Null),
+                            (json!("계열 1"), json!("line"), json!(true)),
+                        ],
+                        "engine order, stable inside each group"
+                    );
+                }
+                "area" => assert_eq!(stored["grouping"], "percent_stacked"),
+                "radar" => assert_eq!(stored["radar_style"], "marker"),
+                _ => assert_eq!(stored["series"][1]["bubble_sizes"], json!([0.5, 3.0, 12.0])),
+            }
+            session.execute(Command::Undo)?;
+            assert_eq!(
+                format!("{:?}", session.core.document()),
+                original,
+                "{kind}: one undo"
+            );
+            assert!(
+                session
+                    .run("chart.list", json!({}))?
+                    .as_array()
+                    .context("charts")?
+                    .is_empty()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn new_kind_inputs_reject_invalid_or_foreign_settings_without_dropping_them() -> Result<()> {
+        // Combo needs a column and a line; a secondary axis only on a line.
+        let mut combo = draft_for_kind("combo");
+        for series in &mut combo.series {
+            series.plot = "column".into();
+        }
+        assert!(combo.spec().is_err());
+        combo.series[1].plot = "line".into();
+        combo.series[0].secondary_axis = true;
+        assert!(combo.spec().is_err(), "secondary column");
+        combo.series[0].secondary_axis = false;
+        let spec = combo.spec()?;
+        let mut foreign = spec.clone();
+        foreign["series"][0]["secondary_axis"] = json!(true);
+        assert!(Draft::from_spec(&foreign).is_err());
+        foreign = spec.clone();
+        foreign["series"][0]
+            .as_object_mut()
+            .context("series")?
+            .remove("plot");
+        assert!(Draft::from_spec(&foreign).is_err(), "combo needs plot");
+        // Settings of another kind are refused, never silently dropped.
+        let column = draft_for_kind("column").spec()?;
+        for (key, value) in [
+            ("plot", json!("line")),
+            ("secondary_axis", json!(true)),
+            ("bubble_sizes", json!([1, 2, 3])),
+        ] {
+            let mut foreign = column.clone();
+            foreign["series"][0][key] = value;
+            assert!(Draft::from_spec(&foreign).is_err(), "{key}");
+        }
+        for (key, value) in [
+            ("radar_style", json!("filled")),
+            ("scatter_style", json!("marker")),
+        ] {
+            let mut foreign = column.clone();
+            foreign[key] = value;
+            assert!(Draft::from_spec(&foreign).is_err(), "{key}");
+        }
+        let mut pie = draft_for_kind("pie").spec()?;
+        pie["grouping"] = json!("stacked");
+        assert!(Draft::from_spec(&pie).is_err(), "grouping on pie");
+        let mut radar = draft_for_kind("radar");
+        radar.radar_style = "spiral".into();
+        assert!(radar.spec().is_err());
+        // Bubble sizes: non-negative numbers, one per point; the draft keeps the input.
+        for bad in ["-1", "크기", "NaN"] {
+            let mut bubble = draft_for_kind("bubble");
+            bubble.series[0].bubble_sizes[1] = bad.into();
+            assert!(bubble.spec().is_err(), "{bad}");
+            assert_eq!(bubble.series[0].bubble_sizes[1], bad);
+        }
+        let mut bubble = draft_for_kind("bubble");
+        bubble.add_row();
+        assert_eq!(bubble.series[0].bubble_sizes.len(), 4);
+        assert_eq!(bubble.spec()?["series"][0]["bubble_sizes"][3], 1.0);
+        bubble.remove_row();
+        let spec = bubble.spec()?;
+        let mut missing = spec.clone();
+        missing["series"][0]
+            .as_object_mut()
+            .context("series")?
+            .remove("bubble_sizes");
+        assert!(Draft::from_spec(&missing).is_err());
+        assert!(
+            spec["categories"]
+                .as_array()
+                .context("categories")?
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -1547,9 +2076,9 @@ mod tests {
     }
 
     #[test]
-    fn scatter_and_stock_forms_accept_real_keyboard_input_and_reject_bad_prices_without_losing_draft()
+    fn scatter_bubble_and_stock_forms_accept_real_keyboard_input_and_reject_bad_values_without_losing_draft()
     -> Result<()> {
-        for kind in ["scatter", "stock_hlc", "stock_ohlc"] {
+        for kind in ["scatter", "stock_hlc", "stock_ohlc", "bubble"] {
             let ctx = egui::Context::default();
             let mut app = HwpApp::with_context(ctx.clone(), None, None, false)?;
             app.session
@@ -1565,29 +2094,14 @@ mod tests {
             for _ in 0..3 {
                 frame(&mut app, &ctx, vec![]);
             }
-            let field = if kind == "scatter" {
-                "scatter_x"
-            } else {
-                "stock_high"
+            // (field, rejected input and the word its message names, accepted input)
+            let (field, bad, good) = match kind {
+                "scatter" => ("scatter_x", None, "-7.25"),
+                "bubble" => ("bubble_size", Some(("-3", "크기")), "4"),
+                _ => ("stock_high", Some(("5", "고가")), "15"),
             };
-            type_in_region(
-                &mut app,
-                &ctx,
-                field,
-                if kind == "scatter" { "-7.25" } else { "5" },
-            )?;
-            if kind == "scatter" {
-                assert_eq!(
-                    app.ext
-                        .object
-                        .chart_authoring
-                        .as_ref()
-                        .context("draft")?
-                        .draft
-                        .x_values[0],
-                    "-7.25"
-                );
-            } else {
+            if let Some((bad, word)) = bad {
+                type_in_region(&mut app, &ctx, field, bad)?;
                 let apply = app
                     .ext
                     .object
@@ -1607,10 +2121,24 @@ mod tests {
                     editor
                         .error
                         .as_ref()
-                        .is_some_and(|message| message.contains("고가"))
+                        .is_some_and(|message| message.contains(word)),
+                    "{kind}: {:?}",
+                    editor.error
                 );
                 assert_eq!(document_state(&app.session), original);
-                type_in_region(&mut app, &ctx, field, "15")?;
+            }
+            type_in_region(&mut app, &ctx, field, good)?;
+            if kind == "scatter" {
+                assert_eq!(
+                    app.ext
+                        .object
+                        .chart_authoring
+                        .as_ref()
+                        .context("draft")?
+                        .draft
+                        .x_values[0],
+                    "-7.25"
+                );
             }
             let preview = app
                 .ext
@@ -1637,9 +2165,56 @@ mod tests {
             if kind == "scatter" {
                 assert_eq!(definition["chart"]["series"][0]["x_values"][0], -7.25);
             }
+            if kind == "bubble" {
+                assert_eq!(definition["chart"]["series"][0]["bubble_sizes"][0], 4.0);
+            }
             app.session.execute(Command::Undo)?;
             assert_eq!(document_state(&app.session)["model"], original["model"]);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn combo_secondary_axis_checkbox_is_a_real_input_and_reaches_the_document() -> Result<()> {
+        let ctx = egui::Context::default();
+        let mut app = HwpApp::with_context(ctx.clone(), None, None, false)?;
+        app.session.execute(Command::Insert("혼합형 본문".into()))?;
+        let original = document_state(&app.session);
+        app.open_chart_creation(None);
+        app.ext
+            .object
+            .chart_authoring
+            .as_mut()
+            .context("editor")?
+            .draft = draft_for_kind("combo");
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let editor = app.ext.object.chart_authoring.as_ref().context("editor")?;
+        let (rect, clip, _) = editor.regions["combo_secondary"];
+        assert!(
+            clip.contains_rect(rect),
+            "visible checkbox: {rect:?} {clip:?}"
+        );
+        click(&mut app, &ctx, rect.center());
+        let editor = app.ext.object.chart_authoring.as_ref().context("editor")?;
+        assert!(
+            editor.draft.series[1].secondary_axis,
+            "click toggles the line series"
+        );
+        let apply = editor.regions["apply"].0;
+        click(&mut app, &ctx, apply.center());
+        assert!(app.ext.object.chart_authoring.is_none(), "apply succeeded");
+        let chart = app
+            .session
+            .run("chart.definition.get", json!({"index":0}))?["chart"]
+            .clone();
+        assert_eq!(chart["kind"], "combo");
+        assert_eq!(chart["series"][0]["plot"], "column");
+        assert_eq!(chart["series"][1]["plot"], "line");
+        assert_eq!(chart["series"][1]["secondary_axis"], true);
+        app.session.execute(Command::Undo)?;
+        assert_eq!(document_state(&app.session)["model"], original["model"]);
         Ok(())
     }
 
@@ -1724,16 +2299,24 @@ mod tests {
                 "{name} clipped: {rect:?} {clip:?}"
             );
         }
-        // Common dialog order: refresh on the left, main action then cancel at the right.
-        let (refresh, apply, cancel) = (
+        // Common dialog order: a right-hand column of the main action, 취소, then the
+        // extra command, beside the form and the preview.
+        let (preview, refresh, apply, cancel) = (
+            editor.regions["preview"].0,
             editor.regions["refresh"].0,
             editor.regions["apply"].0,
             editor.regions["cancel"].0,
         );
-        assert!(refresh.right() < apply.left() && apply.right() <= cancel.left());
+        assert!(preview.right() < apply.left(), "{preview:?} {apply:?}");
         assert!(
-            cancel.left() - refresh.right() > 200.0,
-            "{refresh:?} {cancel:?}"
+            (apply.left() - cancel.left()).abs() < 0.5
+                && (apply.left() - refresh.left()).abs() < 0.5,
+            "{apply:?} {cancel:?} {refresh:?}"
+        );
+        assert!(apply.bottom() <= cancel.top() && cancel.bottom() < refresh.top());
+        assert!(
+            apply.top() < preview.top(),
+            "buttons start at the top: {apply:?}"
         );
         let (title_rect, _, title_id) = editor.regions["title"];
         click(&mut app, &context, title_rect.center());
@@ -1792,8 +2375,8 @@ mod tests {
     }
 
     #[test]
-    fn grouping_round_trips_for_bars_and_lines_only() -> Result<()> {
-        for kind in ["column", "bar", "line"] {
+    fn grouping_round_trips_for_bars_lines_and_areas_only() -> Result<()> {
+        for kind in ["column", "bar", "line", "area"] {
             let mut draft = draft_for_kind(kind);
             draft.add_series();
             draft.grouping = "percent_stacked".into();

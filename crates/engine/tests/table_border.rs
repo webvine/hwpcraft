@@ -193,3 +193,151 @@ fn rows_and_columns_go_into_a_ragged_table_on_its_grid() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Laid-out (y, h) of the cell at (row, col) on page 1.
+fn cell_rows(s: &Session, row: u64, col: u64) -> anyhow::Result<(f64, f64)> {
+    let layout: Value = serde_json::from_str(&s.page_control_layout(0)?)?;
+    let cell = layout["controls"]
+        .as_array()
+        .and_then(|c| c.iter().find(|t| t["type"] == "table"))
+        .and_then(|t| t["cells"].as_array())
+        .and_then(|cells| {
+            cells
+                .iter()
+                .find(|c| c["row"].as_u64() == Some(row) && c["col"].as_u64() == Some(col))
+        })
+        .ok_or_else(|| anyhow::anyhow!("cell {row},{col}"))?;
+    Ok((
+        cell["y"].as_f64().unwrap_or(0.0),
+        cell["h"].as_f64().unwrap_or(0.0),
+    ))
+}
+
+#[test]
+fn a_row_border_moves_only_for_the_block_columns() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.run("insert.table", json!({"rows": 3, "columns": 3}))?;
+    let table: Value = serde_json::from_str(TABLE)?;
+    // Taller rows than the text needs, so the edge has room to move both ways.
+    s.run(
+        "table.move_border",
+        json!({"table": table, "vertical": false, "boundary": 2, "delta_mm": 10.0}),
+    )?;
+    let before: Vec<(f64, f64)> = (0..3)
+        .map(|r| cell_rows(&s, r, 0))
+        .collect::<anyhow::Result<_>>()?;
+    let px = 4.0 * 96.0 / 25.4;
+    // The first column only: the edge under row 1 (boundary 1) moves 4 mm down.
+    s.run(
+        "table.move_border",
+        json!({"table": table, "vertical": false, "boundary": 1, "delta_mm": 4.0,
+               "range": {"start_row": 0, "start_col": 0, "end_row": 1, "end_col": 0}}),
+    )?;
+    let check = |s: &Session| -> anyhow::Result<()> {
+        let near = |a: f64, b: f64| (a - b).abs() < 1.0;
+        let top = cell_rows(s, 0, 0)?;
+        assert!(near(top.1, before[0].1 + px), "the block grows: {top:?}");
+        // The other columns keep their edge where it was.
+        let (y, h) = cell_rows(s, 0, 1)?;
+        assert!(near(y, before[0].0) && near(h, before[0].1), "{y} {h}");
+        // The cell under the moved edge (grid row 2 after the new thin row 1) gives the
+        // same height up; its bottom stays.
+        let bottom = before[1].0 + before[1].1;
+        let (y, h) = cell_rows(s, 2, 0)?;
+        assert!(near(y, before[1].0 + px), "{y}");
+        assert!(near(y + h, bottom), "{} vs {bottom}", y + h);
+        // The table ends where it did.
+        let last = before[2].0 + before[2].1;
+        let (y, h) = cell_rows(s, 3, 2)?;
+        assert!(near(y + h, last), "{} vs {last}", y + h);
+        Ok(())
+    };
+    check(&s)?;
+    let temp = tempfile::tempdir()?;
+    for ext in ["hwp", "hwpx"] {
+        let path = temp.path().join(format!("ragged-rows.{ext}"));
+        s.save(&path)?;
+        let mut r = Session::new()?;
+        r.open(&path)?;
+        check(&r)?;
+    }
+    s.execute(Command::Undo)?;
+    let top = cell_rows(&s, 0, 0)?;
+    assert!((top.1 - before[0].1).abs() < 1.0, "undone in one step");
+    // Shrinking a cell below its text is refused and leaves the table alone.
+    let generation = s.generation;
+    let refused = s
+        .run(
+            "table.move_border",
+            json!({"table": table, "vertical": false, "boundary": 1, "delta_mm": -3.0,
+                   "range": {"start_row": 0, "start_col": 0, "end_row": 0, "end_col": 1}}),
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(refused.contains("셀 내용"), "{refused}");
+    assert_eq!(s.generation, generation);
+    let (_, h) = cell_rows(&s, 0, 2)?;
+    assert!((h - before[0].1).abs() < 1.0, "left alone: {h}");
+    Ok(())
+}
+
+#[test]
+fn a_row_border_moves_from_where_text_has_pushed_it() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.run("insert.table", json!({"rows": 2, "columns": 2}))?;
+    let table: Value = serde_json::from_str(TABLE)?;
+    // Three lines in the second cell make row 1 taller than its stored height.
+    s.select(
+        hwpcraft_doc::Cursor {
+            section: 0,
+            paragraph: 0,
+            offset: 0,
+            cell: Some(hwpcraft_doc::Cell {
+                control: 2,
+                index: 1,
+                paragraph: 0,
+            }),
+        },
+        false,
+    )?;
+    for _ in 0..2 {
+        s.execute(Command::Insert("가".into()))?;
+        s.execute(Command::Split)?;
+    }
+    let (y0, h0) = cell_rows(&s, 0, 0)?;
+    let (y1, h1) = cell_rows(&s, 1, 1)?;
+    let px = 3.0 * 96.0 / 25.4;
+    s.run(
+        "table.move_border",
+        json!({"table": table, "vertical": false, "boundary": 1, "delta_mm": -3.0,
+               "range": {"start_row": 0, "start_col": 0, "end_row": 1, "end_col": 0}}),
+    )?;
+    // The first cell shrinks 3 mm from where it is drawn, not from its stored height.
+    let (y, h) = cell_rows(&s, 0, 0)?;
+    assert!(
+        (y - y0).abs() < 1.0 && (h - (h0 - px)).abs() < 1.0,
+        "{h} vs {h0}"
+    );
+    let (_, tall) = cell_rows(&s, 0, 1)?;
+    assert!(
+        (tall - h0).abs() < 1.0,
+        "the text cell keeps its height: {tall}"
+    );
+    // The table bottom stays, in the block and outside it.
+    let (y, h) = cell_rows(&s, 1, 0)?;
+    assert!(
+        ((y + h) - (y1 + h1)).abs() < 1.0,
+        "{} vs {}",
+        y + h,
+        y1 + h1
+    );
+    let (y, h) = cell_rows(&s, 2, 1)?;
+    assert!(
+        ((y + h) - (y1 + h1)).abs() < 1.0,
+        "{} vs {}",
+        y + h,
+        y1 + h1
+    );
+    Ok(())
+}

@@ -4,7 +4,7 @@
 //! HWPX `hp:dutmal`); the base text leaves the paragraph text when it moves
 //! into the control, and comes back when the 덧말 is removed.
 use super::*;
-use crate::control_slots::insert_control;
+use crate::control_slots::{insert_control, remove_control};
 use crate::ext_format::CHAR_OVERLAP_CTRL_CHAR;
 use hwpcraft_doc::model::control::Ruby;
 use serde::Deserialize;
@@ -25,7 +25,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "format.ruby",
-        "본문 한 문단 안에서 선택한 글자(기준 글, 1–100자)에 덧말을 답니다. text(필수, 1–100자): 덧말. position: top(기본)·bottom. align: center(기본)·left·right. size(10–100, 기본 50): 덧말 크기 비율(%). 결과: control(문단 안 컨트롤 번호).",
+        "본문 또는 표 셀의 한 문단 안에서 선택한 글자(기준 글, 1–100자)에 덧말을 답니다. text(필수, 1–100자): 덧말. position: top(기본)·bottom. align: center(기본)·left·right. size(10–100, 기본 50): 덧말 크기 비율(%). 결과: control(문단 안 컨트롤 번호).",
         r#"{"text":"한국어","position":"top"}"#,
     ),
     (
@@ -118,11 +118,9 @@ impl Session {
         }))
     }
 
+    /// The caret paragraph: a body paragraph or a first-level table cell paragraph.
     fn ruby_paragraph(&self) -> Result<Cursor> {
         let c = self.cursor;
-        if c.cell.is_some() {
-            bail!("덧말은 본문 문단에 넣습니다. 표 안에서는 아직 지원하지 않습니다.");
-        }
         self.paragraph(c)?;
         Ok(c)
     }
@@ -156,23 +154,35 @@ impl Session {
         p.apply(&mut ruby)?;
         let mut control = 0;
         self.transaction(|s| {
-            s.core
-                .delete_range_native(
+            match c.cell {
+                Some(t) => s.core.delete_text_in_cell_native(
+                    c.section,
+                    c.paragraph,
+                    t.control,
+                    t.index,
+                    t.paragraph,
+                    range.start,
+                    range.len(),
+                ),
+                None => s.core.delete_range_native(
                     c.section,
                     c.paragraph,
                     range.start,
                     c.paragraph,
                     range.end,
                     None,
-                )
-                .map_err(err)?;
-            let section = &mut s.core.document_mut().sections[c.section];
-            section.raw_stream = None;
-            let para = &mut section.paragraphs[c.paragraph];
+                ),
+            }
+            .map_err(err)?;
+            s.core.document_mut().sections[c.section].raw_stream = None;
+            let para = s.paragraph_mut(c)?;
             // CTRL_DATA records and field ranges move with it (see control_slots).
             control = insert_control(para, range.start, Control::Ruby(ruby), None);
             para.control_mask |= 1 << CHAR_OVERLAP_CTRL_CHAR;
             s.refresh_layout()?;
+            // The delete broke the lines without the base text; break them again with it
+            // in the control (RHWP counts its width since patch 0071).
+            s.reflow(c)?;
             s.clear_selection();
             s.cursor = Cursor {
                 offset: range.start,
@@ -224,9 +234,8 @@ impl Session {
         let mut ruby = self.ruby_at(c, control)?;
         p.apply(&mut ruby)?;
         self.transaction(|s| {
-            let section = &mut s.core.document_mut().sections[c.section];
-            section.raw_stream = None;
-            section.paragraphs[c.paragraph].controls[control] = Control::Ruby(ruby);
+            s.core.document_mut().sections[c.section].raw_stream = None;
+            s.paragraph_mut(c)?.controls[control] = Control::Ruby(ruby);
             s.refresh_layout()
         })?;
         Ok(self.info())
@@ -245,10 +254,32 @@ impl Session {
             .copied()
             .unwrap_or(0);
         self.transaction(|s| {
-            s.delete_control_keeping_fields(c.section, c.paragraph, control, false)?;
-            s.core
-                .insert_text_native(c.section, c.paragraph, position, &ruby.main_text)
-                .map_err(err)?;
+            match c.cell {
+                Some(t) => {
+                    // RHWP removes controls of body paragraphs only; the slot helper
+                    // keeps the cell paragraph's field ranges and CTRL_DATA in step.
+                    s.core.document_mut().sections[c.section].raw_stream = None;
+                    remove_control(s.paragraph_mut(c)?, control);
+                    s.refresh_layout()?;
+                    s.core
+                        .insert_text_in_cell_native(
+                            c.section,
+                            c.paragraph,
+                            t.control,
+                            t.index,
+                            t.paragraph,
+                            position,
+                            &ruby.main_text,
+                        )
+                        .map_err(err)?;
+                }
+                None => {
+                    s.delete_control_keeping_fields(c.section, c.paragraph, control, false)?;
+                    s.core
+                        .insert_text_native(c.section, c.paragraph, position, &ruby.main_text)
+                        .map_err(err)?;
+                }
+            }
             s.clear_selection();
             s.cursor = Cursor {
                 offset: position + ruby.main_text.chars().count(),

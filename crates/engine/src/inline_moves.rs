@@ -105,7 +105,18 @@ impl Session {
                 ..to
             };
             s.anchor = None;
-            s.refresh_layout()
+            s.refresh_layout()?;
+            // The slots moved under RHWP: break both paragraphs' lines again.
+            s.reflow(Cursor {
+                section: a.section,
+                paragraph: a.paragraph,
+                offset: 0,
+                cell: None,
+            })?;
+            if (a.section, a.paragraph) != (to.section, to.paragraph) {
+                s.reflow(to)?;
+            }
+            Ok(())
         })?;
         Ok(moved)
     }

@@ -1,0 +1,126 @@
+diff --git a/src/document_core/commands/object_ops/table.rs b/src/document_core/commands/object_ops/table.rs
+index 063bdabca..026777dec 100644
+--- a/src/document_core/commands/object_ops/table.rs
++++ b/src/document_core/commands/object_ops/table.rs
+@@ -834,6 +834,35 @@ impl DocumentCore {
+         treat_as_char: bool,
+         col_widths_hu: Option<&[u32]>,
+         row_heights_hu: Option<&[u32]>,
++    ) -> Result<String, HwpError> {
++        self.create_table_ex_with_cell_para_shape_native(
++            section_idx,
++            para_idx,
++            char_offset,
++            row_count,
++            col_count,
++            treat_as_char,
++            col_widths_hu,
++            row_heights_hu,
++            None,
++        )
++    }
++
++    /// [HwpCraft 0100] [`Self::create_table_ex_native`] 에 셀 문단 모양을 더한 것.
++    /// `cell_para_shape_id` 가 None 이면 같은 동작이고, Some 이면 새 셀 문단을 처음부터 그
++    /// 모양으로 만든다(0098 의 `TableCreationOptions::cell_para_shape_id` 와 같은 뜻).
++    #[allow(clippy::too_many_arguments)]
++    pub fn create_table_ex_with_cell_para_shape_native(
++        &mut self,
++        section_idx: usize,
++        para_idx: usize,
++        char_offset: usize,
++        row_count: u16,
++        col_count: u16,
++        treat_as_char: bool,
++        col_widths_hu: Option<&[u32]>,
++        row_heights_hu: Option<&[u32]>,
++        cell_para_shape_id: Option<u16>,
+     ) -> Result<String, HwpError> {
+         use crate::model::paragraph::{CharShapeRef, LineSeg};
+         use crate::model::style::{
+@@ -859,14 +888,28 @@ impl DocumentCore {
+                 row_count, col_count
+             )));
+         }
++        // [HwpCraft 0100] 셀 문단 모양 번호는 문서를 바꾸기 전에 확인한다.
++        if let Some(id) = cell_para_shape_id {
++            if usize::from(id) >= self.document.doc_info.para_shapes.len() {
++                return Err(HwpError::RenderError(format!(
++                    "셀 문단 모양 ID {} 범위 초과 (총 {}개)",
++                    id,
++                    self.document.doc_info.para_shapes.len()
++                )));
++            }
++        }
+ 
+         if !treat_as_char {
+-            return self.create_table_native(
++            return self.create_table_with_options_native(
+                 section_idx,
+                 para_idx,
+                 char_offset,
+                 row_count,
+                 col_count,
++                &super::TableCreationOptions {
++                    cell_para_shape_id,
++                    ..Default::default()
++                },
+             );
+         }
+ 
+@@ -963,7 +1006,7 @@ impl DocumentCore {
+                 cell.vertical_align = crate::model::table::VerticalAlign::Center;
+                 for cp in &mut cell.paragraphs {
+                     cp.char_count_msb = true;
+-                    cp.para_shape_id = default_para_shape_id;
++                    cp.para_shape_id = cell_para_shape_id.unwrap_or(default_para_shape_id);
+                     // create_table_native 와 동일 — 빈 char_shapes 는 charPrIDRef="0" 이 된다.
+                     // default_char_shape_id 는 여기서 쓰라고 계산된 값이었으나 누락돼 있었다.
+                     cp.char_shapes = vec![CharShapeRef {
+@@ -1767,6 +1810,46 @@ mod tests {
+         );
+     }
+ 
++    /// [HwpCraft 0100] 글자처럼 취급하는 표도 셀 문단 모양을 정해 만들 수 있다. 범위 밖
++    /// 번호는 문서를 바꾸지 않고 거절한다.
++    #[test]
++    fn an_inline_table_takes_the_cell_para_shape_it_is_given() {
++        let mut core = core_with_shaped_paragraph();
++        core.create_table_ex_with_cell_para_shape_native(0, 0, 0, 2, 3, true, None, None, Some(0))
++            .unwrap();
++        for cell in &table_of(&core).cells {
++            assert_eq!(cell.paragraphs[0].para_shape_id, 0);
++            assert_eq!(
++                cell.paragraphs[0]
++                    .char_shapes
++                    .first()
++                    .map(|cs| cs.char_shape_id),
++                Some(7)
++            );
++        }
++        let mut core = core_with_shaped_paragraph();
++        let fills = core.document.doc_info.border_fills.len();
++        let controls = core.document.sections[0].paragraphs[0].controls.len();
++        assert!(core
++            .create_table_ex_with_cell_para_shape_native(
++                0,
++                0,
++                0,
++                2,
++                3,
++                true,
++                None,
++                None,
++                Some(u16::MAX)
++            )
++            .is_err());
++        assert_eq!(core.document.doc_info.border_fills.len(), fills);
++        assert_eq!(
++            core.document.sections[0].paragraphs[0].controls.len(),
++            controls
++        );
++    }
++
+     #[test]
+     fn create_table_ex_native_cells_inherit_char_shape() {
+         let mut core = core_with_shaped_paragraph();

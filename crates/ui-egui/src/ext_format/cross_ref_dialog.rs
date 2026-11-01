@@ -5,11 +5,11 @@
 use super::super::*;
 use serde_json::Value;
 
-/// What a table reference shows: (engine `show`, label).
+/// What a table or picture reference shows: (engine `show`, label).
 const SHOWS: [(&str, &str); 3] = [
     ("page", "쪽 번호"),
-    ("number", "캡션 번호"),
-    ("caption", "캡션 전체"),
+    ("number", "번호"),
+    ("caption", "캡션 전체·제목"),
 ];
 const KINDS: [(&str, &str); 4] = [
     ("headings", "개요"),
@@ -18,12 +18,17 @@ const KINDS: [(&str, &str); 4] = [
     ("bookmarks", "책갈피"),
 ];
 
+/// Do targets of this kind offer number and caption references?
+fn captioned(kind: usize) -> bool {
+    matches!(KINDS[kind].0, "tables" | "pictures" | "headings")
+}
+
 pub(crate) struct CrossRefDialog {
     kind: usize,
     /// `tools.cross_reference.targets` when the window opened.
     targets: Value,
     picked: Option<usize>,
-    /// Index into `SHOWS`; only tables offer more than the page.
+    /// Index into `SHOWS`; only tables and pictures offer more than the page.
     show: usize,
     /// Cross references already in the document, for 모두 새로 고침.
     references: usize,
@@ -153,14 +158,16 @@ impl HwpApp {
                             });
                     });
                 super::super::ext_shell::group(ui, "참조 내용");
-                if KINDS[d.kind].0 == "tables" {
+                if captioned(d.kind) {
                     ui.horizontal(|ui| {
                         for (i, (_, label)) in SHOWS.iter().enumerate() {
                             ui.radio_value(&mut d.show, i, *label);
                         }
                     });
                     if d.show == 1 {
-                        ui.label("한글처럼 번호만 넣습니다. \"표 \"는 앞에 직접 입력하세요.");
+                        ui.label(
+                            "한글처럼 번호만 넣습니다(개요는 보이는 번호 \"1.\"). \"표 \"·\"그림 \"은 앞에 직접 입력하세요.",
+                        );
                     }
                 } else {
                     ui.label("쪽 번호");
@@ -171,7 +178,7 @@ impl HwpApp {
                 }
                 super::super::ext_shell::notice(
                     ui,
-                    "캐럿 위치에 대상의 쪽 번호(표는 캡션 번호·캡션도)를 넣습니다. 쪽이나 캡션이 바뀌는 편집 뒤에는 모두 새로 고침을 누르세요. 쪽 번호는 문서의 실제 쪽 순서입니다. 그림·개요의 번호·제목 참조는 아직 없습니다.",
+                    "캐럿 위치에 대상의 쪽 번호(표·그림은 캡션 번호·캡션, 개요는 번호·제목도)를 넣습니다. 쪽이나 캡션·제목이 바뀌는 편집 뒤에는 모두 새로 고침을 누르세요. 쪽 번호는 문서의 실제 쪽 순서입니다.",
                 );
             },
         );
@@ -182,7 +189,7 @@ impl HwpApp {
                     .and_then(|i| d.items().get(i))
                     .map(|item| d.entry(item))
                 {
-                    let show = if KINDS[d.kind].0 == "tables" {
+                    let show = if captioned(d.kind) {
                         SHOWS[d.show].0
                     } else {
                         "page"

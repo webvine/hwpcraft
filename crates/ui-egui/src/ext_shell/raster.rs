@@ -261,6 +261,18 @@ impl HwpApp {
             ctx.request_repaint_after(PREFETCH_QUIET - since.elapsed().min(PREFETCH_QUIET));
             return;
         }
+        // A page made ahead has its SVG built on this thread, and the first build of a
+        // page with BMP or TIFF pictures converts them (about 90 ms a page in the 2025
+        // handbook). While the wheel turns or a button is held (scroll bar, drag), wait:
+        // the work lands in the pause instead of in the middle of the gesture.
+        let gesture = ctx.input(|i| {
+            f64::from(i.time_since_last_scroll()) < SCROLL_QUIET.as_secs_f64()
+                || i.pointer.any_down()
+        });
+        if gesture {
+            ctx.request_repaint_after(SCROLL_QUIET);
+            return;
+        }
         let pass = ctx.cumulative_pass_nr();
         let (at, now, _) = &self.ext.shell.requested;
         if !self.raster_async()
@@ -304,6 +316,8 @@ impl HwpApp {
 
 /// How long the document must stay unchanged before pages out of view are made ahead.
 const PREFETCH_QUIET: std::time::Duration = std::time::Duration::from_millis(150);
+/// How long after the last wheel step pages out of view wait.
+const SCROLL_QUIET: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[cfg(test)]
 mod raster_tests {
@@ -403,6 +417,51 @@ mod raster_tests {
             "the page in view waits for nothing"
         );
         until(&mut a, &[0, 1], |a| current(a, 1));
+        Ok(())
+    }
+
+    /// While the wheel turns, the page below waits; it is made once the wheel stops.
+    #[test]
+    fn scrolling_holds_back_pages_out_of_view_until_it_pauses() -> anyhow::Result<()> {
+        let mut a = app(3)?;
+        // Page 1 in view, nothing made ahead yet: after the first pass has noted the
+        // document, a fresh edit holds prefetching back.
+        pass(&mut a, &[1]);
+        a.ext.shell.edit_seen.1 = Some(Instant::now() + Duration::from_secs(60));
+        until(&mut a, &[1], |a| current(a, 1));
+        assert!(!current(&a, 2));
+        a.ext.shell.edit_seen.1 = None;
+        let ctx = a.ctx.clone();
+        let frame = |a: &mut HwpApp, time: f64, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |_| {
+                let _ = a.shell_page_texture(&ctx, 1);
+                a.prefetch_pages(&ctx);
+            });
+            out.textures_delta.clear();
+        };
+        let wheel = || egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: Vec2::new(0.0, -1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let queued = |a: &HwpApp| {
+            a.ext
+                .shell
+                .raster
+                .as_ref()
+                .is_some_and(|r| r.busy.iter().any(|k| k.page == 2))
+        };
+        frame(&mut a, 100.0, vec![wheel()]);
+        frame(&mut a, 100.1, vec![wheel()]);
+        assert!(!queued(&a) && !current(&a, 2), "made ahead mid-scroll");
+        frame(&mut a, 101.0, vec![]);
+        assert!(queued(&a) || current(&a, 2), "made once the wheel stopped");
         Ok(())
     }
 

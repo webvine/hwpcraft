@@ -142,6 +142,8 @@ impl HwpApp {
         )
         .show(ctx, |ui| {
             ui.set_width(470.0);
+            // The options gap of the modal dialogs (chrome::modal).
+            ui.spacing_mut().item_spacing.x = 8.0;
             close |= chrome::title(
                 ui,
                 if replace {

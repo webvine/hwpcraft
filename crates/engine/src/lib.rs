@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 mod ext_format;
 mod ext_object;
 mod ext_page;
+mod image_prewarm;
 use ext_page::ViewMarks;
 mod ext_table;
 mod extensions;
@@ -41,6 +42,7 @@ mod hwp_parameters;
 pub use hwp_parameters::{PreparedHwpAction, hwp_parameter_schema};
 mod contexts;
 pub use contexts::{CellStep, DocumentAddress};
+mod context_walk;
 mod contexts_v2;
 pub use contexts_v2::{ContextAddress, ContextStep};
 mod comments;
@@ -50,8 +52,10 @@ pub use find::{FindDirection, FindOptions};
 mod links;
 mod macros;
 mod nested_caret;
+pub use caret::column_number;
 pub use links::HyperlinkEdit;
-pub use nested_caret::NestedCaret;
+use nested_caret::NestedBlockRects;
+pub use nested_caret::{NestedBlock, NestedCaret};
 mod distribution;
 mod highlights;
 mod nested_presentation;
@@ -97,6 +101,7 @@ mod style_sets;
 mod table_border;
 mod table_styles;
 mod track_changes;
+mod track_record;
 
 fn hwpx_track_marks_of(path: &Path) -> usize {
     let hwpx = path
@@ -111,6 +116,7 @@ fn hwpx_track_marks_of(path: &Path) -> usize {
 }
 mod captions;
 mod form_insert;
+mod form_properties;
 mod layout_cache;
 mod protocol;
 mod tabs;
@@ -267,6 +273,9 @@ pub struct Session {
     created_table: Option<ObjectAddress>,
     /// Caret in a nested table cell or a text box (see `nested_caret`).
     nested: Option<NestedCaret>,
+    nested_block: Option<NestedBlock>,
+    /// Cell boxes of the nested block, keyed by (generation, page, block).
+    nested_block_rects: std::cell::RefCell<Option<NestedBlockRects>>,
     pub cursor: Cursor,
     /// Selection is confined to the current paragraph, including table cells.
     pub anchor: Option<usize>,
@@ -285,10 +294,18 @@ pub struct Session {
     typing: Option<Cursor>,
     typing_chars: usize,
     insertion_shape: InsertionShapeState,
+    /// Names of combo boxes whose items HwpCraft set: the document script's list for
+    /// such a name no longer stands for them in an HWP save (`form_properties`).
+    edited_combo_items: std::collections::HashSet<String>,
     clipboard_text: Option<String>,
     clipboard_replay: Option<std::rc::Rc<clipboard_history::ClipboardReplay>>,
     page_clipboard: Option<std::rc::Rc<hwpcraft_doc::model::document::Document>>,
     pub generation: u64,
+    /// Changes when the session starts on another document (new, open, reset) and
+    /// never while one document is edited: the document's identity for MCP's
+    /// desktop connection, which must not carry a client's id over to a document
+    /// the user opened since.
+    pub document_serial: u64,
     render_highlights: std::cell::RefCell<Option<(u64, Vec<HighlightRect>)>>,
     /// A failed layout is cached as its message so per-frame callers do not retry it.
     page_field_cache: std::cell::RefCell<Option<(u64, CachedPageFields)>>,
@@ -313,6 +330,15 @@ pub struct Session {
     macros: macros::MacroRecorder,
     /// HWPX insert/delete marks found when the file opened (RHWP drops them).
     track_marks: usize,
+    /// Recording changes (`document.track_changes.record`), see `track_record`.
+    track_recorder: Option<track_record::TrackRecorder>,
+    /// Inside an edit recording may make (`Session::track_scope`).
+    track_editing: bool,
+    /// Rows of ancestor tables grown for nested content, by (table instance id, row):
+    /// (growth, the grown cell's height then). See `context_reflow_ancestors`.
+    context_growth: std::collections::HashMap<(u32, usize), (u32, u32)>,
+    /// Colours the last 셀 음영 steps started from (see `ext_table::ShadeBase`).
+    shade_base: Option<ext_table::ShadeBase>,
 }
 impl Session {
     pub fn new() -> Result<Self> {
@@ -327,12 +353,18 @@ impl Session {
         Ok(Self::with_core(core, None))
     }
     fn with_core(core: DocumentCore, path: Option<PathBuf>) -> Self {
+        fn next_document_serial() -> u64 {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        }
         Self {
             core,
             deferred_depth: 0,
             transaction_depth: 0,
             created_table: None,
             nested: None,
+            nested_block: None,
+            nested_block_rects: Default::default(),
             authored: path.is_none(),
             path,
             password: None,
@@ -343,10 +375,12 @@ impl Session {
             typing: None,
             typing_chars: 0,
             insertion_shape: InsertionShapeState::default(),
+            edited_combo_items: Default::default(),
             clipboard_text: None,
             clipboard_replay: None,
             page_clipboard: None,
             generation: 0,
+            document_serial: next_document_serial(),
             render_highlights: std::cell::RefCell::new(None),
             page_field_cache: std::cell::RefCell::new(None),
             page_field_previous: std::cell::RefCell::new(None),
@@ -364,12 +398,17 @@ impl Session {
             history_scopes: atomic_history::HistoryScopes::default(),
             macros: Default::default(),
             track_marks: 0,
+            track_recorder: None,
+            track_editing: false,
+            context_growth: Default::default(),
+            shade_base: None,
         }
     }
     pub fn open(&mut self, path: &Path) -> Result<()> {
         self.ensure_history_replacement_allowed()?;
         let mut core = hwpcraft_formats::open(path)?;
         comments::restore_memo_content(&mut core)?;
+        track_changes::seal_tracked_sections(&mut core);
         let generation = self.generation + 1;
         let mut opened = Self::with_core(core, Some(path.to_owned()));
         opened.generation = generation;
@@ -379,7 +418,8 @@ impl Session {
             && !layout_cache::has_authored_rows(opened.core.document());
         opened.page_count()?;
         opened.macros = self.take_macro_recorder();
-        opened.track_marks = hwpx_track_marks_of(path);
+        opened.track_marks =
+            track_changes::unread_track_marks(hwpx_track_marks_of(path), opened.core.document());
         *self = opened;
         Ok(())
     }
@@ -388,13 +428,15 @@ impl Session {
         self.ensure_history_replacement_allowed()?;
         let mut core = hwpcraft_formats::open_with_password(path, password)?;
         comments::restore_memo_content(&mut core)?;
+        track_changes::seal_tracked_sections(&mut core);
         let generation = self.generation + 1;
         let mut opened = Self::with_core(core, Some(path.to_owned()));
         opened.generation = generation;
         opened.password = Some(password.to_owned());
         opened.page_count()?;
         opened.macros = self.take_macro_recorder();
-        opened.track_marks = hwpx_track_marks_of(path);
+        opened.track_marks =
+            track_changes::unread_track_marks(hwpx_track_marks_of(path), opened.core.document());
         *self = opened;
         Ok(())
     }
@@ -438,8 +480,10 @@ impl Session {
         !self.redo.is_empty()
     }
     pub fn save(&mut self, path: &Path) -> Result<()> {
-        // Change tracking cannot be kept; see `track_changes`.
-        self.refuse_tracked_save(path)?;
+        // HWP and HWPX saves keep change tracking; others refuse it, see `track_changes`.
+        if !self.keeps_track_changes(path) {
+            self.refuse_tracked_save(path)?;
+        }
         self.with_save_times(path, |s| s.save_with_tab_widths(path))?;
         if matches!(
             path.extension()
@@ -495,12 +539,17 @@ impl Session {
         if let Some(a) = self.span_anchor {
             let len = self.len();
             let offset = self.cursor.offset.min(len);
-            let anchor = a.cell.map(|t| t.paragraph).unwrap_or(a.paragraph);
-            let caret = self
-                .cursor
-                .cell
-                .map(|t| t.paragraph)
-                .unwrap_or(self.cursor.paragraph);
+            let anchor = (
+                a.section,
+                a.cell.map(|t| t.paragraph).unwrap_or(a.paragraph),
+            );
+            let caret = (
+                self.cursor.section,
+                self.cursor
+                    .cell
+                    .map(|t| t.paragraph)
+                    .unwrap_or(self.cursor.paragraph),
+            );
             return if anchor < caret {
                 0..offset
             } else {
@@ -851,6 +900,12 @@ impl Session {
             .collect()
     }
     fn snapshot(&mut self) -> Snapshot {
+        // RHWP keeps at most 100 snapshots: 40 undo + 40 redo steps, the one taken
+        // here and those of an enclosing atomic batch or checkpoint stay below it.
+        debug_assert!(
+            self.undo.len() + self.redo.len() <= 80,
+            "history snapshots must stay under RHWP's limit of 100"
+        );
         Snapshot {
             id: self.save_history_snapshot(),
             cursor: self.cursor,
@@ -935,6 +990,7 @@ impl Session {
         self.deferred_depth -= 1;
         if self.deferred_depth == 0 {
             self.core.end_batch_native().map_err(err)?;
+            self.follow_connectors()?;
         }
         Ok(())
     }
@@ -955,6 +1011,15 @@ impl Session {
         resumed?;
         Ok(value)
     }
+    /// Count a change made outside the undo history (dirty, redraw, new generation).
+    pub(crate) fn mark_changed(&mut self) {
+        self.revision = self.next_revision;
+        self.next_revision += 1;
+        self.generation += 1;
+        self.clear_geometry();
+        self.visual_hint.set(None);
+        self.hit_hint.set(None);
+    }
     fn transaction(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
         if self.transaction_depth > 0 {
             // Part of an enclosing transaction: it records the one undo step and
@@ -964,6 +1029,8 @@ impl Session {
             self.transaction_depth -= 1;
             return result;
         }
+        // While recording changes, only the edits it records may change the document.
+        self.guard_track_recording()?;
         self.transaction_depth = 1;
         let result = self.outer_transaction(f);
         self.transaction_depth = 0;
@@ -976,13 +1043,18 @@ impl Session {
         self.visual_hint.set(None);
         self.hit_hint.set(None);
         *self.render_highlights.borrow_mut() = None;
-        let result = f(self);
+        let result = f(self).and_then(|()| self.follow_connectors());
         self.clear_geometry();
         *self.render_highlights.borrow_mut() = None;
         if let Err(e) = result {
-            self.core
-                .restore_snapshot_native(snapshot.id)
-                .map_err(err)?;
+            if let Err(restore) = self.core.restore_snapshot_native(snapshot.id) {
+                // The edit failed part way and could not be taken back: the document
+                // keeps the partial change, so it counts as changed and is redrawn,
+                // and the error names both failures.
+                self.retire_history_snapshot(snapshot.id);
+                self.mark_changed();
+                return Err(e.context(format!("되돌리기도 실패했습니다: {restore}")));
+            }
             self.retire_history_snapshot(snapshot.id);
             self.cursor = snapshot.cursor;
             self.anchor = snapshot.anchor;
@@ -1070,32 +1142,7 @@ impl Session {
     // RHWP split APIs count inline controls as logical characters; text editing
     // and our public cursor use scalar text offsets. Convert only at this boundary.
     fn split_offset(&self, c: Cursor) -> Result<usize> {
-        let p = self.paragraph(c)?;
-        let positions = p.control_text_positions();
-        let at_trailing_placeholder = c.offset == p.text.chars().count() && p.text.ends_with(' ');
-        let before = p
-            .controls
-            .iter()
-            .zip(positions)
-            .filter(|(ctrl, pos)| {
-                (*pos < c.offset
-                    || (at_trailing_placeholder
-                        && *pos == c.offset
-                        && matches!(ctrl, Control::AutoNumber(_))))
-                    && matches!(
-                        ctrl,
-                        Control::Shape(_)
-                            | Control::Table(_)
-                            | Control::Picture(_)
-                            | Control::Equation(_)
-                            | Control::Footnote(_)
-                            | Control::Endnote(_)
-                            | Control::AutoNumber(_)
-                            | Control::CharOverlap(_)
-                    )
-            })
-            .count();
-        Ok(c.offset + before)
+        Ok(contexts::logical_split_offset(self.paragraph(c)?, c.offset))
     }
     fn split(&mut self) -> Result<()> {
         let c = self.cursor;
@@ -1123,13 +1170,19 @@ impl Session {
         }
         self.cursor.offset = 0;
         self.anchor = None;
+        // Recording: the new break is an insert (`track_record`).
+        self.track_split(Cursor { offset: 0, ..c })?;
         Ok(())
     }
     fn insert(&mut self, text: &str) -> Result<()> {
         if text.len() > 1_000_000 {
             bail!("한 번에 입력할 수 있는 텍스트는 1 MB 이하입니다.");
         }
+        check_typed_text(text)?;
         let replace = self.overwrite && !self.has_selection();
+        if replace && self.track_recording() {
+            bail!("변경 추적 기록 중에는 수정(겹쳐 쓰기) 모드로 입력할 수 없습니다.");
+        }
         self.delete_selection()?;
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if replace {
@@ -1173,6 +1226,7 @@ impl Session {
                 r.map_err(err)?;
                 s.repair_trailing_number_stride(c, old_len);
                 ticket.apply_range(&mut s.core, c, c.offset..c.offset + line.chars().count())?;
+                s.track_inserted(c, c.offset..c.offset + line.chars().count())?;
                 s.cursor.offset += line.chars().count();
             }
             Ok(())
@@ -1189,6 +1243,9 @@ impl Session {
     fn delete(&mut self, back: bool) -> Result<()> {
         if self.has_selection() {
             return self.delete_selection();
+        }
+        if self.track_recording() {
+            return self.track_delete(back);
         }
         let c = self.cursor;
         let length = self.len();
@@ -1275,7 +1332,26 @@ impl Session {
     pub fn execute(&mut self, command: Command) -> Result<()> {
         self.guard_distribution()?;
         let step = self.record_command(&command);
-        self.recorded(|| step, |s| s.execute_unrecorded(command))
+        // Typing, deleting and splitting are what change recording records.
+        let recordable = matches!(
+            command,
+            Command::Insert(_)
+                | Command::Backspace
+                | Command::Delete
+                | Command::Split
+                | Command::Undo
+                | Command::Redo
+        );
+        self.recorded(
+            || step,
+            move |s| {
+                if recordable {
+                    s.track_scope(|s| s.execute_unrecorded(command))
+                } else {
+                    s.execute_unrecorded(command)
+                }
+            },
+        )
     }
     fn execute_unrecorded(&mut self, command: Command) -> Result<()> {
         if let Command::Character(value) = command {
@@ -1294,13 +1370,26 @@ impl Session {
         ) {
             self.guard_protected()?;
         }
+        // Refused before the typing group or undo step starts.
+        if let Command::Insert(text) = &command {
+            check_typed_text(text)?;
+        }
         if let Command::Insert(text) = &command
             && self.coalesce_typing(text)
             && !self.insertion_shape.has_pending()
         {
             // Continue the previous undo step without cloning the document again.
             let at = self.cursor;
-            self.insert(text)?;
+            if let Err(e) = self
+                .insert(text)
+                .and_then(|()| self.follow_connectors_in(Some(at.section)))
+            {
+                // Outside a transaction nothing rolls a partial insert back: count it
+                // as a change and end the typing group, whose undo step predates it.
+                self.typing = None;
+                self.mark_changed();
+                return Err(e);
+            }
             self.clear_geometry();
             self.visual_hint.set(None);
             self.hit_hint.set(None);
@@ -1403,11 +1492,26 @@ impl Session {
                         }
                         // RHWP counts an inline object as one position (`split_offset`).
                         let at = s.split_offset(c)?;
+                        // New cells start in 바탕글's paragraph shape, as in Hangul (see
+                        // `plain_table_cells`); made so, no cell is laid out twice.
+                        let options = hwpcraft_doc::TableCreationOptions {
+                            cell_para_shape_id: Some(s.plain_para_shape_id()),
+                            ..Default::default()
+                        };
                         let created = s
                             .core
-                            .create_table_native(c.section, c.paragraph, at, rows, columns)
+                            .create_table_with_options_native(
+                                c.section,
+                                c.paragraph,
+                                at,
+                                rows,
+                                columns,
+                                &options,
+                            )
                             .map_err(err)?;
-                        s.created_table = Some(objects::inserted_address(c.section, &created)?);
+                        let table = objects::inserted_address(c.section, &created)?;
+                        s.plain_table_cells(table)?;
+                        s.created_table = Some(table);
                     }
                     Command::Undo | Command::Redo => {}
                 }
@@ -1509,6 +1613,11 @@ impl Session {
     }
 
     pub fn character_properties(&self) -> Result<Value> {
+        if let Some(id) = self.nested_char_shape_id()? {
+            return Ok(serde_json::from_str(
+                &self.core.build_char_properties_json_by_id(id),
+            )?);
+        }
         if !self.has_selection() {
             return self.insertion_shape.properties(self);
         }
@@ -1531,6 +1640,11 @@ impl Session {
     }
 
     pub fn paragraph_properties(&self) -> Result<Value> {
+        if let Some((section, id)) = self.nested_para_shape_id()? {
+            return Ok(serde_json::from_str(
+                &self.core.build_para_properties_json(id, section),
+            )?);
+        }
         let c = self.cursor;
         let raw = if let Some(t) = c.cell {
             self.core.get_cell_para_properties_at_native(
@@ -1610,6 +1724,23 @@ impl Session {
         let pages = self.page_count();
         json!({"pages":pages.as_ref().ok(),"layoutError":pages.as_ref().err().map(ToString::to_string),"sections":self.core.document().sections.len(),"paragraphs":self.paragraph_total(),"dirty":self.dirty(),"path":self.path})
     }
+}
+
+/// Refuse control characters other than tab and line breaks in typed text. A HWP
+/// file reads codes 1–31 as inline-control slots (8 code units each), so such a
+/// character made the rest of its paragraph disappear on reopening, and HWPX
+/// dropped it; U+FFFE/U+FFFF are not characters.
+pub(crate) fn check_typed_text(text: &str) -> Result<()> {
+    if let Some(c) = text.chars().find(|c| {
+        (c.is_ascii_control() && !matches!(c, '\t' | '\n' | '\r' | '\u{7f}'))
+            || matches!(c, '\u{fffe}' | '\u{ffff}')
+    }) {
+        bail!(
+            "입력할 글에 넣을 수 없는 제어 문자 U+{:04X}가 있습니다. 탭과 줄 바꿈 외의 제어 문자는 HWP로 저장하면 그 뒤 글이 사라지므로 받지 않습니다.",
+            u32::from(c)
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

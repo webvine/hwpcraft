@@ -385,6 +385,207 @@ fn shape(
     Ok(())
 }
 
+/// Turn the placeholder space of each automatic number in `p` into U+FFFC, which
+/// the HWP writer reads as the number's slot even right after another slot (it takes
+/// a space there for text). `after_slot`: only numbers right after a slot without a
+/// character. Returns whether `p` has number slots and whether one changed; on an
+/// error `p` is unchanged.
+fn mark_number_slots(p: &mut Paragraph, after_slot: bool) -> Result<(bool, bool)> {
+    let positions = p.control_text_positions();
+    let mut chars: Vec<char> = p.text.chars().collect();
+    let mut slots = BTreeSet::new();
+    let mut changed = false;
+    for (control, pos) in p.controls.iter().zip(positions) {
+        if !matches!(control, Control::AutoNumber(_)) {
+            continue;
+        }
+        let pos = if pos == chars.len() && pos > 0 && chars.last() == Some(&' ') {
+            pos - 1
+        } else {
+            pos
+        };
+        ensure!(slots.insert(pos), "자동 번호의 HWP 저장 자리표가 겹칩니다.");
+        if chars.get(pos) == Some(&'\u{fffc}') {
+            continue;
+        }
+        ensure!(
+            chars.get(pos) == Some(&' '),
+            "자동 번호의 HWP 저장 자리표를 확인하지 못했습니다."
+        );
+        let start = *p
+            .char_offsets
+            .get(pos)
+            .ok_or_else(|| anyhow!("자동 번호의 HWP 스트림 시작 위치가 없습니다."))?;
+        if let Some(end) = p.char_offsets.get(pos + 1) {
+            ensure!(
+                *end >= start.saturating_add(8),
+                "자동 번호의 HWP 제어 슬롯 폭이 부족합니다."
+            );
+        } else {
+            ensure!(
+                pos + 1 == chars.len(),
+                "자동 번호의 HWP 마지막 자리표가 잘못되었습니다."
+            );
+        }
+        if after_slot {
+            // Where the character before (a number's slot counts 8 units) ends.
+            let flush = match pos.checked_sub(1) {
+                None => 0,
+                Some(i) => {
+                    let width = if slots.contains(&i) {
+                        8
+                    } else {
+                        chars[i].len_utf16() as u32
+                    };
+                    p.char_offsets.get(i).map_or(start, |o| o + width)
+                }
+            };
+            if start <= flush {
+                continue;
+            }
+        }
+        chars[pos] = '\u{fffc}';
+        changed = true;
+    }
+    if !slots.is_empty() {
+        p.text = chars.into_iter().collect();
+    }
+    Ok((!slots.is_empty(), changed))
+}
+
+/// Every paragraph of a section with its depth (0 for body paragraphs), each before
+/// the paragraphs inside it: body, table cells and captions, text boxes and object
+/// captions, notes, headers and footers, memos and master pages.
+fn each_section_paragraph(
+    section: &mut hwpcraft_doc::model::document::Section,
+    visit: &mut impl FnMut(&mut Paragraph, usize) -> Result<()>,
+) -> Result<()> {
+    each_paragraph(&mut section.paragraphs, 0, visit)?;
+    for master in &mut section.section_def.master_pages {
+        each_paragraph(&mut master.paragraphs, 1, visit)?;
+    }
+    Ok(())
+}
+
+/// Does any paragraph [`each_paragraph`] reaches hold an automatic number?
+fn has_number(paras: &[Paragraph], depth: usize) -> bool {
+    fn shape(s: &ShapeObject, depth: usize) -> bool {
+        let caption = match s {
+            ShapeObject::Group(g) => {
+                if g.children.iter().any(|c| shape(c, depth + 1)) {
+                    return true;
+                }
+                g.caption.as_ref()
+            }
+            ShapeObject::Picture(p) => p.caption.as_ref(),
+            ShapeObject::Chart(c) => c.caption.as_ref(),
+            ShapeObject::Ole(o) => o.caption.as_ref(),
+            _ => None,
+        };
+        s.drawing().is_some_and(|d| {
+            d.text_box
+                .as_ref()
+                .is_some_and(|t| has_number(&t.paragraphs, depth + 1))
+                || d.caption
+                    .as_ref()
+                    .is_some_and(|c| has_number(&c.paragraphs, depth + 1))
+        }) || caption.is_some_and(|c| has_number(&c.paragraphs, depth + 1))
+    }
+    depth <= 64
+        && paras.iter().any(|p| {
+            p.controls.iter().any(|control| match control {
+                Control::AutoNumber(_) => true,
+                Control::Table(t) => {
+                    t.cells.iter().any(|c| has_number(&c.paragraphs, depth + 1))
+                        || t.caption
+                            .as_ref()
+                            .is_some_and(|c| has_number(&c.paragraphs, depth + 1))
+                }
+                Control::Header(h) => has_number(&h.paragraphs, depth + 1),
+                Control::Footer(h) => has_number(&h.paragraphs, depth + 1),
+                Control::Footnote(h) => has_number(&h.paragraphs, depth + 1),
+                Control::Endnote(h) => has_number(&h.paragraphs, depth + 1),
+                Control::HiddenComment(h) => has_number(&h.paragraphs, depth + 1),
+                Control::Field(f) => has_number(&f.memo_paragraphs, depth + 1),
+                Control::Picture(p) => p
+                    .caption
+                    .as_ref()
+                    .is_some_and(|c| has_number(&c.paragraphs, depth + 1)),
+                Control::Shape(s) => shape(s, depth + 1),
+                _ => false,
+            })
+        })
+}
+
+fn each_paragraph(
+    paras: &mut [Paragraph],
+    depth: usize,
+    visit: &mut impl FnMut(&mut Paragraph, usize) -> Result<()>,
+) -> Result<()> {
+    ensure!(depth <= 64, "문단 중첩 깊이 제한 초과");
+    for p in paras {
+        visit(p, depth)?;
+        for control in &mut p.controls {
+            match control {
+                Control::Table(t) => {
+                    for cell in &mut t.cells {
+                        each_paragraph(&mut cell.paragraphs, depth + 1, visit)?;
+                    }
+                    if let Some(c) = &mut t.caption {
+                        each_paragraph(&mut c.paragraphs, depth + 1, visit)?;
+                    }
+                }
+                Control::Header(h) => each_paragraph(&mut h.paragraphs, depth + 1, visit)?,
+                Control::Footer(h) => each_paragraph(&mut h.paragraphs, depth + 1, visit)?,
+                Control::Footnote(h) => each_paragraph(&mut h.paragraphs, depth + 1, visit)?,
+                Control::Endnote(h) => each_paragraph(&mut h.paragraphs, depth + 1, visit)?,
+                Control::HiddenComment(h) => each_paragraph(&mut h.paragraphs, depth + 1, visit)?,
+                Control::Field(f) => each_paragraph(&mut f.memo_paragraphs, depth + 1, visit)?,
+                Control::Picture(p) => {
+                    if let Some(c) = &mut p.caption {
+                        each_paragraph(&mut c.paragraphs, depth + 1, visit)?;
+                    }
+                }
+                Control::Shape(s) => each_shape_paragraph(s, depth + 1, visit)?,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn each_shape_paragraph(
+    s: &mut ShapeObject,
+    depth: usize,
+    visit: &mut impl FnMut(&mut Paragraph, usize) -> Result<()>,
+) -> Result<()> {
+    ensure!(depth <= 64, "도형 중첩 깊이 제한 초과");
+    if let Some(d) = s.drawing_mut() {
+        if let Some(t) = &mut d.text_box {
+            each_paragraph(&mut t.paragraphs, depth + 1, visit)?;
+        }
+        if let Some(c) = &mut d.caption {
+            each_paragraph(&mut c.paragraphs, depth + 1, visit)?;
+        }
+    }
+    let caption = match s {
+        ShapeObject::Group(g) => {
+            for child in &mut g.children {
+                each_shape_paragraph(child, depth + 1, visit)?;
+            }
+            g.caption.as_mut()
+        }
+        ShapeObject::Picture(p) => p.caption.as_mut(),
+        ShapeObject::Chart(c) => c.caption.as_mut(),
+        ShapeObject::Ole(o) => o.caption.as_mut(),
+        _ => None,
+    };
+    if let Some(c) = caption {
+        each_paragraph(&mut c.paragraphs, depth + 1, visit)?;
+    }
+    Ok(())
+}
+
 fn document(
     doc: &mut Document,
     mut visit: impl FnMut(&mut AutoNumber) -> Result<()>,
@@ -558,68 +759,53 @@ pub fn export(core: &DocumentCore, password: Option<&[u8]>) -> Result<Vec<u8>> {
 /// The returned core holds only the model (no layout): pass it to the HWP
 /// serializer and never render from it.
 pub fn prepare_hwp(core: &DocumentCore) -> Result<Option<DocumentCore>> {
-    if !core
-        .document()
-        .sections
-        .iter()
-        .flat_map(|s| &s.paragraphs)
-        .any(|p| {
+    // Paragraphs inside the body count only in a section written from the model; a
+    // stored stream already holds native number slots.
+    if !core.document().sections.iter().any(|s| {
+        s.paragraphs.iter().any(|p| {
             p.controls
                 .iter()
                 .any(|c| matches!(c, Control::AutoNumber(_)))
-        })
-    {
+        }) || (s.raw_stream.is_none()
+            && (has_number(&s.paragraphs, 0)
+                || s.section_def
+                    .master_pages
+                    .iter()
+                    .any(|m| has_number(&m.paragraphs, 0))))
+    }) {
         return Ok(None);
     }
     let snapshot = core.prepare_hwp_export_snapshot();
     let mut doc = snapshot.document().clone();
     let mut changed = false;
     for section in &mut doc.sections {
+        let mut touched = false;
         for p in &mut section.paragraphs {
-            let positions = p.control_text_positions();
-            let mut chars: Vec<char> = p.text.chars().collect();
-            let mut slots = BTreeSet::new();
-            for (control, pos) in p.controls.iter().zip(positions) {
-                if !matches!(control, Control::AutoNumber(_)) {
-                    continue;
-                }
-                let pos = if pos == chars.len() && pos > 0 && chars.last() == Some(&' ') {
-                    pos - 1
-                } else {
-                    pos
-                };
-                ensure!(slots.insert(pos), "자동 번호의 HWP 저장 자리표가 겹칩니다.");
-                if chars.get(pos) == Some(&'\u{fffc}') {
-                    continue;
-                }
-                ensure!(
-                    chars.get(pos) == Some(&' '),
-                    "자동 번호의 HWP 저장 자리표를 확인하지 못했습니다."
-                );
-                let start = *p
-                    .char_offsets
-                    .get(pos)
-                    .ok_or_else(|| anyhow!("자동 번호의 HWP 스트림 시작 위치가 없습니다."))?;
-                if let Some(end) = p.char_offsets.get(pos + 1) {
-                    ensure!(
-                        *end >= start.saturating_add(8),
-                        "자동 번호의 HWP 제어 슬롯 폭이 부족합니다."
-                    );
-                } else {
-                    ensure!(
-                        pos + 1 == chars.len(),
-                        "자동 번호의 HWP 마지막 자리표가 잘못되었습니다."
-                    );
-                }
-                chars[pos] = '\u{fffc}';
-                changed = true;
-            }
-            if !slots.is_empty() {
-                p.text = chars.into_iter().collect();
+            let (slots, marked) = mark_number_slots(p, false)?;
+            if slots {
                 p.stored_text_partition_dirty = true;
-                section.raw_stream = None;
-                section.raw_provenance = None;
+                touched = true;
             }
+            changed |= marked;
+        }
+        // Cells, captions, text boxes, notes, headers and master pages: only a number
+        // right after another slot, which the writer would take for a space. Their
+        // rows stay (the placeholder keeps the text length), and a number whose slot
+        // is not a plain placeholder is left as it is.
+        if touched || section.raw_stream.is_none() {
+            each_section_paragraph(section, &mut |p, depth| {
+                if depth > 0
+                    && let Ok((_, true)) = mark_number_slots(p, true)
+                {
+                    changed = true;
+                    touched = true;
+                }
+                Ok(())
+            })?;
+        }
+        if touched {
+            section.raw_stream = None;
+            section.raw_provenance = None;
         }
     }
     if !changed {

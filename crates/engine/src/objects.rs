@@ -1,5 +1,7 @@
 use super::*;
+use hwpcraft_doc::model::document::Document;
 use hwpcraft_doc::model::shape::ShapeObject;
+use hwpcraft_doc::model::style::{HeadType, ParaShapeMods};
 use serde::{Deserialize, Serialize};
 
 /// Addresses refer to top-level controls, never silently to nested objects.
@@ -102,6 +104,14 @@ fn shape_label(s: &ShapeObject) -> &'static str {
 fn plain_text(text: &str) -> Result<()> {
     if text.len() > 10_000 || text.chars().any(char::is_control) {
         bail!("제어 문자가 없는 한 줄, 10 KB 이하의 텍스트를 입력하세요.");
+    }
+    Ok(())
+}
+/// One line of note or text-box text: like [`plain_text`] but tabs are allowed, as in
+/// the body. Their width is laid out when the document is saved.
+fn line_text(text: &str) -> Result<()> {
+    if text.len() > 10_000 || text.chars().any(|c| c.is_control() && c != '\t') {
+        bail!("탭 말고는 제어 문자가 없는 한 줄, 10 KB 이하의 텍스트를 입력하세요.");
     }
     Ok(())
 }
@@ -319,7 +329,7 @@ impl Session {
     }
     pub fn insert_note(&mut self, endnote: bool, text: &str) -> Result<ObjectAddress> {
         self.body_insert()?;
-        plain_text(text)?;
+        line_text(text)?;
         let mut inserted = None;
         // The note and its text are two native edits; lay the section out once.
         self.transaction(|s| {
@@ -383,7 +393,7 @@ impl Session {
         Ok(self.note_suffix(at)?.to_owned())
     }
     pub fn set_note_text(&mut self, at: ObjectAddress, text: &str) -> Result<()> {
-        plain_text(text)?;
+        line_text(text)?;
         let count = self.note_suffix(at)?.chars().count();
         self.transaction(|s| {
             s.core
@@ -399,7 +409,7 @@ impl Session {
         self.body_insert()?;
         let width = dimension(p.width_mm)?;
         let height = dimension(p.height_mm)?;
-        plain_text(&p.text)?;
+        line_text(&p.text)?;
         if p.kind != ShapeKind::Textbox && !p.text.is_empty() {
             bail!("텍스트는 글상자에만 넣을 수 있습니다.");
         }
@@ -534,7 +544,7 @@ impl Session {
         Ok(tb.paragraphs[0].text.clone())
     }
     pub fn set_textbox_text(&mut self, at: ObjectAddress, text: &str) -> Result<()> {
-        plain_text(text)?;
+        line_text(text)?;
         let count = self.textbox_text(at)?.chars().count();
         self.transaction(|s| {
             s.core
@@ -612,12 +622,81 @@ impl Session {
                 .collect::<Vec<_>>()
         )
     }
+    /// New table cells start as 바탕글 paragraphs, as in Hangul (2024 probe, 10-31: a
+    /// table made in a paragraph with spacing and an indent gets ParaShape 0 cells).
+    /// RHWP gives them the caret paragraph's shape; its spacing before was left out
+    /// while editing but counted when a saved HWPX was opened again, so single-line
+    /// rows grew. Character shapes stay as RHWP gives them (the caret's).
+    /// 바탕글's (the first style's) paragraph shape.
+    pub(crate) fn plain_para_shape_id(&self) -> u16 {
+        self.core
+            .document()
+            .doc_info
+            .styles
+            .first()
+            .map_or(0, |s| s.para_shape_id)
+    }
+    pub(crate) fn plain_table_cells(&mut self, a: ObjectAddress) -> Result<()> {
+        let plain = self.plain_para_shape_id();
+        let doc = self.core.document();
+        let Some(Control::Table(table)) = doc
+            .sections
+            .get(a.section)
+            .and_then(|s| s.paragraphs.get(a.paragraph))
+            .and_then(|p| p.controls.get(a.control))
+        else {
+            return Ok(());
+        };
+        let cells: Vec<(usize, usize)> = table
+            .cells
+            .iter()
+            .enumerate()
+            .flat_map(|(i, cell)| {
+                cell.paragraphs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.para_shape_id != plain || p.style_id != 0)
+                    .map(move |(k, _)| (i, k))
+            })
+            .collect();
+        if cells.is_empty() {
+            return Ok(());
+        }
+        self.deferred_layout(|s| {
+            for &(cell, paragraph) in &cells {
+                s.core
+                    .set_cell_para_shape_id_native(
+                        a.section,
+                        a.paragraph,
+                        a.control,
+                        cell,
+                        paragraph,
+                        plain,
+                    )
+                    .map_err(err)?;
+            }
+            // The style id does not enter layout: keep RHWP's layout and undo reuse.
+            // Callers pass a table the same transaction just created, so its section
+            // is already stamped and has no raw stream to keep in step.
+            if let Some(Control::Table(table)) =
+                s.core.document_mut_keeping_layout().sections[a.section].paragraphs[a.paragraph]
+                    .controls
+                    .get_mut(a.control)
+            {
+                for (cell, paragraph) in cells {
+                    table.cells[cell].paragraphs[paragraph].style_id = 0;
+                }
+            }
+            Ok(())
+        })
+    }
     pub fn apply_style(&mut self, id: usize) -> Result<()> {
         if id > 255 || id >= self.core.document().doc_info.styles.len() {
             bail!("스타일을 찾지 못했습니다.");
         }
         self.transaction(|s| {
             let c = s.cursor;
+            carry_style_head(s.core.document_mut(), c, id);
             if let Some(cell) = c.cell {
                 s.core
                     .apply_cell_style_native(
@@ -636,5 +715,108 @@ impl Session {
             }
             Ok(())
         })
+    }
+}
+
+/// Head of a paragraph shape: kind, level, numbering definition.
+type Head = (HeadType, u8, u16);
+
+/// The head a paragraph style gives. Like RHWP's style application, "개요 N" styles number
+/// at level N−1 from the section's outline numbering; other styles carry their shape's head.
+fn style_head(doc: &Document, id: usize) -> Option<Head> {
+    let style = doc.doc_info.styles.get(id)?;
+    let outline = style
+        .local_name
+        .trim()
+        .strip_prefix("개요")
+        .and_then(|n| n.trim().parse::<u8>().ok())
+        .filter(|n| (1..=10).contains(n));
+    if let Some(n) = outline {
+        return Some((HeadType::Outline, n - 1, 0));
+    }
+    let shape = doc
+        .doc_info
+        .para_shapes
+        .get(usize::from(style.para_shape_id))?;
+    Some((shape.head_type, shape.para_level, shape.numbering_id))
+}
+
+fn same_head(a: Head, b: Head) -> bool {
+    match a.0 {
+        HeadType::None => b.0 == HeadType::None,
+        // Outline numbers come from the section, whatever the shape's definition says.
+        HeadType::Outline => b.0 == HeadType::Outline && a.1 == b.1,
+        _ => a == b,
+    }
+}
+
+/// Before applying paragraph style `id` at `cursor`, give a paragraph with direct paragraph
+/// formatting the new style's head. RHWP keeps such a paragraph's whole shape, head
+/// included, so a heading given 개요 1 and then centred passed its number to every later
+/// paragraph even after 바탕글, and a centred paragraph given 개요 1 got no number. A head
+/// the paragraph was given directly (not the old style's) stays, like the other overrides.
+fn carry_style_head(doc: &mut Document, cursor: Cursor, id: usize) {
+    let Some(para) = cursor_paragraph(doc, cursor) else {
+        return;
+    };
+    let (old_id, shape_id) = (usize::from(para.style_id), para.para_shape_id);
+    let (Some(old), Some(new)) = (doc.doc_info.styles.get(old_id), doc.doc_info.styles.get(id))
+    else {
+        return;
+    };
+    if new.style_type == 1 || shape_id == old.para_shape_id {
+        // A character style leaves the paragraph shape; an undecorated paragraph is
+        // reshaped by RHWP from the new style.
+        return;
+    }
+    let Some(shape) = doc.doc_info.para_shapes.get(usize::from(shape_id)) else {
+        return;
+    };
+    let current = (shape.head_type, shape.para_level, shape.numbering_id);
+    let (Some(old_head), Some(new_head)) = (style_head(doc, old_id), style_head(doc, id)) else {
+        return;
+    };
+    if !same_head(current, old_head) || same_head(current, new_head) {
+        return;
+    }
+    let mods = ParaShapeMods {
+        head_type: Some(new_head.0),
+        para_level: Some(new_head.1),
+        numbering_id: Some(new_head.2),
+        ..ParaShapeMods::default()
+    };
+    let shape_id = doc.find_or_create_para_shape(shape_id, &mods);
+    if let Some(para) = cursor_paragraph_mut(doc, cursor) {
+        para.para_shape_id = shape_id;
+    }
+}
+
+fn cursor_paragraph(doc: &Document, c: Cursor) -> Option<&Paragraph> {
+    let para = doc.sections.get(c.section)?.paragraphs.get(c.paragraph)?;
+    let Some(cell) = c.cell else {
+        return Some(para);
+    };
+    match para.controls.get(cell.control)? {
+        Control::Table(t) => t.cells.get(cell.index)?.paragraphs.get(cell.paragraph),
+        _ => None,
+    }
+}
+
+fn cursor_paragraph_mut(doc: &mut Document, c: Cursor) -> Option<&mut Paragraph> {
+    let para = doc
+        .sections
+        .get_mut(c.section)?
+        .paragraphs
+        .get_mut(c.paragraph)?;
+    let Some(cell) = c.cell else {
+        return Some(para);
+    };
+    match para.controls.get_mut(cell.control)? {
+        Control::Table(t) => t
+            .cells
+            .get_mut(cell.index)?
+            .paragraphs
+            .get_mut(cell.paragraph),
+        _ => None,
     }
 }

@@ -3,30 +3,48 @@
 //! HWP/HWPX store every inline tab with its laid-out width. Tabs typed in HwpCraft
 //! have no stored width, so RHWP writes a zero-width marker and Hangul then draws
 //! the tab with no width. Before saving, fill those tabs the way Hangul places them;
-//! after saving, put the live model back so later edits keep re-flowing tabs.
+//! after saving, put the live model back so later edits keep re-flowing tabs. Body
+//! paragraphs and table cells, headers, footers, notes and text boxes at any depth
+//! are measured from RHWP's caret positions.
 use super::*;
 use hwpcraft_doc::model::paragraph::{TAB_EXT_PLACEHOLDER, tab_ext_is_placeholder};
 
-/// Where a tabbed paragraph lives: body paragraph, or a first-level table cell paragraph.
-#[derive(Clone, Copy)]
-struct Slot {
-    section: usize,
-    paragraph: usize,
-    cell: Option<Cell>,
+/// Where a tabbed paragraph lives.
+#[derive(Clone)]
+enum Slot {
+    /// A body paragraph or a first-level table cell paragraph: the body caret reaches it.
+    Body {
+        section: usize,
+        paragraph: usize,
+        cell: Option<Cell>,
+    },
+    /// A paragraph of a header, footer, footnote, endnote, text box or nested table cell.
+    Context(ContextAddress),
 }
 
 type Saved = Vec<(Slot, Vec<[u16; 7]>)>;
 
 impl Session {
-    fn tab_paragraph_mut(&mut self, at: Slot) -> Option<&mut Paragraph> {
+    fn tab_paragraph_mut(&mut self, at: &Slot) -> Option<&mut Paragraph> {
+        let (section, paragraph, cell) = match at {
+            Slot::Body {
+                section,
+                paragraph,
+                cell,
+            } => (*section, *paragraph, *cell),
+            Slot::Context(address) => {
+                return self.context_v2_paragraph_mut_keeping_layout(address).ok();
+            }
+        };
+        // Only the save fills these records, and it puts the old ones back.
         let p = self
             .core
-            .document_mut()
+            .document_mut_keeping_layout()
             .sections
-            .get_mut(at.section)?
+            .get_mut(section)?
             .paragraphs
-            .get_mut(at.paragraph)?;
-        match at.cell {
+            .get_mut(paragraph)?;
+        match cell {
             None => Some(p),
             Some(t) => match p.controls.get_mut(t.control)? {
                 Control::Table(table) => table
@@ -43,7 +61,7 @@ impl Session {
         for (s, section) in self.core.document().sections.iter().enumerate() {
             for (p, para) in section.paragraphs.iter().enumerate() {
                 if para.text.contains('\t') {
-                    out.push(Slot {
+                    out.push(Slot::Body {
                         section: s,
                         paragraph: p,
                         cell: None,
@@ -54,7 +72,7 @@ impl Session {
                         for (i, cell) in table.cells.iter().enumerate() {
                             for (k, cp) in cell.paragraphs.iter().enumerate() {
                                 if cp.text.contains('\t') {
-                                    out.push(Slot {
+                                    out.push(Slot::Body {
                                         section: s,
                                         paragraph: p,
                                         cell: Some(Cell {
@@ -70,7 +88,53 @@ impl Session {
                 }
             }
         }
+        let nested =
+            context_walk::nested_paragraphs(self.core.document(), &|p| p.text.contains('\t'));
+        out.extend(nested.into_iter().map(Slot::Context));
         out
+    }
+    /// The paragraph a slot names, as it is now.
+    fn tab_paragraph(&self, at: &Slot) -> Option<Paragraph> {
+        match at {
+            Slot::Body {
+                section,
+                paragraph,
+                cell,
+            } => self
+                .paragraph(Cursor {
+                    section: *section,
+                    paragraph: *paragraph,
+                    offset: 0,
+                    cell: *cell,
+                })
+                .ok()
+                .cloned(),
+            Slot::Context(address) => self.context_v2_paragraph(address).ok().cloned(),
+        }
+    }
+    /// Caret (page index, x, y) before scalar `offset` of a slot's paragraph, in page
+    /// pixels.
+    fn tab_caret(&self, at: &Slot, offset: usize) -> Option<(u64, f64, f64)> {
+        let v: Value = match at {
+            Slot::Body {
+                section,
+                paragraph,
+                cell,
+            } => self
+                .caret_at(Cursor {
+                    section: *section,
+                    paragraph: *paragraph,
+                    offset,
+                    cell: *cell,
+                })
+                .ok()?,
+            Slot::Context(address) => {
+                let layout = self.page_field_layout().ok().flatten();
+                let core = layout.as_ref().map_or(&self.core, |layout| &layout.core);
+                context_walk::caret_rect(core, address, offset)?
+            }
+        };
+        Some((v["pageIndex"].as_u64()?, v["x"].as_f64()?, v["y"].as_f64()?))
     }
     /// Inline tab record for the tab at scalar `offset`: width in HWPUNIT plus the
     /// kind and fill of the tab stop it reaches. `None` when layout cannot tell (line wrap).
@@ -84,23 +148,13 @@ impl Session {
     /// will actually draw them. `existing` keeps a record Hangul already wrote.
     fn tab_record(
         &self,
-        at: Slot,
+        at: &Slot,
         para: &Paragraph,
         offset: usize,
         existing: Option<[u16; 7]>,
         line: &mut (f64, f64),
     ) -> Option<[u16; 7]> {
-        let caret = |offset| -> Option<(u64, f64, f64)> {
-            let v = self
-                .caret_at(Cursor {
-                    section: at.section,
-                    paragraph: at.paragraph,
-                    offset,
-                    cell: at.cell,
-                })
-                .ok()?;
-            Some((v["pageIndex"].as_u64()?, v["x"].as_f64()?, v["y"].as_f64()?))
-        };
+        let caret = |offset| self.tab_caret(at, offset);
         let (page, x_rhwp, y0) = caret(offset)?;
         let (page1, x1, y1) = caret(offset + 1)?;
         if page != page1 || (y0 - y1).abs() > 0.5 {
@@ -116,10 +170,10 @@ impl Session {
             return Some(r);
         }
         // Stops are measured from the column start (body) or the paragraph's first
-        // caret position (table cells); positions are stored at twice HWPUNIT.
-        let base = match at.cell {
-            Some(_) => caret(0)?.1,
-            None => {
+        // caret position (table cells, headers, notes, text boxes); positions are
+        // stored at twice HWPUNIT.
+        let base = match at {
+            Slot::Body { cell: None, .. } => {
                 let info = self.page_info(page as u32).ok()?;
                 info["columns"]
                     .as_array()
@@ -131,6 +185,7 @@ impl Session {
                     })
                     .unwrap_or(0.0)
             }
+            _ => caret(0)?.1,
         };
         let doc = self.core.document();
         let stop = doc
@@ -205,19 +260,24 @@ impl Session {
             u16::from(stop.fill_type),
         ))
     }
+    /// Some tab has no stored width yet, so an HWP save fills it in
+    /// (`materialize_tabs`) and writes that paragraph's section again.
+    pub(crate) fn tab_widths_missing(&self) -> bool {
+        self.tab_slots().iter().any(|at| {
+            self.tab_paragraph(at).is_some_and(|para| {
+                let tabs = para.text.chars().filter(|c| *c == '\t').count();
+                para.tab_extended.len() < tabs
+                    || para.tab_extended[..tabs].iter().any(tab_ext_is_placeholder)
+            })
+        })
+    }
     /// Fill missing tab widths; returns the original records for `restore_tabs`.
     fn materialize_tabs(&mut self) -> Saved {
         let mut saved = Vec::new();
         for at in self.tab_slots() {
-            let Ok(para) = self.paragraph(Cursor {
-                section: at.section,
-                paragraph: at.paragraph,
-                offset: 0,
-                cell: at.cell,
-            }) else {
+            let Some(para) = self.tab_paragraph(&at) else {
                 continue;
             };
-            let para = para.clone();
             let mut records = para.tab_extended.clone();
             let mut changed = false;
             let mut line = (f64::INFINITY, 0.0);
@@ -242,7 +302,7 @@ impl Session {
                     .get(n)
                     .copied()
                     .filter(|r| !tab_ext_is_placeholder(r));
-                let Some(record) = self.tab_record(at, &para, offset, existing, &mut line) else {
+                let Some(record) = self.tab_record(&at, &para, offset, existing, &mut line) else {
                     continue;
                 };
                 if existing.is_some() {
@@ -254,7 +314,7 @@ impl Session {
                 records[n] = record;
                 changed = true;
             }
-            if changed && let Some(target) = self.tab_paragraph_mut(at) {
+            if changed && let Some(target) = self.tab_paragraph_mut(&at) {
                 saved.push((at, std::mem::replace(&mut target.tab_extended, records)));
             }
         }
@@ -262,7 +322,7 @@ impl Session {
     }
     fn restore_tabs(&mut self, saved: Saved) {
         for (at, records) in saved {
-            if let Some(target) = self.tab_paragraph_mut(at) {
+            if let Some(target) = self.tab_paragraph_mut(&at) {
                 target.tab_extended = records;
             }
         }
@@ -276,16 +336,25 @@ impl Session {
     /// a 44-page report, which a periodic recovery save would spend on the UI thread).
     pub(crate) fn save_with_tab_widths_for(&mut self, path: &Path, copy: bool) -> Result<()> {
         self.guard_distribution()?;
-        // HWP5 picture-effect fields are not written yet: refuse rather than drop
-        // them. Effects kept as raw bytes from an opened .hwp are not modelled here.
-        self.refuse_picture_effects_save(path)?;
-        let saved = self.materialize_tabs();
+        if !copy {
+            self.refuse_unkept_hwp_save(path)?;
+            // HWP has no field for combo box items; see `form_properties`.
+            self.refuse_combo_item_loss(path)?;
+        }
+        // Every model change below is undone before this returns: they go through
+        // `document_mut_keeping_layout`, which keeps undo and typeset reuse on. Only
+        // the HWP and HWPX writers read tab widths, so a PDF lays out the live model.
+        let saved = if is_hwp(path) {
+            self.materialize_tabs()
+        } else {
+            Vec::new()
+        };
         // See `layout_cache`: a document HwpCraft wrote hands out no row caches.
         let hidden = (self.authored
             && path
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("hwpx")))
-        .then(|| crate::layout_cache::hide(self.core.document_mut()));
+        .then(|| crate::layout_cache::hide(self.core.document_mut_keeping_layout()));
         // An HWP file keeps rows: a document HwpCraft wrote gets the fresh ones its
         // HWPX copy is laid out with (`layout_cache::with_fresh_rows`).
         let fresh = (self.authored
@@ -296,7 +365,7 @@ impl Session {
         .then(|| crate::layout_cache::with_fresh_rows(&self.core))
         .flatten()
         // Swapped into this core, so the writers still see its source format.
-        .map(|doc| std::mem::replace(self.core.document_mut(), doc));
+        .map(|doc| std::mem::replace(self.core.document_mut_keeping_layout(), doc));
         let core = &self.core;
         *self.page_field_cache.borrow_mut() = None;
         *self.render_highlights.borrow_mut() = None;
@@ -311,13 +380,15 @@ impl Session {
                 self.render_pdf(&(0..self.page_count()?).collect::<Vec<_>>())
                     .and_then(|bytes| hwpcraft_formats::atomic_write(path, &bytes))
             }
+            // A changed tracked document: BodyText accepted, ViewText marked.
+            _ if self.rewrites_tracked_hwp(path) => self.save_tracked_hwp(path),
             _ => hwpcraft_formats::save(core, path),
         })();
         if let Some(tags) = hidden {
-            crate::layout_cache::restore(self.core.document_mut(), tags);
+            crate::layout_cache::restore(self.core.document_mut_keeping_layout(), tags);
         }
         if let Some(live) = fresh {
-            *self.core.document_mut() = live;
+            *self.core.document_mut_keeping_layout() = live;
         }
         self.restore_tabs(saved);
         *self.page_field_cache.borrow_mut() = None;

@@ -1,0 +1,531 @@
+diff --git a/src/serializer/hwpx/context.rs b/src/serializer/hwpx/context.rs
+index 2c8e8db..eeb2a3c 100644
+--- a/src/serializer/hwpx/context.rs
++++ b/src/serializer/hwpx/context.rs
+@@ -168,6 +168,8 @@ pub struct SerializeContext {
+     /// ID 풀과 마찬가지로 한 번의 직렬화 생명주기에만 속하며, 완료 시 바이트와 함께
+     /// `SerializedDocument`로 이동한다.
+     pub content_loss: ContentLossReport,
++    /// [HwpCraft 0083] 마지막으로 쓴 변경 추적 표지 짝의 `Id` (문서 안에서 1부터 차례로).
++    pub track_mark_id: u32,
+ }
+ 
+ impl Default for SerializeContext {
+@@ -191,6 +193,7 @@ impl Default for SerializeContext {
+             sub_list_depth: 0,
+             body_coldef_template_pending: false,
+             content_loss: ContentLossReport::new(SerializedFormat::Hwpx),
++            track_mark_id: 0,
+         }
+     }
+ }
+diff --git a/src/serializer/hwpx/header.rs b/src/serializer/hwpx/header.rs
+index d9997e2..12864af 100644
+--- a/src/serializer/hwpx/header.rs
++++ b/src/serializer/hwpx/header.rs
+@@ -102,6 +102,18 @@ pub fn write_header(doc: &Document, ctx: &SerializeContext) -> Result<Vec<u8>, S
+             .write_all(memo_properties.as_bytes())
+             .map_err(|e| SerializeError::XmlError(format!("memoProperties splice: {e}")))?;
+     }
++    // [HwpCraft 0083] 변경 추적(trackChanges·trackChangeAuthors)도 refList 의 마지막
++    // 자식이다. 원본 HWPX 의 블록이 있으면 그대로, 없으면 HWP5 형식 레코드에서 만든다.
++    if let Some(track_changes) = doc
++        .doc_info
++        .track_changes_xml
++        .clone()
++        .or_else(|| track_changes_xml_from_records(&doc.doc_info))
++    {
++        w.get_mut()
++            .write_all(track_changes.as_bytes())
++            .map_err(|e| SerializeError::XmlError(format!("trackChanges splice: {e}")))?;
++    }
+     end_tag(&mut w, "hh:refList")?;
+ 
+     // 문서 설정 tail: 원본 HWPX 가 있으면 그대로 splice(compatibleDocument/
+@@ -123,6 +135,76 @@ pub fn write_header(doc: &Document, ctx: &SerializeContext) -> Result<Vec<u8>, S
+     Ok(w.into_inner())
+ }
+ 
++/// [HwpCraft 0083] HWP5 형식 변경 추적 레코드(TRACK_CHANGE 96 · TRACK_CHANGE_AUTHOR 97,
++/// `parser::hwpx::header::read_track_changes` 와 같은 배치)로 OWPML `trackChanges`·
++/// `trackChangeAuthors` 블록을 만든다. id 는 레코드 순번(1부터)으로, 본문 표지의 `TcId`
++/// 와 범위 태그 데이터가 그 번호다. 날짜는 HWP5 레코드처럼 지역 시각으로 쓴다(시간대
++/// 표시 없음). 알 수 없는 종류는 스키마 철자 그대로 `UnKown`. 레코드가 없으면 None.
++fn track_changes_xml_from_records(doc_info: &crate::model::document::DocInfo) -> Option<String> {
++    use crate::parser::hwpx::header::{HWPTAG_TRACK_CHANGE, HWPTAG_TRACK_CHANGE_AUTHOR};
++    let records = |tag| {
++        doc_info
++            .extra_records
++            .iter()
++            .filter(move |r| r.tag_id == tag)
++            .map(|r| r.data.as_slice())
++    };
++    let word = |data: &[u8], at: usize| {
++        data.get(at..at + 2)
++            .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
++    };
++    let changes: Vec<&[u8]> = records(HWPTAG_TRACK_CHANGE).collect();
++    let authors: Vec<&[u8]> = records(HWPTAG_TRACK_CHANGE_AUTHOR).collect();
++    if changes.is_empty() && authors.is_empty() {
++        return None;
++    }
++    let mut xml = format!(r#"<hh:trackChanges itemCnt="{}">"#, changes.len());
++    for (i, data) in changes.iter().enumerate() {
++        let kind = data
++            .get(..4)
++            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
++        let kind = match kind {
++            0x10 => "Insert",
++            0x11 => "Delete",
++            0x12 => "CharShape",
++            0x13 => "ParaShape",
++            _ => "UnKown",
++        };
++        xml.push_str(&format!(
++            r#"<hh:trackChange type="{kind}" date="{:04}-{:02}-{:02}T{:02}:{:02}:00" authorID="{}" hide="0" id="{}"/>"#,
++            word(data, 4),
++            word(data, 6),
++            word(data, 8),
++            word(data, 10),
++            word(data, 12),
++            word(data, 14),
++            i + 1
++        ));
++    }
++    xml.push_str("</hh:trackChanges>");
++    xml.push_str(&format!(r#"<hh:trackChangeAuthors itemCnt="{}">"#, authors.len()));
++    for (i, data) in authors.iter().enumerate() {
++        let len = usize::from(word(data, 0));
++        let units: Vec<u16> = (0..len).map(|k| word(data, 4 + 2 * k)).collect();
++        let name = String::from_utf16_lossy(&units);
++        let tail = 4 + 2 * len;
++        let mark = word(data, tail) != 0;
++        let color = data
++            .get(tail + 2..tail + 6)
++            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
++        // HWP COLORREF 0x00BBGGRR → #RRGGBB
++        let rgb = ((color & 0xFF) << 16) | (color & 0xFF00) | ((color >> 16) & 0xFF);
++        xml.push_str(&format!(
++            r##"<hh:trackChangeAuthor name="{}" mark="{}" color="#{rgb:06X}" id="{}"/>"##,
++            crate::serializer::hwpx::utils::xml_escape(&name),
++            u8::from(mark),
++            i + 1
++        ));
++    }
++    xml.push_str("</hh:trackChangeAuthors>");
++    Some(xml)
++}
++
+ // =====================================================================
+ // <hh:beginNum>
+ // =====================================================================
+diff --git a/src/serializer/hwpx/mod.rs b/src/serializer/hwpx/mod.rs
+index a3ed0c7..86be116 100644
+--- a/src/serializer/hwpx/mod.rs
++++ b/src/serializer/hwpx/mod.rs
+@@ -30,6 +30,8 @@ pub mod writer;
+ 
+ #[cfg(test)]
+ mod bindata_save_passthrough_tests;
++#[cfg(test)]
++mod track_changes_tests;
+ 
+ use std::collections::HashSet;
+ use std::fmt::Write as _;
+diff --git a/src/serializer/hwpx/section.rs b/src/serializer/hwpx/section.rs
+index 2bb1775..b57646b 100644
+--- a/src/serializer/hwpx/section.rs
++++ b/src/serializer/hwpx/section.rs
+@@ -1006,6 +1006,10 @@ pub(crate) struct InlineCursor<'a> {
+     pub markpen_marks: &'a [crate::model::paragraph::MarkpenMark],
+     /// 다음에 방출할 `markpen_marks` 인덱스
+     pub markpen_idx: usize,
++    /// [HwpCraft 0083] 변경 추적 표지 (문자 인덱스, XML) — 문자 인덱스 오름차순
++    pub track_marks: &'a [(usize, String)],
++    /// 다음에 방출할 `track_marks` 인덱스
++    pub track_idx: usize,
+     /// [#5537] `title_marks[i]` 가 **앞(닫히는) run 소유**인가 — char_shapes 경계
+     /// 유닛이 표시 끝 유닛과 일치하면 원본은 표시까지를 앞 run 에 뒀다는 증거다.
+     /// 비어 있으면 전부 false(종전 동작: 다음 run 머리 방출).
+@@ -1045,6 +1049,7 @@ impl InlineCursor<'_> {
+             }
+             self.markpen_idx += 1;
+         }
++        self.flush_track_marks(t_xml, buf);
+         while let Some(m) = self.title_marks.get(self.mark_idx) {
+             if m.char_idx > self.char_idx {
+                 break;
+@@ -1090,6 +1095,19 @@ impl InlineCursor<'_> {
+             }
+             self.markpen_idx += 1;
+         }
++        self.flush_track_marks(t_xml, buf);
++    }
++
++    /// [HwpCraft 0083] 현재 문자 위치에 걸린 변경 추적 표지를 방출한다.
++    fn flush_track_marks(&mut self, t_xml: &mut String, buf: &mut String) {
++        while let Some((char_idx, xml)) = self.track_marks.get(self.track_idx) {
++            if *char_idx > self.char_idx {
++                break;
++            }
++            flush_buf(t_xml, buf);
++            t_xml.push_str(xml);
++            self.track_idx += 1;
++        }
+     }
+ 
+     fn flush_prev_owned_marks_at_fragment_end(&mut self, t_xml: &mut String, buf: &mut String) {
+@@ -1498,6 +1516,9 @@ fn render_control_slot_tracked(
+ struct PositionedMarkpens<'a> {
+     marks: Vec<(u32, &'a crate::model::paragraph::MarkpenMark)>,
+     next: usize,
++    /// [HwpCraft 0083] 변경 추적 표지 (UTF-16 위치, XML) — 위치 오름차순
++    track: Vec<(u32, String)>,
++    track_next: usize,
+ }
+ 
+ impl PositionedMarkpens<'_> {
+@@ -1509,15 +1530,37 @@ impl PositionedMarkpens<'_> {
+         para: &Paragraph,
+         cursor: &mut InlineCursor<'_>,
+     ) {
++        let due_track = self
++            .track
++            .get(self.track_next)
++            .is_some_and(|(pos, _)| *pos <= position);
+         if !self
+             .marks
+             .get(self.next)
+             .is_some_and(|(pos, _)| *pos <= position)
++            && !due_track
+         {
+             return;
+         }
+         flush_text_fragment(&mut splitter.content, text, &para.tab_extended, cursor);
+-        while let Some(&(pos, mark)) = self.marks.get(self.next) {
++        loop {
++            let markpen = self.marks.get(self.next).map(|(pos, _)| *pos);
++            let track = self.track.get(self.track_next).map(|(pos, _)| *pos);
++            // [HwpCraft 0083] 변경 추적 표지가 같은 자리 형광펜보다 먼저 오면 그것부터.
++            let track_due = track
++                .filter(|&p| p <= position)
++                .filter(|&t| markpen.is_none_or(|m| t < m));
++            if let Some(track_pos) = track_due {
++                splitter.cut_before(track_pos);
++                splitter.content.push_str("<hp:t>");
++                splitter.content.push_str(&self.track[self.track_next].1);
++                splitter.content.push_str("</hp:t>");
++                self.track_next += 1;
++                continue;
++            }
++            let Some(&(pos, mark)) = self.marks.get(self.next) else {
++                break;
++            };
+             if pos > position {
+                 break;
+             }
+@@ -1536,6 +1579,48 @@ impl PositionedMarkpens<'_> {
+     }
+ }
+ 
++/// [HwpCraft 0083] 문단의 변경 추적 범위 태그(삽입 16 · 삭제 17)를 OWPML 표지로 바꾼다:
++/// (UTF-16 위치, `<hp:insertBegin paraend TcId Id/>` 등). 데이터(`TcId`)는
++/// `trackChange@id` 다. 범위가 문단 나눔을 덮으면 닫는 표지에, 나눔에서 시작하면 여는
++/// 표지에 `paraend="1"` 을 달고 글 끝에 둔다 (`parser::hwpx::section` 의 읽기와 짝).
++/// 같은 자리에서는 닫는 표지가 먼저다. 표지 짝의 `Id` 는 문서 안에서 1부터 차례로 준다.
++fn track_mark_xml(para: &Paragraph, ctx: &mut SerializeContext) -> Vec<(u32, String)> {
++    let break_pos = para.char_count.saturating_sub(1);
++    let mut marks: Vec<(u32, u8, String)> = Vec::new();
++    for tag in &para.range_tags {
++        let name = match tag.tag >> 24 {
++            16 => "insert",
++            17 => "delete",
++            _ => continue,
++        };
++        let tc = tag.tag & 0x00FF_FFFF;
++        let begin_at_break = para.char_count > 0 && tag.start >= break_pos;
++        let end_at_break = para.char_count > 0 && tag.end >= para.char_count;
++        let begin = tag.start.min(break_pos);
++        let end = if end_at_break { break_pos } else { tag.end };
++        ctx.track_mark_id += 1;
++        let id = ctx.track_mark_id;
++        marks.push((
++            begin,
++            1,
++            format!(
++                r#"<hp:{name}Begin paraend="{}" TcId="{tc}" Id="{id}"/>"#,
++                u8::from(begin_at_break)
++            ),
++        ));
++        marks.push((
++            end,
++            0,
++            format!(
++                r#"<hp:{name}End paraend="{}" TcId="{tc}" Id="{id}"/>"#,
++                u8::from(end_at_break)
++            ),
++        ));
++    }
++    marks.sort_by_key(|(pos, order, _)| (*pos, *order));
++    marks.into_iter().map(|(pos, _, xml)| (pos, xml)).collect()
++}
++
+ fn render_runs(
+     para: &Paragraph,
+     ctx: &mut SerializeContext,
+@@ -1552,6 +1637,8 @@ fn render_runs_in_paragraph_scope(
+     para: &Paragraph,
+     ctx: &mut SerializeContext,
+ ) -> (String, bool, u32, Vec<u32>, Vec<u32>) {
++    // [HwpCraft 0083] 변경 추적 표지 — 표지 짝 번호를 한 번만 매긴다.
++    let track_marks = track_mark_xml(para, ctx);
+     // ID 참조 무결성 (구현계획서 1.5): 실제 char_shapes entry 만 reference.
+     // 빈 IR 의 fallback 0 은 제외 — char_shapes 미등록 문서(`Document::default()`)의
+     // 직렬화를 깨지 않도록.
+@@ -1571,6 +1658,7 @@ fn render_runs_in_paragraph_scope(
+         // 표시만 있고 텍스트가 없는 문단도 8유닛을 점유한다 — 여기서 빠지면 축이 밀린다.
+         && para.title_marks.is_empty()
+         && para.markpen_marks.is_empty()
++        && track_marks.is_empty()
+     {
+         // 방출할 것이 없는 문단 — 옮길 슬롯도 없으므로 위치 축은 그대로다.
+         return (String::new(), true, 0, Vec::new(), Vec::new());
+@@ -1688,10 +1776,23 @@ fn render_runs_in_paragraph_scope(
+             })
+         })
+         .collect();
++    let track_chars: Vec<(usize, String)> = track_marks
++        .iter()
++        .cloned()
++        .map(|(pos, xml)| {
++            let char_idx = para
++                .char_offsets
++                .iter()
++                .position(|&o| o >= pos)
++                .unwrap_or(para.text.chars().count());
++            (char_idx, xml)
++        })
++        .collect();
+     let mut cursor = InlineCursor {
+         title_marks: &para.title_marks,
+         markpen_marks: &para.markpen_marks,
+         markpen_idx: 0,
++        track_marks: &track_chars,
+         mark_owned_by_prev: &mark_owned_by_prev,
+         // [#4895] 출처가 제어 표기였던 문단만 `<hp:hyphen/>` 로 되돌린다.
+         soft_hyphen_as_element: para.control_mask & (1u32 << 0x0018) != 0,
+@@ -1775,6 +1876,7 @@ fn render_runs_in_paragraph_scope(
+ 
+     // 메인 경로 — UTF-16 위치 축 위에서 슬롯/필드/문자/경계를 함께 처리
+     cursor.markpen_marks = &[];
++    cursor.track_marks = &[];
+     let mut markpens = PositionedMarkpens {
+         marks: para
+             .markpen_marks
+@@ -1782,6 +1884,8 @@ fn render_runs_in_paragraph_scope(
+             .map(|m| (m.stream_position(para), m))
+             .collect(),
+         next: 0,
++        track: track_marks,
++        track_next: 0,
+     };
+     markpens.marks.sort_by_key(|(pos, _)| *pos);
+     let mut text_buf = String::new();
+@@ -2400,7 +2504,7 @@ fn flush_trailing_title_marks(
+     tab_extended: &[[u16; 7]],
+     cursor: &mut InlineCursor<'_>,
+ ) {
+-    if cursor.mark_idx < cursor.title_marks.len() {
++    if cursor.mark_idx < cursor.title_marks.len() || cursor.track_idx < cursor.track_marks.len() {
+         out.push_str(&render_hp_t_content("", tab_extended, cursor));
+     }
+ }
+diff --git a/src/serializer/hwpx/track_changes_tests.rs b/src/serializer/hwpx/track_changes_tests.rs
+new file mode 100644
+index 0000000..a95e2f2
+--- /dev/null
++++ b/src/serializer/hwpx/track_changes_tests.rs
+@@ -0,0 +1,183 @@
++//! [HwpCraft 0082/0083] HWPX 변경 추적: 본문 표지(OWPML `hp:insertBegin`/`insertEnd`/
++//! `deleteBegin`/`deleteEnd`, `TrackChangeTag`)와 헤더 `hh:trackChanges`·
++//! `hh:trackChangeAuthors` 를 읽어 HWP5 와 같은 범위 태그(16 삽입 · 17 삭제)와 DocInfo
++//! 레코드(96 · 97)로 싣고, 저장할 때 다시 쓴다. 변경 추적이 든 HWPX 실표본이 없어
++//! 명세(ParaList·Header XML schema)대로 표지를 넣은 합성 문서로 시험한다.
++
++use std::io::{Cursor, Read, Write};
++
++use crate::document_core::DocumentCore;
++use crate::model::document::Document;
++use crate::parser::hwpx::header::{HWPTAG_TRACK_CHANGE, HWPTAG_TRACK_CHANGE_AUTHOR};
++use crate::parser::hwpx::parse_hwpx;
++use crate::serializer::hwpx::serialize_hwpx;
++
++const TRACK: &str = concat!(
++    r#"<hh:trackChanges itemCnt="2">"#,
++    r#"<hh:trackChange type="Insert" date="2026-11-01T09:30:00Z" authorID="1" hide="0" id="1"/>"#,
++    r#"<hh:trackChange type="Delete" date="2026-11-01T09:31:00Z" authorID="1" hide="0" id="2"/>"#,
++    r#"</hh:trackChanges>"#,
++    r#"<hh:trackChangeAuthors itemCnt="1">"#,
++    r##"<hh:trackChangeAuthor name="검토자" mark="1" color="#FF0000" id="1"/>"##,
++    r#"</hh:trackChangeAuthors>"#,
++);
++
++/// HWPX 패키지의 XML 항목을 `edit` 로 고쳐 다시 묶는다.
++fn rewrite(bytes: &[u8], edit: impl Fn(&str, String) -> String) -> Vec<u8> {
++    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip open");
++    let mut out = Cursor::new(Vec::<u8>::new());
++    let mut writer = zip::ZipWriter::new(&mut out);
++    for i in 0..archive.len() {
++        let mut entry = archive.by_index(i).expect("entry");
++        let name = entry.name().to_string();
++        let mut data = Vec::new();
++        entry.read_to_end(&mut data).expect("read entry");
++        if name.ends_with(".xml") {
++            data = edit(&name, String::from_utf8(data).expect("utf-8 xml")).into_bytes();
++        }
++        let method = if name == "mimetype" {
++            zip::CompressionMethod::Stored
++        } else {
++            zip::CompressionMethod::Deflated
++        };
++        let options = zip::write::SimpleFileOptions::default().compression_method(method);
++        writer.start_file(name, options).expect("start_file");
++        writer.write_all(&data).expect("write entry");
++    }
++    writer.finish().expect("finish");
++    out.into_inner()
++}
++
++fn entry(bytes: &[u8], name: &str) -> String {
++    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip open");
++    let mut text = String::new();
++    archive
++        .by_name(name)
++        .expect("entry")
++        .read_to_string(&mut text)
++        .expect("read");
++    text
++}
++
++/// "가나다라 마바사아 자차카타": "마바" 삽입(변경 1), "자차카타"와 문단 나눔 삭제(변경 2).
++fn tracked_hwpx() -> Vec<u8> {
++    let mut core = DocumentCore::new_empty();
++    core.create_blank_document_native().expect("blank");
++    core.insert_text_native(0, 0, 0, "가나다라 마바사아 자차카타")
++        .expect("text");
++    let plain = core.export_hwpx_native().expect("hwpx");
++    rewrite(&plain, |name, xml| match name {
++        "Contents/header.xml" => {
++            assert!(xml.contains("</hh:refList>"), "refList");
++            xml.replacen("</hh:refList>", &format!("{TRACK}</hh:refList>"), 1)
++        }
++        "Contents/section0.xml" => {
++            assert!(xml.contains("가나다라 마바사아 자차카타"), "본문 글");
++            xml.replacen(
++                "가나다라 마바사아 자차카타",
++                concat!(
++                    r#"가나다라 <hp:insertBegin paraend="0" TcId="1" Id="1"/>마바"#,
++                    r#"<hp:insertEnd paraend="0" TcId="1" Id="1"/>사아 "#,
++                    r#"<hp:deleteBegin paraend="0" TcId="2" Id="2"/>자차카타"#,
++                    r#"<hp:deleteEnd paraend="1" TcId="2" Id="2"/>"#,
++                ),
++                1,
++            )
++        }
++        _ => xml,
++    })
++}
++
++/// 본문 첫 문단의 변경 추적 범위: (종류, 데이터, 시작 글자, 끝 글자, 나눔까지 덮는가).
++fn tracked_ranges(doc: &Document) -> Vec<(u32, u32, usize, usize, bool)> {
++    let para = &doc.sections[0].paragraphs[0];
++    let char_at = |pos: u32| {
++        para.char_offsets
++            .iter()
++            .position(|&o| o >= pos)
++            .unwrap_or(para.text.chars().count())
++    };
++    para.range_tags
++        .iter()
++        .filter(|t| matches!(t.tag >> 24, 16 | 17))
++        .map(|t| {
++            (
++                t.tag >> 24,
++                t.tag & 0x00FF_FFFF,
++                char_at(t.start),
++                char_at(t.end),
++                t.end >= para.char_count,
++            )
++        })
++        .collect()
++}
++
++fn records(doc: &Document, tag: u16) -> Vec<Vec<u8>> {
++    doc.doc_info
++        .extra_records
++        .iter()
++        .filter(|r| r.tag_id == tag)
++        .map(|r| r.data.clone())
++        .collect()
++}
++
++const EXPECTED: [(u32, u32, usize, usize, bool); 2] =
++    [(16, 1, 5, 7, false), (17, 2, 10, 14, true)];
++
++#[test]
++fn hwpx_track_change_marks_and_records_are_read() {
++    let doc = parse_hwpx(&tracked_hwpx()).expect("parse");
++    assert_eq!(doc.sections[0].paragraphs[0].text, "가나다라 마바사아 자차카타");
++    assert_eq!(tracked_ranges(&doc), EXPECTED);
++
++    let changes = records(&doc, HWPTAG_TRACK_CHANGE);
++    assert_eq!(changes.len(), 2);
++    let word = |data: &[u8], at: usize| u16::from_le_bytes([data[at], data[at + 1]]);
++    // 종류 · 년 · 월 · 일 · 시 · 분 · 작성자 번호
++    assert_eq!(&changes[0][..4], &0x10u32.to_le_bytes());
++    assert_eq!(&changes[1][..4], &0x11u32.to_le_bytes());
++    assert_eq!(
++        (1..=6).map(|i| word(&changes[1], 2 + 2 * i)).collect::<Vec<_>>(),
++        [2026, 11, 1, 9, 31, 1]
++    );
++    let authors = records(&doc, HWPTAG_TRACK_CHANGE_AUTHOR);
++    assert_eq!(authors.len(), 1);
++    let name: Vec<u16> = (0..usize::from(word(&authors[0], 0)))
++        .map(|k| word(&authors[0], 4 + 2 * k))
++        .collect();
++    assert_eq!(String::from_utf16_lossy(&name), "검토자");
++}
++
++#[test]
++fn hwpx_track_changes_survive_hwpx_and_hwp_saves() {
++    let doc = parse_hwpx(&tracked_hwpx()).expect("parse");
++
++    // HWPX: 헤더 블록은 원문 그대로, 본문 표지는 범위 태그에서 다시 쓴다.
++    let saved = serialize_hwpx(&doc).expect("hwpx save");
++    assert!(entry(&saved, "Contents/header.xml").contains(TRACK));
++    let section = entry(&saved, "Contents/section0.xml");
++    assert!(section.contains("<hp:insertBegin"), "{section}");
++    assert!(section.contains(r#"<hp:deleteEnd paraend="1""#), "{section}");
++    let back = parse_hwpx(&saved).expect("reparse");
++    assert_eq!(tracked_ranges(&back), EXPECTED);
++    assert_eq!(
++        records(&back, HWPTAG_TRACK_CHANGE),
++        records(&doc, HWPTAG_TRACK_CHANGE)
++    );
++
++    // 원문 블록이 없으면(HWP 에서 온 문서) 레코드에서 헤더 블록을 만든다.
++    let mut from_records = doc.clone();
++    from_records.doc_info.track_changes_xml = None;
++    let saved = serialize_hwpx(&from_records).expect("hwpx from records");
++    let back = parse_hwpx(&saved).expect("reparse from records");
++    assert_eq!(tracked_ranges(&back), EXPECTED);
++    for tag in [HWPTAG_TRACK_CHANGE, HWPTAG_TRACK_CHANGE_AUTHOR] {
++        assert_eq!(records(&back, tag), records(&doc, tag), "tag {tag}");
++    }
++
++    // HWP: 범위 태그는 PARA_RANGE_TAG, 레코드는 DocInfo 에 실린다.
++    let hwp = crate::serializer::serialize_hwp(&doc).expect("hwp save");
++    let back = crate::parser::parse_hwp(&hwp).expect("hwp reparse");
++    assert_eq!(tracked_ranges(&back), EXPECTED);
++    assert_eq!(records(&back, HWPTAG_TRACK_CHANGE).len(), 2);
++}

@@ -6,15 +6,18 @@
 //! queued, the window is woken, and the window runs them on its own `Session`
 //! between frames ([`DesktopBridge::serve`]). The window's document is listed by
 //! `list_documents`; documents an MCP client creates are separate, as with the
-//! CLI server. MCP cannot close the window's document.
+//! CLI server. MCP cannot close the window's document or swap another one in, and
+//! when the user opens or makes another document in the window, the old
+//! `document_id` ends and the new document gets one of its own.
 use crate::Headless;
-use crate::document_workers::{DocumentWorkers, ExternalDocument, ExternalInfo};
+use crate::document_workers::{DocumentWorkers, ExternalDocument, ExternalInfo, Wake};
 use crate::sdk_http::{self, AuthToken};
 use crate::sdk_service::HwpService;
 use anyhow::{Context, Result, anyhow, bail};
 use hwpcraft_engine::Session;
 use std::{
     net::SocketAddr,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread::JoinHandle,
@@ -28,6 +31,10 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:7083";
 
 pub struct DesktopBridge {
     document: ExternalDocument,
+    /// `Session::document_serial` of the document `document` stands for.
+    serial: u64,
+    workers: Arc<DocumentWorkers>,
+    wake: Wake,
     /// Holds a placeholder session between `serve` calls; the window's session is
     /// swapped in while its requests run.
     backend: Headless,
@@ -68,10 +75,12 @@ impl DesktopBridge {
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         let workers = Arc::new(DocumentWorkers::new(None));
-        let document = workers.attach_external(Arc::new(wake), info(session))?;
+        let wake: Wake = Arc::new(wake);
+        let document = workers.attach_external(Arc::clone(&wake), info(session))?;
         let shutdown = CancellationToken::new();
         let failure: Arc<Mutex<Option<String>>> = Arc::default();
         let server = {
+            let server_workers = Arc::clone(&workers);
             let shutdown = shutdown.clone();
             let failure = Arc::clone(&failure);
             std::thread::Builder::new()
@@ -84,7 +93,7 @@ impl DesktopBridge {
                             .build()?;
                         runtime.block_on(async move {
                             let listener = tokio::net::TcpListener::from_std(listener)?;
-                            let service = HwpService::new(workers)?;
+                            let service = HwpService::new(server_workers)?;
                             sdk_http::serve_listener(service, listener, token, shutdown).await
                         })
                     })();
@@ -96,9 +105,14 @@ impl DesktopBridge {
                 })
                 .context("MCP 서버 스레드를 만들지 못했습니다.")?
         };
+        let mut backend = Headless::new(None)?;
+        backend.window = true;
         Ok(Self {
             document,
-            backend: Headless::new(None)?,
+            serial: session.document_serial,
+            workers,
+            wake,
+            backend,
             shutdown,
             server: Some(server),
             url: format!("http://{address}/mcp"),
@@ -128,16 +142,32 @@ impl DesktopBridge {
     /// least one) and refresh its listed title and state. Returns how many ran;
     /// the window redraws when this is not zero.
     pub fn serve(&mut self, session: &mut Session, budget: Duration) -> Result<usize> {
+        self.follow(session)?;
         std::mem::swap(&mut self.backend.session, session);
-        let served = self.document.serve(&mut self.backend, budget);
+        // This runs on the window's thread: an engine panic must not take the
+        // window, and the user's unsaved document, down with it.
+        let served = catch_unwind(AssertUnwindSafe(|| {
+            self.document.serve(&mut self.backend, budget)
+        }));
         std::mem::swap(&mut self.backend.session, session);
+        let Ok(served) = served else {
+            // The document may be partly changed: the user keeps it and decides.
+            // Clients lose this id (queued requests fail) and find the document
+            // again under a new one.
+            self.backend.usable = true;
+            self.reattach(session)?;
+            return Err(anyhow!(
+                "MCP 요청을 처리하다 내부 오류가 났습니다. 문서를 확인하세요. 이 문서의 MCP document_id가 새로 바뀌었습니다."
+            ));
+        };
         if !self.backend.usable {
             // An atomic batch could not restore the document; the window shows
             // the error and keeps the document as it is for the user to decide.
+            // The worker marked the id closed, so clients get a new one.
             self.backend.usable = true;
-            self.document.set_info(info(session));
+            self.reattach(session)?;
             return Err(anyhow!(
-                "MCP 일괄 작업을 되돌리지 못했습니다. 문서를 확인하고 필요하면 저장하지 말고 다시 여세요."
+                "MCP 일괄 작업을 되돌리지 못했습니다. 문서를 확인하고 필요하면 저장하지 말고 다시 여세요. 이 문서의 MCP document_id가 새로 바뀌었습니다."
             ));
         }
         self.document.set_info(info(session));
@@ -146,8 +176,30 @@ impl DesktopBridge {
 
     /// Refresh the listed title and unsaved state (after the user opens, saves or
     /// edits a document in the window).
-    pub fn update(&self, session: &Session) {
+    pub fn update(&mut self, session: &Session) {
+        if self.follow(session).is_err() {
+            return;
+        }
         self.document.set_info(info(session));
+    }
+
+    /// A new `document_id` when the window now holds another document.
+    fn follow(&mut self, session: &Session) -> Result<()> {
+        if session.document_serial == self.serial {
+            return Ok(());
+        }
+        self.reattach(session)
+    }
+
+    /// End the current `document_id` (its queued requests fail, subscribers hear it
+    /// close) and attach `session` under a new one.
+    fn reattach(&mut self, session: &Session) -> Result<()> {
+        let fresh = self
+            .workers
+            .attach_external(Arc::clone(&self.wake), info(session))?;
+        drop(std::mem::replace(&mut self.document, fresh));
+        self.serial = session.document_serial;
+        Ok(())
     }
 }
 
@@ -283,6 +335,203 @@ mod tests {
         drop(bridge);
         let address = url.trim_start_matches("http://").trim_end_matches("/mcp");
         assert!(std::net::TcpStream::connect(address).is_err());
+        Ok(())
+    }
+
+    /// Serve on the "window" thread until `client` finishes.
+    fn serve_until<T>(
+        bridge: &mut DesktopBridge,
+        session: &mut Session,
+        client: std::thread::JoinHandle<T>,
+    ) -> T {
+        let started = Instant::now();
+        while !client.is_finished() {
+            let _ = bridge.serve(session, Duration::from_millis(50));
+            assert!(started.elapsed() < Duration::from_secs(30), "client stuck");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        client.join().unwrap()
+    }
+
+    #[test]
+    fn the_window_document_is_never_swapped_and_its_id_follows_the_window() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let token_file = dir.path().join("token");
+        let mut session = Session::new()?;
+        session.execute(Command::Insert("사용자 글".into()))?;
+        let mut bridge = DesktopBridge::start(
+            "127.0.0.1:0".parse()?,
+            Some(token_file.clone()),
+            &session,
+            || {},
+        )?;
+        let token = std::fs::read_to_string(&token_file)?.trim().to_owned();
+        let address = bridge
+            .url()
+            .trim_start_matches("http://")
+            .trim_end_matches("/mcp")
+            .to_owned();
+        let id = bridge.document_id().to_owned();
+        let other = dir.path().join("other.hwpx");
+        Session::new()?.save(&other)?;
+        let (a, t, i) = (address.clone(), token.clone(), id.clone());
+        let client = std::thread::spawn(move || {
+            [
+                call(
+                    &a,
+                    &t,
+                    "new_document",
+                    json!({"document_id": i, "force": true}),
+                ),
+                call(
+                    &a,
+                    &t,
+                    "open_document",
+                    json!({"document_id": i, "path": other, "force": true}),
+                ),
+                call(
+                    &a,
+                    &t,
+                    "execute",
+                    json!({"document_id": i, "command": "file.new", "params": {"force": true}}),
+                ),
+            ]
+        });
+        for refused in serve_until(&mut bridge, &mut session, client) {
+            assert_eq!(refused["isError"], true, "{refused}");
+        }
+        assert_eq!(session.text(), "사용자 글", "the user's document stays");
+
+        // The user opens another document in the window: the old id ends.
+        session.reset()?;
+        bridge.update(&session);
+        let fresh = bridge.document_id().to_owned();
+        assert_ne!(fresh, id);
+        let (a, t, i, f) = (address.clone(), token.clone(), id.clone(), fresh.clone());
+        let client = std::thread::spawn(move || {
+            (
+                call(&a, &t, "get_text", json!({"document_id": i})),
+                call(
+                    &a,
+                    &t,
+                    "execute",
+                    json!({"document_id": f, "command": "text.insert", "params": {"text": "새 창 문서"}}),
+                ),
+            )
+        });
+        let (old, new) = serve_until(&mut bridge, &mut session, client);
+        assert_eq!(old["isError"], true, "the old id is gone: {old}");
+        assert_eq!(new["isError"], false, "{new}");
+        assert_eq!(session.text(), "새 창 문서");
+        Ok(())
+    }
+
+    /// A PDF export of the window's document is prepared a few pages per frame and
+    /// written on another thread, so the window keeps drawing; an edit made by the
+    /// user while pages are prepared fails the export instead of mixing states.
+    #[test]
+    fn a_window_pdf_export_spans_frames() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let token_file = dir.path().join("token");
+        let mut session = Session::new()?;
+        // Full pages of text: preparing each takes a noticeable part of a frame.
+        let line = "한글 문서를 PDF로 내보내는 동안에도 창은 계속 그려야 합니다. ".repeat(40);
+        for n in 0..40 {
+            session.execute(Command::Insert(format!("{n}쪽 {line}")))?;
+            session.run("insert.page_break", json!({}))?;
+        }
+        let mut bridge = DesktopBridge::start(
+            "127.0.0.1:0".parse()?,
+            Some(token_file.clone()),
+            &session,
+            || {},
+        )?;
+        let token = std::fs::read_to_string(&token_file)?.trim().to_owned();
+        let address = bridge
+            .url()
+            .trim_start_matches("http://")
+            .trim_end_matches("/mcp")
+            .to_owned();
+        let id = bridge.document_id().to_owned();
+        let pdf = dir.path().join("window.pdf");
+        let (a, t, i, path) = (address.clone(), token.clone(), id.clone(), pdf.clone());
+        let client = std::thread::spawn(move || {
+            call(
+                &a,
+                &t,
+                "save_document",
+                json!({"document_id": i, "path": path}),
+            )
+        });
+        let started = Instant::now();
+        let (mut frames, mut longest) = (0, Duration::ZERO);
+        while !client.is_finished() {
+            let frame = Instant::now();
+            if bridge.serve(&mut session, Duration::from_millis(5))? > 0 {
+                frames += 1;
+            }
+            longest = longest.max(frame.elapsed());
+            assert!(started.elapsed() < Duration::from_secs(120), "export stuck");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let total = started.elapsed();
+        let saved = client.join().unwrap();
+        assert_eq!(saved["isError"], false, "{saved}");
+        assert!(frames > 1, "the export took {frames} frame(s) in {total:?}");
+        // No frame holds the window for the whole export.
+        assert!(
+            longest * 3 < total,
+            "longest frame {longest:?} of {total:?} over {frames} frames"
+        );
+        assert!(std::fs::read(&pdf)?.starts_with(b"%PDF-"));
+
+        // The user types while pages are prepared: the export fails, no file.
+        let other = dir.path().join("edited.pdf");
+        let (a, t, i, path) = (address, token, id, other.clone());
+        let client = std::thread::spawn(move || {
+            call(
+                &a,
+                &t,
+                "save_document",
+                json!({"document_id": i, "path": path}),
+            )
+        });
+        let mut typed = false;
+        while !client.is_finished() {
+            let served = bridge.serve(&mut session, Duration::from_millis(1))?;
+            if served > 0 && !typed {
+                session.execute(Command::Insert("사용자 입력".into()))?;
+                typed = true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let refused = client.join().unwrap();
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert!(!other.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn an_engine_panic_does_not_take_the_window_down() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut session = Session::new()?;
+        session.execute(Command::Insert("남는 글".into()))?;
+        let mut bridge = DesktopBridge::start(
+            "127.0.0.1:0".parse()?,
+            Some(dir.path().join("token")),
+            &session,
+            || {},
+        )?;
+        let id = bridge.document_id().to_owned();
+        bridge.workers.queue_panic(&id)?;
+        assert!(
+            bridge
+                .serve(&mut session, Duration::from_millis(50))
+                .is_err()
+        );
+        assert_eq!(session.text(), "남는 글", "the window keeps its document");
+        assert_ne!(bridge.document_id(), id, "clients get a new id");
+        assert_eq!(bridge.serve(&mut session, Duration::from_millis(10))?, 0);
         Ok(())
     }
 

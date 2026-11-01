@@ -36,16 +36,19 @@ pub enum Motion {
     DocumentEnd,
 }
 
-/// Paragraphs that can be selected together: one section body or one table cell.
+/// Paragraphs that can be selected together: the body (over sections, as in
+/// Hangul) or one table cell.
 fn same_container(a: &Cursor, b: &Cursor) -> bool {
-    a.section == b.section
-        && match (a.cell, b.cell) {
-            (None, None) => true,
-            (Some(x), Some(y)) => {
-                a.paragraph == b.paragraph && x.control == y.control && x.index == y.index
-            }
-            _ => false,
+    match (a.cell, b.cell) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            a.section == b.section
+                && a.paragraph == b.paragraph
+                && x.control == y.control
+                && x.index == y.index
         }
+        _ => false,
+    }
 }
 fn same_paragraph(a: &Cursor, b: &Cursor) -> bool {
     a.section == b.section && a.paragraph == b.paragraph && a.cell == b.cell
@@ -53,6 +56,10 @@ fn same_paragraph(a: &Cursor, b: &Cursor) -> bool {
 /// Paragraph index within the container (body paragraph or cell paragraph).
 fn index(c: &Cursor) -> usize {
     c.cell.map(|t| t.paragraph).unwrap_or(c.paragraph)
+}
+/// Document order of a selection end: section, then paragraph, then offset.
+fn order(c: &Cursor) -> (usize, usize, usize) {
+    (c.section, index(c), c.offset)
 }
 fn with_index(c: Cursor, i: usize, offset: usize) -> Cursor {
     match c.cell {
@@ -92,7 +99,7 @@ impl Session {
     pub fn span(&self) -> Option<(Cursor, Cursor)> {
         let a = self.span_anchor?;
         let b = self.cursor;
-        if (index(&a), a.offset) <= (index(&b), b.offset) {
+        if order(&a) <= order(&b) {
             Some((a, b))
         } else {
             Some((b, a))
@@ -112,20 +119,35 @@ impl Session {
             return Ok(vec![(self.cursor, self.selection())]);
         };
         let mut out = Vec::new();
-        for i in index(&start)..=index(&end) {
-            let c = with_index(start, i, 0);
-            let len = self.paragraph(c)?.text.chars().count();
-            let from = if i == index(&start) {
-                start.offset.min(len)
+        for section in start.section..=end.section {
+            let first = if section == start.section {
+                index(&start)
             } else {
                 0
             };
-            let to = if i == index(&end) {
-                end.offset.min(len)
+            let last = if section == end.section {
+                index(&end)
             } else {
-                len
+                self.core.document().sections[section]
+                    .paragraphs
+                    .len()
+                    .saturating_sub(1)
             };
-            out.push((c, from..to.max(from)));
+            for i in first..=last {
+                let c = with_index(Cursor { section, ..start }, i, 0);
+                let len = self.paragraph(c)?.text.chars().count();
+                let from = if section == start.section && i == index(&start) {
+                    start.offset.min(len)
+                } else {
+                    0
+                };
+                let to = if section == end.section && i == index(&end) {
+                    end.offset.min(len)
+                } else {
+                    len
+                };
+                out.push((c, from..to.max(from)));
+            }
         }
         Ok(out)
     }
@@ -176,9 +198,28 @@ impl Session {
     }
     /// Delete the current selection, including a multi-paragraph span.
     pub(crate) fn delete_selection(&mut self) -> Result<()> {
-        let Some((start, end)) = self.span() else {
+        if self.track_recording() && self.has_selection() {
+            return self.track_delete_selection();
+        }
+        let Some((start, mut end)) = self.span() else {
             return self.delete_range(self.selection());
         };
+        if end.section > start.section {
+            // Over section boundaries: the later sections join the first one (as
+            // deleting a section break does), then the joined range goes.
+            let joined: usize = self.core.document().sections[start.section..end.section]
+                .iter()
+                .map(|s| s.paragraphs.len())
+                .sum();
+            for section in (start.section + 1..=end.section).rev() {
+                self.join_sections(section, false)?;
+            }
+            end = Cursor {
+                section: start.section,
+                paragraph: joined + end.paragraph,
+                ..end
+            };
+        }
         let cell = start.cell.map(|t| (start.paragraph, t.control, t.index));
         self.core
             .delete_range_native(
@@ -194,8 +235,24 @@ impl Session {
         self.clear_selection();
         Ok(())
     }
-    /// Select the whole cell, or the whole body of the caret's section.
+    /// Select the whole cell, or the whole body of the document (every section).
     pub fn select_all(&mut self) -> Result<()> {
+        if self.cursor.cell.is_none() {
+            let sections = &self.core.document().sections;
+            let last = sections.len().saturating_sub(1);
+            let paragraph = sections
+                .get(last)
+                .map_or(0, |s| s.paragraphs.len().saturating_sub(1));
+            let end = Cursor {
+                section: last,
+                paragraph,
+                offset: 0,
+                cell: None,
+            };
+            let len = self.paragraph(end)?.text.chars().count();
+            self.select(Cursor::default(), false)?;
+            return self.select(Cursor { offset: len, ..end }, true);
+        }
         let count = match self.cursor.cell {
             Some(t) => match self
                 .core
@@ -290,9 +347,26 @@ impl Session {
             },
         }
     }
+    /// The caret's line: its page and the line's cross position (y, or x in a vertical
+    /// section, where a line is a column).
     fn caret_line(&self, c: Cursor) -> Option<(u64, f64)> {
         let v = self.caret_at(c).ok()?;
-        Some((v["pageIndex"].as_u64()?, v["y"].as_f64()?))
+        let along = if v["vertical"] == true { "x" } else { "y" };
+        Some((v["pageIndex"].as_u64()?, v[along].as_f64()?))
+    }
+    /// In a vertical section (세로쓰기) the arrows follow the columns: ↑↓ move through
+    /// the column's characters, ← goes on to the next column (to the left), → back.
+    fn vertical_motion(&self, motion: Motion) -> Motion {
+        if !self.caret().is_ok_and(|v| v["vertical"] == true) {
+            return motion;
+        }
+        match motion {
+            Motion::Up => Motion::Left,
+            Motion::Down => Motion::Right,
+            Motion::Left => Motion::Down,
+            Motion::Right => Motion::Up,
+            other => other,
+        }
     }
     /// Zero-based global page of a position (body paragraph of a cell caret).
     pub fn page_of(&self, c: Cursor) -> Option<usize> {
@@ -451,14 +525,92 @@ impl Session {
                 Cursor { offset: o, ..c }
             }
             Motion::Up | Motion::Down | Motion::PageUp | Motion::PageDown => {
-                let v = self.caret()?;
+                let up = matches!(motion, Motion::Up | Motion::PageUp);
+                // A paragraph that holds only objects (a table) may have no caret
+                // position of its own; only those are asked, a caret costs a layout.
+                let caretable = |t: Cursor| {
+                    self.paragraph(t)
+                        .is_ok_and(|p| !p.text.is_empty() || p.controls.is_empty())
+                        || self.caret_at(t).is_ok()
+                };
+                // The nearest paragraph in the motion's direction with a caret, in the
+                // paragraph list `base` belongs to; past a cell's first or last
+                // paragraph, the body paragraphs around the table.
+                let neighbour = |base: Cursor| -> Cursor {
+                    let mut base = base;
+                    loop {
+                        let count = self.paragraph_count(&base);
+                        let mut j = index(&base);
+                        loop {
+                            let next = if up { j.checked_sub(1) } else { Some(j + 1) };
+                            match next {
+                                Some(n) if n < count => {
+                                    let t = with_index(base, n, 0);
+                                    if caretable(t) {
+                                        return t;
+                                    }
+                                    j = n;
+                                }
+                                _ => break,
+                            }
+                        }
+                        if base.cell.is_none() {
+                            return c;
+                        }
+                        base = Cursor {
+                            offset: 0,
+                            cell: None,
+                            ..base
+                        };
+                    }
+                };
+                let Ok(v) = self.caret() else {
+                    return Ok(neighbour(c));
+                };
                 let page = v["pageIndex"].as_u64().unwrap_or(0) as u32;
                 let x = v["x"].as_f64().unwrap_or(0.0);
                 let y = v["y"].as_f64().unwrap_or(0.0);
                 let h = v["height"].as_f64().unwrap_or(16.0).max(4.0);
+                // A vertical section's lines are columns, the next one to the left.
+                let w = v["width"].as_f64().unwrap_or(0.0);
+                let vertical = v["vertical"] == true;
                 let target = match motion {
-                    Motion::Up => self.hit_test(page, x, y - h * 0.7),
-                    Motion::Down => self.hit_test(page, x, y + h * 1.7),
+                    Motion::Up if vertical => self.hit_test(page, x + w * 2.1, y),
+                    Motion::Down if vertical => self.hit_test(page, x - w * 1.1, y),
+                    // A line made tall by an object treated as a character holds the
+                    // caret low in it: probe on, a caret height at a time, until the hit
+                    // leaves the caret's line.
+                    Motion::Up | Motion::Down => {
+                        let line = self.caret_line(c);
+                        let probe = |k: f64| {
+                            let dy = if up { -h * (0.7 + k) } else { h * (1.7 + k) };
+                            self.hit_test(page, x, y + dy)
+                        };
+                        // No further than the paragraph's tallest line (HWPUNIT, 75 a px).
+                        let tallest = self.paragraph(c).map_or(0.0, |p| {
+                            p.line_segs
+                                .iter()
+                                .map(|l| f64::from(l.line_height.max(0)) / 75.0)
+                                .fold(0.0, f64::max)
+                        });
+                        let steps = ((tallest / h).ceil() as u32).min(40);
+                        let mut hit = probe(0.0);
+                        for k in 1..=steps {
+                            match &hit {
+                                Ok(t)
+                                    if *t == c
+                                        || (t.section == c.section
+                                            && t.cell == c.cell
+                                            && index(t) == i
+                                            && self.caret_line(*t) == line) =>
+                                {
+                                    hit = probe(f64::from(k));
+                                }
+                                _ => break,
+                            }
+                        }
+                        hit
+                    }
                     Motion::PageUp if page > 0 => self.hit_test(page - 1, x, y),
                     Motion::PageDown if page + 1 < self.page_count()? => {
                         self.hit_test(page + 1, x, y)
@@ -466,14 +618,13 @@ impl Session {
                     _ => Ok(c),
                 };
                 match target {
-                    Ok(t) if t != c && self.paragraph(t).is_ok() => t,
+                    Ok(t) if t != c && self.paragraph(t).is_ok() && caretable(t) => t,
+                    // A table-only paragraph has no caret: go on to the next one with
+                    // a caret beyond it.
+                    Ok(t) if t != c && self.paragraph(t).is_ok() => neighbour(t),
                     // Fall back to the neighbouring paragraph when hit testing lands
                     // in a margin, a nested object or the same place.
-                    _ => match motion {
-                        Motion::Up | Motion::PageUp if i > 0 => with_index(c, i - 1, 0),
-                        Motion::Down | Motion::PageDown if i + 1 < count => with_index(c, i + 1, 0),
-                        _ => c,
-                    },
+                    _ => neighbour(c),
                 }
             }
             Motion::ParagraphStart => Cursor { offset: 0, ..c },
@@ -599,6 +750,7 @@ impl Session {
     }
     fn move_caret_unrecorded(&mut self, motion: Motion, extend: bool) -> Result<()> {
         self.hit_hint.set(None);
+        let motion = self.vertical_motion(motion);
         if !extend && self.has_selection() && matches!(motion, Motion::Left | Motion::Right) {
             // Like Hangul, an arrow collapses a selection to its matching edge.
             let edges = self.selected_paragraphs()?;
@@ -655,6 +807,11 @@ impl Session {
             return Ok(String::new());
         }
         let text = self.span_text()?;
+        // RHWP's rich copy covers one section; over sections only the text goes out.
+        if self.span().is_some_and(|(a, b)| a.section != b.section) {
+            self.clipboard_text = None;
+            return Ok(text);
+        }
         let replay = clipboard_history::ClipboardReplay::prepare(self)?;
         let result = replay.copy_into(&mut self.core);
         if result.is_ok() {
@@ -669,7 +826,7 @@ impl Session {
         self.guard_protected()?;
         let text = self.copy()?;
         if self.has_selection() {
-            self.transaction(|s| s.delete_selection())?;
+            self.track_scope(|s| s.transaction(|s| s.delete_selection()))?;
         }
         Ok(text)
     }
@@ -684,7 +841,7 @@ impl Session {
         let (Some((first, r1)), Some((last, r2))) = (parts.first(), parts.last()) else {
             return Ok(None);
         };
-        if first.cell.is_some() {
+        if first.cell.is_some() || first.section != last.section {
             return Ok(None);
         }
         Ok(self

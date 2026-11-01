@@ -7,37 +7,31 @@
 //! header, so a new object uses 0 (no border fill, also seen there) and keeps
 //! `DrawFrame=1`.
 use super::*;
+use crate::ext_object::FormAt;
+use crate::form_properties::{FormProps, MM};
 use hwpcraft_doc::model::control::{FormObject, FormType};
 use hwpcraft_doc::model::shape::{CommonObjAttr, HorzRelTo, TextWrap, VertRelTo};
-use serde::Deserialize;
 use std::collections::HashMap;
 
-const MM: f64 = 7200.0 / 25.4;
-const MAX_TEXT: usize = 256;
-const MAX_ITEMS: usize = 64;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// form.insert parameters: the kind and the properties `form.properties` takes.
 pub(crate) struct FormSpec {
     /// check_box | edit | combo_box | radio_button | push_button
     kind: String,
-    #[serde(default)]
-    caption: Option<String>,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    checked: bool,
-    #[serde(default)]
-    items: Vec<String>,
-    /// Radio buttons with the same group are exclusive.
-    #[serde(default)]
-    group: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    width_mm: Option<f64>,
-    #[serde(default)]
-    height_mm: Option<f64>,
+    props: FormProps,
+}
+
+impl FormSpec {
+    pub(crate) fn parse(params: Value) -> Result<Self> {
+        let Value::Object(mut map) = params else {
+            bail!("form.insert 매개 변수는 JSON 객체입니다.");
+        };
+        let kind = match map.remove("kind") {
+            Some(Value::String(kind)) => kind,
+            _ => bail!("kind는 check_box·edit·combo_box·radio_button·push_button입니다."),
+        };
+        let props = serde_json::from_value(Value::Object(map))?;
+        Ok(Self { kind, props })
+    }
 }
 
 /// (type, default size in HWPUNIT, background 0x00BBGGRR, default caption)
@@ -64,21 +58,6 @@ fn type_label(t: FormType) -> &'static str {
         FormType::ComboBox => "ComboBox",
         FormType::RadioButton => "RadioButton",
         FormType::Edit => "Edit",
-    }
-}
-
-fn check_text(label: &str, value: &str) -> Result<()> {
-    if value.chars().count() > MAX_TEXT || value.chars().any(char::is_control) {
-        bail!("{label}은(는) 제어 문자 없이 {MAX_TEXT}자 이하입니다.");
-    }
-    Ok(())
-}
-
-fn size(mm: Option<f64>, default: u32, label: &str) -> Result<u32> {
-    match mm {
-        None => Ok(default),
-        Some(v) if v.is_finite() && (3.0..=200.0).contains(&v) => Ok((v * MM).round() as u32),
-        Some(_) => bail!("{label}는 3–200 mm입니다."),
     }
 }
 
@@ -164,7 +143,7 @@ fn properties(
 }
 
 /// Every form object of the document (body and table cells).
-fn all_forms(doc: &hwpcraft_doc::model::document::Document) -> Vec<&FormObject> {
+pub(crate) fn all_forms(doc: &hwpcraft_doc::model::document::Document) -> Vec<&FormObject> {
     fn walk<'a>(list: &'a [Paragraph], out: &mut Vec<&'a FormObject>) {
         for c in list.iter().flat_map(|p| &p.controls) {
             match c {
@@ -181,7 +160,7 @@ fn all_forms(doc: &hwpcraft_doc::model::document::Document) -> Vec<&FormObject> 
     out
 }
 
-fn paragraph_at(
+pub(crate) fn paragraph_at(
     doc: &mut hwpcraft_doc::model::document::Document,
     at: Cursor,
 ) -> Result<&mut Paragraph> {
@@ -207,47 +186,25 @@ impl Session {
     /// Insert a form object at the caret as a character; returns its `at`.
     pub(crate) fn insert_form(&mut self, spec: FormSpec) -> Result<Value> {
         let (form_type, (dw, dh), back, default_caption) = defaults(&spec.kind)?;
-        let caption = spec.caption.unwrap_or_else(|| default_caption.to_owned());
-        let text = spec.text.unwrap_or_default();
-        check_text("caption", &caption)?;
-        check_text("text", &text)?;
-        let group = spec.group.unwrap_or_default();
-        check_text("group", &group)?;
-        let width = size(spec.width_mm, dw, "너비")?;
-        let height = size(spec.height_mm, dh, "높이")?;
-        match form_type {
-            FormType::ComboBox => {
-                if spec.items.len() > MAX_ITEMS {
-                    bail!("목록 항목은 {MAX_ITEMS}개 이하입니다.");
-                }
-                for item in &spec.items {
-                    check_text("items", item)?;
-                }
-                if !text.is_empty() && !spec.items.contains(&text) {
-                    bail!("콤보 상자의 text는 items 중 하나여야 합니다.");
-                }
-            }
-            _ if !spec.items.is_empty() => bail!("items는 콤보 상자(combo_box) 전용입니다."),
-            _ => {}
+        let props = spec.props;
+        props.validate(form_type)?;
+        let caption = props
+            .caption
+            .clone()
+            .unwrap_or_else(|| default_caption.to_owned());
+        let text = props.text.clone().unwrap_or_default();
+        let items = props.items.clone().unwrap_or_default();
+        let group = props.group.clone().unwrap_or_default();
+        if form_type == FormType::ComboBox && !text.is_empty() && !items.contains(&text) {
+            bail!("콤보 상자의 text는 items 중 하나여야 합니다.");
         }
-        if spec.checked && !matches!(form_type, FormType::CheckBox | FormType::RadioButton) {
-            bail!("checked는 선택 상자·라디오 단추 전용입니다.");
-        }
-        if !group.is_empty() && form_type != FormType::RadioButton {
-            bail!("group은 라디오 단추 전용입니다.");
-        }
-        if !text.is_empty() && !matches!(form_type, FormType::Edit | FormType::ComboBox) {
-            bail!("text는 입력 상자·콤보 상자 전용입니다(단추 글은 caption).");
-        }
-        if !caption.is_empty() && matches!(form_type, FormType::Edit | FormType::ComboBox) {
-            bail!("입력 상자·콤보 상자에는 caption이 없습니다. text를 쓰세요.");
-        }
+        let width = props.width_mm.map_or(dw, |mm| (mm * MM).round() as u32);
+        let height = props.height_mm.map_or(dh, |mm| (mm * MM).round() as u32);
         let existing = all_forms(self.core.document());
         let label = type_label(form_type);
-        let name = match spec.name {
+        let name = match props.name.clone() {
             Some(n) => {
-                check_text("name", &n)?;
-                if n.trim().is_empty() || existing.iter().any(|f| f.name == n) {
+                if existing.iter().any(|f| f.name == n) {
                     bail!("양식 개체 이름은 비어 있지 않고 문서 안에서 서로 달라야 합니다.");
                 }
                 n
@@ -281,9 +238,9 @@ impl Session {
             height,
             fore_color: 0,
             back_color: back,
-            value: i32::from(spec.checked),
+            value: i32::from(props.checked.unwrap_or(false)),
             enabled: true,
-            properties: properties(form_type, tab_order, &group, &spec.items),
+            properties: properties(form_type, tab_order, &group, &items),
         };
         self.guard_protected()?;
         let mut at = None;
@@ -311,10 +268,16 @@ impl Session {
             // Extended inline control (same character code as pictures and equations).
             para.control_mask |= 1 << 11;
             para.has_para_text = true;
-            para.invalidate_layout_inputs();
-            s.core
-                .relayout_paragraph_native(c.section, c.paragraph, c.cell.map(|t| t.control))
-                .map_err(err)?;
+            // The other properties (font, colours, …) and the layout of the paragraph.
+            let form_at = FormAt {
+                section: c.section,
+                paragraph: c.paragraph,
+                control: ci,
+                cell: c.cell,
+            };
+            s.apply_form_props(&form_at, &props)?;
+            // The new slot can push the rest of the line on.
+            s.reflow(c)?;
             at = Some(json!({"section": c.section, "paragraph": c.paragraph, "control": ci, "cell": c.cell}));
             s.clear_selection();
             Ok(())

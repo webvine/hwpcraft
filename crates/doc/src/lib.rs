@@ -3,6 +3,8 @@
 pub const VERSION: &str = include_str!("../../../VERSION");
 pub use rhwp::DocumentCore;
 pub use rhwp::docdiff;
+/// Table creation options (column widths, alignments, cell paragraph shape).
+pub use rhwp::document_core::TableCreationOptions;
 pub use rhwp::document_core::hyperlink::{HyperlinkInfo, HyperlinkTarget};
 /// Privacy scan option/result types for `DocumentCore::scan_pii` / `detect_hidden_text`.
 pub use rhwp::document_core::queries::{hidden_text, pii_scan};
@@ -11,9 +13,13 @@ pub use rhwp::paint::RenderProfile;
 pub use rhwp::paint::{LayerNode, LayerNodeKind, PaintOp};
 pub use rhwp::parser::FileFormat;
 pub use rhwp::parser::body_text::parse_paragraph_list as parse_hwp_paragraph_list;
+/// HWP stream decompression (raw deflate, zlib fallback) with an output cap.
+pub use rhwp::parser::cfb_reader::decompress_stream_limited as decompress_hwp_stream;
 pub use rhwp::parser::record::Record as HwpRecord;
 pub use rhwp::password_crypto;
 pub use rhwp::renderer::hyperlinks::{PdfDest, PdfLink};
+/// Convert one picture ahead into RHWP's process-wide memo (patch 0059).
+pub use rhwp::renderer::image_resolver::prewarm_image_conversion;
 pub use rhwp::renderer::layout::set_layout_diagnostics;
 pub use rhwp::renderer::pdf::PdfExportOptions;
 pub use rhwp::renderer::pdf::svgs_to_pdf_with_links;

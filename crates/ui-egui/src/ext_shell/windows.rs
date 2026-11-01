@@ -30,6 +30,8 @@ pub(crate) enum Request {
     Focus,
     /// The window's outer rectangle.
     Place(egui::Rect),
+    /// 모두 아이콘으로: minimize.
+    Minimize,
 }
 
 /// 창 배열 kinds.
@@ -144,6 +146,7 @@ impl Windows {
     pub(crate) fn send(&self, id: u32, request: Request) -> std::io::Result<()> {
         let text = match request {
             Request::Focus => "focus".to_owned(),
+            Request::Minimize => "minimize".to_owned(),
             Request::Place(r) => {
                 format!("place {} {} {} {}", r.min.x, r.min.y, r.width(), r.height())
             }
@@ -176,6 +179,7 @@ fn parse_request(text: &str) -> Option<Request> {
     let mut words = text.split_whitespace();
     match words.next()? {
         "focus" => Some(Request::Focus),
+        "minimize" => Some(Request::Minimize),
         "place" => {
             let numbers: Vec<f32> = words.map(|w| w.parse().ok()).collect::<Option<_>>()?;
             let [x, y, w, h] = numbers[..] else {
@@ -191,6 +195,28 @@ fn parse_request(text: &str) -> Option<Request> {
         }
         _ => None,
     }
+}
+
+/// The work area (of `areas`, in desktop coordinates) holding the centre of this
+/// window's `outer` rectangle, in egui points. The OS may give desktop pixels or points
+/// (PowerShell's DPI awareness); both readings are tried.
+pub(crate) fn monitor_area_of(
+    areas: &[egui::Rect],
+    outer: egui::Rect,
+    pixels_per_point: f32,
+) -> Option<egui::Rect> {
+    let centre = outer.center();
+    let scale = pixels_per_point.max(0.25);
+    areas
+        .iter()
+        .copied()
+        .find(|a| a.contains(centre))
+        .or_else(|| {
+            areas
+                .iter()
+                .map(|a| egui::Rect::from_min_max(a.min / scale, a.max / scale))
+                .find(|a| a.contains(centre))
+        })
 }
 
 /// Outer rectangles for `count` windows in `area`, this window first.
@@ -275,6 +301,9 @@ impl HwpApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             Some(Request::Place(outer)) => place_window(ctx, outer),
+            Some(Request::Minimize) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
             None => {}
         }
     }
@@ -289,16 +318,28 @@ impl HwpApp {
             .unwrap_or_default()
     }
 
-    /// 창 배열: this window and every other one, on the main monitor.
+    /// 창 배열: this window and every other one, in the work area of the monitor this
+    /// window is on (the main monitor's, task bar estimated, when the OS does not say).
     pub(crate) fn arrange_windows(&mut self, ctx: &egui::Context, how: Arrangement) {
         let peers = self.other_windows();
         let screen = ctx
             .input(|i| i.viewport().monitor_size)
             .unwrap_or(egui::vec2(1280.0, 800.0));
-        let area = egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(screen.x, (screen.y - TASK_BAR).max(300.0)),
-        );
+        let outer = ctx.input(|i| i.viewport().outer_rect);
+        let area = outer
+            .and_then(|outer| {
+                monitor_area_of(
+                    &crate::platform::monitor_work_areas(),
+                    outer,
+                    ctx.pixels_per_point(),
+                )
+            })
+            .unwrap_or_else(|| {
+                egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(screen.x, (screen.y - TASK_BAR).max(300.0)),
+                )
+            });
         let rects = arrange(area, peers.len() + 1, how);
         place_window(ctx, rects[0]);
         let mut failed = 0;
@@ -311,6 +352,22 @@ impl HwpApp {
             (0, _) => "다른 창이 없어 이 창만 배열했습니다.".into(),
             (n, 0) => format!("창 {}개를 배열했습니다.", n + 1),
             (n, f) => format!("창 {}개 중 {f}개에 배열을 알리지 못했습니다.", n + 1),
+        };
+    }
+
+    /// 창 배열 ▸ 모두 아이콘으로: minimize this window and every other one.
+    pub(crate) fn minimize_windows(&mut self, ctx: &egui::Context) {
+        let peers = self.other_windows();
+        let mut failed = 0;
+        if let Some(windows) = &self.ext.shell.windows {
+            for peer in &peers {
+                failed += usize::from(windows.send(peer.id, Request::Minimize).is_err());
+            }
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        self.message = match failed {
+            0 => format!("창 {}개를 아이콘으로 줄였습니다.", peers.len() + 1),
+            f => format!("창 {}개 중 {f}개에 알리지 못했습니다.", peers.len() + 1),
         };
     }
 
@@ -445,6 +502,28 @@ mod tests {
             assert_eq!(parse_request(text), None, "{text}");
         }
         assert_eq!(parse_request(" focus\n"), Some(Request::Focus));
+        assert_eq!(parse_request("minimize"), Some(Request::Minimize));
+        // The window on the left monitor arranges there, not on the main one.
+        let areas = [
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1040.0)),
+            egui::Rect::from_min_size(egui::pos2(-1920.0, 0.0), egui::vec2(1920.0, 1040.0)),
+        ];
+        let left = egui::Rect::from_min_size(egui::pos2(-1500.0, 100.0), egui::vec2(800.0, 600.0));
+        assert_eq!(monitor_area_of(&areas, left, 1.0), Some(areas[1]));
+        // A window off every listed area (pixels read as points): the scaled reading.
+        let scaled = [egui::Rect::from_min_size(
+            egui::pos2(3000.0, 0.0),
+            egui::vec2(1500.0, 900.0),
+        )];
+        let at_150 = egui::Rect::from_min_size(egui::pos2(2100.0, 50.0), egui::vec2(400.0, 300.0));
+        assert_eq!(
+            monitor_area_of(&scaled, at_150, 1.5),
+            Some(egui::Rect::from_min_size(
+                egui::pos2(2000.0, 0.0),
+                egui::vec2(1000.0, 600.0)
+            ))
+        );
+        assert_eq!(monitor_area_of(&[], left, 1.0), None);
     }
 
     #[test]

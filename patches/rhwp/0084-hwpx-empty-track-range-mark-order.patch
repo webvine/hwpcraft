@@ -1,0 +1,55 @@
+diff --git a/src/serializer/hwpx/section.rs b/src/serializer/hwpx/section.rs
+index b57646b..7bb2b82 100644
+--- a/src/serializer/hwpx/section.rs
++++ b/src/serializer/hwpx/section.rs
+@@ -1583,7 +1583,9 @@ impl PositionedMarkpens<'_> {
+ /// (UTF-16 위치, `<hp:insertBegin paraend TcId Id/>` 등). 데이터(`TcId`)는
+ /// `trackChange@id` 다. 범위가 문단 나눔을 덮으면 닫는 표지에, 나눔에서 시작하면 여는
+ /// 표지에 `paraend="1"` 을 달고 글 끝에 둔다 (`parser::hwpx::section` 의 읽기와 짝).
+-/// 같은 자리에서는 닫는 표지가 먼저다. 표지 짝의 `Id` 는 문서 안에서 1부터 차례로 준다.
++/// 같은 자리에서는 닫는 표지가 먼저다 — 다만 빈 범위(문단 나눔만 덮는 삽입 등)의 닫는
++/// 표지는 제 여는 표지 뒤다(HwpCraft 0084: 앞에 두면 읽기가 짝 없는 표지 둘로 읽어 범위가
++/// 둘이 된다). 표지 짝의 `Id` 는 문서 안에서 1부터 차례로 준다.
+ fn track_mark_xml(para: &Paragraph, ctx: &mut SerializeContext) -> Vec<(u32, String)> {
+     let break_pos = para.char_count.saturating_sub(1);
+     let mut marks: Vec<(u32, u8, String)> = Vec::new();
+@@ -1610,7 +1612,7 @@ fn track_mark_xml(para: &Paragraph, ctx: &mut SerializeContext) -> Vec<(u32, Str
+         ));
+         marks.push((
+             end,
+-            0,
++            if begin == end { 2 } else { 0 },
+             format!(
+                 r#"<hp:{name}End paraend="{}" TcId="{tc}" Id="{id}"/>"#,
+                 u8::from(end_at_break)
+diff --git a/src/serializer/hwpx/track_changes_tests.rs b/src/serializer/hwpx/track_changes_tests.rs
+index a95e2f2..8786863 100644
+--- a/src/serializer/hwpx/track_changes_tests.rs
++++ b/src/serializer/hwpx/track_changes_tests.rs
+@@ -148,6 +148,26 @@ fn hwpx_track_change_marks_and_records_are_read() {
+     assert_eq!(String::from_utf16_lossy(&name), "검토자");
+ }
+ 
++/// [HwpCraft 0084] 문단 나눔만 덮는 삽입(빈 범위)은 표지 짝 하나로 쓰고 읽는다. 같은 자리에서
++/// 끝나는 삭제(나눔까지)와 함께 있어도 범위가 둘로 갈리지 않는다.
++#[test]
++fn a_paragraph_break_insert_survives_hwpx() {
++    let mut doc = parse_hwpx(&tracked_hwpx()).expect("parse");
++    let para = &mut doc.sections[0].paragraphs[0];
++    para.range_tags.push(crate::model::paragraph::RangeTag {
++        start: para.char_count - 1,
++        end: para.char_count,
++        tag: (16 << 24) | 1,
++    });
++    let back = parse_hwpx(&serialize_hwpx(&doc).expect("save")).expect("reparse");
++    let mut expected = EXPECTED.to_vec();
++    expected.push((16, 1, 14, 14, true));
++    expected.sort();
++    let mut got = tracked_ranges(&back);
++    got.sort();
++    assert_eq!(got, expected);
++}
++
+ #[test]
+ fn hwpx_track_changes_survive_hwpx_and_hwp_saves() {
+     let doc = parse_hwpx(&tracked_hwpx()).expect("parse");

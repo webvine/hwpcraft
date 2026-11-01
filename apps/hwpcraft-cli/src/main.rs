@@ -26,11 +26,18 @@ fn main() -> Result<()> {
         .position(|a| a == "--accept-track-changes")
         .map(|i| args.remove(i))
         .is_some();
-    // `--drop-picture-effects`: save as .hwp without the picture effects HWP
-    // cannot hold yet (refused otherwise).
+    // `--drop-picture-effects`: accepted from older scripts; .hwp now keeps
+    // picture effects, so nothing is dropped.
     let drop_picture_effects = args
         .iter()
         .position(|a| a == "--drop-picture-effects")
+        .map(|i| args.remove(i))
+        .is_some();
+    // `--drop-combo-items`: save a .hwp without the combo box items HWP cannot hold
+    // (refused otherwise).
+    let drop_combo_items = args
+        .iter()
+        .position(|a| a == "--drop-combo-items")
         .map(|i| args.remove(i))
         .is_some();
     let command = args.first().map(String::as_str).unwrap_or("--help");
@@ -44,7 +51,7 @@ fn main() -> Result<()> {
     if command == "--help" {
         println!("  mcp [--automation-read-root DIR] [--automation-write-root DIR] (stdio server)");
         println!(
-            "HwpCraft CLI (옵션: --password <암호>  암호 문서 열기·암호 저장, --accept-track-changes  변경 추적 문서를 결과본으로 합쳐 저장, --drop-picture-effects  그림 효과를 빼고 .hwp로 저장)\n  info <hwp|hwpx>\n  text <hwp|hwpx>\n  convert <input> <output.hwp|hwpx|pdf|txt|docx>\n  render <input> <output.png> [page: 1-based]\n  new <output.hwp|hwpx> [text]\n  edit <input.hwp|hwpx|--new> <commands.json> <output.hwp|hwpx>\n  demo <output-directory>\n  commands\n  --version"
+            "HwpCraft CLI (옵션: --password <암호>  암호 문서 열기·암호 저장, --accept-track-changes  변경 추적 문서를 결과본으로 합쳐 저장, --drop-picture-effects  이전 판 호환(이제 .hwp도 그림 효과를 저장하므로 빼지 않음), --drop-combo-items  .hwp에 담을 수 없는 콤보 상자 목록을 빼고 저장)\n  info <hwp|hwpx>\n  text <hwp|hwpx>\n  convert <input> <output.hwp|hwpx|pdf|txt|docx>\n  render <input> <output.png> [page: 1-based]\n  new <output.hwp|hwpx> [text]\n  edit <input.hwp|hwpx|--new> <commands.json> <output.hwp|hwpx>\n  demo <output-directory>\n  commands\n  --version"
         );
         return Ok(());
     }
@@ -81,7 +88,13 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
-        if drop_picture_effects {
+        if drop_combo_items {
+            let dropped = session.save_dropping_combo_items(path, accept_track_changes)?;
+            if dropped > 0 {
+                eprintln!("콤보 상자 {dropped}개의 목록을 빼고 저장했습니다.");
+            }
+            Ok(())
+        } else if drop_picture_effects {
             let dropped = session.save_dropping_picture_effects(path, accept_track_changes)?;
             if dropped > 0 {
                 eprintln!("그림 효과 {dropped}개를 빼고 저장했습니다.");

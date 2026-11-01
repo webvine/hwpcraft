@@ -442,3 +442,31 @@ fn every_command_documents_its_parameters_and_actions_resolve() {
     );
     assert!(hwpcraft_engine::hwp_action("NoSuchAction").is_none());
 }
+
+/// Statistics count memos (memo fields), and the status bar's column (단) comes
+/// from the page's laid-out column boxes.
+#[test]
+fn statistics_count_memos_and_the_caret_column_is_found() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("메모를 달 문장".into()))?;
+    s.select(at(0, 0), false)?;
+    s.select(at(0, 2), true)?;
+    s.run("memo.create", json!({"text": "확인"}))?;
+    let stats = s.run("document.statistics", json!({}))?;
+    assert_eq!(stats["memos"], 1, "{stats}");
+    assert_eq!(stats["hiddenComments"], 0, "{stats}");
+
+    let columns = s.page_columns(0)?;
+    assert!(!columns.is_empty());
+    let [x, y, w, h] = columns[0].1;
+    assert_eq!(s.column_at(0, x + w / 2.0, y + h / 2.0), 1);
+    // Two equal columns side by side: a point in the right box is column 2.
+    let boxes = [
+        (0, [0.0, 0.0, 100.0, 500.0]),
+        (1, [120.0, 0.0, 100.0, 500.0]),
+    ];
+    assert_eq!(hwpcraft_engine::column_number(&boxes, 150.0, 10.0), 2);
+    assert_eq!(hwpcraft_engine::column_number(&boxes, 110.0, 10.0), 1);
+    assert_eq!(hwpcraft_engine::column_number(&[], 10.0, 10.0), 1);
+    Ok(())
+}

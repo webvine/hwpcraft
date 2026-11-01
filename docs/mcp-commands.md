@@ -101,7 +101,7 @@ python scripts/mcp-command-docs.py ../.build/hwpcraft/release/hwpcraft-cli.exe -
 
 ## 차트 만들기·구성 변경
 
-`chart.create`는 본문에서 `column`·`bar`·`line`·`pie`·`doughnut`·`scatter`·`stock_hlc`·`stock_ohlc`·`column_3d`·`bar_3d`·`pie_3d`를 지원합니다. `chart.types`에서 각 종류의 실제 제약을 먼저 조회하고, 기존 자체 차트는 `chart.definition.get {index}`의 최신 구성과 `generation`으로 편집하세요. 다음은 본문 커서가 준비된 문서의 새 차트 예제입니다. 선택이 있다면 기존 내용을 대체할 수 있으므로 삽입 대상을 먼저 확인하세요.
+`chart.create`는 본문에서 `column`·`bar`·`line`·`pie`·`doughnut`·`scatter`·`stock_hlc`·`stock_ohlc`·`column_3d`·`bar_3d`·`pie_3d`·`combo`·`area`·`radar`·`bubble`(15종)을 지원합니다. `chart.types`에서 각 종류의 실제 제약을 먼저 조회하고, 기존 자체 차트는 `chart.definition.get {index}`의 최신 구성과 `generation`으로 편집하세요. 다음은 본문 커서가 준비된 문서의 새 차트 예제입니다. 선택이 있다면 기존 내용을 대체할 수 있으므로 삽입 대상을 먼저 확인하세요.
 
 ```json
 {"name":"execute","arguments":{"document_id":"<doc>","command":"chart.create","params":{"chart":{"kind":"column","title":"분기 실적","categories":["전반기","후반기"],"series":[{"name":"매출","values":[4,6],"color":"#4472C4"}],"width_mm":120,"height_mm":75,"legend":false}}}}
@@ -109,13 +109,13 @@ python scripts/mcp-command-docs.py ../.build/hwpcraft/release/hwpcraft-cli.exe -
 {"name":"execute","arguments":{"document_id":"<doc>","command":"caret.get","params":{}}}
 ```
 
-생성 결과의 `index`를 사용하고 최신 `generation`으로 자체 차트를 재구성합니다. 아래 `index:0`·세대 42는 예시이며 실제 반환값으로 바꿉니다. `chart`는 부분 patch가 아니라 완전한 교체 정의입니다.
+생성 결과의 `index`를 사용하고 최신 `generation`(생성 결과에는 없으므로 `chart.definition.get {index}`이나 `caret.get`에서 읽음)으로 자체 차트를 재구성합니다. 아래 `index:0`·세대 42는 예시이며 실제 반환값으로 바꿉니다. `chart`는 부분 patch가 아니라 완전한 교체 정의입니다.
 
 ```json
 {"name":"execute","arguments":{"document_id":"<doc>","command":"chart.configure","params":{"index":0,"expected_generation":42,"chart":{"kind":"doughnut","title":"매출 구성","categories":["전반기","후반기"],"series":[{"name":"매출","values":[4,6],"color":"#4472C4"}],"width_mm":120,"height_mm":75,"legend":false}}}}
 ```
 
-`chart.configure`는 본문에 직접 있는 HwpCraft 자체 생성 차트만 받습니다. 다른 지원 차트의 값만 바꾸는 작업은 기존 `chart.data`/`chart.data.get` 계약을 검색하세요. 범주 1–1,000개, 계열 1–64개, 전체 값 16,000개 이내이며 각 계열의 값 수는 범주 수와 같아야 합니다. 원형·도넛은 한 계열·음수 없는 값·양수 합계를 요구합니다. 다른 종류·중첩/그룹 도넛 표시를 지원한다고 해석하지 마세요.
+`chart.configure`는 본문에 직접 있는 HwpCraft 자체 생성 차트만 받습니다. 다른 지원 차트의 값만 바꾸는 작업은 기존 `chart.data`/`chart.data.get` 계약을 검색하세요. 범주 1–1,000개, 계열 1–64개, 전체 값 16,000개 이내이며 각 계열의 값 수는 범주 수와 같아야 합니다. 원형·도넛은 한 계열·음수 없는 값·양수 합계를 요구합니다. 이 15종 밖의 종류·중첩/그룹 도넛 표시를 지원한다고 해석하지 마세요.
 
 새 차트는 실제 내장 OOXML/OLE 데이터를 사용하고 자체 HWP/HWPX 저장·재열기와 PNG/PDF 표시를 검사했습니다. 실제 CLI 종단 검사에는 생성→도넛 구성→값 변경→실패 rollback→왕복·시각 확인이 포함됩니다. 그러나 생성 결과의 **`nativeInterop:"unverified"`**는 그대로 유지합니다. 한컴 아래한글에서 새 차트를 네이티브로 열고 편집하는 호환성 검증은 아직 완료되지 않았습니다.
 
@@ -124,7 +124,7 @@ python scripts/mcp-command-docs.py ../.build/hwpcraft/release/hwpcraft-cli.exe -
 - `picture.effects` {address, shadow|glow|soft_edge|reflection: 객체=설정·null=해제·생략=유지, clear} → effects
 - `picture.effects.get` {address}
 
-단위는 mm·투명도 0–100 %·방향 0–360°·#RRGGBB입니다. 효과가 있는 문서를 .hwp로 저장하는 규칙은 `save_document`의 `dropPictureEffects`를 보세요.
+단위는 mm·투명도 0–100 %·방향 0–360°·#RRGGBB입니다. 효과는 .hwp와 HWPX 저장 모두에 남습니다. `save_document`의 `dropPictureEffects`는 예전 호출을 위해 받기만 하고 아무것도 빼지 않습니다.
 
 ## 그림 넣기·개체 캡션
 
@@ -139,15 +139,17 @@ python scripts/mcp-command-docs.py ../.build/hwpcraft/release/hwpcraft-cli.exe -
 
 - `form.insert` {kind check_box|edit|combo_box|radio_button|push_button, caption?, text?, checked?, items?[](콤보), group?(라디오), name?, width_mm?, height_mm?} → at. 캐럿 자리(본문·표 셀)에 글자처럼 넣고, 값은 form.set으로 고친다. 기본 크기·색·속성은 한글이 새로 넣은 개체의 값(표본 form-01.hwpx).
 - `form.list` {} · `form.get` · `form.set` — 문서의 양식 개체 목록과 값 조회·변경
+- `form.properties.get` {at} — 양식 개체 속성(이름·글·글꼴·색·크기·테두리·사용 가능·인쇄·콤보 목록·라디오 묶음·입력 상자 속성) 조회
+- `form.properties` {at, …} — 같은 키로 속성 고치기(한 번 실행 취소). 콤보 목록은 HWPX에만 저장
 
 ## 메모·댓글
 
-- `memo.create` {text, author?} — 본문이나 표 셀(한 단계)의 선택 범위 또는 캐럿 자리에 메모
-- `memo.reply` {id, text, author?} — 댓글(한글처럼 같은 범위에 중첩한 메모). 캐럿 자리 메모에는 달 수 없음
-- `memo.list` {} → 각 메모의 id, at(본문·셀 주소), anchor, text, author, replyTo(스레드 첫 메모 id, 첫 메모는 null), thread(바깥에서 안쪽 순서 0, 1, 2…)
+- `memo.create` {text, author?} — 본문이나 표 셀(한 단계)의 선택 범위 또는 캐럿 자리에 메모. 같은 구역의 여러 본문 문단에 걸친 선택(`selection.range`)도 됩니다
+- `memo.reply` {id, text, author?} — 댓글(한글처럼 같은 범위에 중첩한 메모). 캐럿 자리 메모와 여러 문단 메모에는 달 수 없음
+- `memo.list` {} → 각 메모의 id, at(본문·셀 주소), anchor, text, author, replyTo(스레드 첫 메모 id, 첫 메모는 null), thread(바깥에서 안쪽 순서 0, 1, 2…). 여러 문단 메모는 start·end가 null이고 spanStart·endAt{section, paragraph, offset}이 있으며 anchor는 문단 사이를 줄 바꿈으로 이은 글
 - `memo.update` {id, text?, author?} · `memo.delete` {id} — 첫 메모를 지우면 댓글도 함께 지우고 removedIds를 돌려줌(실행 취소 한 단계)
 
-메모 해결 상태는 한글에 없는 기능이라 두지 않습니다. 여러 문단에 걸친 메모는 아직 만들 수 없습니다.
+메모 해결 상태는 한글에 없는 기능이라 두지 않습니다. 여러 문단에 걸친 메모는 한글 저장본처럼 첫 문단에 메모 시작을, 마지막 문단에 끝 표식을 둡니다. 끝 표식 바로 앞에서 친 글은 메모 안에 들어갑니다(한 문단 메모는 끝에서 친 글이 메모 밖). 표 셀 사이·구역 사이에 걸친 메모는 만들지 않습니다.
 
 ## 날짜 필드
 
@@ -191,16 +193,16 @@ HWP/HWPX로 저장할 때 문서 만든 시각(없을 때)과 마지막 저장 �
 - `index.mark.list` {} → marks[{section, paragraph, control, first, second, page}] · `index.mark.update` {section, paragraph, control, first?, second?} · `index.mark.delete` {section, paragraph, control}
 - `tools.index` {} — 캐럿 위치(본문)에 색인: 첫소리 묶음 머리 `(ᄀ)`…, `낱말<탭>1, 3`, 둘째 키는 그 아래 `   둘째 키<탭>2`(한글 2024 색인 만들기 기본 모양, 바탕글). 결과 entries·groups·first·paragraphs
 
-한글은 색인을 새 문서에 만들고 HwpCraft는 캐럿 위치에 넣습니다. 다시 부르면 하나 더 넣으므로, 고친 뒤에는 옛 색인 문단을 지우고 다시 만드세요. 쪽 번호는 문서의 실제 쪽 순서입니다. 공개 액션 `IndexMark`·`IndexMarkModify`·`MakeIndex`에 대응합니다.
+한글은 색인을 새 문서에 만들고 HwpCraft는 캐럿 위치에 넣습니다. 색인 문단은 "색인" 스타일(바탕글 모양)로 쓰고, 다시 부르면 캐럿과 상관없이 문서에 있는 색인을 그 자리에서 새로 고칩니다(결과 `updated:true`, 실행 취소 한 단계). 쪽 번호는 문서의 실제 쪽 순서입니다. 공개 액션 `IndexMark`·`IndexMarkModify`·`MakeIndex`에 대응합니다.
 
-## 상호 참조(쪽 번호·표 캡션 번호)
+## 상호 참조(쪽 번호·표와 그림 캡션 번호·개요 번호와 제목)
 
-- `insert.cross_reference` {target: {bookmark: 이름} | {heading: 개요 제목} | {table: n} | {picture: n}, show: "page"|"number"|"caption"} → field_id, text, (page) bookmark·page, (number·caption) table
+- `insert.cross_reference` {target: {bookmark: 이름} | {heading: 개요 제목} | {table: n} | {picture: n}, show: "page"|"number"|"caption"} → field_id, text, (page) bookmark·page, (number·caption) table·picture·heading
 - `tools.cross_reference.update` {} → references, updated, missing, skipped
-- `tools.cross_reference.list` {} → items[{field_id, show, text, section, paragraph, bookmark·page | table·expected}]
+- `tools.cross_reference.list` {} → items[{field_id, show, text, section, paragraph, bookmark·page | table·expected | picture·expected | heading·expected}]
 - `tools.cross_reference.targets` {} → headings[{title, level, page}], tables·pictures[{n, caption, page}], bookmarks[{name, page}]
 
-커서 자리에 대상의 쪽 번호를 한글과 같은 상호 참조 필드(`%xrf`, 책갈피 대상·쪽 번호)로 넣습니다. 표·그림 번호는 본문 순서로 1부터 셉니다. 개요·표·그림 대상에는 그 문단에 `hwpcraft-ref-…` 책갈피를 달아 가리킵니다. 표·그림·책갈피·머리말·쪽 번호 같은 개체가 든 문단과 표 셀 안에는 넣지 않습니다. 넣을 대상과 그 번호(`n`)는 `tools.cross_reference.targets`로 먼저 확인합니다. 쪽이 바뀌는 편집 뒤에는 `tools.cross_reference.update`로 모든 참조를 지금 쪽으로 고칩니다(한 번 실행 취소). HWP·HWPX 저장 후 다시 열어도 필드와 대상이 유지됩니다. 표는 캡션 번호(`show:"number"`, 한글처럼 숫자만 보입니다)와 캡션 전체(`show:"caption"`, 예: "표 1 예산 집행")도 참조합니다. 보고서의 "표 1 참조"는 "표 "를 직접 입력한 뒤 번호 참조를 넣습니다.
+커서 자리에 대상의 쪽 번호를 한글과 같은 상호 참조 필드(`%xrf`, 책갈피 대상·쪽 번호)로 넣습니다. 표·그림 번호는 본문 순서로 1부터 셉니다. 개요·표·그림 대상에는 그 문단에 `hwpcraft-ref-…` 책갈피를 달아 가리킵니다. 본문 문단과 표 셀 문단(한 단계 표)에 넣습니다. 표·그림·책갈피·각주 같은 개체가 든 문단에도 넣지만, 개체 바로 뒤 자리에는 넣지 않으므로 한 글자 떨어진 자리에 넣습니다. 나중에 참조 끝에 개체가 붙으면 새로 고칠 때 그 참조를 건너뛰고 skipped로 알립니다. 날짜 필드(`insert.date_field`)도 같습니다. 넣을 대상과 그 번호(`n`)는 `tools.cross_reference.targets`로 먼저 확인합니다. 쪽이 바뀌는 편집 뒤에는 `tools.cross_reference.update`로 모든 참조를 지금 쪽으로 고칩니다(한 번 실행 취소). HWP·HWPX 저장 후 다시 열어도 필드와 대상이 유지됩니다. 표와 그림은 캡션 번호(`show:"number"`, 한글처럼 숫자만 보입니다)와 캡션 전체(`show:"caption"`, 예: "표 1 예산 집행")도 참조합니다. 보고서의 "표 1 참조"는 "표 "를 직접 입력한 뒤 번호 참조를 넣습니다.
 
 ```json
 {"name":"type_text","arguments":{"document_id":"<doc>","text":"자세한 내용은 표 "}}
@@ -208,7 +210,7 @@ HWP/HWPX로 저장할 때 문서 만든 시각(없을 때)과 마지막 저장 �
 {"name":"type_text","arguments":{"document_id":"<doc>","text":"을 참조하세요."}}
 ```
 
-번호·캡션 참조는 표 자체를 개체 id로 가리킵니다(id가 없거나 겹치면 새로 줍니다). 캡션을 고친 뒤 `tools.cross_reference.update`를 실행하면 새 캡션으로 바뀝니다. HWP 저장본의 명령 문자열과 보이는 글은 한글 2024와 같습니다. 다만 한글이 HWPX 저장본의 이 필드를 번호·캡션 참조로 읽는지는 아직 확인하지 못했습니다. 그림·개요의 번호·제목 참조는 아직 없습니다.
+번호·캡션 참조는 표·그림 자체를 개체 id로 가리킵니다(id가 없거나 겹치면 새로 줍니다). 명령 문자열은 한컴 공개 ActionCrossRef 규격대로 표가 `?#id;0;1;0;0`, 그림이 `?#id;1;1;0;0`입니다(셋째 칸 1 = 번호, 2 = 캡션). 캡션을 고친 뒤 `tools.cross_reference.update`를 실행하면 새 캡션으로 바뀝니다. 표 참조의 HWP 명령 문자열과 보이는 글은 한글 2024에서 확인했습니다. 그림 참조는 같은 규격을 따랐지만 한글에서 직접 확인하지는 못했고, 한글이 HWPX 저장본의 번호·캡션 참조 필드를 그렇게 읽는지도 아직 확인하지 못했습니다. 개요는 `{"heading": "제목 글자"}`와 `show:"number"`(보이는 번호, 예 "2.")·`show:"caption"`(제목 글)로 참조합니다. 한글 2024 실측대로 그 개요 문단의 id(`?#<문단 id>;5;1|2;0;0`)로 가리키며, 문단에 id가 없거나 겹치면 새로 줍니다. 개요 문단이어야 하며(본문 문단은 한글도 "?"를 보임), HWPX 저장은 RHWP 0069가 문단 id를 지켜야 이어집니다.
 
 ## 선택·배치 좌표·문맥 편집
 
@@ -284,7 +286,7 @@ HWP/HWPX로 저장할 때 문서 만든 시각(없을 때)과 마지막 저장 �
 
 ## 덧말·첫 글자 장식·그림 글머리표
 
-- `format.ruby` {text, position?: top|bottom, align?, size?} — 본문 한 문단 안 선택 글자에 덧말. `format.ruby.list` {} → 캐럿 문단의 덧말(control 번호), `format.ruby.update` {control, …바꿀 것}, `format.ruby.delete` {control}(기준 글은 본문 글자로 되돌림)
+- `format.ruby` {text, position?: top|bottom, align?, size?} — 본문 또는 표 셀의 한 문단 안 선택 글자에 덧말. `format.ruby.list` {} → 캐럿 문단의 덧말(control 번호), `format.ruby.update` {control, …바꿀 것}, `format.ruby.delete` {control}(기준 글은 그 문단 글자로 되돌림)
 - `format.drop_cap` {style: double|triple|margin|none, font?, gap_mm?} — 캐럿 문단 첫 글자 장식(첫 글자를 테두리 없는 글상자로 옮김, none은 되돌림)
 - `format.bullet.picture` {path, level?} — PNG·JPG·BMP·GIF(1 MB·512픽셀 이하)를 캐럿·선택 문단의 그림 글머리표로
 
@@ -314,7 +316,9 @@ HWP/HWPX로 저장할 때 문서 만든 시각(없을 때)과 마지막 저장 �
 ## 문서마당·변경 추적 문서
 
 - `file.template.save` {name} — 지금 문서를 사용자 서식(설정 폴더 `templates/`, HWPX·암호 문서는 HWP)으로 저장. `file.template.list` {} · `file.template.new` {name, force?}(사본을 새 문서로 엶) · `file.template.delete` {name}
-- `document.track_changes` {} → tracked, authors·changes·ranges(HWP), marks(HWPX). 변경 추적 기록이 있으면 HWP/HWPX 저장은 기본 거절이고 `save_document`의 `acceptTrackChanges:true`로만(결과본으로 합침) 저장합니다
+- `document.track_changes` {} → tracked, recording, authors·changes·ranges(HWP), marks(HWPX), keptOnHwpSave·keptOnHwpxSave, list(본문과 표 셀의 변경마다 change 번호·kind insert/delete/format·section·paragraph·cell·start·end·text·author·date·paragraphBreak, 1000개까지, listTruncated). HWP·HWPX 저장은 고쳤든 아니든 변경 추적 기록을 그대로 둡니다: 고치지 않은 HWP는 원본 바이트대로, 고친 HWP는 모든 변경을 적용한 결과본을 BodyText에, 변경 표시본을 ViewText에 쓰고, HWPX는 insertBegin·deleteBegin 표식과 헤더의 변경·작성자 목록을 씁니다(save_document 결과의 trackChangesKept). DOCX·쪽/블록 저장·암호를 건 HWP는 기록을 담지 못해 기본 거절이고, `acceptTrackChanges:true`면 모든 변경을 적용한 결과본으로 저장합니다. 화면·PNG·PDF는 삽입한 글에 파란 밑줄, 삭제한 글에 빨간 취소선, 서식 변경에 초록 밑줄을 긋습니다. HWPX 표식은 OWPML 명세 기반이며 실표본으로는 확인하지 못했습니다
+- `document.track_changes.accept` {change | all:true} — 변경 적용: 삽입은 남기고 삭제한 글(덮은 문단 나눔 포함)은 지움, 서식 변경은 지금 서식으로 확정. `document.track_changes.reject` {change | all:true} — 변경 취소: 삽입한 글은 지우고 삭제한 글은 되살림. 서식 변경은 옛 서식을 몰라 취소하지 못하고 unsupported로 셉니다. 결과 resolved·remaining·unsupported·tracked, 남은 변경이 없으면 변경 추적 기록도 지우며 한 번에 되돌립니다
+- `document.track_changes.record` {on, author?} — 변경 추적 기록 켜기·끄기(한글 검토 ▸ 변경 추적). 켜면 본문과 표 셀의 글자 입력·지우기·문단 나누기·합치기를 변경으로 기록합니다(넣은 글은 삽입, 지운 글은 삭제 표시로 남김, 이번 기록에서 넣은 글을 지우면 바로 지움, 같은 작성자·같은 분의 편집은 변경 하나로 묶음). 기록 중에는 그 밖의 편집(서식·개체·표 구조·구역·서식 있는 붙여넣기·수정 모드 입력)은 이유와 함께 거절합니다. 켜짐 상태는 파일에 저장하지 않습니다
 
 ## 공개 한글 동작과 ParameterSet
 

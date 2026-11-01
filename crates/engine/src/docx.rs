@@ -19,7 +19,7 @@ impl Session {
             bail!("DOCX 저장 파일 이름은 .docx로 끝나야 합니다.");
         }
         if accept_track_changes {
-            self.drop_track_changes();
+            self.accept_all_track_changes()?;
         }
         self.refuse_tracked_save(path)?;
         hwpcraft_formats::file_access::check_write(&path.to_string_lossy())

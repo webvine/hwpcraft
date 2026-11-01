@@ -4,7 +4,7 @@
 use rmcp::{
     ErrorData, RoleServer,
     model::{
-        ClientJsonRpcMessage, ClientRequest, GetMeta, ProtocolVersion, RequestId,
+        ClientJsonRpcMessage, ClientRequest, GetExtensions, GetMeta, ProtocolVersion, RequestId,
         ServerJsonRpcMessage,
     },
     transport::Transport,
@@ -32,8 +32,25 @@ enum Pending {
     Queued(oneshot::Receiver<io::Result<()>>),
 }
 
+/// Which lifecycle a connection uses, decided by its first request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    Undecided,
+    /// 2025-era: `initialize`, then `notifications/initialized`; the SDK negotiates
+    /// the version and keeps the client's capabilities for the connection.
+    Initialized,
+    /// 2026-07-28: stateless, every request carries its protocol `_meta`.
+    Stateless,
+}
+
 pub(crate) struct StrictStdio<R> {
     subscription_shutdown: CancellationToken,
+    lifecycle: Lifecycle,
+    /// Read order of the next `tools/call` ([`crate::admission::Arrival`]), the
+    /// connection's gate, and the numbers of calls not yet answered by request id.
+    next_call: u64,
+    admission: std::sync::Arc<crate::admission::Admission>,
+    unanswered: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
     read: BufReader<R>,
     line: Vec<u8>,
     discarding: bool,
@@ -66,6 +83,10 @@ where
     tokio::spawn(write_actor(write, receiver));
     StrictStdio {
         subscription_shutdown,
+        lifecycle: Lifecycle::Undecided,
+        next_call: 0,
+        admission: Default::default(),
+        unanswered: Default::default(),
         read: BufReader::new(read),
         line: Vec::new(),
         discarding: false,
@@ -87,9 +108,19 @@ fn broken_pipe() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "MCP output is closed")
 }
 
-// The SDK's bootstrap loop accepts legacy ping before selecting a lifecycle.
-// This server deliberately supports only stateless, inline-metadata requests.
-// Validate that boundary before the SDK can take its legacy bootstrap branch.
+/// Does this first request open a 2025-era connection? An `initialize` naming a
+/// version that still has the handshake does (the SDK answers with that version
+/// when it is supported, else the newest supported one that has a handshake).
+/// An `initialize` naming 2026-07-28 or later is a malformed modern request.
+fn opens_initialized_lifecycle(message: &ClientJsonRpcMessage) -> bool {
+    matches!(message, ClientJsonRpcMessage::Request(request)
+        if matches!(&request.request, ClientRequest::InitializeRequest(initialize)
+            if initialize.params.protocol_version.has_initialize()))
+}
+
+// A 2026-07-28 connection is stateless with inline metadata on every request.
+// Validate that boundary before the SDK can take its legacy bootstrap branch
+// (it accepts a legacy ping before selecting a lifecycle).
 fn modern_request_error(message: &ClientJsonRpcMessage) -> Option<ErrorData> {
     let ClientJsonRpcMessage::Request(request) = message else {
         return None;
@@ -138,6 +169,18 @@ fn modern_request_error(message: &ClientJsonRpcMessage) -> Option<ErrorData> {
         ));
     }
     None
+}
+
+/// Let the calls read after this request id go (its answer is out or it was
+/// cancelled). Releasing a number twice is harmless.
+fn release(
+    admission: &crate::admission::Admission,
+    unanswered: &std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    key: &str,
+) {
+    if let Some(number) = unanswered.lock().ok().and_then(|mut map| map.remove(key)) {
+        admission.release(number);
+    }
 }
 
 async fn write_actor<W: AsyncWrite + Unpin>(mut write: W, mut jobs: mpsc::Receiver<WriteJob>) {
@@ -269,6 +312,41 @@ impl<R: AsyncRead + Send + Unpin + 'static> StrictStdio<R> {
         Ok(())
     }
 
+    /// Number each `tools/call` in read order, for the admission gate.
+    fn stamp(&mut self, mut message: ClientJsonRpcMessage) -> ClientJsonRpcMessage {
+        match &mut message {
+            ClientJsonRpcMessage::Request(request)
+                if matches!(request.request, ClientRequest::CallToolRequest(_)) =>
+            {
+                let number = self.next_call;
+                self.next_call += 1;
+                request
+                    .request
+                    .extensions_mut()
+                    .insert(crate::admission::Arrival {
+                        number,
+                        admission: self.admission.clone(),
+                    });
+                if let (Ok(key), Ok(mut unanswered)) =
+                    (serde_json::to_string(&request.id), self.unanswered.lock())
+                {
+                    unanswered.insert(key, number);
+                }
+            }
+            // A call cancelled before the SDK starts it never reaches the gate.
+            ClientJsonRpcMessage::Notification(notification) => {
+                if let Ok(value) = serde_json::to_value(&notification.notification)
+                    && value["method"] == "notifications/cancelled"
+                    && let Ok(key) = serde_json::to_string(&value["params"]["requestId"])
+                {
+                    release(&self.admission, &self.unanswered, &key);
+                }
+            }
+            _ => {}
+        }
+        message
+    }
+
     fn error(&mut self, error: ErrorData, id: Option<RequestId>) -> io::Result<()> {
         self.pending = Some(Pending::Unqueued(encode(&ServerJsonRpcMessage::error(
             error, id,
@@ -284,6 +362,13 @@ impl<R: AsyncRead + Send + Unpin + 'static> Transport<RoleServer> for StrictStdi
         &mut self,
         message: ServerJsonRpcMessage,
     ) -> impl Future<Output = io::Result<()>> + Send + 'static {
+        // An answered call no longer holds the ones read after it.
+        if let ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_) = &message
+            && let Ok(value) = serde_json::to_value(&message)
+            && let Ok(key) = serde_json::to_string(&value["id"])
+        {
+            release(&self.admission, &self.unanswered, &key);
+        }
         let bytes = encode(&message);
         let writer = self.writer.clone();
         async move {
@@ -341,10 +426,26 @@ impl<R: AsyncRead + Send + Unpin + 'static> Transport<RoleServer> for StrictStdi
                                 serde_json::from_value::<RequestId>(id.clone()).ok()
                             });
                             match serde_json::from_value::<ClientJsonRpcMessage>(value) {
-                                Ok(message) => match modern_request_error(&message) {
-                                    Some(error) => self.error(error, id),
-                                    None => return Some(message),
-                                },
+                                Ok(message) => {
+                                    if self.lifecycle == Lifecycle::Undecided
+                                        && matches!(message, ClientJsonRpcMessage::Request(_))
+                                    {
+                                        self.lifecycle = if opens_initialized_lifecycle(&message) {
+                                            Lifecycle::Initialized
+                                        } else {
+                                            Lifecycle::Stateless
+                                        };
+                                    }
+                                    // The SDK enforces the 2025 lifecycle itself.
+                                    let error = match self.lifecycle {
+                                        Lifecycle::Initialized => None,
+                                        _ => modern_request_error(&message),
+                                    };
+                                    match error {
+                                        Some(error) => self.error(error, id),
+                                        None => return Some(self.stamp(message)),
+                                    }
+                                }
                                 Err(_) => self
                                     .error(ErrorData::invalid_request("Invalid request", None), id),
                             }
@@ -391,15 +492,30 @@ mod legacy_initialize_tests {
         modern_request_error(&message)
     }
 
+    fn opens(body: serde_json::Value) -> bool {
+        serde_json::from_value::<ClientJsonRpcMessage>(body)
+            .is_ok_and(|message| opens_initialized_lifecycle(&message))
+    }
+
     #[test]
-    fn a_2025_initialize_learns_the_supported_version() {
-        let error = rejection(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-            "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"legacy","version":"1"}}}))
-        .expect("legacy initialize must be rejected");
-        assert_eq!(error.code.0, -32022);
-        let data = error.data.expect("versions");
-        assert_eq!(data["requested"], "2025-11-25");
-        assert_eq!(data["supported"], serde_json::json!(["2026-07-28"]));
+    fn a_2025_initialize_opens_the_initialized_lifecycle() {
+        for version in ["2025-03-26", "2025-06-18", "2025-11-25", "2024-11-05"] {
+            assert!(
+                opens(
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":version,"capabilities":{},"clientInfo":{"name":"legacy","version":"1"}}})
+                ),
+                "{version}"
+            );
+        }
+        // 2026-07-28 has no handshake; other requests do not open one either.
+        assert!(!opens(
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"x","version":"1"}}})
+        ));
+        assert!(!opens(
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+        ));
     }
 
     #[test]

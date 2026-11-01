@@ -1,0 +1,328 @@
+diff --git a/src/document_core/queries/cursor_rect.rs b/src/document_core/queries/cursor_rect.rs
+index 36c7339..a6096b9 100644
+--- a/src/document_core/queries/cursor_rect.rs
++++ b/src/document_core/queries/cursor_rect.rs
+@@ -395,6 +395,11 @@ impl DocumentCore {
+         };
+         use crate::renderer::render_tree::{RenderNode, RenderNodeType};
+ 
++        // [HwpCraft 0090] 세로쓰기 구역은 열 자리로 잰다.
++        if let Some(rect) = self.vertical_cursor_rect(section_idx, para_idx, char_offset) {
++            return Ok(rect);
++        }
++
+         // 문단이 포함된 페이지 찾기 — [#4179] 텍스트가 렌더될 수 없는
+         // 순수-중간 연속 컷 페이지는 후보에서 제외 (스캔 순서·결과 좌표 불변)
+         let pages = self.find_text_scan_pages_for_paragraph(section_idx, para_idx)?;
+@@ -1547,6 +1552,11 @@ impl DocumentCore {
+         use crate::renderer::layout::{CellContext, CellPathEntry};
+         use crate::renderer::render_tree::{RenderNode, RenderNodeType};
+ 
++        // [HwpCraft 0090] 세로쓰기 구역의 쪽은 열 자리로 찾는다.
++        if let Some(hit) = self.vertical_hit_test(page_num, x, y) {
++            return Ok(hit);
++        }
++
+         let tree = self.build_page_tree_cached(page_num)?;
+ 
+         // 문자 위치를 미리 계산한 TextRun 정보
+diff --git a/src/document_core/queries/mod.rs b/src/document_core/queries/mod.rs
+index 3a1f8c1..86db666 100644
+--- a/src/document_core/queries/mod.rs
++++ b/src/document_core/queries/mod.rs
+@@ -1,6 +1,7 @@
+ mod bookmark_query;
+ mod cursor_nav;
+ mod cursor_rect;
++mod vertical_cursor;
+ pub(crate) mod doc_tree_nav;
+ /// [#3828] `explain` 명령 전용 집계(각주/미주 개수) — 다른 조회가 채우지 못하는 구멍.
+ pub mod explain;
+diff --git a/src/document_core/queries/vertical_cursor.rs b/src/document_core/queries/vertical_cursor.rs
+new file mode 100644
+index 0000000..7ba5ab5
+--- /dev/null
++++ b/src/document_core/queries/vertical_cursor.rs
+@@ -0,0 +1,227 @@
++//! [HwpCraft 0090] 세로쓰기 구역의 캐럿과 누른 자리.
++//!
++//! 세로 구역의 본문은 열로 그린다(HwpCraft 0089). 가로 캐럿 계산(렌더 트리의 글자 x
++//! 경계)은 그 열에 맞지 않으므로, 세로 구역은 그리기와 같은 열 자리
++//! (`vertical_page_columns`)와 열 안 글자 경계(`vertical_line_offsets`)로 바로 잰다.
++//! 캐럿은 열을 가로지르는 막대다: `x`·`width` 가 열, `y` 가 글자 위 끝이고 `vertical: true`.
++
++use crate::document_core::DocumentCore;
++use crate::renderer::layout::{vertical_line_offsets, vertical_page_columns, VerticalColumn};
++use crate::renderer::pagination::{PageContent, PageItem};
++
++impl DocumentCore {
++    /// 세로 구역 `section_idx` 의 쪽 가운데 `keep` 이 고른 쪽들: (전역 쪽 번호, 그 쪽의 열들).
++    /// 열은 고른 쪽에서만 만든다 — 긴 문서에서 캐럿 질의마다 모든 쪽을 다시 재지 않는다.
++    fn vertical_section_pages(
++        &self,
++        section_idx: usize,
++        keep: impl Fn(u32, &PageContent) -> bool,
++    ) -> Vec<(u32, Vec<VerticalColumn>)> {
++        let Some(result) = self.pagination.get(section_idx) else {
++            return Vec::new();
++        };
++        let first: u32 = self.pagination[..section_idx]
++            .iter()
++            .map(|r| r.pages.len() as u32)
++            .sum();
++        let paragraphs = self.section_render_paragraphs(section_idx);
++        let composed = self.section_render_composed(section_idx);
++        result
++            .pages
++            .iter()
++            .enumerate()
++            .filter(|(i, page)| keep(first + *i as u32, page))
++            .map(|(i, page)| {
++                (
++                    first + i as u32,
++                    vertical_page_columns(
++                        page,
++                        paragraphs,
++                        composed,
++                        &page.layout.body_area,
++                        self.dpi,
++                    ),
++                )
++            })
++            .collect()
++    }
++
++    fn section_is_vertical(&self, section_idx: usize) -> Option<u8> {
++        self.document
++            .sections
++            .get(section_idx)
++            .map(|s| s.section_def.text_direction)
++            .filter(|&d| d != 0)
++    }
++
++    /// 열 안 글자 `char_offset` 의 위 끝 y(열 위에서 잰 거리).
++    fn vertical_offset_in(
++        &self,
++        section_idx: usize,
++        col: &VerticalColumn,
++        char_offset: usize,
++    ) -> f64 {
++        let direction = self.section_is_vertical(section_idx).unwrap_or(1);
++        let composed = self.section_render_composed(section_idx);
++        let Some(line) = composed
++            .get(col.para_index)
++            .and_then(|c| c.lines.get(col.line_index))
++        else {
++            return 0.0;
++        };
++        let offsets = vertical_line_offsets(line, &self.styles, direction);
++        let k = char_offset.saturating_sub(col.char_start);
++        offsets.get(k).or(offsets.last()).copied().unwrap_or(0.0)
++    }
++
++    /// 세로 구역이면 캐럿 사각형 JSON, 아니면 `None`.
++    pub(crate) fn vertical_cursor_rect(
++        &self,
++        section_idx: usize,
++        para_idx: usize,
++        char_offset: usize,
++    ) -> Option<String> {
++        self.section_is_vertical(section_idx)?;
++        // 그 문단이 든 쪽만.
++        let pages = self.vertical_section_pages(section_idx, |_, page| {
++            page.column_contents
++                .iter()
++                .flat_map(|c| &c.items)
++                .any(|item| {
++                    matches!(item,
++                    PageItem::FullParagraph { para_index }
++                    | PageItem::PartialParagraph { para_index, .. } if *para_index == para_idx)
++                })
++        });
++        let found = pages.iter().find_map(|(page, cols)| {
++            cols.iter()
++                .find(|c| {
++                    c.para_index == para_idx
++                        && c.char_start <= char_offset
++                        && (char_offset < c.char_end || (c.last_line && char_offset == c.char_end))
++                })
++                .map(|c| (*page, *c))
++        });
++        // 열 끝 자리(다음 열의 시작과 같은 위치)는 다음 열 맨 위로 본다.
++        let (page, col) = found.or_else(|| {
++            pages.iter().find_map(|(page, cols)| {
++                cols.iter()
++                    .filter(|c| c.para_index == para_idx)
++                    .last()
++                    .map(|c| (*page, *c))
++            })
++        })?;
++        let y = col.top + self.vertical_offset_in(section_idx, &col, char_offset);
++        Some(format!(
++            "{{\"pageIndex\":{},\"x\":{:.1},\"y\":{:.1},\"height\":{:.1},\"width\":{:.1},\"vertical\":true}}",
++            page, col.x, y, 1.0, col.width
++        ))
++    }
++
++    /// 세로 구역 쪽이면 누른 자리 JSON(`hit_test_native` 와 같은 꼴), 아니면 `None`.
++    pub(crate) fn vertical_hit_test(&self, page_num: u32, x: f64, y: f64) -> Option<String> {
++        let mut first = 0u32;
++        let mut section_idx = None;
++        for (i, result) in self.pagination.iter().enumerate() {
++            let n = result.pages.len() as u32;
++            if page_num < first + n {
++                section_idx = Some(i);
++                break;
++            }
++            first += n;
++        }
++        let section_idx = section_idx?;
++        self.section_is_vertical(section_idx)?;
++        let pages = self.vertical_section_pages(section_idx, |p, _| p == page_num);
++        let (_, cols) = pages.into_iter().next()?;
++        // 누른 x 를 품은 열, 없으면 가장 가까운 열.
++        let col = cols
++            .iter()
++            .min_by(|a, b| {
++                let d = |c: &VerticalColumn| {
++                    if x < c.x {
++                        c.x - x
++                    } else {
++                        (x - c.x - c.width).max(0.0)
++                    }
++                };
++                d(a).total_cmp(&d(b))
++            })
++            .copied()?;
++        let direction = self.section_is_vertical(section_idx).unwrap_or(1);
++        let composed = self.section_render_composed(section_idx);
++        let line = composed.get(col.para_index)?.lines.get(col.line_index)?;
++        let offsets = vertical_line_offsets(line, &self.styles, direction);
++        let along = y - col.top;
++        let mut k = 0usize;
++        while k + 1 < offsets.len() && along > (offsets[k] + offsets[k + 1]) / 2.0 {
++            k += 1;
++        }
++        let max = if col.last_line {
++            col.char_end
++        } else {
++            col.char_end.saturating_sub(1).max(col.char_start)
++        };
++        let offset = (col.char_start + k).min(max);
++        let caret_y = col.top + offsets.get(offset - col.char_start).copied().unwrap_or(0.0);
++        Some(format!(
++            "{{\"sectionIndex\":{},\"paragraphIndex\":{},\"charOffset\":{},\"cursorRect\":{{\"pageIndex\":{},\"x\":{:.1},\"y\":{:.1},\"height\":{:.1},\"width\":{:.1},\"vertical\":true}}}}",
++            section_idx, col.para_index, offset, page_num, col.x, caret_y, 1.0, col.width
++        ))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use crate::document_core::DocumentCore;
++    use crate::model::control::Control;
++
++    fn vertical(text: &str) -> DocumentCore {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        let mut doc = core.document().clone();
++        doc.sections[0].raw_stream = None;
++        doc.sections[0].section_def.text_direction = 1;
++        for control in doc.sections[0]
++            .paragraphs
++            .iter_mut()
++            .flat_map(|p| p.controls.iter_mut())
++        {
++            if let Control::SectionDef(sd) = control {
++                sd.text_direction = 1;
++            }
++        }
++        core.set_document(doc);
++        core.insert_text_native(0, 0, 0, text).unwrap();
++        core
++    }
++
++    fn json(s: &str) -> serde_json::Value {
++        serde_json::from_str(s).unwrap()
++    }
++
++    /// 세로 캐럿은 열을 가로지르고, 누른 자리는 열과 글자 위치로 찾는다(HwpCraft 0090).
++    #[test]
++    fn vertical_caret_and_hit_test_follow_the_columns() {
++        let core = vertical(&"가".repeat(60));
++        let first = json(&core.get_cursor_rect_native(0, 0, 0).unwrap());
++        let second = json(&core.get_cursor_rect_native(0, 0, 1).unwrap());
++        let next_column = json(&core.get_cursor_rect_native(0, 0, 58).unwrap());
++        assert_eq!(first["vertical"], true);
++        assert_eq!(first["x"], second["x"]);
++        assert!(second["y"].as_f64() > first["y"].as_f64());
++        assert!(next_column["x"].as_f64() < first["x"].as_f64());
++        assert_eq!(next_column["y"], first["y"]);
++        // 둘째 글자의 가운데를 누르면 그 글자 앞이나 뒤(1 또는 2).
++        let x = first["x"].as_f64().unwrap() + first["width"].as_f64().unwrap() / 2.0;
++        let y = second["y"].as_f64().unwrap() + 2.0;
++        let hit = json(&core.hit_test_native(0, x, y).unwrap());
++        assert_eq!(hit["charOffset"], 1, "{hit}");
++        let hit = json(
++            &core
++                .hit_test_native(0, next_column["x"].as_f64().unwrap() + 1.0, y)
++                .unwrap(),
++        );
++        assert_eq!(hit["charOffset"], 59, "{hit}");
++    }
++}
+diff --git a/src/renderer/layout.rs b/src/renderer/layout.rs
+index 90a588a..7a71c52 100644
+--- a/src/renderer/layout.rs
++++ b/src/renderer/layout.rs
+@@ -3725,6 +3725,8 @@ mod table_partial;
+ mod text_measurement;
+ mod utils;
+ mod vertical_body;
++// [HwpCraft 0090] 세로 구역 캐럿·누른 자리가 그리기와 같은 열 자리를 쓴다.
++pub(crate) use vertical_body::{vertical_line_offsets, vertical_page_columns, VerticalColumn};
+ 
+ pub(crate) use paragraph_layout::ensure_min_baseline;
+ pub(crate) use paragraph_layout::ruby_text_styles;
+diff --git a/src/renderer/layout/vertical_body.rs b/src/renderer/layout/vertical_body.rs
+index f4b9394..c5af86b 100644
+--- a/src/renderer/layout/vertical_body.rs
++++ b/src/renderer/layout/vertical_body.rs
+@@ -6,9 +6,10 @@
+ //! [`vertical_char_advance`] 만큼 내려간다 — 줄 나눔이 쓰는 길이와 같다. 세워 그리는 글자
+ //! (한글·한자, 영문 세움의 영문·숫자)는 열 가운데에, 눕혀 그리는 글자(영문 눕힘의 영문·숫자,
+ //! 괄호·줄표 등)는 90도 돌려 그린다(세로 형태 문자가 있으면 그 문자). 표·그림·각주 같은
+-//! 개체는 아직 그리지 않는다(README 한계).
++//! 개체는 아직 그리지 않는다(README 한계). 열의 자리(`vertical_page_columns`)와 열 안 글자
++//! 경계(`vertical_line_offsets`)는 캐럿·누른 자리 찾기(HwpCraft 0090)도 같이 쓴다.
+ 
+-use super::super::composer::ComposedParagraph;
++use super::super::composer::{ComposedLine, ComposedParagraph};
+ use super::super::hwpunit_to_px;
+ use super::super::page_layout::{LayoutRect, PageLayoutInfo};
+ use super::super::pagination::{PageContent, PageItem};
+@@ -91,6 +92,24 @@ pub(crate) fn vertical_page_columns(
+     columns
+ }
+ 
++/// 열 안 글자 경계: 글자 i 의 위 끝(열 위에서 잰 거리), 마지막은 열의 글자 끝. 글자 수 + 1 개.
++pub(crate) fn vertical_line_offsets(
++    line: &ComposedLine,
++    styles: &ResolvedStyleSet,
++    text_direction: u8,
++) -> Vec<f64> {
++    let mut offsets = vec![0.0];
++    let mut y = 0.0;
++    for run in &line.runs {
++        let style = run.text_style(styles);
++        for ch in run.text.chars() {
++            y += vertical_char_advance(ch, &style, text_direction);
++            offsets.push(y);
++        }
++    }
++    offsets
++}
++
+ /// 세로 열에서 글자 하나를 어떻게 그리는가: (그릴 글자, 회전 각, 글자 상자 너비).
+ pub(crate) fn vertical_glyph(ch: char, font_size: f64, text_direction: u8) -> (char, f64, f64) {
+     let rotate = is_vertical_rotate_char(ch)

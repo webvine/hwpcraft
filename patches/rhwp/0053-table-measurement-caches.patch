@@ -1,0 +1,140 @@
+diff --git a/src/renderer/height_measurer.rs b/src/renderer/height_measurer.rs
+index 741096c..26ed3c7 100644
+--- a/src/renderer/height_measurer.rs
++++ b/src/renderer/height_measurer.rs
+@@ -4816,12 +4816,15 @@ impl HeightMeasurer {
+                 };
+             }
+         }
++        // 측정 셀마다 표 전체를 찾지 않도록 (행, 열)의 첫 셀을 한 번 색인한다.
++        let mut cell_at = std::collections::HashMap::with_capacity(table.cells.len());
++        for cell in &table.cells {
++            cell_at
++                .entry((cell.row as usize, cell.col as usize))
++                .or_insert(cell);
++        }
+         for mc in &mut measured_cells {
+-            let Some(cell) = table
+-                .cells
+-                .iter()
+-                .find(|c| c.row as usize == mc.row && c.col as usize == mc.col)
+-            else {
++            let Some(&cell) = cell_at.get(&(mc.row, mc.col)) else {
+                 continue;
+             };
+             let wrap_bottom = self.cell_wrap_objects_bottom_height(&cell.paragraphs);
+diff --git a/src/renderer/layout.rs b/src/renderer/layout.rs
+index 803dbfb..6ece00e 100644
+--- a/src/renderer/layout.rs
++++ b/src/renderer/layout.rs
+@@ -3685,6 +3685,11 @@ pub struct LayoutEngine {
+     /// `cell_units_uncached` 안에서 계산되어 52,694 셀 표에서 O(셀²)(≈28억) 로 폭증했다.
+     /// `cell_units_cache` 와 동일 조판 경계에서 clear 한다.
+     table_nested_text_flag_cache: std::cell::RefCell<std::collections::HashMap<usize, bool>>,
++    /// 중첩 표 본체 높이 — (표 주소, 스타일 주소, 선언 높이 신뢰 여부) 키. 신뢰 여부는
++    /// 조각 렌더 동안 꺼지는 `declared_trust_allowed` 이며 높이 계산이 그것을 읽는다.
++    /// `cell_units_cache` 와 같은 경계에서 비우고, 셀 편집 무효화 때는 통째로 비운다.
++    nested_table_body_height_cache:
++        std::cell::RefCell<std::collections::HashMap<(usize, usize, bool), f64>>,
+     /// [#4149] 셀 커서 fast path 프로브 차단 스캔(개요/번호 문단·AutoNumber 컨트롤
+     /// 보유 여부)의 표 포인터 키 메모 — 거대 표 서브트리 재스캔 방지.
+     /// `cell_units_cache` 와 동일 조판 경계에서 clear 한다.
+@@ -3811,6 +3816,9 @@ impl LayoutEngine {
+             declared_trust_allowed: std::cell::Cell::new(true),
+             cell_units_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+             table_nested_text_flag_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
++            nested_table_body_height_cache: std::cell::RefCell::new(
++                std::collections::HashMap::new(),
++            ),
+             cursor_probe_block_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+             single_line_overflow_cache: Default::default(),
+             #[cfg(test)]
+@@ -3823,6 +3831,7 @@ impl LayoutEngine {
+     pub fn clear_layout_caches(&self) {
+         self.cell_units_cache.borrow_mut().clear();
+         self.table_nested_text_flag_cache.borrow_mut().clear();
++        self.nested_table_body_height_cache.borrow_mut().clear();
+         self.cursor_probe_block_cache.borrow_mut().clear();
+         self.single_line_overflow_cache.clear();
+     }
+diff --git a/src/renderer/layout/table_layout.rs b/src/renderer/layout/table_layout.rs
+index 9921e15..4d1f2ac 100644
+--- a/src/renderer/layout/table_layout.rs
++++ b/src/renderer/layout/table_layout.rs
+@@ -9320,6 +9320,28 @@ impl LayoutEngine {
+         &self,
+         table: &crate::model::table::Table,
+         styles: &ResolvedStyleSet,
++    ) -> f64 {
++        // 같은 중첩 표의 높이를 분할 판정마다 다시 묻는다. 행 높이 해석 전체를 다시
++        // 하지 않도록 표 단위로 한 번만 계산한다(`cell_units_cache` 와 같은 수명).
++        let key = (
++            table as *const crate::model::table::Table as usize,
++            styles as *const ResolvedStyleSet as usize,
++            self.declared_trust_allowed.get(),
++        );
++        if let Some(&height) = self.nested_table_body_height_cache.borrow().get(&key) {
++            return height;
++        }
++        let height = self.nested_table_body_height_uncached(table, styles);
++        self.nested_table_body_height_cache
++            .borrow_mut()
++            .insert(key, height);
++        height
++    }
++
++    fn nested_table_body_height_uncached(
++        &self,
++        table: &crate::model::table::Table,
++        styles: &ResolvedStyleSet,
+     ) -> f64 {
+         let col_count = table.col_count as usize;
+         let row_count = table.row_count as usize;
+@@ -10843,6 +10865,8 @@ impl LayoutEngine {
+         local_after: bool,
+         unit_fingerprint_unchanged: bool,
+     ) {
++        // 편집한 셀을 품은 중첩 표의 높이가 바뀔 수 있다. 어느 표인지 좁히지 않고 모두 버린다.
++        self.nested_table_body_height_cache.borrow_mut().clear();
+         let edited_cell_key = edited_cell as *const crate::model::table::Cell as usize;
+         let owner_table_key = owner_table as *const crate::model::table::Table as usize;
+         let cached_owner_flag = self
+diff --git a/src/renderer/layout/table_partial.rs b/src/renderer/layout/table_partial.rs
+index d7b7c9c..5965b4c 100644
+--- a/src/renderer/layout/table_partial.rs
++++ b/src/renderer/layout/table_partial.rs
+@@ -4700,19 +4700,24 @@ impl LayoutEngine {
+                 )
+                 && table.row_count > 1
+                 && table.repeat_header
+-                && !table.leading_header_rows().is_empty()
+                 // 이 보정은 반복 제목행 바로 뒤에서 표 끝까지 걸친 가운데
+                 // 정렬 셀의 저장 물리 높이를 두 조각에 나누는 경우에만 필요하다.
+                 // 일반 83행 교육 표까지 열면 다른 조각이 본문 아래로 밀린다.
+-                && table.cells.iter().any(|cell| {
+-                    cell.row as usize == table.leading_header_rows().len()
+-                        && cell.row_span > 1
+-                        && cell.row as usize + cell.row_span as usize == table.row_count as usize
+-                        && matches!(
+-                            cell.vertical_align,
+-                            crate::model::table::VerticalAlign::Center
+-                        )
+-                })
++                // 제목행 수는 셀마다 다시 세지 않고 한 번만 센다.
++                && {
++                    let header_rows = table.leading_header_rows().len();
++                    header_rows > 0
++                        && table.cells.iter().any(|cell| {
++                            cell.row as usize == header_rows
++                                && cell.row_span > 1
++                                && cell.row as usize + cell.row_span as usize
++                                    == table.row_count as usize
++                                && matches!(
++                                    cell.vertical_align,
++                                    crate::model::table::VerticalAlign::Center
++                                )
++                        })
++                }
+                 && table.outer_margin_top > 0
+                 && enclosing_cell_ctx.is_none()
+                 && !repeat_fragment_outer_margin

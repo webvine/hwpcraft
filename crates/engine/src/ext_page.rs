@@ -73,19 +73,30 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("page.hide", "현재 쪽만 감추기", ""),
     ("page.master.list", "바탕쪽 목록", ""),
     ("page.label", "라벨 문서 만들기", ""),
+    ("page.label.add_page", "라벨 새 쪽 추가하기", ""),
+    ("page.text_direction", "글자 방향(구역 세로쓰기)", ""),
+    ("page.manuscript", "원고지 문서 만들기", ""),
     ("page.column_def_break", "단 정의 나누기", "Ctrl+Alt+Enter"),
     ("page.section_break", "구역 나누기", "Alt+Shift+Enter"),
     ("file.template.list", "문서마당 목록", ""),
     ("file.template.new", "문서마당에서 새 문서", "Ctrl+Alt+N"),
     ("file.template.save", "현재 문서를 문서마당에 저장", ""),
     ("file.template.delete", "문서마당 서식 지우기", ""),
-    ("page.master.get", "바탕쪽 글 조회 (양쪽·홀수·짝수)", ""),
     (
-        "page.master.set",
-        "바탕쪽 만들기/고치기 (양쪽·홀수·짝수, 글)",
+        "page.master.get",
+        "바탕쪽 글 조회 (양쪽·홀수·짝수·마지막 쪽)",
         "",
     ),
-    ("page.master.delete", "바탕쪽 지우기 (양쪽·홀수·짝수)", ""),
+    (
+        "page.master.set",
+        "바탕쪽 만들기/고치기 (양쪽·홀수·짝수·마지막 쪽, 글)",
+        "",
+    ),
+    (
+        "page.master.delete",
+        "바탕쪽 지우기 (양쪽·홀수·짝수·마지막 쪽)",
+        "",
+    ),
     ("file.doc_info", "문서 정보", "Ctrl+Q,I"),
     ("file.print_pdf", "인쇄용 PDF 만들기 (쪽 범위)", "Ctrl+P"),
     (
@@ -266,6 +277,21 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
         r#"{"rows":8,"columns":2,"labelWidthMm":99.1,"labelHeightMm":34.0,"gapXMm":2.5}"#,
     ),
     (
+        "page.text_direction",
+        "direction: horizontal(가로), vertical(세로, 영문 눕힘) 또는 vertical_all(세로, 영문 세움). 지금 구역의 글자 방향을 바꿉니다(한 번에 실행 취소). HWP·HWPX에 저장됩니다. 결과: section, direction.",
+        r#"{"direction":"vertical"}"#,
+    ),
+    (
+        "page.manuscript",
+        "새 원고지 문서: chars 400(기본, A4 세로 20칸×20줄) 또는 200(A4 가로 20칸×10줄). 구역에 줄 격자·글자 격자와 원고지 정서법을 켜고, 칸 표를 양쪽 바탕쪽에 그립니다. fill: true면 지금 문서의 본문 글을 옮겨 채웁니다. file.new처럼 지금 문서를 바꿉니다(force: true면 저장하지 않은 변경을 버림). 결과: chars, columns, rows, cellMm, pitchMm, pages.",
+        r#"{"chars":400,"fill":true}"#,
+    ),
+    (
+        "page.label.add_page",
+        "매개 변수 없음. 라벨 문서(본문 첫 표) 끝에 쪽을 나누고 같은 줄·칸 수, 칸 너비, 줄 높이의 빈 라벨 표를 테두리 없이 넣습니다(한글의 라벨 새 쪽 추가하기). 결과: pages.",
+        r#"{}"#,
+    ),
+    (
         "file.template.list",
         "매개 변수 없음. 사용자 서식(설정 폴더의 templates): name, format, bytes, modified.",
         "{}",
@@ -287,18 +313,18 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "page.master.get",
-        "applyTo: both(기본), odd 또는 even. 지금 구역의 그 바탕쪽 글, exists, editable, reason.",
+        "applyTo: both(기본), odd, even, last(구역의 마지막 쪽) 또는 optional(임의 쪽, page: 구역 안 쪽 번호 1부터). 지금 구역의 그 바탕쪽 글, exists, editable, reason.",
         r#"{"applyTo":"both"}"#,
     ),
     (
         "page.master.set",
-        "applyTo: both(기본), odd 또는 even, text: \\n으로 나눈 줄(줄마다 한 문단, 10 KB까지). 지금 구역의 그 바탕쪽을 글로 만들거나 바꿉니다. 한글처럼 홀수·짝수 바탕쪽은 그 쪽에서 양쪽 바탕쪽 대신 쓰입니다. 바탕쪽에 그림·도형이 있거나 마지막 쪽·임의 쪽 바탕쪽이 있는 구역은 거절합니다.",
+        "applyTo: both(기본), odd, even, last 또는 optional(page 필요), text: \\n으로 나눈 줄(줄마다 한 문단, 10 KB까지). 지금 구역의 그 바탕쪽을 글로 만들거나 바꿉니다. 한글처럼 홀수·짝수 바탕쪽은 그 쪽에서 양쪽 바탕쪽 대신 쓰이고, last(마지막 쪽 바탕쪽)는 구역의 마지막 쪽, optional(임의 쪽 바탕쪽)은 구역 안 page번째 쪽에서 다른 바탕쪽 대신 쓰입니다(겹치게 하기 없음). 임의 쪽 바탕쪽은 HWPX에만 저장되며 .hwp 저장은 거절합니다. 그림·도형·떠 있는 표는 새 글 첫 문단에 그대로 남고, 글자처럼 취급한 표나 쪽 번호 같은 조판 부호가 든 바탕쪽(context.v2의 master_page로 고침)이나 쪽 번호 없는 임의 쪽 바탕쪽(HWP 파일)이 있는 구역은 거절합니다.",
         r#"{"applyTo":"both","text":"대외비"}"#,
     ),
     (
         "page.master.delete",
-        "applyTo: both(기본), odd 또는 even. 지금 구역의 그 바탕쪽을 지웁니다.",
-        r#"{"applyTo":"both"}"#,
+        "applyTo: both(기본), odd, even, last 또는 optional(page 필요). 지금 구역의 그 바탕쪽을 지웁니다.",
+        r#"{"applyTo":"optional","page":2}"#,
     ),
     (
         "file.doc_info",
@@ -556,6 +582,13 @@ pub const HF_FIELDS: &[(&str, u8, char)] = &[
     ("total_pages", 2, '\u{16}'),
     ("file_name", 3, '\u{17}'),
 ];
+/// Date fields of a header or footer: (kind, the 문서 요약 field command). Hangul's 날짜
+/// 코드 typed in a header is the body's `%smr` field (measured in Hangul 2024); its 머리말
+/// 마당 entries hold no date.
+pub const HF_DATE_FIELDS: &[(&str, &str)] = &[
+    ("date_created", "$createtime"),
+    ("date_saved", "$modifiedtime"),
+];
 
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
@@ -713,22 +746,49 @@ const MASTER_KINDS: [(HeaderFooterApply, &str, &str, u32); 3] = [
     (HeaderFooterApply::Even, "even", "짝수 쪽", 0x4000_0000),
     (HeaderFooterApply::Odd, "odd", "홀수 쪽", 0x8000_0000),
 ];
-/// Raw records a text master page is made of: list header and paragraph records.
-const MASTER_RECORD_TAGS: [u16; 6] = [66, 67, 68, 69, 70, 72];
+/// Whether a raw section-definition record is part of a master page the model holds:
+/// list header, paragraph and control records and the pictures, shapes, tables and
+/// equations in them (HWPTAG_PARA_HEADER..LIST_HEADER, SHAPE_COMPONENT..EQEDIT).
+/// Edited master pages are saved from the model and these records dropped.
+fn master_record(tag: u16) -> bool {
+    matches!(tag, 66..=72 | 76..=88)
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct MasterTarget {
     #[serde(default = "both")]
     apply_to: String,
+    /// The section's page (1-based) of an `optional` (임의 쪽) master page.
+    #[serde(default)]
+    page: Option<u16>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct MasterText {
     #[serde(default = "both")]
     apply_to: String,
+    #[serde(default)]
+    page: Option<u16>,
     text: String,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Manuscript {
+    #[serde(default = "manuscript_chars")]
+    chars: u32,
+    #[serde(default)]
+    fill: bool,
+    #[serde(default)]
+    force: bool,
+}
+fn manuscript_chars() -> u32 {
+    400
+}
+/// Section flag bits 16–18: 글자 방향 (0 가로, 1 세로 영문 눕힘, 2 세로 영문 세움).
+const SECTION_TEXT_DIRECTION: u32 = 0x0007_0000;
+/// Section flag bit 22: 원고지 정서법 (HWPX `grid@wonggojiFormat`).
+const SECTION_WONGGOJI_FORMAT: u32 = 0x0040_0000;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Label {
@@ -820,11 +880,67 @@ fn print_one() -> u32 {
 fn print_yes() -> bool {
     true
 }
-/// The master-page kind named by `applyTo`.
-fn master_kind(apply_to: &str) -> Result<HeaderFooterApply> {
+/// A master page HwpCraft edits: 양쪽·홀수·짝수, the section's last page (Hangul's
+/// 마지막 쪽 바탕쪽) or one page of the section (임의 쪽 바탕쪽, 1-based). The last two
+/// are stored as extension master pages.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MasterSlot {
+    Base(HeaderFooterApply),
+    Last,
+    Optional(u16),
+}
+/// The master-page kind named by `applyTo` (and `page` for `optional`).
+fn master_kind(apply_to: &str, page: Option<u16>) -> Result<MasterSlot> {
+    match apply_to {
+        "last" => return Ok(MasterSlot::Last),
+        "optional" => {
+            return match page {
+                Some(page @ 1..=9999) => Ok(MasterSlot::Optional(page)),
+                _ => bail!("임의 쪽 바탕쪽은 page에 구역 안 쪽 번호(1–9999)를 주세요."),
+            };
+        }
+        _ => {}
+    }
     match MASTER_KINDS.iter().find(|(_, name, ..)| *name == apply_to) {
-        Some((kind, ..)) => Ok(*kind),
-        None => bail!("적용 쪽은 both, odd, even 중 하나여야 합니다."),
+        Some((kind, ..)) => Ok(MasterSlot::Base(*kind)),
+        None => bail!("적용 쪽은 both, odd, even, last, optional 중 하나여야 합니다."),
+    }
+}
+/// (applyTo name, Korean label) of a master page slot.
+fn master_label(slot: MasterSlot) -> (&'static str, String) {
+    match slot {
+        MasterSlot::Base(kind) => {
+            let (_, name, label, _) = MASTER_KINDS[master_kind_index(kind)];
+            (name, label.to_owned())
+        }
+        MasterSlot::Last => ("last", "마지막 쪽".to_owned()),
+        MasterSlot::Optional(page) => ("optional", format!("임의 쪽({page}쪽)")),
+    }
+}
+/// Extension master page flag for Hangul's 임의 쪽 (an OPTIONAL_PAGE in HWPX).
+const MASTER_OPTIONAL: u16 = 0x04;
+/// The section page (1-based) an 임의 쪽 master page goes on. Only HWPX stores it
+/// (`masterPage@pageNumber`); an HWP file's master list header has no place for it.
+fn optional_master_page(m: &MasterPage) -> Option<u16> {
+    (m.is_extension && m.ext_flags & MASTER_OPTIONAL != 0)
+        .then_some(m.hwpx_page_number)
+        .flatten()
+        .filter(|&n| n > 0)
+}
+/// Whether master page `m` is the one `slot` names.
+fn master_in_slot(m: &MasterPage, slot: MasterSlot) -> bool {
+    match slot {
+        MasterSlot::Base(kind) => m.apply_to == kind && !m.is_extension,
+        MasterSlot::Last => m.is_extension && m.ext_flags & MASTER_OPTIONAL == 0,
+        MasterSlot::Optional(page) => optional_master_page(m) == Some(page),
+    }
+}
+/// The slot master page `m` fills.
+fn master_slot_of(m: &MasterPage) -> MasterSlot {
+    if !m.is_extension {
+        MasterSlot::Base(m.apply_to)
+    } else {
+        optional_master_page(m).map_or(MasterSlot::Last, MasterSlot::Optional)
     }
 }
 /// Position of `kind` in [`MASTER_KINDS`] (Hangul's storage order).
@@ -835,31 +951,71 @@ fn master_kind_index(kind: HeaderFooterApply) -> usize {
         .unwrap_or(0)
 }
 /// Why `sec`'s master pages cannot be edited without losing something, if so.
-fn master_edit_block(sec: &hwpcraft_doc::model::document::Section) -> Option<&'static str> {
+pub(crate) fn master_edit_block(
+    sec: &hwpcraft_doc::model::document::Section,
+) -> Option<&'static str> {
     let masters = &sec.section_def.master_pages;
-    if masters.iter().any(|m| m.is_extension) {
-        return Some("마지막 쪽·임의 쪽 바탕쪽이 있는 구역은 아직 편집할 수 없습니다.");
-    }
-    // Pictures and drawing shapes are kept through a text edit (`master_objects`).
+    // An 임의 쪽 master page read from an HWP file does not say which page it is on.
     if masters.iter().any(|m| {
-        m.paragraphs
-            .iter()
-            .flat_map(|p| &p.controls)
-            .any(|c| !matches!(c, Control::Picture(_) | Control::Shape(_)))
+        m.is_extension && m.ext_flags & MASTER_OPTIONAL != 0 && optional_master_page(m).is_none()
     }) {
+        return Some("쪽 번호가 없는 임의 쪽 바탕쪽(HWP 파일)이 있는 구역은 편집할 수 없습니다.");
+    }
+    // Hangul keeps one master page of each kind. A file with more lists than its section
+    // flags name kinds is read with two of a kind, and saving it from the model would
+    // turn the extra one into another kind (RHWP samples hwpctl_Action_Table, exam_science).
+    let mut kinds: Vec<usize> = masters
+        .iter()
+        .filter(|m| !m.is_extension)
+        .map(|m| master_kind_index(m.apply_to))
+        .collect();
+    let count = kinds.len();
+    kinds.sort_unstable();
+    kinds.dedup();
+    if kinds.len() != count {
         return Some(
-            "표 같은 개체가 든 바탕쪽은 아직 편집할 수 없습니다. 보기와 저장은 그대로 됩니다.",
+            "같은 종류의 바탕쪽이 둘 이상 있는 구역은 편집하지 않습니다. 보기와 저장은 그대로 됩니다.",
         );
     }
     if sec
         .section_def
         .extra_child_records
         .iter()
-        .any(|r| !MASTER_RECORD_TAGS.contains(&r.tag_id))
+        .any(|r| !master_record(r.tag_id))
     {
         return Some("이 구역의 바탕쪽에 알 수 없는 기록이 있어 편집하지 않습니다.");
     }
     None
+}
+/// Whether `page.master.set` keeps control `c` of a master page whose text it
+/// replaces: pictures and shapes, and tables that float on the page. They go to the
+/// end of the new first paragraph, which leaves a floating object where it was.
+fn master_text_keeps(c: &Control) -> bool {
+    match c {
+        Control::Picture(_) | Control::Shape(_) => true,
+        Control::Table(t) => !t.common.treat_as_char,
+        _ => false,
+    }
+}
+/// Why the text of `sec`'s `slot` master page cannot be replaced as a whole, if so.
+/// Paragraph edits (`context.v2.*` with a `master_page` step) keep everything else.
+fn master_text_block(
+    sec: &hwpcraft_doc::model::document::Section,
+    slot: MasterSlot,
+) -> Option<&'static str> {
+    master_edit_block(sec).or_else(|| {
+        sec.section_def
+            .master_pages
+            .iter()
+            .filter(|m| master_in_slot(m, slot))
+            .flat_map(|m| &m.paragraphs)
+            .flat_map(|p| &p.controls)
+            .any(|c| !master_text_keeps(c))
+            .then_some(
+                "글자처럼 취급한 표나 쪽 번호 같은 조판 부호가 든 바탕쪽은 글 전체를 바꾸지 않습니다. \
+                 context.v2(master_page)로 문단과 표 셀 글을 고치세요.",
+            )
+    })
 }
 fn apply_code(apply_to: &str) -> Result<u8> {
     Ok(match apply_to {
@@ -1184,6 +1340,33 @@ impl Session {
                 let p: Label = serde_json::from_value(params)?;
                 self.create_label_sheet(&p)
             }
+            "page.label.add_page" => self.add_label_page(),
+            "page.text_direction" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Direction {
+                    direction: String,
+                }
+                let p: Direction = serde_json::from_value(params)?;
+                let value = match p.direction.as_str() {
+                    "horizontal" => 0,
+                    "vertical" => 1,
+                    "vertical_all" => 2,
+                    _ => bail!("direction은 horizontal, vertical, vertical_all 중 하나입니다."),
+                };
+                self.transaction(|s| {
+                    s.edit_section_def(section, |sd| {
+                        sd.text_direction = value;
+                        sd.flags = (sd.flags & !SECTION_TEXT_DIRECTION) | (u32::from(value) << 16);
+                    });
+                    s.refresh_layout()
+                })?;
+                Ok(json!({"section": section, "direction": p.direction}))
+            }
+            "page.manuscript" => {
+                let p: Manuscript = serde_json::from_value(params)?;
+                self.create_manuscript(&p)
+            }
             "page.column_def_break" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -1254,22 +1437,22 @@ impl Session {
             }
             "page.master.get" => {
                 let p: MasterTarget = serde_json::from_value(params)?;
-                self.master_page_text(section, master_kind(&p.apply_to)?)
+                self.master_page_text(section, master_kind(&p.apply_to, p.page)?)
             }
             "page.master.set" => {
                 let p: MasterText = serde_json::from_value(params)?;
-                let kind = master_kind(&p.apply_to)?;
+                let kind = master_kind(&p.apply_to, p.page)?;
                 self.set_master_page_text(section, kind, Some(&p.text))?;
                 self.master_page_text(section, kind)
             }
             "page.master.delete" => {
                 let p: MasterTarget = serde_json::from_value(params)?;
-                let kind = master_kind(&p.apply_to)?;
+                let kind = master_kind(&p.apply_to, p.page)?;
                 if !self.master_page_text(section, kind)?["exists"]
                     .as_bool()
                     .unwrap_or(false)
                 {
-                    let label = MASTER_KINDS[master_kind_index(kind)].2;
+                    let label = master_label(kind).1;
                     bail!("이 구역에는 {label} 바탕쪽이 없습니다.");
                 }
                 self.set_master_page_text(section, kind, None)?;
@@ -1287,8 +1470,17 @@ impl Session {
                             .map(|m| {
                                 json!({
                                     "applyTo": format!("{:?}", m.apply_to),
+                                    "kind": if !m.is_extension {
+                                        "base"
+                                    } else if m.ext_flags & MASTER_OPTIONAL != 0 {
+                                        "optional"
+                                    } else {
+                                        "last"
+                                    },
+                                    "page": optional_master_page(m),
                                     "extension": m.is_extension,
                                     "overlap": m.overlap,
+                                    "textReason": master_text_block(s, master_slot_of(m)),
                                     "text": m.paragraphs.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n"),
                                 })
                             })
@@ -1643,10 +1835,9 @@ impl Session {
 
     /// 구역 나누기: the body from the caret on becomes a new section. As in Hangul, the
     /// new section copies the section definition (page setup, numbering shapes) and the
-    /// column layout at the caret, and page numbers continue. Hangul leaves the master
-    /// pages to carry on from the previous section; RHWP does not draw them across
-    /// sections, so they are copied, which Hangul shows the same way. Headers and
-    /// footers already carry on in both.
+    /// column layout at the caret, and page numbers continue. As in Hangul the new
+    /// section has no master pages of its own and the previous section's carry on
+    /// (RHWP patch 0061). Headers and footers carry on as well.
     fn section_break(&mut self) -> Result<Value> {
         self.require_body()?;
         self.transaction(|s| {
@@ -1696,6 +1887,12 @@ impl Session {
             def.picture_num = 0;
             def.table_num = 0;
             def.equation_num = 0;
+            // As in Hangul the new section gets no master pages of its own: the earlier
+            // section's carry on (RHWP draws them across sections), so editing them changes
+            // both. The raw child records went with them (the writer rebuilds the rest).
+            def.master_pages.clear();
+            def.flags &= !MASTER_KIND_FLAGS;
+            def.extra_child_records.clear();
             // The two definition controls take the paragraph's first two slots, as in a
             // section that was read from a file.
             let head = crate::control_slots::insert_head_control;
@@ -1821,8 +2018,11 @@ impl Session {
                 "저장하지 않은 변경이 있습니다. 먼저 저장하거나 force: true로 명시적으로 버리세요."
             );
         }
-        self.reset()?;
-        self.execute(Command::PageSetup(crate::page::PageSetup {
+        // The sheet is built aside and replaces the document only once it is complete,
+        // so a size the page setup refuses leaves the open document as it was.
+        self.ensure_history_replacement_allowed()?;
+        let mut sheet = Self::new()?;
+        sheet.execute(Command::PageSetup(crate::page::PageSetup {
             width_mm: paper_w,
             height_mm: paper_h,
             landscape: false,
@@ -1844,7 +2044,7 @@ impl Session {
             widths.push(w);
         }
         let table_columns = widths.len();
-        self.run(
+        sheet.run(
             "table.create",
             json!({
                 "rows": rows,
@@ -1855,7 +2055,7 @@ impl Session {
             }),
         )?;
         let none = json!({"type": 0, "width": 0, "color": "#000000"});
-        self.run(
+        sheet.run(
             "table.cell_properties",
             json!({
                 "range": {"start_row": 0, "start_col": 0, "end_row": rows - 1, "end_col": table_columns - 1},
@@ -1866,8 +2066,10 @@ impl Session {
             }),
         )?;
         // A new document: no file yet, nothing to save.
-        self.path = None;
-        self.saved_revision = self.revision;
+        sheet.saved_revision = sheet.revision;
+        sheet.generation += self.generation + 1;
+        sheet.macros = self.take_macro_recorder();
+        *self = sheet;
         Ok(json!({
             "labels": rows * columns,
             "rows": rows,
@@ -1876,14 +2078,335 @@ impl Session {
         }))
     }
 
+    /// Change `section`'s definition (the section's copy and its 구역 정의 control) and
+    /// drop the raw records so the edited model is what gets saved.
+    fn edit_section_def(
+        &mut self,
+        section: usize,
+        edit: impl Fn(&mut hwpcraft_doc::model::document::SectionDef),
+    ) {
+        let doc = self.core.document_mut();
+        let Some(sec) = doc.sections.get_mut(section) else {
+            return;
+        };
+        edit(&mut sec.section_def);
+        for control in sec
+            .paragraphs
+            .iter_mut()
+            .flat_map(|p| p.controls.iter_mut())
+        {
+            if let Control::SectionDef(def) = control {
+                edit(def);
+            }
+        }
+        sec.raw_stream = None;
+    }
+
+    /// 원고지: a new document whose section puts one character in each cell (줄 격자,
+    /// 글자 격자, 원고지 정서법 as Hangul stores them) with the paper's cells drawn by a
+    /// table on the 양쪽 master page. Our own sizes: 400자 is A4 portrait, 200자 A4
+    /// landscape, 20 cells a row; each row is a band above a row of square cells.
+    fn create_manuscript(&mut self, p: &Manuscript) -> Result<Value> {
+        let (landscape, rows) = match p.chars {
+            400 => (false, 20u32),
+            200 => (true, 10u32),
+            _ => bail!("원고지는 chars 200 또는 400입니다."),
+        };
+        const COLUMNS: u32 = 20;
+        if self.dirty() && !p.force {
+            bail!(
+                "저장하지 않은 변경이 있습니다. 먼저 저장하거나 force: true로 명시적으로 버리세요."
+            );
+        }
+        let text = if p.fill {
+            self.core
+                .document()
+                .sections
+                .iter()
+                .flat_map(|s| &s.paragraphs)
+                .map(|p| p.text.replace(|c: char| c.is_control(), ""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
+        let (paper_w, paper_h) = if landscape {
+            (297.0, 210.0)
+        } else {
+            (210.0, 297.0)
+        };
+        let (left, right, top, bottom) = (20.0, 20.0, 20.0, 15.0);
+        let (body_w, body_h) = (paper_w - left - right, paper_h - top - bottom);
+        let cell_mm = body_w / f64::from(COLUMNS);
+        let pitch_mm = body_h / f64::from(rows);
+        let hu = |mm: f64| (mm * HU_PER_MM).round();
+        self.reset()?;
+        self.execute(Command::PageSetup(crate::page::PageSetup {
+            width_mm: paper_w,
+            height_mm: paper_h,
+            landscape: false,
+            left_mm: left,
+            right_mm: right,
+            top_mm: top,
+            bottom_mm: bottom,
+            header_mm: 0.0,
+            footer_mm: 0.0,
+            gutter_mm: 0.0,
+            binding: 0,
+        }))?;
+        // The paper: band rows (merged) between rows of square cells, thin red lines,
+        // no cell padding so the rows keep their heights.
+        let made = self.run(
+            "table.create",
+            json!({
+                "rows": rows * 2,
+                "columns": COLUMNS,
+                "width_mm": body_w,
+                "height_mm": body_h,
+            }),
+        )?;
+        let table = made["table"].clone();
+        let last_col = COLUMNS - 1;
+        let red = json!({"type": 1, "width": 1, "color": "#d23c3c"});
+        self.run(
+            "table.cell_properties",
+            json!({
+                "table": table,
+                "range": {"start_row": 0, "start_col": 0, "end_row": rows * 2 - 1, "end_col": last_col},
+                "props": {"applyInnerMargin": true, "paddingLeft": 0, "paddingRight": 0, "paddingTop": 0, "paddingBottom": 0},
+                "borders": {
+                    "left": red, "right": red, "top": red, "bottom": red,
+                    "inner_vertical": red, "inner_horizontal": red,
+                },
+            }),
+        )?;
+        for row in 0..rows {
+            let band = row * 2;
+            self.run(
+                "table.cell_properties",
+                json!({
+                    "table": table,
+                    "range": {"start_row": band, "start_col": 0, "end_row": band, "end_col": last_col},
+                    "props": {"height": hu(pitch_mm - cell_mm) as u64},
+                }),
+            )?;
+            self.run(
+                "table.cell_properties",
+                json!({
+                    "table": table,
+                    "range": {"start_row": band + 1, "start_col": 0, "end_row": band + 1, "end_col": last_col},
+                    "props": {"height": hu(cell_mm) as u64},
+                }),
+            )?;
+            self.run(
+                "table.merge",
+                json!({
+                    "table": table,
+                    "range": {"start_row": band, "start_col": 0, "end_row": band, "end_col": last_col},
+                }),
+            )?;
+        }
+        // Behind the text at the body area's corner of the paper (a master page's
+        // inline content would start at the paper's corner).
+        self.run(
+            "table.properties",
+            json!({
+                "table": table,
+                "props": {
+                    "treatAsChar": false,
+                    "textWrap": "BehindText",
+                    "vertRelTo": "Paper",
+                    "horzRelTo": "Paper",
+                    "vertOffset": hu(top) as i64,
+                    "horzOffset": hu(left) as i64,
+                    "outerLeft": 0, "outerRight": 0, "outerTop": 0, "outerBottom": 0,
+                    "allowOverlap": true,
+                },
+            }),
+        )?;
+        let address: crate::ObjectAddress = serde_json::from_value(table.clone())?;
+        let paper = self
+            .core
+            .document()
+            .sections
+            .get(address.section)
+            .and_then(|s| s.paragraphs.get(address.paragraph))
+            .and_then(|p| p.controls.get(address.control))
+            .cloned()
+            .ok_or_else(|| anyhow!("원고지 칸 표를 만들지 못했습니다."))?;
+        self.run("table.delete", json!({"table": table}))?;
+        let (char_grid, line_grid) = (hu(cell_mm) as i16, hu(pitch_mm) as i16);
+        let doc = self.core.document_mut();
+        let sec = &mut doc.sections[0];
+        let pd = &sec.section_def.page_def;
+        let text_width = pd.width.saturating_sub(pd.margin_left + pd.margin_right);
+        let text_height = pd
+            .height
+            .saturating_sub(pd.margin_top + pd.margin_bottom + pd.margin_header + pd.margin_footer);
+        let template = sec
+            .paragraphs
+            .first()
+            .cloned()
+            .unwrap_or_else(DocParagraph::new_empty);
+        let mut first = DocParagraph::new_empty_like(&template);
+        crate::control_slots::insert_control(&mut first, 0, paper, None);
+        first.control_mask |= 1 << 11;
+        first.has_para_text = true;
+        first.invalidate_layout_inputs();
+        let masters = vec![MasterPage {
+            apply_to: HeaderFooterApply::Both,
+            paragraphs: vec![first],
+            text_width,
+            text_height,
+            ..Default::default()
+        }];
+        let kinds = MASTER_KINDS[master_kind_index(HeaderFooterApply::Both)].3;
+        self.edit_section_def(0, |sd| {
+            sd.flags = (sd.flags & !MASTER_KIND_FLAGS) | kinds | SECTION_WONGGOJI_FORMAT;
+            sd.char_grid = char_grid;
+            sd.line_grid = line_grid;
+            sd.extra_child_records.clear();
+            sd.master_pages = masters.clone();
+        });
+        self.refresh_layout()?;
+        if !text.is_empty() {
+            self.execute(Command::Insert(text))?;
+        }
+        // A new document: no file yet, nothing to save; nothing to undo either.
+        self.undo.clear();
+        self.redo.clear();
+        self.path = None;
+        self.saved_revision = self.revision;
+        Ok(json!({
+            "chars": p.chars,
+            "columns": COLUMNS,
+            "rows": rows,
+            "cellMm": (cell_mm * 100.0).round() / 100.0,
+            "pitchMm": (pitch_mm * 100.0).round() / 100.0,
+            "pages": self.page_count()?,
+        }))
+    }
+
+    /// 라벨 새 쪽 추가하기: at the document's end, a page with an empty copy of the label
+    /// table (the body's first table, as `page.label` makes it): the same rows, column
+    /// widths and row heights, without borders.
+    fn add_label_page(&mut self) -> Result<Value> {
+        // The caret is usually in a label (a cell); it moves to the document's end.
+        let doc = self.core.document();
+        let table = doc
+            .sections
+            .first()
+            .into_iter()
+            .flat_map(|s| &s.paragraphs)
+            .flat_map(|p| &p.controls)
+            .find_map(|c| match c {
+                Control::Table(t) => Some(t),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                anyhow!("라벨 문서가 아닙니다. 쪽 → 라벨 → 라벨 문서 만들기로 먼저 만드세요.")
+            })?;
+        let (rows, columns) = (table.row_count, table.col_count);
+        let mm = |hu: u32| f64::from(hu) / HU_PER_MM;
+        let widths: Vec<f64> = (0..columns)
+            .map(|c| {
+                table
+                    .cells
+                    .iter()
+                    .find(|cell| cell.col == c && cell.col_span <= 1)
+                    .map_or(0.0, |cell| mm(cell.width))
+            })
+            .collect();
+        let height: f64 = (0..rows)
+            .map(|r| {
+                table
+                    .cells
+                    .iter()
+                    .find(|cell| cell.row == r && cell.row_span <= 1)
+                    .map_or(0.0, |cell| mm(cell.height))
+            })
+            .sum();
+        if widths.iter().any(|w| *w <= 0.0) || height <= 0.0 {
+            bail!("라벨 표의 칸 크기를 읽지 못했습니다(합친 칸이 있는 표).");
+        }
+        let width: f64 = widths.iter().sum();
+        self.transaction(|s| {
+            let last = s.core.document().sections.len() - 1;
+            let para = s.core.document().sections[last].paragraphs.len() - 1;
+            let offset = s.core.document().sections[last].paragraphs[para]
+                .text
+                .chars()
+                .count();
+            s.select(
+                Cursor {
+                    section: last,
+                    paragraph: para,
+                    offset,
+                    ..Cursor::default()
+                },
+                false,
+            )?;
+            s.execute(Command::PageBreak)?;
+            s.run(
+                "table.create",
+                json!({
+                    "rows": rows,
+                    "columns": columns,
+                    "width_mm": width,
+                    "height_mm": height,
+                    "column_widths_mm": widths,
+                }),
+            )?;
+            let none = json!({"type": 0, "width": 0, "color": "#000000"});
+            s.run(
+                "table.cell_properties",
+                json!({
+                    "range": {"start_row": 0, "start_col": 0, "end_row": rows - 1, "end_col": columns - 1},
+                    "borders": {
+                        "left": none, "right": none, "top": none, "bottom": none,
+                        "inner_vertical": none, "inner_horizontal": none,
+                    },
+                }),
+            )?;
+            Ok(())
+        })?;
+        Ok(json!({ "pages": self.page_count()? }))
+    }
+
     /// Write the document to `path` (.hwp/.hwpx, same bytes as [`Session::save`]) without
     /// making it the document's file or marking it saved: 자동 복구 copies.
     pub fn save_copy(&mut self, path: &std::path::Path) -> Result<()> {
         self.save_with_tab_widths_for(path, true)
     }
 
+    /// An HWP file has no place for an 임의 쪽 master page's page number (HWPX keeps it
+    /// as `pageNumber`), so saving one there would move it to the section's last page.
+    pub(crate) fn refuse_unkept_hwp_save(&self, path: &std::path::Path) -> Result<()> {
+        let hwp = path
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("hwp"));
+        if !hwp {
+            return Ok(());
+        }
+        for (i, sec) in self.core.document().sections.iter().enumerate() {
+            if let Some(page) = sec
+                .section_def
+                .master_pages
+                .iter()
+                .find_map(optional_master_page)
+            {
+                bail!(
+                    "{}구역에 임의 쪽 바탕쪽({page}쪽)이 있어 .hwp로 저장할 수 없습니다. HWP 형식에는 임의 쪽 바탕쪽의 쪽 번호를 담을 자리가 없어 마지막 쪽으로 옮겨집니다. .hwpx로 저장하거나, 임의 쪽 바탕쪽을 지우고 저장하세요.",
+                    i + 1
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// The text of `section`'s 양쪽 master page and whether it can be edited.
-    fn master_page_text(&self, section: usize, kind: HeaderFooterApply) -> Result<Value> {
+    fn master_page_text(&self, section: usize, kind: MasterSlot) -> Result<Value> {
         let sec = self
             .core
             .document()
@@ -1894,11 +2417,15 @@ impl Session {
             .section_def
             .master_pages
             .iter()
-            .find(|m| m.apply_to == kind && !m.is_extension);
-        let reason = master_edit_block(sec);
+            .find(|m| master_in_slot(m, kind));
+        let reason = master_text_block(sec, kind);
         Ok(json!({
             "section": section,
-            "applyTo": MASTER_KINDS[master_kind_index(kind)].1,
+            "applyTo": master_label(kind).0,
+            "page": match kind {
+                MasterSlot::Optional(page) => Some(page),
+                _ => None,
+            },
             "exists": master.is_some(),
             "text": master.map(|m| m.paragraphs.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n")),
             "editable": reason.is_none(),
@@ -1910,11 +2437,13 @@ impl Session {
     /// `section` in one undo step. Each line becomes a paragraph shaped like the
     /// section's first paragraph; the text area is the body (page minus margins,
     /// header and footer), as Hangul stores it. The master pages stay in Hangul's order
-    /// (양쪽, 짝수, 홀수) and the section flags name the kinds present.
+    /// (양쪽, 짝수, 홀수, then the last page's) and the section flags name the base kinds
+    /// present. The last page's master page replaces the base one on that page, as HWP5
+    /// files read it (RHWP sets `replace_base` for every extension master page there).
     fn set_master_page_text(
         &mut self,
         section: usize,
-        kind: HeaderFooterApply,
+        kind: MasterSlot,
         text: Option<&str>,
     ) -> Result<()> {
         if let Some(text) = text
@@ -1931,7 +2460,11 @@ impl Session {
             .sections
             .get(section)
             .ok_or_else(|| anyhow!("구역이 없습니다."))?;
-        if let Some(why) = master_edit_block(sec) {
+        let block = match text {
+            Some(_) => master_text_block(sec, kind),
+            None => master_edit_block(sec),
+        };
+        if let Some(why) = block {
             bail!("{why}");
         }
         let text = text.map(|t| t.replace("\r\n", "\n").replace('\r', "\n"));
@@ -1944,16 +2477,16 @@ impl Session {
                 pd.margin_top + pd.margin_bottom + pd.margin_header + pd.margin_footer,
             );
             let mut masters = std::mem::take(&mut sec.section_def.master_pages);
-            // The page's pictures and shapes stay with the new text.
+            // The page's pictures, shapes and floating tables stay with the new text.
             let objects: Vec<Control> = masters
                 .iter()
-                .filter(|m| m.apply_to == kind && !m.is_extension)
+                .filter(|m| master_in_slot(m, kind))
                 .flat_map(|m| &m.paragraphs)
                 .flat_map(|p| &p.controls)
-                .filter(|c| matches!(c, Control::Picture(_) | Control::Shape(_)))
+                .filter(|c| master_text_keeps(c))
                 .cloned()
                 .collect();
-            masters.retain(|m| m.apply_to != kind);
+            masters.retain(|m| !master_in_slot(m, kind));
             if let Some(text) = &text {
                 let template = sec
                     .paragraphs
@@ -1979,20 +2512,56 @@ impl Session {
                     }
                     first.invalidate_layout_inputs();
                 }
-                masters.push(MasterPage {
-                    apply_to: kind,
-                    paragraphs,
-                    text_width,
-                    text_height,
-                    ..Default::default()
+                masters.push(match kind {
+                    MasterSlot::Base(kind) => MasterPage {
+                        apply_to: kind,
+                        paragraphs,
+                        text_width,
+                        text_height,
+                        ..Default::default()
+                    },
+                    // HWPX LAST_PAGE with pageDuplicate="0"; HWP5 extension flags 0x02 with
+                    // the overlap bit Hangul sets on them as well.
+                    MasterSlot::Last => MasterPage {
+                        apply_to: HeaderFooterApply::Both,
+                        is_extension: true,
+                        overlap: true,
+                        replace_base: true,
+                        ext_flags: 0x03,
+                        paragraphs,
+                        text_width,
+                        text_height,
+                        ..Default::default()
+                    },
+                    // HWPX OPTIONAL_PAGE pageNumber=page pageDuplicate="0" (only HWPX keeps
+                    // the page; `refuse_unkept_hwp_save` stops an HWP save).
+                    MasterSlot::Optional(page) => MasterPage {
+                        apply_to: HeaderFooterApply::Both,
+                        is_extension: true,
+                        overlap: true,
+                        replace_base: true,
+                        ext_flags: 0x03 | MASTER_OPTIONAL,
+                        hwpx_page_number: Some(page),
+                        paragraphs,
+                        text_width,
+                        text_height,
+                        ..Default::default()
+                    },
                 });
             }
-            masters.sort_by_key(|m| master_kind_index(m.apply_to));
+            masters.sort_by_key(|m| {
+                (
+                    m.is_extension,
+                    master_kind_index(m.apply_to),
+                    optional_master_page(m),
+                )
+            });
             // HWP keeps the kinds present in the top section-flag bits and reads raw
             // records before the model; the raw copies are dropped so the edited model
             // is what gets saved.
             let flags = masters
                 .iter()
+                .filter(|m| !m.is_extension)
                 .fold(sec.section_def.flags & !MASTER_KIND_FLAGS, |flags, m| {
                     flags | MASTER_KINDS[master_kind_index(m.apply_to)].3
                 });
@@ -2323,14 +2892,18 @@ pub struct ViewMarks {
     pub transparent_borders: bool,
 }
 
-fn hf_field(kind: &str) -> Result<(u8, char)> {
+/// A header field: an RHWP marker field (`Ok(Ok(code))`) or a date field (`Ok(Err(command))`).
+fn hf_field(kind: &str) -> Result<std::result::Result<u8, &'static str>> {
+    if let Some((_, command)) = HF_DATE_FIELDS.iter().find(|(k, _)| *k == kind) {
+        return Ok(Err(command));
+    }
     HF_FIELDS
         .iter()
         .find(|(k, _, _)| *k == kind)
-        .map(|(_, code, c)| (*code, *c))
+        .map(|(_, code, _)| Ok(*code))
         .ok_or_else(|| {
             anyhow!(
-                "머리말/꼬리말 필드는 page_number, total_pages, file_name 중 하나입니다: {kind}"
+                "머리말/꼬리말 필드는 page_number, total_pages, file_name, date_created, date_saved 중 하나입니다: {kind}"
             )
         })
 }
@@ -2445,6 +3018,23 @@ impl Session {
                     let (s, e) = placeholder(start);
                     at_control.push((s, e, "total_pages"));
                 }
+                Control::Field(f)
+                    if f.field_type == FieldType::Summary
+                        && HF_DATE_FIELDS.iter().any(|(_, c)| *c == f.command) =>
+                {
+                    let kind = HF_DATE_FIELDS
+                        .iter()
+                        .find(|(_, c)| *c == f.command)
+                        .map_or("date_created", |(k, _)| *k);
+                    let (s, e) = p
+                        .field_ranges
+                        .iter()
+                        .find(|r| r.control_idx == ci)
+                        .map_or((start, start), |r| {
+                            (r.start_char_idx, r.end_char_idx.max(r.start_char_idx))
+                        });
+                    at_control.push((s, e, kind));
+                }
                 Control::Field(f) if f.field_type == FieldType::Path => {
                     // The field wraps the literal file name (empty for an unsaved document).
                     let (s, e) = p
@@ -2529,12 +3119,19 @@ impl Session {
             bail!("머리말/꼬리말은 제어 문자 없는 한 줄, 10 KB 이하로 입력하세요.");
         }
         let length = p.text.chars().count();
-        let mut fields: Vec<(usize, usize, u8)> = Vec::with_capacity(p.fields.len());
+        let mut fields: Vec<(usize, usize, std::result::Result<u8, &str>)> =
+            Vec::with_capacity(p.fields.len());
         for (i, f) in p.fields.iter().enumerate() {
             if f.offset > length {
                 bail!("필드 위치 {}가 글자 수 {length}를 넘습니다.", f.offset);
             }
-            fields.push((f.offset, i, hf_field(&f.kind)?.0));
+            let field = hf_field(&f.kind)?;
+            if let Err(command) = field
+                && self.date_field_text(command).is_none()
+            {
+                bail!("저장한 적 없는 문서라 마지막 저장 날짜가 없습니다. 먼저 저장하세요.");
+            }
+            fields.push((f.offset, i, field));
         }
         // Insert from the end so earlier offsets stay valid. Fields sharing an offset are
         // inserted last-listed first, so the listed order is the final order.
@@ -2559,13 +3156,83 @@ impl Session {
                     .insert_text_in_header_footer_native(section, header, apply, 0, 0, &text)
                     .map_err(err)?;
             }
-            for (offset, _, code) in &fields {
-                s.core
-                    .insert_field_in_hf_native(section, header, apply, 0, *offset, *code)
-                    .map_err(err)?;
+            for (offset, _, field) in &fields {
+                match *field {
+                    Ok(code) => {
+                        s.core
+                            .insert_field_in_hf_native(section, header, apply, 0, *offset, code)
+                            .map_err(err)?;
+                    }
+                    Err(command) => {
+                        s.insert_hf_date_field(section, header, apply, *offset, command)?
+                    }
+                }
             }
             Ok(())
         })
+    }
+
+    /// A date field (`command` `$createtime` or `$modifiedtime`) at character `offset` of
+    /// the section's header or footer paragraph, showing the time as the body's date
+    /// fields do. RHWP has no field insertion for header paragraphs: the text goes in
+    /// through RHWP, the field markers through `control_slots::wrap_field`.
+    fn insert_hf_date_field(
+        &mut self,
+        section: usize,
+        header: bool,
+        apply: u8,
+        offset: usize,
+        command: &'static str,
+    ) -> Result<()> {
+        use hwpcraft_doc::model::control::{Field, FieldType, Parameter, ParameterList};
+        let text = self
+            .date_field_text(command)
+            .ok_or_else(|| anyhow!("문서 요약 정보에 그 시각이 없습니다."))?;
+        self.core
+            .insert_text_in_header_footer_native(section, header, apply, 0, offset, &text)
+            .map_err(err)?;
+        let info: Value = serde_json::from_str(
+            &self
+                .core
+                .get_header_footer_native(section, header, apply)
+                .map_err(err)?,
+        )?;
+        let index = |k: &str| info[k].as_u64().and_then(|v| usize::try_from(v).ok());
+        let (Some(pi), Some(ci)) = (index("paraIndex"), index("controlIndex")) else {
+            bail!("머리말/꼬리말을 찾지 못했습니다.");
+        };
+        let field_id = max_field_id(self.core.document()).saturating_add(1);
+        let doc = self.core.document_mut();
+        let para = match doc.sections[section].paragraphs[pi].controls.get_mut(ci) {
+            Some(Control::Header(h)) => h.paragraphs.first_mut(),
+            Some(Control::Footer(f)) => f.paragraphs.first_mut(),
+            _ => None,
+        }
+        .ok_or_else(|| anyhow!("머리말/꼬리말 문단을 찾지 못했습니다."))?;
+        let end = offset + text.chars().count();
+        crate::control_slots::wrap_field(
+            para,
+            offset,
+            end,
+            Control::Field(Field {
+                field_type: FieldType::Summary,
+                ctrl_id: crate::cross_ref::SUMMARY_CTRL,
+                command: command.to_owned(),
+                properties: 8,
+                field_id,
+                parameters: ParameterList {
+                    name: Some(String::new()),
+                    items: vec![Parameter::String {
+                        name: Some("Command".into()),
+                        value: command.to_owned(),
+                        preserve_space: false,
+                    }],
+                },
+                ..Default::default()
+            }),
+        );
+        doc.sections[section].raw_stream = None;
+        Ok(())
     }
 
     /// 구역 설정 of the cursor's section, numbers as stored plus mm conversions.
@@ -2581,6 +3248,17 @@ impl Session {
         v["section"] = json!(self.cursor.section);
         v["sections"] = json!(self.core.document().sections.len());
         v["lineNumbersSupported"] = json!(false);
+        if let Some(sec) = self.core.document().sections.get(self.cursor.section) {
+            let sd = &sec.section_def;
+            v["textDirection"] = json!(match sd.text_direction {
+                1 => "vertical",
+                2 => "vertical_all",
+                _ => "horizontal",
+            });
+            v["lineGrid"] = json!(sd.line_grid);
+            v["charGrid"] = json!(sd.char_grid);
+            v["manuscript"] = json!(sd.flags & SECTION_WONGGOJI_FORMAT != 0 && sd.char_grid > 0);
+        }
         Ok(v)
     }
 
@@ -3177,15 +3855,32 @@ impl Session {
             .ok_or_else(|| anyhow!("복사한 쪽이 없습니다. 먼저 쪽 복사하기를 실행하세요."))?;
         let count: usize = foreign.sections.iter().map(|s| s.paragraphs.len()).sum();
         let page = self.page_target(page)?;
-        let (sec, range) = self.page_paragraphs(page)?;
-        let last = range.end.max(range.start + 1) - 1;
-        let len = self.text_len(sec, last)?;
+        // The copy goes where the page's text ends: before the next page's first
+        // position in the same section, else at the end of the section. A paragraph
+        // that runs on to the next page is cut there, as 쪽 복사 cuts it.
+        let (start, next) = self.page_span(page)?;
+        let sec = start.section;
+        let cut = next.filter(|n| n.offset > 0);
+        let last = match next {
+            Some(n) if n.offset > 0 => n.paragraph,
+            Some(n) => n.paragraph.saturating_sub(1).max(start.paragraph),
+            None => self.core.document().sections[sec]
+                .paragraphs
+                .len()
+                .saturating_sub(1),
+        };
         let mut end = Cursor::default();
         self.transaction(|s| {
+            if let Some(n) = cut {
+                let at = s.split_offset(n)?;
+                s.core
+                    .split_paragraph_native(sec, n.paragraph, at, None)
+                    .map_err(err)?;
+            }
             let split = s.split_offset(Cursor {
                 section: sec,
                 paragraph: last,
-                offset: len,
+                offset: s.text_len(sec, last)?,
                 cell: None,
             })?;
             s.core
@@ -3428,6 +4123,9 @@ impl Session {
             bail!("표 밖 본문의 블록만 저장할 수 있습니다.");
         }
         let (start, end) = match self.span() {
+            Some((start, end)) if start.section != end.section => {
+                bail!("블록 저장은 한 구역 안의 선택만 지원합니다.")
+            }
             Some(span) => span,
             None => {
                 let r = self.selection();
@@ -3545,4 +4243,31 @@ impl Session {
         out.set_document(out.document().clone());
         Ok((Self::with_core(out, None), text))
     }
+}
+
+/// The largest field id in the document (body, table cells, headers and footers), so a
+/// new field gets an unused one.
+fn max_field_id(doc: &hwpcraft_doc::model::document::Document) -> u32 {
+    fn walk(paragraphs: &[Paragraph], max: &mut u32) {
+        for p in paragraphs {
+            for control in &p.controls {
+                match control {
+                    Control::Field(f) => *max = (*max).max(f.field_id),
+                    Control::Table(t) => {
+                        for cell in &t.cells {
+                            walk(&cell.paragraphs, max);
+                        }
+                    }
+                    Control::Header(h) => walk(&h.paragraphs, max),
+                    Control::Footer(f) => walk(&f.paragraphs, max),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut max = 0;
+    for section in &doc.sections {
+        walk(&section.paragraphs, &mut max);
+    }
+    max
 }

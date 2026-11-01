@@ -291,17 +291,13 @@ fn unsupported_memo_requests_fail_without_mutating_document() -> anyhow::Result<
         assert_eq!(s.generation, generation, "{command}");
         assert_eq!(s.info(), document_before, "{command}");
     }
+    // A selection across paragraphs gets one memo across them, as Hangul stores it
+    // (tests/memo_spanning.rs has the details).
     s.select(at(0, 0), false)?;
     s.select(at(1, 1), true)?;
-    let before = s.selected_text();
-    assert!(create(&mut s, "다문단 범위").is_err());
-    assert_eq!(s.selected_text(), before);
-    assert!(
-        s.run("memo.list", json!({}))?
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+    let made = create(&mut s, "다문단 범위")?;
+    assert_eq!(made["anchor"], "본문\n둘", "{made}");
+    assert_eq!(made["endAt"]["paragraph"], 1, "{made}");
     Ok(())
 }
 

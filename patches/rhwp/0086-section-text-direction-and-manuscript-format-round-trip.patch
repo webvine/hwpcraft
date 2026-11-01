@@ -1,0 +1,187 @@
+diff --git a/src/model/document.rs b/src/model/document.rs
+index 5e6dda2..9711917 100644
+--- a/src/model/document.rs
++++ b/src/model/document.rs
+@@ -290,6 +290,10 @@ pub struct Section {
+     pub raw_provenance: Option<crate::model::raw_provenance::SectionSeal>,
+ }
+ 
++/// 구역 정의 속성 bit 22: 원고지 정서법(HWPX `grid@wonggojiFormat`). 글자 격자(`char_grid`)가
++/// 있는 구역에서 반각 영문·숫자 두 자를 한 칸에 넣는다(HwpCraft 패치 0086).
++pub const SECTION_WONGGOJI_FORMAT: u32 = 0x0040_0000;
++
+ /// 구역 정의 (HWPTAG_CTRL_HEADER - 'secd')
+ #[derive(Debug, Clone, Default, serde::Serialize)]
+ pub struct SectionDef {
+@@ -342,7 +346,8 @@ pub struct SectionDef {
+     pub first_page_fill: bool,
+     /// 빈 줄 감추기 (bit 19): 페이지 시작 부분의 빈 줄 2개까지 높이 0 처리
+     pub hide_empty_line: bool,
+-    /// 텍스트 방향 (0: 가로, 1: 세로)
++    /// 텍스트 방향 (0: 가로, 1: 세로 영문 눕힘, 2: 세로 영문 세움). HWP5 `secd` 속성
++    /// bit 16–18, HWPX `secPr@textDirection` HORIZONTAL/VERTICAL/VERTICALALL.
+     pub text_direction: u8,
+     /// 개요 번호 ID (SectionDef 바이트 14-15, Numbering 테이블 참조, 1-based)
+     pub outline_numbering_id: u16,
+diff --git a/src/parser/body_text.rs b/src/parser/body_text.rs
+index bc72f6a..351b3e3 100644
+--- a/src/parser/body_text.rs
++++ b/src/parser/body_text.rs
+@@ -894,6 +894,11 @@ fn parse_section_def(ctrl_data: &[u8], child_records: &[Record], ctrl_level: u16
+     sd.first_page_border = sd.flags & 0x0100 != 0;
+     sd.first_page_fill = sd.flags & 0x0200 != 0;
+     sd.hide_empty_line = sd.flags & 0x00080000 != 0; // bit 19: 빈 줄 감추기
++
++    // bit 16-18: 글자 방향 (0 가로, 1 세로 영문 눕힘, 2 세로 영문 세움). 원고지 정서법(bit 22)은
++    // flags 에 그대로 둔다(HwpCraft 패치 0086).
++    sd.text_direction = ((sd.flags >> 16) & 0x07) as u8;
++
+     sd.page_num_type = ((sd.flags >> 20) & 0x03) as u8; // bit 20-21: 쪽 번호 종류 (0=이어서, 1=홀수, 2=짝수)
+ 
+     // 줄 번호 매기기: flags bit 24 가 표시, 확장 tail offset 10..19 가 설정이다
+diff --git a/src/parser/hwpx/section.rs b/src/parser/hwpx/section.rs
+index 2686de4..fa9267d 100644
+--- a/src/parser/hwpx/section.rs
++++ b/src/parser/hwpx/section.rs
+@@ -414,7 +414,12 @@ fn parse_section_def_start(e: &quick_xml::events::BytesStart, sec_def: &mut Sect
+         match attr.key.as_ref().as_bytes() {
+             b"textDirection" => {
+                 let val = attr_str(&attr);
+-                sec_def.text_direction = if val == "VERTICAL" { 1 } else { 0 };
++                // VERTICALALL = 영문 세움(HWP5 값 2, HwpCraft 패치 0086).
++                sec_def.text_direction = match val.as_str() {
++                    "VERTICAL" => 1,
++                    "VERTICALALL" => 2,
++                    _ => 0,
++                };
+             }
+             b"tabStop" => {
+                 sec_def.default_tab_spacing = parse_u32(&attr);
+@@ -482,6 +487,14 @@ fn parse_grid(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef) {
+         match attr.key.as_ref().as_bytes() {
+             b"lineGrid" => sec_def.line_grid = parse_i32(&attr) as i16,
+             b"charGrid" => sec_def.char_grid = parse_i32(&attr) as i16,
++            // 원고지 정서법: HWP5 와 같이 flags bit 22 에 둔다(HwpCraft 패치 0086).
++            b"wonggojiFormat" => {
++                if parse_i32(&attr) != 0 {
++                    sec_def.flags |= crate::model::document::SECTION_WONGGOJI_FORMAT;
++                } else {
++                    sec_def.flags &= !crate::model::document::SECTION_WONGGOJI_FORMAT;
++                }
++            }
+             _ => {}
+         }
+     }
+diff --git a/src/serializer/control.rs b/src/serializer/control.rs
+index 6481c47..1cc33d9 100644
+--- a/src/serializer/control.rs
++++ b/src/serializer/control.rs
+@@ -333,7 +333,11 @@ fn serialize_section_def(
+     // flags bit 20-21은 동기화하지 않는다. HWP5는 page_num_type을 별도 필드로
+     // 갖지 않고 flags bit 20-21로만 표현하므로, 여기서 반영하지 않으면 HWPX
+     // 출처 문서를 HWP5로 저장할 때 홀/짝 쪽번호 시작 설정이 유실된다.
+-    let flags = (sd.flags & !0x0030_0000) | (((sd.page_num_type as u32) & 0x03) << 20);
++    // 글자 방향(bit 16-18)도 같은 이유로 필드에서 다시 쓴다: HWPX 출처의 세로쓰기 구역이
++    // HWP5 저장에서 가로가 됐다(HwpCraft 패치 0086).
++    let flags = (sd.flags & !0x0037_0000)
++        | (((sd.page_num_type as u32) & 0x03) << 20)
++        | (((sd.text_direction as u32) & 0x07) << 16);
+     w.write_u32(flags).unwrap();
+     w.write_i16(sd.column_spacing).unwrap();
+     w.write_i16(sd.line_grid).unwrap();
+diff --git a/src/serializer/hwpx/section.rs b/src/serializer/hwpx/section.rs
+index be8551d..2bb1775 100644
+--- a/src/serializer/hwpx/section.rs
++++ b/src/serializer/hwpx/section.rs
+@@ -147,14 +147,14 @@ fn replace_secpr_scalars(xml: &str, sd: &SectionDef) -> String {
+     // (parser/hwpx/section.rs) 직렬화기는 이 필드를 재출력하지 않아, 세로쓰기 구역이
+     // .hwpx 저장 시 HORIZONTAL 로 유실됐다. text_direction==1 일 때만 치환한다
+     // (기본 0 문서는 템플릿 HORIZONTAL 유지). 템플릿엔 secPr 에만 등장하므로 replacen(1) 안전.
+-    let out = if sd.text_direction == 1 {
+-        out.replacen(
+-            r#"textDirection="HORIZONTAL""#,
+-            r#"textDirection="VERTICAL""#,
+-            1,
+-        )
+-    } else {
+-        out
++    let vertical = match sd.text_direction {
++        1 => Some(r#"textDirection="VERTICAL""#),
++        2 => Some(r#"textDirection="VERTICALALL""#),
++        _ => None,
++    };
++    let out = match vertical {
++        Some(direction) => out.replacen(r#"textDirection="HORIZONTAL""#, direction, 1),
++        None => out,
+     };
+     let out = out.replacen(
+         r#"outlineShapeIDRef="1""#,
+@@ -194,8 +194,10 @@ fn replace_secpr_scalars(xml: &str, sd: &SectionDef) -> String {
+     let out = out.replacen(
+         r#"<hp:grid lineGrid="0" charGrid="0" wonggojiFormat="0"/>"#,
+         &format!(
+-            r#"<hp:grid lineGrid="{}" charGrid="{}" wonggojiFormat="0"/>"#,
+-            sd.line_grid, sd.char_grid
++            r#"<hp:grid lineGrid="{}" charGrid="{}" wonggojiFormat="{}"/>"#,
++            sd.line_grid,
++            sd.char_grid,
++            u8::from(sd.flags & crate::model::document::SECTION_WONGGOJI_FORMAT != 0)
+         ),
+         1,
+     );
+@@ -6608,3 +6610,55 @@ mod tests {
+         assert!(xml.contains("<hp:shadow"), "shadow 방출: {xml}");
+     }
+ }
++
++#[cfg(test)]
++mod section_direction_round_trip_tests {
++    use crate::document_core::DocumentCore;
++    use crate::model::control::Control;
++    use crate::model::document::{SectionDef, SECTION_WONGGOJI_FORMAT};
++
++    fn manuscript_vertical(sd: &mut SectionDef) {
++        sd.text_direction = 2;
++        sd.flags |= SECTION_WONGGOJI_FORMAT;
++        sd.line_grid = 3000;
++        sd.char_grid = 2126;
++    }
++
++    /// 세로쓰기(영문 세움)와 원고지 정서법이 HWP·HWPX 저장과 HWPX→HWP 변환을 지난다
++    /// (HwpCraft 패치 0086).
++    #[test]
++    fn vertical_and_manuscript_sections_survive_hwp_and_hwpx() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        let mut doc = core.document().clone();
++        // 편집한 구역은 원본 레코드 대신 모델에서 쓴다.
++        doc.sections[0].raw_stream = None;
++        manuscript_vertical(&mut doc.sections[0].section_def);
++        for control in doc.sections[0]
++            .paragraphs
++            .iter_mut()
++            .flat_map(|p| p.controls.iter_mut())
++        {
++            if let Control::SectionDef(sd) = control {
++                manuscript_vertical(sd);
++            }
++        }
++        core.set_document(doc);
++        let hwp = DocumentCore::from_bytes(&core.export_hwp_native().unwrap()).unwrap();
++        let hwpx = DocumentCore::from_bytes(&core.export_hwpx_native().unwrap()).unwrap();
++        let converted = DocumentCore::from_bytes(&hwpx.export_hwp_native().unwrap()).unwrap();
++        for (label, back) in [("hwp", &hwp), ("hwpx", &hwpx), ("hwpx to hwp", &converted)] {
++            let sd = &back.document().sections[0].section_def;
++            assert_eq!(
++                (
++                    sd.text_direction,
++                    sd.flags & SECTION_WONGGOJI_FORMAT != 0,
++                    sd.line_grid,
++                    sd.char_grid
++                ),
++                (2, true, 3000, 2126),
++                "{label}"
++            );
++        }
++    }
++}

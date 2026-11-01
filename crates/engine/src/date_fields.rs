@@ -40,7 +40,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "tools.date_field.update",
-        "매개 변수 없음. 본문의 날짜 필드($createtime·$modifiedtime) 글을 지금 문서 요약 정보의 시각으로 다시 씁니다(한 번 실행 취소). 저장해도 필드 글은 바뀌지 않고 이 명령으로 바뀝니다. 결과: fields, updated.",
+        "매개 변수 없음. 본문·표 셀·머리말·꼬리말·각주·글상자의 날짜 필드($createtime·$modifiedtime) 글을 지금 문서 요약 정보의 시각으로 다시 씁니다(한 번 실행 취소). 저장해도 필드 글은 바뀌지 않고 이 명령으로 바뀝니다. 결과: fields, updated.",
         r#"{}"#,
     ),
 ];
@@ -85,7 +85,7 @@ pub fn fixed_clock(secs: Option<i64>) {
 }
 
 /// The clock: a fixed test clock, `SOURCE_DATE_EPOCH` (seconds) when set, otherwise now.
-fn now() -> DateTime<Utc> {
+pub(crate) fn now() -> DateTime<Utc> {
     let fixed = FIXED_CLOCK.load(std::sync::atomic::Ordering::SeqCst);
     if fixed != i64::MIN
         && let Some(time) = Utc.timestamp_opt(fixed, 0).single()
@@ -295,7 +295,7 @@ impl Session {
 
     fn stamp_save_times(&mut self, at: DateTime<Utc>) -> SavedTimes {
         let created = self.document_times().0.unwrap_or(at);
-        let doc = self.core.document_mut();
+        let doc = self.core.document_mut_keeping_layout();
         let mut saved = SavedTimes {
             summary: None,
             hpf: None,
@@ -350,7 +350,7 @@ impl Session {
     }
 
     fn restore_save_times(&mut self, saved: SavedTimes) {
-        let doc = self.core.document_mut();
+        let doc = self.core.document_mut_keeping_layout();
         if let Some((i, before)) = saved.summary {
             doc.extra_streams[i].1 = before;
         }
@@ -364,7 +364,7 @@ impl Session {
     }
 
     /// The text a date field shows now, or `None` when the document has no such time.
-    fn date_field_text(&self, command: &str) -> Option<String> {
+    pub(crate) fn date_field_text(&self, command: &str) -> Option<String> {
         let (created, saved) = self.document_times();
         match command {
             CREATED => Some(long_form(created.unwrap_or_else(now))),
@@ -408,58 +408,134 @@ impl Session {
         Ok(out)
     }
 
-    /// Body date fields: (section, paragraph, field id, command, shown text).
-    fn date_fields(&self) -> Vec<(usize, usize, u32, String, String)> {
+    /// Date fields in the body and its table cells: (section, paragraph, cell, field
+    /// id, command, shown text).
+    #[allow(clippy::type_complexity)]
+    fn date_fields(&self) -> Vec<(usize, usize, Option<Cell>, u32, String, String)> {
         let mut out = Vec::new();
-        for (s, section) in self.core.document().sections.iter().enumerate() {
-            for (p, para) in section.paragraphs.iter().enumerate() {
-                for range in &para.field_ranges {
-                    let Some(Control::Field(f)) = para.controls.get(range.control_idx) else {
-                        continue;
-                    };
-                    if f.field_type != FieldType::Summary
-                        || !matches!(f.command.as_str(), CREATED | MODIFIED)
-                    {
-                        continue;
-                    }
-                    let text: String = para
-                        .text
-                        .chars()
-                        .skip(range.start_char_idx)
-                        .take(range.end_char_idx.saturating_sub(range.start_char_idx))
-                        .collect();
-                    out.push((s, p, f.field_id, f.command.clone(), text));
-                }
+        for (s, p, cell, para) in crate::cross_ref::field_paragraphs(self.core.document()) {
+            for (id, command, _, text) in date_ranges(para) {
+                out.push((s, p, cell, id, command, text));
             }
         }
         out
     }
 
+    /// Date fields in headers, footers, notes, text boxes and nested cells (a 날짜 코드
+    /// typed while editing a header is the same field as in the body): (address, command,
+    /// character range, shown text).
+    fn context_date_fields(&self) -> Vec<(ContextAddress, String, std::ops::Range<usize>, String)> {
+        let doc = self.core.document();
+        let mut out = Vec::new();
+        for address in crate::context_walk::nested_paragraphs(doc, &|p| !date_ranges(p).is_empty())
+        {
+            let Ok(para) = self.context_v2_paragraph(&address) else {
+                continue;
+            };
+            for (_, command, range, text) in date_ranges(para) {
+                out.push((address.clone(), command, range, text));
+            }
+        }
+        out
+    }
+
+    /// Show `value` in the context date field over `range`. The new text goes in after
+    /// the field's first character, where it is inside the field, and then the old text
+    /// around it is removed; text put where the old text began would land in front of
+    /// the field. Runs inside the caller's transaction.
+    fn rewrite_context_date_field(
+        &mut self,
+        address: &ContextAddress,
+        range: std::ops::Range<usize>,
+        value: &str,
+    ) -> Result<()> {
+        let n = value.chars().count();
+        let first = range.start + 1;
+        self.context_v2_replace_ranges(&[(address.clone(), first..first)], value)?;
+        self.context_v2_replace_ranges(
+            &[
+                (address.clone(), first + n..range.end + n),
+                (address.clone(), range.start..first),
+            ],
+            "",
+        )
+    }
+
     fn update_date_fields(&mut self) -> Result<Value> {
         self.guard_protected()?;
         let fields = self.date_fields();
+        let contexts = self.context_date_fields();
+        let context_fields = contexts.len();
+        // Nothing to rewrite: no undo step for an unchanged document.
+        let stale = |command: &str, text: &str| {
+            self.date_field_text(command)
+                .is_some_and(|value| value != text && !text.is_empty())
+        };
+        if !fields.iter().any(|f| stale(&f.4, &f.5)) && !contexts.iter().any(|f| stale(&f.1, &f.3))
+        {
+            return Ok(json!({"fields": fields.len() + context_fields, "updated": 0}));
+        }
         let mut updated = 0;
         self.transaction(|s| {
-            for (sec, para, id, command, text) in fields.iter().cloned() {
+            for (sec, para, cell, id, command, text) in fields.iter().cloned() {
                 let Some(value) = s.date_field_text(&command) else {
                     continue;
                 };
                 if value == text || text.is_empty() {
                     continue;
                 }
-                let saved = s.text_fields_as_links(sec, para);
+                let saved = s.text_fields_as_links(sec, para, cell);
                 let result = s.core.replace_hyperlink_text_native(
-                    &hwpcraft_doc::HyperlinkTarget::body(sec, para),
+                    &crate::cross_ref::field_target(sec, para, cell),
                     id,
                     &value,
                 );
-                s.restore_field_types(sec, para, &saved);
+                s.restore_field_types(sec, para, cell, &saved);
                 result.map_err(err)?;
+                updated += 1;
+            }
+            // One field at a time: rewriting one moves the others in its paragraph.
+            for _ in 0..context_fields {
+                let Some((address, range, value)) = s.context_date_fields().into_iter().find_map(
+                    |(address, command, range, text)| {
+                        let value = s.date_field_text(&command)?;
+                        (value != text && text.chars().count() >= 2)
+                            .then_some((address, range, value))
+                    },
+                ) else {
+                    break;
+                };
+                s.rewrite_context_date_field(&address, range, &value)?;
                 updated += 1;
             }
             s.cursor.offset = s.cursor.offset.min(s.len());
             Ok(())
         })?;
-        Ok(json!({"fields": fields.len(), "updated": updated}))
+        Ok(json!({"fields": fields.len() + context_fields, "updated": updated}))
     }
+}
+
+/// The date fields of one paragraph: (field id, command, character range, shown text).
+fn date_ranges(para: &Paragraph) -> Vec<(u32, String, std::ops::Range<usize>, String)> {
+    para.field_ranges
+        .iter()
+        .filter_map(|range| {
+            let Some(Control::Field(f)) = para.controls.get(range.control_idx) else {
+                return None;
+            };
+            if f.field_type != FieldType::Summary
+                || !matches!(f.command.as_str(), CREATED | MODIFIED)
+            {
+                return None;
+            }
+            let span = range.start_char_idx..range.end_char_idx.max(range.start_char_idx);
+            let text: String = para
+                .text
+                .chars()
+                .skip(span.start)
+                .take(span.len())
+                .collect();
+            Some((f.field_id, f.command.clone(), span, text))
+        })
+        .collect()
 }

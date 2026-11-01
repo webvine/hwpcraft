@@ -1,0 +1,69 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index b6cd0ac..eae62d5 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -4391,3 +4391,28 @@ mod hwpcraft_session_edit_scope_tests {
+         assert!(!untouched.section_layout_profile(0).session_edited());
+     }
+ }
++
++#[cfg(test)]
++mod hwpcraft_section_renumber_tests {
++    use super::DocumentCore;
++
++    /// An earlier section that gains a page renumbers the sections after it, which the
++    /// edit leaves untouched (they kept the page numbers they were laid out with).
++    #[test]
++    fn a_section_that_gains_a_page_renumbers_the_next_sections() {
++        let mut core = DocumentCore::from_bytes(include_bytes!(
++            "../../../samples/hwp-multi-001.hwp"
++        ))
++        .expect("open");
++        let before = core.page_count();
++        let mut splits = 0;
++        while core.page_count() == before && splits < 200 {
++            core.split_paragraph_native(0, 0, 0, None).expect("split");
++            splits += 1;
++        }
++        assert!(core.page_count() > before);
++        let mut fresh = DocumentCore::new_empty();
++        fresh.set_document(core.document().clone());
++        assert_eq!(core.dump_page_items(None), fresh.dump_page_items(None));
++    }
++}
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 6d2de5b..d7ea5d4 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -5392,6 +5392,31 @@ impl DocumentCore {
+                 .any(|p| p.controls.iter().any(|c| matches!(c, Control::Endnote(_))))
+         });
+         for (idx, section) in self.document.sections.iter().enumerate() {
++            // [HwpCraft] A section that continues the page numbers of the one before it
++            // is laid out again when that one now ends on another number (it gained or
++            // lost pages): its numbers, odd/even headers and master pages follow from
++            // them. The rule for the numbers is the carry below.
++            if !self.dirty_sections[idx] && idx > 0 && carry_last_page_number > 0 {
++                use crate::model::control::{AutoNumberType, Control};
++                let continues = section.section_def.page_num == 0
++                    && !section.paragraphs.iter().any(|p| {
++                        p.controls.iter().any(|c| {
++                            matches!(c, Control::NewNumber(nn) if nn.number_type == AutoNumberType::Page)
++                        })
++                    });
++                let renumbered = continues
++                    && self
++                        .pagination
++                        .get(idx)
++                        .and_then(|result| result.pages.first())
++                        .is_some_and(|first| {
++                            !first.page_number_restarted
++                                && first.page_number != carry_last_page_number + 1
++                        });
++                if renumbered {
++                    self.dirty_sections[idx] = true;
++                }
++            }
+             if !self.dirty_sections[idx] {
+                 // dirty가 아닌 구역에서도 carry를 업데이트
+                 if let Some(pages) = self.pagination.get(idx) {

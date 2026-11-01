@@ -1,0 +1,413 @@
+diff --git a/src/model/document.rs b/src/model/document.rs
+index b00a2f9..7fa21c2 100644
+--- a/src/model/document.rs
++++ b/src/model/document.rs
+@@ -232,6 +232,11 @@ pub struct DocInfo {
+     /// 라운드트립 시 refList에 재방출되지 않아, memoPr(메모 테두리/색상 모양)이
+     /// 통째로 소실되는 문제를 splice 보존으로 막는다. 원본에 없으면 None.
+     pub memo_properties_xml: Option<String>,
++    /// [HwpCraft 0082] HWPX 헤더 `<hh:refList>` 안의 변경 추적 블록
++    /// (`<hh:trackChanges>`·`<hh:trackChangeAuthors>`)을 원본 그대로 보존한다. 같은 내용은
++    /// HWP5 형식 `extra_records`(TRACK_CHANGE 96 · TRACK_CHANGE_AUTHOR 97)로도 실어
++    /// 목록·적용에 쓰고, HWPX 저장은 이 원문을 refList 에 다시 쓴다. 원본에 없으면 None.
++    pub track_changes_xml: Option<String>,
+     /// DISTRIBUTE_DOC_DATA 레코드 제거 플래그 (serializer에서 raw_stream surgical remove 수행)
+     pub distribute_doc_data_removed: bool,
+     /// raw_stream이 model 변경과 동기화되지 않음 (serializer에서 재생성 필요)
+diff --git a/src/model/raw_provenance.rs b/src/model/raw_provenance.rs
+index 80a2ee4..eb00803 100644
+--- a/src/model/raw_provenance.rs
++++ b/src/model/raw_provenance.rs
+@@ -135,6 +135,7 @@ pub fn doc_info_model_digest(doc_info: &DocInfo, doc_props: &DocProperties) -> [
+         bullet_count,
+         memo_shape_count,
+         memo_properties_xml,
++        track_changes_xml,
+         distribute_doc_data_removed: _,
+         raw_stream_dirty: _,
+         hwpx_head_tail,
+@@ -157,6 +158,7 @@ pub fn doc_info_model_digest(doc_info: &DocInfo, doc_props: &DocProperties) -> [
+         bullet_count: u32,
+         memo_shape_count: u32,
+         memo_properties_xml: &'a Option<String>,
++        track_changes_xml: &'a Option<String>,
+         hwpx_head_tail: &'a Option<String>,
+         hwpml_version: &'a Option<String>,
+         props: &'a DocProperties,
+@@ -176,6 +178,7 @@ pub fn doc_info_model_digest(doc_info: &DocInfo, doc_props: &DocProperties) -> [
+         bullet_count: *bullet_count,
+         memo_shape_count: *memo_shape_count,
+         memo_properties_xml,
++        track_changes_xml,
+         hwpx_head_tail,
+         hwpml_version,
+         props: doc_props,
+diff --git a/src/parser/hwpx/header.rs b/src/parser/hwpx/header.rs
+index 65bef1c..6990124 100644
+--- a/src/parser/hwpx/header.rs
++++ b/src/parser/hwpx/header.rs
+@@ -240,10 +240,157 @@ pub(super) fn parse_hwpx_header_with_plain_margin_units(
+     // 설정이라 헤더 재생성 시 splice 로 무손실 복원한다.
+     doc_info.hwpx_head_tail = extract_head_tail(xml);
+     doc_info.memo_properties_xml = extract_memo_properties(xml);
++    read_track_changes(xml, &mut doc_info);
+ 
+     Ok((doc_info, doc_props))
+ }
+ 
++/// [HwpCraft 0082] HWP5 DocInfo 변경 추적 레코드 태그 (HWPTAG_BEGIN + 80 / + 81).
++pub(crate) const HWPTAG_TRACK_CHANGE: u16 = tags::HWPTAG_BEGIN + 80;
++pub(crate) const HWPTAG_TRACK_CHANGE_AUTHOR: u16 = tags::HWPTAG_BEGIN + 81;
++
++/// [HwpCraft 0082] `<hh:trackChanges>`·`<hh:trackChangeAuthors>` (refList 자식, OWPML
++/// Header XML schema `TrackChange`·`TrackChangeAuthor`)를 원문 그대로 보존하고, 같은
++/// 내용을 HWP5 형식 레코드로 싣는다. 레코드 형식은 한글 2024 HWP 실측과 같다:
++/// TRACK_CHANGE 26바이트 = u32 종류(0x10 삽입 · 0x11 삭제 · 0x12 글자 모양 · 0x13 문단
++/// 모양) + u16 년·월·일·시·분 + u16 작성자 번호(1부터) + 0 열 바이트,
++/// TRACK_CHANGE_AUTHOR = u16 이름 길이 + 0 두 바이트 + UTF-16 이름 + u16 표시(mark) +
++/// u32 색 + 0 두 바이트. 본문 표지의 `TcId` 가 `trackChange@id` 이므로 레코드는 id-1
++/// 자리에 둔다(빈 번호는 종류 0 레코드로 채움). 실표본이 없어 명세로만 맞췄다.
++fn read_track_changes(xml: &str, doc_info: &mut DocInfo) {
++    let blocks: Vec<String> = ["hh:trackChanges", "hh:trackChangeAuthors"]
++        .iter()
++        .filter_map(|tag| extract_block(xml, tag))
++        .collect();
++    if blocks.is_empty() {
++        return;
++    }
++    let block = blocks.concat();
++    let mut changes: Vec<(u32, Vec<u8>)> = Vec::new();
++    let mut authors: Vec<(u32, String, bool, u32)> = Vec::new();
++    let mut reader = Reader::from_str(&block);
++    let mut buf = Vec::new();
++    loop {
++        match reader.read_event_into(&mut buf) {
++            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
++                let attr = |name: &[u8]| {
++                    e.attributes()
++                        .flatten()
++                        .find(|a| a.key.as_ref().as_bytes() == name)
++                        .map(|a| attr_str(&a))
++                        .unwrap_or_default()
++                };
++                let number = |name: &[u8]| attr(name).trim().parse::<u32>().unwrap_or(0);
++                match local_name(e.name().as_ref()) {
++                    b"trackChange" => {
++                        let kind: u32 = match attr(b"type").as_str() {
++                            "Insert" => 0x10,
++                            "Delete" => 0x11,
++                            "CharShape" => 0x12,
++                            "ParaShape" => 0x13,
++                            _ => 0,
++                        };
++                        // xs:dateTime: 2026-11-01T00:05:00Z → 년·월·일·시·분.
++                        let date = attr(b"date");
++                        let fields: Vec<u16> = date
++                            .split(|c: char| !c.is_ascii_digit())
++                            .filter(|s| !s.is_empty())
++                            .take(5)
++                            .map(|s| s.parse().unwrap_or(0))
++                            .collect();
++                        let mut data = Vec::with_capacity(26);
++                        data.extend_from_slice(&kind.to_le_bytes());
++                        for i in 0..5 {
++                            data.extend_from_slice(&fields.get(i).copied().unwrap_or(0).to_le_bytes());
++                        }
++                        // 작성자 번호는 아래에서 순번으로 바꾼다 — 우선 authorID 를 둔다.
++                        data.extend_from_slice(&(number(b"authorID") as u16).to_le_bytes());
++                        data.extend_from_slice(&[0u8; 10]);
++                        changes.push((number(b"id"), data));
++                    }
++                    b"trackChangeAuthor" => {
++                        let mark = matches!(attr(b"mark").as_str(), "1" | "true");
++                        let color = u32::from_str_radix(attr(b"color").trim_start_matches('#'), 16)
++                            .map(|rgb| {
++                                // #RRGGBB → HWP COLORREF 0x00BBGGRR
++                                ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF)
++                            })
++                            .unwrap_or(0);
++                        authors.push((number(b"id"), attr(b"name"), mark, color));
++                    }
++                    _ => {}
++                }
++            }
++            Ok(Event::Eof) | Err(_) => break,
++            _ => {}
++        }
++        buf.clear();
++    }
++    authors.sort_by_key(|a| a.0);
++    changes.sort_by_key(|c| c.0);
++    for (_, name, mark, color) in &authors {
++        let units: Vec<u16> = name.encode_utf16().collect();
++        let mut data = Vec::with_capacity(12 + units.len() * 2);
++        data.extend_from_slice(&(units.len() as u16).to_le_bytes());
++        data.extend_from_slice(&[0, 0]);
++        for unit in units {
++            data.extend_from_slice(&unit.to_le_bytes());
++        }
++        data.extend_from_slice(&u16::from(*mark).to_le_bytes());
++        data.extend_from_slice(&color.to_le_bytes());
++        data.extend_from_slice(&[0, 0]);
++        doc_info.extra_records.push(RawRecord {
++            tag_id: HWPTAG_TRACK_CHANGE_AUTHOR,
++            level: 1,
++            data,
++        });
++    }
++    let mut next_id = changes.first().map_or(1, |c| c.0.min(1));
++    for (id, mut data) in changes {
++        // 빈 번호는 종류 0 레코드로 채워 `TcId - 1` 자리가 맞게 한다.
++        while next_id < id {
++            let mut filler = vec![0u8; 26];
++            filler[..4].copy_from_slice(&0u32.to_le_bytes());
++            doc_info.extra_records.push(RawRecord {
++                tag_id: HWPTAG_TRACK_CHANGE,
++                level: 1,
++                data: filler,
++            });
++            next_id += 1;
++        }
++        let author_id = u32::from(u16::from_le_bytes([data[14], data[15]]));
++        let author = authors
++            .iter()
++            .position(|a| a.0 == author_id)
++            .map_or(0, |i| i + 1) as u16;
++        data[14..16].copy_from_slice(&author.to_le_bytes());
++        doc_info.extra_records.push(RawRecord {
++            tag_id: HWPTAG_TRACK_CHANGE,
++            level: 1,
++            data,
++        });
++        next_id = id + 1;
++    }
++    doc_info.track_changes_xml = Some(block);
++}
++
++/// `<tag ...>...</tag>` 또는 자기닫힘 `<tag .../>` 블록을 원문 그대로 꺼낸다.
++fn extract_block(xml: &str, tag: &str) -> Option<String> {
++    let open = format!("<{tag}");
++    let start = xml
++        .match_indices(&open)
++        .map(|(i, _)| i)
++        .find(|&i| matches!(xml.as_bytes().get(i + open.len()), Some(b' ' | b'>' | b'/')))?;
++    let tail = &xml[start..];
++    let first_close = tail.find('>')?;
++    if tail.as_bytes()[first_close - 1] == b'/' {
++        return Some(tail[..=first_close].to_string());
++    }
++    let close = format!("</{tag}>");
++    let end = tail.find(&close)? + close.len();
++    Some(tail[..end].to_string())
++}
++
+ /// HWPX 헤더 원문에서 `<hh:memoProperties>...</hh:memoProperties>`
+ /// (또는 자기닫힘 `<hh:memoProperties .../>`) 블록을 그대로 추출한다.
+ /// `parse_memo_shape`가 만드는 HWPTAG_MEMO_SHAPE 바이너리는 hwpx→hwp5
+diff --git a/src/parser/hwpx/section.rs b/src/parser/hwpx/section.rs
+index fa9267d..8786546 100644
+--- a/src/parser/hwpx/section.rs
++++ b/src/parser/hwpx/section.rs
+@@ -723,6 +723,8 @@ fn parse_paragraph_body(
+                             text_parts.push(format!("{MARKPEN_BEGIN_PART_PREFIX}{color}"));
+                         }
+                     }
++                    // [HwpCraft 0082] run 바로 아래 변경 추적 표지.
++                    l if is_track_mark(l) => text_parts.push(track_part(ce)),
+                     b"run" => {
+                         // 런 시작: charPrIDRef 읽기
+                         for attr in ce.attributes().flatten() {
+@@ -915,6 +917,7 @@ fn parse_paragraph_body(
+                             text_parts.push(format!("{MARKPEN_BEGIN_PART_PREFIX}{color}"));
+                         }
+                     }
++                    l if is_track_mark(l) => text_parts.push(track_part(ce)),
+                     b"run" => {
+                         // self-closing 빈 run (예: <hp:run charPrIDRef="42"/>)
+                         // 빈 paragraph 의 char_shape 가 누락되어 default(id=0) 로
+@@ -1020,6 +1023,8 @@ fn parse_paragraph_body(
+             // 텍스트에는 들어가지 않는다. fieldRange는 visual_text 좌표를 쓰므로 여기서
+             // 센티널 길이를 더하면 그 뒤 fieldBegin/fieldEnd가 두 글자 밀린다.
+             TITLE_MARK_PART_IGNORE | TITLE_MARK_PART_KEEP => {}
++            // [HwpCraft 0082] 변경 추적 표지는 본문 글자가 아니다.
++            p if p.starts_with(TRACK_PART_PREFIX) => {}
+             _ => {
+                 visible_char_idx += part.chars().count();
+             }
+@@ -1043,6 +1048,7 @@ fn parse_paragraph_body(
+     let mut visual_text = String::new();
+     let mut char_offsets: Vec<u32> = Vec::new();
+     let mut utf16_pos: u32 = 0;
++    let mut track_marks: Vec<(u32, String)> = Vec::new();
+ 
+     for part in &text_parts {
+         match part.as_str() {
+@@ -1061,6 +1067,10 @@ fn parse_paragraph_body(
+                 });
+                 utf16_pos += 8;
+             }
++            // [HwpCraft 0082] 변경 추적 표지 — 위치만 모아 두고 축은 건드리지 않는다.
++            p if p.starts_with(TRACK_PART_PREFIX) => {
++                track_marks.push((utf16_pos, part.clone()));
++            }
+             // [#6956] 형광펜 표지 — 위치만 싣고 축은 건드리지 않는다.
+             p if p.starts_with(MARKPEN_BEGIN_PART_PREFIX) || p == MARKPEN_END_PART => {
+                 para.markpen_marks
+@@ -1091,6 +1101,8 @@ fn parse_paragraph_body(
+     para.text = visual_text;
+     para.char_offsets = char_offsets;
+     para.char_count = utf16_pos + 1; // +1 for 끝 마커
++    para.range_tags
++        .extend(hwpx_track_range_tags(&track_marks, para.char_count));
+ 
+     // [#5961] 저장 lineseg 가 HWP5 축보다 얼마나 짧은지 기록한다.
+     //
+@@ -2117,6 +2129,94 @@ fn parse_lineseg_element(e: &quick_xml::events::BytesStart) -> LineSeg {
+ const MARKPEN_BEGIN_PART_PREFIX: &str = "\u{0007}B";
+ /// [#6956] 형광펜 닫는 표지 sentinel.
+ const MARKPEN_END_PART: &str = "\u{0007}E";
++/// [HwpCraft 0082] 변경 추적 표지 sentinel 접두어. 뒤에 `I|D`, `B|E`, `TcId,Id,paraend`.
++const TRACK_PART_PREFIX: &str = "\u{0007}T";
++
++/// [HwpCraft 0082] OWPML `TrackChangeTag` 요소(`hp:insertBegin` 등)인가.
++fn is_track_mark(local: &[u8]) -> bool {
++    matches!(
++        local,
++        b"insertBegin" | b"insertEnd" | b"deleteBegin" | b"deleteEnd"
++    )
++}
++
++/// [HwpCraft 0082] 변경 추적 표지를 글자 축을 소비하지 않는 sentinel 로 적는다.
++fn track_part(e: &quick_xml::events::BytesStart) -> String {
++    let name = e.name();
++    let local = local_name(name.as_ref());
++    let kind = if local.starts_with(b"insert") { 'I' } else { 'D' };
++    let edge = if local.ends_with(b"Begin") { 'B' } else { 'E' };
++    let attr = |key: &[u8]| {
++        e.attributes()
++            .flatten()
++            .find(|a| a.key.as_ref().as_bytes() == key)
++            .map(|a| attr_str(&a))
++            .unwrap_or_default()
++    };
++    let paraend = matches!(attr(b"paraend").as_str(), "1" | "true");
++    format!(
++        "{TRACK_PART_PREFIX}{kind}{edge}{},{},{}",
++        attr(b"TcId").trim().parse::<u32>().unwrap_or(0),
++        attr(b"Id").trim().parse::<u32>().unwrap_or(0),
++        u8::from(paraend)
++    )
++}
++
++/// [HwpCraft 0082] 한 문단의 변경 추적 표지(위치, sentinel)를 HWP5 와 같은 범위 태그로
++/// 바꾼다: 삽입 16 · 삭제 17, 데이터는 `TcId`(= `trackChange@id`, HWP5 의 1부터 번호).
++/// `paraend` 표지는 문단 나눔 자리다 — 여는 표지면 범위가 나눔에서 시작하고 닫는
++/// 표지면 나눔까지 덮는다(HWP5 실측: 문단 나눔 삽입은 `(글 끝, char_count)`). 문단 안에서
++/// 짝이 없는 여는 표지는 나눔까지, 닫는 표지는 문단 처음부터 덮는다(여러 문단 범위).
++fn hwpx_track_range_tags(
++    marks: &[(u32, String)],
++    char_count: u32,
++) -> Vec<crate::model::paragraph::RangeTag> {
++    let break_pos = char_count.saturating_sub(1);
++    let mut open: Vec<(char, u32, u32, u32)> = Vec::new();
++    let mut out = Vec::new();
++    let tag = |kind: char, tc: u32| {
++        (if kind == 'I' { 16u32 } else { 17u32 } << 24) | (tc & 0x00FF_FFFF)
++    };
++    for (pos, part) in marks {
++        let body = &part[TRACK_PART_PREFIX.len()..];
++        let mut chars = body.chars();
++        let (Some(kind), Some(edge)) = (chars.next(), chars.next()) else {
++            continue;
++        };
++        let nums: Vec<u32> = chars
++            .as_str()
++            .split(',')
++            .map(|s| s.parse().unwrap_or(0))
++            .collect();
++        let (tc, id, paraend) = (
++            nums.first().copied().unwrap_or(0),
++            nums.get(1).copied().unwrap_or(0),
++            nums.get(2).copied().unwrap_or(0) == 1,
++        );
++        if edge == 'B' {
++            open.push((kind, tc, id, if paraend { break_pos } else { *pos }));
++            continue;
++        }
++        let start = open
++            .iter()
++            .rposition(|o| o.0 == kind && (o.2 == id || o.1 == tc))
++            .map_or(0, |i| open.remove(i).3);
++        let end = if paraend { char_count } else { *pos };
++        out.push(crate::model::paragraph::RangeTag {
++            start,
++            end: end.max(start),
++            tag: tag(kind, tc),
++        });
++    }
++    for (kind, tc, _, start) in open {
++        out.push(crate::model::paragraph::RangeTag {
++            start,
++            end: char_count,
++            tag: tag(kind, tc),
++        });
++    }
++    out
++}
+ 
+ const TITLE_MARK_PART_IGNORE: &str = "\u{0008}1";
+ /// `text_parts` 안의 제목 차례 표시 센티널 — `ignore="0"` 쪽.
+@@ -2132,6 +2232,7 @@ fn read_text_content(reader: &mut Reader<&[u8]>) -> Result<String, HwpxError> {
+         .into_iter()
+         .filter(|p| p != TITLE_MARK_PART_IGNORE && p != TITLE_MARK_PART_KEEP)
+         .filter(|p| !p.starts_with(MARKPEN_BEGIN_PART_PREFIX) && p.as_str() != MARKPEN_END_PART)
++        .filter(|p| !p.starts_with(TRACK_PART_PREFIX))
+         .collect())
+ }
+ 
+@@ -2180,6 +2281,13 @@ fn read_text_content_with_tabs(
+                     break;
+                 }
+             }
++            // [HwpCraft 0082] 닫는 태그를 따로 쓴 변경 추적 표지.
++            Ok(Event::Start(ref ce)) if is_track_mark(local_name(ce.name().as_ref())) => {
++                if !text.is_empty() {
++                    parts.push(std::mem::take(&mut text));
++                }
++                parts.push(track_part(ce));
++            }
+             Ok(Event::Empty(ref ce)) => {
+                 let cname = ce.name();
+                 let local = local_name(cname.as_ref());
+@@ -2220,6 +2328,13 @@ fn read_text_content_with_tabs(
+                             parts.push(format!("{MARKPEN_BEGIN_PART_PREFIX}{color}"));
+                         }
+                     }
++                    // [HwpCraft 0082] 변경 추적 표지 — 글자 축을 소비하지 않는다.
++                    l if is_track_mark(l) => {
++                        if !text.is_empty() {
++                            parts.push(std::mem::take(&mut text));
++                        }
++                        parts.push(track_part(ce));
++                    }
+                     // 소프트 하이픈 — 줄바꿈 자리에서만 보인다. 리터럴 '-' 와 구별해야
+                     // 저장 왕복에서 단어가 갈라지지 않는다(ParaList XML schema.xml:291).
+                     b"hyphen" => text.push('\u{00AD}'),
+@@ -5985,6 +6100,8 @@ fn hwpx_part_utf16_width(s: &str, axis_5251: bool) -> u32 {
+         TITLE_MARK_PART_IGNORE | TITLE_MARK_PART_KEEP => 8,
+         // [#6956] 형광펜 표지는 글자 축을 소비하지 않는다.
+         p if p.starts_with(MARKPEN_BEGIN_PART_PREFIX) || p == MARKPEN_END_PART => 0,
++        // [HwpCraft 0082] 변경 추적 표지도 글자 축을 소비하지 않는다.
++        p if p.starts_with(TRACK_PART_PREFIX) => 0,
+         PAGE_FOOTER_SLOT_PART => {
+             if axis_5251 {
+                 0
+@@ -7149,6 +7266,8 @@ fn calc_utf16_len_from_parts(parts: &[String]) -> u32 {
+             TITLE_MARK_PART_IGNORE | TITLE_MARK_PART_KEEP => 8,
+             // [#6956] 형광펜 표지는 글자 축을 소비하지 않는다.
+             p if p.starts_with(MARKPEN_BEGIN_PART_PREFIX) || p == MARKPEN_END_PART => 0,
++            // [HwpCraft 0082] 변경 추적 표지도 글자 축을 소비하지 않는다.
++            p if p.starts_with(TRACK_PART_PREFIX) => 0,
+             PAGE_FOOTER_SLOT_PART => 8,
+             _ => s.chars().map(hwpx_char_utf16_width).sum(),
+         })

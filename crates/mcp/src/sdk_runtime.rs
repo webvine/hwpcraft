@@ -64,12 +64,15 @@ fn options(args: &[String]) -> Result<Options> {
     let mut token_file = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
+        if !arg.starts_with("--") {
+            bail!("unexpected MCP argument: {arg} (options are --name value)");
+        }
         let (flag, inline) = arg
             .split_once('=')
             .map_or((arg.as_str(), None), |(key, value)| (key, Some(value)));
         let value = inline
             .or_else(|| args.next().map(String::as_str))
-            .context("MCP option needs a value")?;
+            .with_context(|| format!("MCP option {flag} needs a value"))?;
         if value.is_empty() || value.starts_with("--") {
             bail!("{flag} needs a value");
         }
@@ -138,7 +141,7 @@ fn options(args: &[String]) -> Result<Options> {
 pub(crate) fn run(args: &[String]) -> Result<()> {
     if args == ["--help"] || args == ["-h"] {
         println!(
-            "hwpcraft-cli mcp [--transport stdio|http] [--listen 127.0.0.1:7082] [--auth-token-file FILE] [--automation-read-root DIR] [--automation-write-root DIR]\nMCP 2026-07-28 only. Requests carry protocol metadata; document operations carry document_id. HTTP is loopback-only and every request needs `Authorization: Bearer <token>`; the token is read from FILE (default: mcp-http-token in the HwpCraft settings folder) and created there, readable only by you, if it does not exist."
+            "hwpcraft-cli mcp [--transport stdio|http] [--listen 127.0.0.1:7082] [--auth-token-file FILE] [--automation-read-root DIR] [--automation-write-root DIR]\nMCP 2026-07-28 (requests carry protocol metadata) and 2025-03-26, 2025-06-18, 2025-11-25 (initialize handshake). Document operations carry document_id. HTTP is loopback-only and every request needs `Authorization: Bearer <token>`; the token is read from FILE (default: mcp-http-token in the HwpCraft settings folder) and created there, readable only by you, if it does not exist."
         );
         return Ok(());
     }

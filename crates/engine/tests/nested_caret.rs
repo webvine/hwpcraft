@@ -156,3 +156,70 @@ fn edits_without_a_nested_caret_are_refused() -> anyhow::Result<()> {
     assert!(s.nested_caret_rect().is_err());
     Ok(())
 }
+
+/// A selection in a nested cell runs over paragraphs: Shift+arrows cross them,
+/// the text and rectangles cover all of them, formatting applies to each, and
+/// Backspace deletes and joins them in one undo step.
+#[test]
+fn a_nested_selection_runs_over_paragraphs() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    let address = nested_table(&mut s)?;
+    s.set_nested(hwpcraft_engine::NestedCaret::at(address.clone(), 0), false)?;
+    s.nested_insert("가나\n다라\n마바")?;
+    let second = address.clone();
+    let paragraphs = |s: &mut Session| -> anyhow::Result<Vec<String>> {
+        (0..3)
+            .map(|k| {
+                let mut a = second.clone();
+                if let Some(ContextStep::TableCell { paragraph, .. }) = a.path.last_mut() {
+                    *paragraph = k;
+                }
+                text_at(s, &a).or_else(|_| Ok(String::new()))
+            })
+            .collect()
+    };
+    assert_eq!(paragraphs(&mut s)?, ["가나", "다라", "마바"]);
+
+    // From "가|나" to "마|바": right after the first character, then Shift+Right
+    // over the paragraph ends.
+    s.set_nested(hwpcraft_engine::NestedCaret::at(address.clone(), 1), false)?;
+    for _ in 0..6 {
+        s.nested_move(Motion::Right, true)?;
+    }
+    assert_eq!(s.nested_selected_text()?, "나\n다라\n마");
+    assert!(!s.nested_selection_rects()?.is_empty());
+    s.nested_character(json!({"bold": true}))?;
+    let generation = s.generation;
+    s.nested_backspace()?;
+    assert_ne!(s.generation, generation);
+    assert_eq!(text_at(&mut s, &address)?, "가바");
+    assert_eq!(
+        s.nested_caret().map(|c| (c.address.clone(), c.offset)),
+        Some((address.clone(), 1))
+    );
+    // One undo brings the three paragraphs back.
+    s.execute(Command::Undo)?;
+    s.revalidate_nested();
+    assert_eq!(paragraphs(&mut s)?, ["가나", "다라", "마바"]);
+    Ok(())
+}
+
+/// The format queries the character and paragraph dialogs read follow the nested
+/// caret while it is active, and the body caret again once it is cleared.
+#[test]
+fn format_queries_follow_the_nested_caret() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    let address = nested_table(&mut s)?;
+    s.set_nested(hwpcraft_engine::NestedCaret::at(address.clone(), 0), false)?;
+    s.nested_insert("굵은 글")?;
+    s.nested_select_paragraph()?;
+    s.nested_character(json!({"bold": true}))?;
+    s.nested_paragraph_format(json!({"alignment": "center"}))?;
+    s.nested_move(Motion::ParagraphEnd, false)?;
+    assert_eq!(s.character_properties()?["bold"], true);
+    let nested = s.paragraph_format()?;
+    s.clear_nested();
+    assert_eq!(s.character_properties()?["bold"], false);
+    assert_ne!(s.paragraph_format()?["alignment"], nested["alignment"], "{nested}");
+    Ok(())
+}

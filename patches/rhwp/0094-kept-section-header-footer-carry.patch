@@ -1,0 +1,276 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 8e8701a..2a41d33 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -4538,3 +4538,70 @@ mod hwpcraft_section_renumber_tests {
+         assert_eq!(core.dump_page_items(None), fresh.dump_page_items(None));
+     }
+ }
++
++#[cfg(test)]
++mod hwpcraft_kept_section_carry_tests {
++    use super::DocumentCore;
++
++    /// Page SVGs without the generated clip ids, which count every node built.
++    fn pages(core: &DocumentCore) -> Vec<String> {
++        (0..core.page_count())
++            .map(|page| {
++                let svg = core.render_page_svg_native(page).expect("svg");
++                let mut out = String::with_capacity(svg.len());
++                let mut rest = svg.as_str();
++                while let Some(at) = rest.find("clip-") {
++                    out.push_str(&rest[..at + 5]);
++                    rest = rest[at + 5..].trim_start_matches(|c: char| c.is_ascii_digit());
++                }
++                out.push_str(rest);
++                out
++            })
++            .collect()
++    }
++
++    /// An edit in a later section keeps the headers it inherits: the earlier section,
++    /// not paginated again, used to hand on the header carry read off its own pages,
++    /// which miss the even header of a section ending on an odd page.
++    #[test]
++    fn an_edit_in_a_later_section_keeps_its_inherited_headers() {
++        let mut core = DocumentCore::from_bytes(include_bytes!(
++            "../../../samples/issue5802/hf_cross_section_inherit.hwp"
++        ))
++        .expect("open");
++        let last = core.document().sections.len() - 1;
++        let para = core.document().sections[last]
++            .paragraphs
++            .iter()
++            .position(|p| p.text.chars().count() >= 2)
++            .expect("text");
++        core.insert_text_native(last, para, 1, "가").expect("insert");
++        let mut fresh = DocumentCore::new_empty();
++        fresh.set_document(core.document().clone());
++        assert_eq!(pages(&core), pages(&fresh));
++    }
++
++    /// An undo that rebuilds only the edited section shows the other pages as they were.
++    #[test]
++    fn undo_rebuilding_one_section_restores_every_page() {
++        let mut core = DocumentCore::from_bytes(include_bytes!(
++            "../../../samples/hwpx/exam_social.hwpx"
++        ))
++        .expect("open");
++        let opened = pages(&core);
++        let id = core.save_snapshot_native();
++        let last = core.document().sections.len() - 1;
++        let para = core.document().sections[last]
++            .paragraphs
++            .iter()
++            .position(|p| p.text.chars().count() >= 2)
++            .expect("text");
++        core.insert_text_native(last, para, 1, "가").expect("insert");
++        core.restore_snapshot_native(id).expect("restore");
++        let undone = pages(&core);
++        assert_eq!(undone.len(), opened.len());
++        for (page, (a, b)) in undone.iter().zip(&opened).enumerate() {
++            assert!(a == b, "page {} differs after undo", page + 1);
++        }
++    }
++}
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 793f0e1..06928c7 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -1058,6 +1058,83 @@ fn optional_master_page_number(
+         .map(usize::from)
+ }
+ 
++/// [HwpCraft] The header/footer carry after section `idx`: the ones it defines (with
++/// their odd/even scope), over those carried into it. A section paginated again and
++/// one kept from the previous pass must hand on the same carry, or the next section
++/// shows another header on its odd or even pages (the kept one used to read the carry
++/// off its own pages, missing a parity its pages did not show).
++fn carry_header_footer_from_section(
++    idx: usize,
++    section: &Section,
++    carry_header_odd: &mut Option<crate::renderer::pagination::HeaderFooterRef>,
++    carry_header_even: &mut Option<crate::renderer::pagination::HeaderFooterRef>,
++    carry_footer_odd: &mut Option<crate::renderer::pagination::HeaderFooterRef>,
++    carry_footer_even: &mut Option<crate::renderer::pagination::HeaderFooterRef>,
++) {
++    use crate::model::header_footer::HeaderFooterApply as HFA;
++    use crate::renderer::pagination::HeaderFooterRef;
++    let mut entries: Vec<(usize, HeaderFooterRef, bool, HFA)> = Vec::new();
++    for (pi, para) in section.paragraphs.iter().enumerate() {
++        for (ci, ctrl) in para.controls.iter().enumerate() {
++            match ctrl {
++                Control::Header(h) => {
++                    entries.push((
++                        pi,
++                        HeaderFooterRef {
++                            para_index: pi,
++                            control_index: ci,
++                            source_section_index: idx,
++                            table_path: Vec::new(),
++                        },
++                        true,
++                        h.apply_to,
++                    ));
++                }
++                Control::Footer(f) => {
++                    entries.push((
++                        pi,
++                        HeaderFooterRef {
++                            para_index: pi,
++                            control_index: ci,
++                            source_section_index: idx,
++                            table_path: Vec::new(),
++                        },
++                        false,
++                        f.apply_to,
++                    ));
++                }
++                Control::Table(table) => {
++                    crate::renderer::pagination::collect_nested_header_footer_controls(
++                        table,
++                        pi,
++                        idx,
++                        ci,
++                        &[],
++                        &mut entries,
++                    );
++                }
++                _ => {}
++            }
++        }
++    }
++
++    for (_, reference, is_header, apply_to) in entries {
++        let (odd, even) = if is_header {
++            (&mut *carry_header_odd, &mut *carry_header_even)
++        } else {
++            (&mut *carry_footer_odd, &mut *carry_footer_even)
++        };
++        match apply_to {
++            HFA::Both => {
++                *odd = Some(reference.clone());
++                *even = Some(reference);
++            }
++            HFA::Odd => *odd = Some(reference),
++            HFA::Even => *even = Some(reference),
++        }
++    }
++}
++
+ fn update_master_page_carry_from_section(
+     section_index: usize,
+     section: &Section,
+@@ -5503,25 +5580,16 @@ impl DocumentCore {
+                         }
+                         carry_last_page_number = last.page_number;
+                     }
+-                    // 머리말/꼬리말 carry 업데이트 (not-dirty 구역)
+-                    for page in &pages.pages {
+-                        let is_odd = page.page_number % 2 == 1;
+-                        if page.active_header.is_some() {
+-                            if is_odd {
+-                                carry_header_odd = page.active_header.clone();
+-                            } else {
+-                                carry_header_even = page.active_header.clone();
+-                            }
+-                        }
+-                        if page.active_footer.is_some() {
+-                            if is_odd {
+-                                carry_footer_odd = page.active_footer.clone();
+-                            } else {
+-                                carry_footer_even = page.active_footer.clone();
+-                            }
+-                        }
+-                    }
+                 }
++                // [HwpCraft] The same header/footer carry as a section paginated again.
++                carry_header_footer_from_section(
++                    idx,
++                    section,
++                    &mut carry_header_odd,
++                    &mut carry_header_even,
++                    &mut carry_footer_odd,
++                    &mut carry_footer_even,
++                );
+                 update_master_page_carry_from_section(
+                     idx,
+                     section,
+@@ -5875,69 +5943,14 @@ impl DocumentCore {
+             // 머리말/꼬리말 carry 업데이트:
+             // 페이지 active_header뿐 아니라 구역에 정의된 머리말 컨트롤도 carry에 반영
+             // (짝수 페이지가 없어도 Even 머리말이 다음 구역에 상속되어야 함)
+-            {
+-                use crate::model::header_footer::HeaderFooterApply as HFA;
+-                let mut entries: Vec<(usize, HeaderFooterRef, bool, HFA)> = Vec::new();
+-                for (pi, para) in section.paragraphs.iter().enumerate() {
+-                    for (ci, ctrl) in para.controls.iter().enumerate() {
+-                        match ctrl {
+-                            Control::Header(h) => {
+-                                entries.push((
+-                                    pi,
+-                                    HeaderFooterRef {
+-                                        para_index: pi,
+-                                        control_index: ci,
+-                                        source_section_index: idx,
+-                                        table_path: Vec::new(),
+-                                    },
+-                                    true,
+-                                    h.apply_to,
+-                                ));
+-                            }
+-                            Control::Footer(f) => {
+-                                entries.push((
+-                                    pi,
+-                                    HeaderFooterRef {
+-                                        para_index: pi,
+-                                        control_index: ci,
+-                                        source_section_index: idx,
+-                                        table_path: Vec::new(),
+-                                    },
+-                                    false,
+-                                    f.apply_to,
+-                                ));
+-                            }
+-                            Control::Table(table) => {
+-                                crate::renderer::pagination::collect_nested_header_footer_controls(
+-                                    table,
+-                                    pi,
+-                                    idx,
+-                                    ci,
+-                                    &[],
+-                                    &mut entries,
+-                                );
+-                            }
+-                            _ => {}
+-                        }
+-                    }
+-                }
+-
+-                for (_, reference, is_header, apply_to) in entries {
+-                    let (odd, even) = if is_header {
+-                        (&mut carry_header_odd, &mut carry_header_even)
+-                    } else {
+-                        (&mut carry_footer_odd, &mut carry_footer_even)
+-                    };
+-                    match apply_to {
+-                        HFA::Both => {
+-                            *odd = Some(reference.clone());
+-                            *even = Some(reference);
+-                        }
+-                        HFA::Odd => *odd = Some(reference),
+-                        HFA::Even => *even = Some(reference),
+-                    }
+-                }
+-            }
++            carry_header_footer_from_section(
++                idx,
++                section,
++                &mut carry_header_odd,
++                &mut carry_header_even,
++                &mut carry_footer_odd,
++                &mut carry_footer_even,
++            );
+ 
+             // 구역 간 page_number_pos 상속: 이 구역에 PageNumberPos가 없으면 이전 구역 값 사용
+             let section_has_own_pnp = result.pages.iter().any(|p| p.page_number_pos.is_some());

@@ -1,5 +1,6 @@
 //! Visual editing in the 수식 편집기 preview: click a drawn piece to put the
-//! script caret there, type into the preview, Tab between empty `{}` slots.
+//! script caret there, drag across pieces to select their script, type into the
+//! preview, Tab between empty `{}` slots.
 //!
 //! The engine's `equation_layout` ties each drawn piece to the script text that
 //! made it; pieces it could not tie keep no range and never move the caret to a
@@ -41,6 +42,75 @@ pub(crate) fn hit(layout: &EquationLayout, x: f64, y: f64) -> Option<usize> {
     } else {
         end
     })
+}
+
+/// The script range a drag from `a` to `b` (layout units) selects: from the first to
+/// the last script offset of the tied pieces the drag box touches, widened to whole
+/// `{}` groups so that typing over it keeps the script balanced. `None` when the box
+/// touches no tied piece.
+pub(crate) fn drag_range(
+    layout: &EquationLayout,
+    script: &str,
+    a: (f64, f64),
+    b: (f64, f64),
+) -> Option<(usize, usize)> {
+    let (x0, x1) = (a.0.min(b.0), a.0.max(b.0));
+    let (y0, y1) = (a.1.min(b.1), a.1.max(b.1));
+    let (start, end) = layout
+        .items
+        .iter()
+        .filter(|i| i.x <= x1 && i.x + i.width >= x0 && i.y <= y1 && i.y + i.height >= y0)
+        .filter_map(range)
+        .reduce(|(s0, e0), (s1, e1)| (s0.min(s1), e0.max(e1)))?;
+    Some(whole_groups(script, start, end))
+}
+
+/// Widen `start..end` until every `{` in it has its `}` and the other way round.
+fn whole_groups(script: &str, mut start: usize, mut end: usize) -> (usize, usize) {
+    let chars: Vec<char> = script.chars().collect();
+    end = end.min(chars.len());
+    start = start.min(end);
+    // Closers without an opener in the range, and openers left open at its end.
+    let (mut depth, mut lowest) = (0i32, 0i32);
+    for c in &chars[start..end] {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                lowest = lowest.min(depth);
+            }
+            _ => {}
+        }
+    }
+    let (mut openers, mut closers) = (-lowest, depth - lowest);
+    let mut nested = 0;
+    while openers > 0 && start > 0 {
+        start -= 1;
+        match chars[start] {
+            '}' => nested += 1,
+            '{' if nested > 0 => nested -= 1,
+            '{' => openers -= 1,
+            _ => {}
+        }
+    }
+    nested = 0;
+    while closers > 0 && end < chars.len() {
+        match chars[end] {
+            '{' => nested += 1,
+            '}' if nested > 0 => nested -= 1,
+            '}' => closers -= 1,
+            _ => {}
+        }
+        end += 1;
+    }
+    (start, end)
+}
+
+/// The selected script range, in order, when the anchor is not at the caret.
+pub(crate) fn selection(anchor: Option<usize>, caret: usize) -> Option<(usize, usize)> {
+    anchor
+        .filter(|a| *a != caret)
+        .map(|a| (a.min(caret), a.max(caret)))
 }
 
 /// The next (or previous) empty slot from `caret`, wrapping around.
@@ -110,21 +180,37 @@ fn byte_at(script: &str, caret: usize) -> usize {
         .map_or(script.len(), |(i, _)| i)
 }
 
-/// Apply one key or text event typed into the preview. Returns true when the
-/// event was used.
+/// Apply one key or text event typed into the preview. Typing, Backspace and Delete
+/// replace a selection (`anchor` to `caret`); moving the caret drops it. Returns true
+/// when the event was used.
 pub(crate) fn apply_event(
     script: &mut String,
     caret: &mut usize,
+    anchor: &mut Option<usize>,
     slots: &[usize],
     event: &egui::Event,
 ) -> bool {
     let count = script.chars().count();
     *caret = (*caret).min(count);
+    let selected = selection(anchor.map(|a| a.min(count)), *caret);
+    let take_selection = |script: &mut String, caret: &mut usize| {
+        if let Some((a, b)) = selected {
+            let (a_byte, b_byte) = (byte_at(script, a), byte_at(script, b));
+            script.replace_range(a_byte..b_byte, "");
+            *caret = a;
+        }
+    };
     match event {
         egui::Event::Text(text) | egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+            take_selection(script, caret);
             script.insert_str(byte_at(script, *caret), text);
             *caret += text.chars().count();
         }
+        egui::Event::Key {
+            key: egui::Key::Backspace | egui::Key::Delete,
+            pressed: true,
+            ..
+        } if selected.is_some() => take_selection(script, caret),
         egui::Event::Key {
             key,
             pressed: true,
@@ -153,16 +239,18 @@ pub(crate) fn apply_event(
         },
         _ => return false,
     }
+    *anchor = None;
     true
 }
 
-/// Draw the slot boxes, the current piece and the caret over the preview image
-/// placed at `dest`.
+/// Draw the slot boxes, the selected pieces (or the current piece) and the caret over
+/// the preview image placed at `dest`.
 pub(crate) fn paint(
     painter: &egui::Painter,
     dest: Rect,
     layout: &EquationLayout,
     caret: usize,
+    selected: Option<(usize, usize)>,
     focused: bool,
 ) {
     if layout.width <= 0.0 || layout.height <= 0.0 {
@@ -191,7 +279,19 @@ pub(crate) fn paint(
             painter.extend(egui::Shape::dashed_line(&[a, b], stroke, 3.0, 2.0));
         }
     }
-    if let Some(i) = current(layout, caret) {
+    if let Some((start, end)) = selected {
+        for i in layout
+            .items
+            .iter()
+            .filter(|i| i.kind != "slot" && range(i).is_some_and(|(s, e)| start <= s && e <= end))
+        {
+            painter.rect_filled(
+                rect(i.x, i.y, i.width, i.height),
+                1.0,
+                accent.gamma_multiply(0.3),
+            );
+        }
+    } else if let Some(i) = current(layout, caret) {
         painter.rect_filled(
             rect(i.x, i.y, i.width, i.height),
             1.0,
@@ -342,10 +442,11 @@ mod tests {
         assert_eq!(first_slot("{} over {} "), Some(1));
         assert_eq!(first_slot("alpha "), None);
 
-        let (mut script, mut caret) = ("{} over {}".to_owned(), 1);
+        let (mut script, mut caret, mut anchor) = ("{} over {}".to_owned(), 1, None);
         assert!(apply_event(
             &mut script,
             &mut caret,
+            &mut anchor,
             &[1, 9],
             &egui::Event::Text("가".into())
         ));
@@ -357,7 +458,13 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         };
-        assert!(apply_event(&mut script, &mut caret, &[10], &tab));
+        assert!(apply_event(
+            &mut script,
+            &mut caret,
+            &mut anchor,
+            &[10],
+            &tab
+        ));
         assert_eq!(caret, 10);
         let back = egui::Event::Key {
             key: egui::Key::Backspace,
@@ -366,8 +473,63 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         };
-        assert!(apply_event(&mut script, &mut caret, &[], &back));
+        assert!(apply_event(
+            &mut script,
+            &mut caret,
+            &mut anchor,
+            &[],
+            &back
+        ));
         assert_eq!((script.as_str(), caret), ("{가} over }", 9));
+        // A selection is replaced by typing and dropped by moving the caret.
+        let (mut script, mut caret, mut anchor) = ("a+b=c".to_owned(), 3, Some(0));
+        assert!(apply_event(
+            &mut script,
+            &mut caret,
+            &mut anchor,
+            &[],
+            &egui::Event::Text("x".into())
+        ));
+        assert_eq!((script.as_str(), caret, anchor), ("x=c", 1, None));
+        let mut anchor = Some(3);
+        assert!(apply_event(
+            &mut script,
+            &mut caret,
+            &mut anchor,
+            &[],
+            &back
+        ));
+        assert_eq!((script.as_str(), caret, anchor), ("x", 1, None));
+    }
+
+    #[test]
+    fn a_drag_selects_the_pieces_it_touches_in_whole_groups() {
+        let l = layout(
+            vec![
+                item("a", 0.0, 10.0, Some(1), Some(2)),
+                item("+", 10.0, 10.0, Some(3), Some(4)),
+                item("b", 20.0, 10.0, Some(11), Some(12)),
+                item("?", 40.0, 10.0, None, None),
+            ],
+            vec![],
+        );
+        let script = "{a + {sqrt b}}";
+        // Over "a" and "+": both pieces, no braces broken.
+        assert_eq!(
+            drag_range(&l, script, (2.0, 2.0), (12.0, 8.0)),
+            Some((1, 4))
+        );
+        // Over "+" and "b": the range would leave `{sqrt b` open, so it takes the `}`.
+        assert_eq!(
+            drag_range(&l, script, (12.0, 2.0), (22.0, 8.0)),
+            Some((3, 13))
+        );
+        assert_eq!(whole_groups("{x} over {y}", 1, 11), (0, 12));
+        assert_eq!(whole_groups("{x} over {y}", 1, 2), (1, 2));
+        // Only untied pieces or empty space: nothing.
+        assert_eq!(drag_range(&l, script, (41.0, 2.0), (60.0, 8.0)), None);
+        assert_eq!(selection(Some(4), 1), Some((1, 4)));
+        assert_eq!(selection(Some(4), 4), None);
     }
 
     #[test]
@@ -461,5 +623,104 @@ mod tests {
             app.ext.object.equation.as_ref().unwrap().script,
             "{x} over {y}"
         );
+    }
+    /// The real editor: drag across two pieces of the preview, then type over them.
+    #[test]
+    fn dragging_across_the_preview_selects_and_typing_replaces() {
+        let mut app =
+            crate::HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        app.open_equation_editor(None);
+        if let Some(d) = app.ext.object.equation.as_mut() {
+            d.script = "a + b + c".into();
+            d.caret = 0;
+        }
+        let ctx = app.ctx.clone();
+        let frame = |app: &mut crate::HwpApp, events: Vec<egui::Event>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 900.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.equation_editor_dialog(ui.ctx()),
+            );
+            output.textures_delta.clear();
+        };
+        // The modal settles its size and place over the first frames.
+        for _ in 0..4 {
+            frame(&mut app, vec![]);
+        }
+        let rect = ctx
+            .read_response(egui::Id::new("equation-preview"))
+            .map(|r| r.rect)
+            .unwrap();
+        let (_, _, size) = app.equation_preview.clone().unwrap();
+        let scale = (rect.width() / size.x).min(rect.height() / size.y).min(1.0);
+        let dest = Rect::from_center_size(rect.center(), size * scale);
+        let layout = app
+            .ext
+            .object
+            .equation
+            .as_ref()
+            .unwrap()
+            .layout
+            .clone()
+            .unwrap()
+            .1;
+        let piece = |start: usize| {
+            let i = layout
+                .items
+                .iter()
+                .find(|i| i.start == Some(start))
+                .unwrap();
+            dest.min
+                + Vec2::new(
+                    ((i.x + i.width / 2.0) / layout.width) as f32 * dest.width(),
+                    ((i.y + i.height / 2.0) / layout.height) as f32 * dest.height(),
+                )
+        };
+        // From the middle of "a" to the middle of "b": the pieces "a", "+" and "b".
+        let (from, to) = (piece(0), piece(4));
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(from), button(from, true)],
+        );
+        let mid = from + (to - from) / 2.0;
+        frame(&mut app, vec![egui::Event::PointerMoved(mid)]);
+        frame(&mut app, vec![egui::Event::PointerMoved(to)]);
+        frame(&mut app, vec![button(to, false)]);
+        let d = app.ext.object.equation.as_ref().unwrap();
+        assert_eq!(
+            selection(d.anchor, d.caret),
+            Some((0, 5)),
+            "{:?} {}",
+            d.anchor,
+            d.caret
+        );
+        // The script box follows the caret.
+        let state = egui::TextEdit::load_state(&ctx, egui::Id::new("equation-script")).unwrap();
+        assert_eq!(
+            state.cursor.char_range().map(|r| r.primary.index.0),
+            Some(5)
+        );
+        frame(&mut app, vec![egui::Event::Text("x".into())]);
+        let d = app.ext.object.equation.as_ref().unwrap();
+        assert_eq!(d.script, "x + c");
+        assert_eq!((d.caret, d.anchor), (1, None));
+        // A click after a drag puts the caret back without a selection.
+        let c = piece(4);
+        frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(c), button(c, true)],
+        );
+        frame(&mut app, vec![button(c, false)]);
+        let d = app.ext.object.equation.as_ref().unwrap();
+        assert_eq!(selection(d.anchor, d.caret), None);
     }
 }

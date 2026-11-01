@@ -1,0 +1,291 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 1ac789f3f..37c955e50 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -4304,87 +4304,89 @@ mod save_scoped_mutation_tests {
+     }
+ }
+ 
+-/// [HwpCraft] A paragraph's text, shapes, rows and controls, with the paragraphs inside
+-/// its tables, boxes, captions and notes: what tells a changed paragraph apart.
+-fn paragraph_fingerprint(para: &Paragraph) -> u64 {
+-    use std::hash::{Hash, Hasher};
+-    fn list(paragraphs: &[Paragraph], h: &mut impl Hasher) {
+-        paragraphs.len().hash(h);
+-        for p in paragraphs {
+-            one(p, h);
++/// [HwpCraft] Do two paragraphs have the same text, shapes, rows and controls, with the
++/// paragraphs inside their tables, boxes, captions and notes? What tells a changed
++/// paragraph apart; a field-by-field comparison stops at the first difference.
++fn same_paragraph(a: &Paragraph, b: &Paragraph) -> bool {
++    fn lists(a: &[Paragraph], b: &[Paragraph]) -> bool {
++        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_paragraph(a, b))
++    }
++    fn frame(a: &crate::model::shape::CommonObjAttr, b: &crate::model::shape::CommonObjAttr) -> bool {
++        (a.width, a.height, a.horizontal_offset, a.vertical_offset)
++            == (b.width, b.height, b.horizontal_offset, b.vertical_offset)
++    }
++    fn shapes(a: &ShapeObject, b: &ShapeObject) -> bool {
++        if !frame(a.common(), b.common()) {
++            return false;
+         }
+-    }
+-    fn shape(s: &ShapeObject, h: &mut impl Hasher) {
+-        let c = s.common();
+-        (c.width, c.height, c.horizontal_offset, c.vertical_offset).hash(h);
+-        if let ShapeObject::Group(g) = s {
+-            for child in &g.children {
+-                shape(child, h);
++        if let (ShapeObject::Group(x), ShapeObject::Group(y)) = (a, b) {
++            if x.children.len() != y.children.len()
++                || !x.children.iter().zip(&y.children).all(|(x, y)| shapes(x, y))
++            {
++                return false;
+             }
+         }
+-        if let Some(d) = s.drawing() {
+-            if let Some(t) = &d.text_box {
+-                list(&t.paragraphs, h);
+-            }
+-            if let Some(c) = &d.caption {
+-                list(&c.paragraphs, h);
++        match (a.drawing(), b.drawing()) {
++            (Some(x), Some(y)) => {
++                let boxes = match (&x.text_box, &y.text_box) {
++                    (Some(x), Some(y)) => lists(&x.paragraphs, &y.paragraphs),
++                    (None, None) => true,
++                    _ => false,
++                };
++                let captions = match (&x.caption, &y.caption) {
++                    (Some(x), Some(y)) => lists(&x.paragraphs, &y.paragraphs),
++                    (None, None) => true,
++                    _ => false,
++                };
++                boxes && captions
+             }
++            (None, None) => true,
++            _ => false,
+         }
+     }
+-    fn one(p: &Paragraph, h: &mut impl Hasher) {
+-        p.text.hash(h);
+-        (p.para_shape_id, p.style_id).hash(h);
+-        for r in &p.char_shapes {
+-            (r.start_pos, r.char_shape_id).hash(h);
++    fn captions(a: &Option<Caption>, b: &Option<Caption>) -> bool {
++        match (a, b) {
++            (Some(x), Some(y)) => lists(&x.paragraphs, &y.paragraphs),
++            (None, None) => true,
++            _ => false,
+         }
+-        for l in &p.line_segs {
+-            (
+-                l.text_start,
+-                l.vertical_pos,
+-                l.line_height,
+-                l.text_height,
+-                l.baseline_distance,
+-                l.line_spacing,
+-                l.column_start,
+-                l.segment_width,
+-                l.tag,
+-            )
+-                .hash(h);
++    }
++    fn controls(a: &Control, b: &Control) -> bool {
++        if std::mem::discriminant(a) != std::mem::discriminant(b) {
++            return false;
+         }
+-        for c in &p.controls {
+-            std::mem::discriminant(c).hash(h);
+-            match c {
+-                Control::Table(t) => {
+-                    let m = &t.common;
+-                    (m.width, m.height, m.horizontal_offset, m.vertical_offset).hash(h);
+-                    (t.row_count, t.col_count, t.cells.len()).hash(h);
+-                    for cell in &t.cells {
+-                        (cell.width, cell.height).hash(h);
+-                        list(&cell.paragraphs, h);
+-                    }
+-                    if let Some(c) = &t.caption {
+-                        list(&c.paragraphs, h);
+-                    }
+-                }
+-                Control::Picture(pic) => {
+-                    let m = &pic.common;
+-                    (m.width, m.height, m.horizontal_offset, m.vertical_offset).hash(h);
+-                    if let Some(c) = &pic.caption {
+-                        list(&c.paragraphs, h);
+-                    }
+-                }
+-                Control::Shape(s) => shape(s, h),
+-                Control::Footnote(n) => list(&n.paragraphs, h),
+-                Control::Endnote(n) => list(&n.paragraphs, h),
+-                Control::Header(n) => list(&n.paragraphs, h),
+-                Control::Footer(n) => list(&n.paragraphs, h),
+-                _ => {}
++        match (a, b) {
++            (Control::Table(x), Control::Table(y)) => {
++                frame(&x.common, &y.common)
++                    && (x.row_count, x.col_count) == (y.row_count, y.col_count)
++                    && x.cells.len() == y.cells.len()
++                    && x.cells.iter().zip(&y.cells).all(|(x, y)| {
++                        (x.width, x.height) == (y.width, y.height)
++                            && lists(&x.paragraphs, &y.paragraphs)
++                    })
++                    && captions(&x.caption, &y.caption)
++            }
++            (Control::Picture(x), Control::Picture(y)) => {
++                frame(&x.common, &y.common) && captions(&x.caption, &y.caption)
+             }
++            (Control::Shape(x), Control::Shape(y)) => shapes(x, y),
++            (Control::Footnote(x), Control::Footnote(y)) => lists(&x.paragraphs, &y.paragraphs),
++            (Control::Endnote(x), Control::Endnote(y)) => lists(&x.paragraphs, &y.paragraphs),
++            (Control::Header(x), Control::Header(y)) => lists(&x.paragraphs, &y.paragraphs),
++            (Control::Footer(x), Control::Footer(y)) => lists(&x.paragraphs, &y.paragraphs),
++            _ => true,
+         }
+     }
+-    let mut h = std::collections::hash_map::DefaultHasher::new();
+-    one(para, &mut h);
+-    h.finish()
++    a.text == b.text
++        && (a.para_shape_id, a.style_id) == (b.para_shape_id, b.style_id)
++        && a.char_shapes.len() == b.char_shapes.len()
++        && a.char_shapes
++            .iter()
++            .zip(&b.char_shapes)
++            .all(|(x, y)| (x.start_pos, x.char_shape_id) == (y.start_pos, y.char_shape_id))
++        && a.line_segs == b.line_segs
++        && a.controls.len() == b.controls.len()
++        && a.controls.iter().zip(&b.controls).all(|(x, y)| controls(x, y))
+ }
+ 
+ /// [HwpCraft] A caller that changed a copy of the document and hands it back
+@@ -4403,23 +4405,24 @@ fn mark_paragraphs_changed_in_session(old: &Document, new: &mut Document) {
+         {
+             continue;
+         }
+-        let a: Vec<u64> = before.paragraphs.iter().map(paragraph_fingerprint).collect();
+-        let b: Vec<u64> = after.paragraphs.iter().map(paragraph_fingerprint).collect();
+-        let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
++        let (a, b) = (&before.paragraphs, &after.paragraphs);
++        let prefix = a.iter().zip(b.iter()).take_while(|(x, y)| same_paragraph(x, y)).count();
++        if prefix == a.len() && prefix == b.len() {
++            continue;
++        }
+         let room = a.len().min(b.len()) - prefix;
+         let suffix = a
+             .iter()
+             .rev()
+             .zip(b.iter().rev())
+             .take(room)
+-            .take_while(|(x, y)| x == y)
++            .take_while(|(x, y)| same_paragraph(x, y))
+             .count();
+-        if prefix == a.len() && prefix == b.len() {
+-            continue;
+-        }
+-        // Removed paragraphs leave their neighbours meeting at `prefix`.
+-        let end = (b.len() - suffix).max(prefix + 1).min(b.len());
+-        for para in &mut after.paragraphs[prefix.min(b.len())..end] {
++        // Removed paragraphs leave their neighbours meeting at `prefix`; removed
++        // trailing ones leave the last paragraph.
++        let start = prefix.min(b.len().saturating_sub(1));
++        let end = (b.len() - suffix).max(start + 1).min(b.len());
++        for para in &mut after.paragraphs[start..end] {
+             para.edited_in_session = true;
+         }
+     }
+@@ -4606,6 +4609,63 @@ mod hwpcraft_kept_section_carry_tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod hwpcraft_set_document_marks_tests {
++    use super::DocumentCore;
++
++    fn edited(core: &DocumentCore) -> Vec<usize> {
++        core.document().sections[0]
++            .paragraphs
++            .iter()
++            .enumerate()
++            .filter_map(|(i, p)| p.edited_in_session.then_some(i))
++            .collect()
++    }
++
++    /// A copy handed back without some paragraphs marks the paragraphs the removal
++    /// joined: the one after a removed middle paragraph, and the last one left when
++    /// the trailing ones were removed.
++    #[test]
++    fn removed_paragraphs_mark_where_they_were() {
++        let mut core =
++            DocumentCore::from_bytes(include_bytes!("../../../samples/20250130-hongbo.hwp"))
++                .expect("open");
++        core.insert_text_native(0, 0, 0, "x").expect("insert");
++        let mut doc = core.document().clone();
++        doc.sections[0].paragraphs.remove(9);
++        core.set_document(doc);
++        assert_eq!(edited(&core), [0, 9]);
++
++        let mut doc = core.document().clone();
++        let keep = doc.sections[0].paragraphs.len() - 2;
++        doc.sections[0].paragraphs.truncate(keep);
++        core.set_document(doc);
++        assert_eq!(edited(&core), [0, 9, keep - 1]);
++    }
++
++    /// A section that starts on an odd page and so skips a number is renumbered right
++    /// when the section before it gains a page.
++    #[test]
++    fn an_odd_start_section_follows_a_page_gained_before_it() {
++        let mut core = DocumentCore::from_bytes(include_bytes!(
++            "../../../samples/hwp-multi-001.hwp"
++        ))
++        .expect("open");
++        let mut doc = core.document().clone();
++        doc.sections[1].section_def.page_num_type = 1;
++        core.set_document(doc);
++        let before = core.page_count();
++        let mut splits = 0;
++        while core.page_count() == before && splits < 200 {
++            core.split_paragraph_native(0, 0, 0, None).expect("split");
++            splits += 1;
++        }
++        let mut fresh = DocumentCore::new_empty();
++        fresh.set_document(core.document().clone());
++        assert_eq!(core.dump_page_items(None), fresh.dump_page_items(None));
++    }
++}
++
+ #[cfg(test)]
+ mod hwpcraft_layout_contract_tests {
+     use super::DocumentCore;
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index c9ee26094..cc9a62a63 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -5558,14 +5558,21 @@ impl DocumentCore {
+                             matches!(c, Control::NewNumber(nn) if nn.number_type == AutoNumberType::Page)
+                         })
+                     });
++                // A section starting on an odd or even page skips a number to get there
++                // (`page_num_type`, see the carry below).
++                let next = carry_last_page_number + 1;
++                let expected = match section.section_def.page_num_type {
++                    1 if next % 2 == 0 => next + 1,
++                    2 if next % 2 == 1 => next + 1,
++                    _ => next,
++                };
+                 let renumbered = continues
+                     && self
+                         .pagination
+                         .get(idx)
+                         .and_then(|result| result.pages.first())
+                         .is_some_and(|first| {
+-                            !first.page_number_restarted
+-                                && first.page_number != carry_last_page_number + 1
++                            !first.page_number_restarted && first.page_number != expected
+                         });
+                 if renumbered {
+                     self.dirty_sections[idx] = true;

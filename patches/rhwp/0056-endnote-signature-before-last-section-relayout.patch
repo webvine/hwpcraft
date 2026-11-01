@@ -1,0 +1,288 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 39a65a6..8c227e2 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -343,6 +343,7 @@ impl DocumentCore {
+             model_stamp_clock: 0,
+             untracked_model_edit: false,
+             typeset_reuse: Vec::new(),
++            endnote_signatures: Vec::new(),
+             typeset_marks: Vec::new(),
+             derived_layout_contract: None,
+             char_style_inputs: None,
+diff --git a/src/document_core/mod.rs b/src/document_core/mod.rs
+index 13eae6e..d57789f 100644
+--- a/src/document_core/mod.rs
++++ b/src/document_core/mod.rs
+@@ -308,6 +308,9 @@ pub struct DocumentCore {
+     pub(crate) untracked_model_edit: bool,
+     /// [HwpCraft 0031] 구역별 직전 조판 원본과 그 입력 서명 (입력 문단의 줄 배치가 그대로면 재사용).
+     pub(crate) typeset_reuse: Vec<Option<queries::rendering::TypesetReuse>>,
++    /// [HwpCraft 0056] 구역마다 문서 끝 미주의 서명(자리·번호·본문·미주 모양). 마지막 구역이
++    /// 모아 그리는 미주가 바뀌었을 때만 마지막 구역을 다시 조판하려고 지난 값을 둔다.
++    pub(crate) endnote_signatures: Vec<Option<u64>>,
+     /// [HwpCraft 0031] 구역별 직전 조판 뒤의 변경 집계.
+     pub(crate) typeset_marks: Vec<queries::rendering::TypesetMarks>,
+     /// 모든 구역의 파생 상태를 만든 문서 전체 조판 계약. 증분 조판 중 계약이 바뀌어
+@@ -625,6 +628,7 @@ impl DocumentCore {
+             model_stamp_clock: 0,
+             untracked_model_edit: false,
+             typeset_reuse: Vec::new(),
++            endnote_signatures: Vec::new(),
+             typeset_marks: Vec::new(),
+             derived_layout_contract: None,
+             char_style_inputs: None,
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 0c8625b..4dfe37a 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -5316,34 +5316,40 @@ impl DocumentCore {
+         }
+         self.dirty_paragraphs.truncate(sec_count);
+         // [HwpCraft 0045] 문서 끝 미주는 마지막 구역이 모아 조판한다. 앞 구역을 다시 조판할 때
+-        // 그 구역에 문서 끝 미주가 있거나(넣기·고치기) 지난번 마지막 구역이 그 구역의 미주를
+-        // 그렸으면(지우기) 마지막 구역도 다시 조판한다. 재사용 열쇠에는 앞 구역 미주가 없으므로
+-        // 그 구역의 재사용 결과도 버린다.
++        // 그 구역의 문서 끝 미주가 바뀌었으면(넣기·고치기·지우기·자리 이동) 마지막 구역도 다시
++        // 조판한다. 재사용 열쇠에는 앞 구역 미주가 없으므로 그 구역의 재사용 결과도 버린다.
++        // [HwpCraft 0056] 미주가 바뀌었는지는 서명으로 가린다: 미주와 상관없는 입력은 마지막
++        // 구역을 건드리지 않는다. 지난번 마지막 구역이 그 구역의 미주를 그렸는데 이제 미주가
++        // 없으면(지우기) 서명이 달라져 다시 조판한다.
++        self.endnote_signatures.resize(sec_count, None);
+         if sec_count > 1 && !self.dirty_sections[sec_count - 1] {
+             let last = sec_count - 1;
+-            let collected_endnote_changed = (0..last)
+-                .filter(|&idx| self.dirty_sections[idx])
+-                .any(|idx| {
+-                    let section = &self.document.sections[idx];
+-                    let at_document_end = matches!(
+-                        section.section_def.endnote_shape.placement,
+-                        crate::model::footnote::FootnotePlacement::EachColumn
+-                    );
+-                    (at_document_end
+-                        && section.paragraphs.iter().any(|para| {
+-                            para.controls
+-                                .iter()
+-                                .any(|ctrl| matches!(ctrl, Control::Endnote(_)))
+-                        }))
+-                        || self.pagination[last]
+-                            .endnotes
+-                            .iter()
+-                            .any(|endnote| endnote.section_index == idx)
+-                });
++            let mut collected_endnote_changed = false;
++            for idx in (0..last).filter(|&idx| self.dirty_sections[idx]) {
++                let (signature, with_objects) =
++                    document_end_endnote_signature(&self.document.sections[idx]);
++                let drawn = self.pagination[last]
++                    .endnotes
++                    .iter()
++                    .any(|endnote| endnote.section_index == idx);
++                if signature != self.endnote_signatures[idx]
++                    || with_objects
++                    || (drawn && signature.is_none())
++                {
++                    collected_endnote_changed = true;
++                }
++                self.endnote_signatures[idx] = signature;
++            }
+             if collected_endnote_changed {
+                 self.dirty_sections[last] = true;
+                 self.typeset_reuse[last] = None;
+             }
++        } else {
++            // 마지막 구역을 어차피 다시 조판한다: 그 결과가 모을 미주의 서명을 기억한다.
++            for idx in 0..sec_count.saturating_sub(1) {
++                self.endnote_signatures[idx] =
++                    document_end_endnote_signature(&self.document.sections[idx]).0;
++            }
+         }
+         // 구역 간 쪽번호 위치/번호 상속
+         let mut carry_page_number_pos: Option<crate::model::control::PageNumberPos> = None;
+@@ -9374,6 +9380,104 @@ mod document_end_endnote_tests {
+         assert!(!pages(&core)[1].contains("EndnoteSeparator"));
+         assert_eq!(pages(&core), fresh_pages(&core), "delete");
+     }
++
++    /// [HwpCraft 0056] An endnote inside a table cell is part of the signature too: editing
++    /// it changes the signature even when the section has other endnotes.
++    #[test]
++    fn an_endnote_in_a_table_cell_changes_the_signature() {
++        use crate::model::table::{Cell, Table};
++        let mut core = two_sections();
++        core.insert_endnote_native(0, 3, 0).unwrap();
++        let ci = endnote_index(&core);
++        let section = &mut core.document_mut().sections[0];
++        let Control::Endnote(note) = section.paragraphs[3].controls[ci].clone() else {
++            panic!("endnote");
++        };
++        let mut cell_para = section.paragraphs[3].clone();
++        cell_para.controls = vec![Control::Endnote(note)];
++        let table = Table {
++            cells: vec![Cell {
++                paragraphs: vec![cell_para],
++                ..Cell::default()
++            }],
++            ..Table::default()
++        };
++        section.paragraphs[1]
++            .controls
++            .push(Control::Table(Box::new(table)));
++        let (before, with_objects) = super::document_end_endnote_signature(section);
++        let before = before.unwrap();
++        assert!(!with_objects, "the endnote number is not an object");
++        let Control::Table(table) = section.paragraphs[1].controls.last_mut().unwrap() else {
++            panic!("table");
++        };
++        let Control::Endnote(note) = &mut table.cells[0].paragraphs[0].controls[0] else {
++            panic!("cell endnote");
++        };
++        note.paragraphs[0].text.push_str("고침");
++        assert_ne!(
++            super::document_end_endnote_signature(section).0.unwrap(),
++            before
++        );
++        // An object inside an endnote (its contents are not in the signature): the
++        // section always lays the last section out again.
++        let Control::Table(table) = section.paragraphs[1].controls.last_mut().unwrap() else {
++            panic!("table");
++        };
++        let Control::Endnote(note) = &mut table.cells[0].paragraphs[0].controls[0] else {
++            panic!("cell endnote");
++        };
++        note.paragraphs[0]
++            .controls
++            .push(Control::Table(Box::new(Table::default())));
++        assert!(super::document_end_endnote_signature(section).1);
++    }
++
++    /// [HwpCraft 0056] Text typed in a section that holds endnotes, away from them,
++    /// leaves the last section's layout alone; a change to the endnotes lays it out again.
++    #[test]
++    fn typing_away_from_endnotes_keeps_the_last_section() {
++        const MARK: usize = usize::MAX;
++        let mut core = two_sections();
++        core.insert_endnote_native(0, 3, 0).unwrap();
++        let _ = core.page_count();
++        let last = core.pagination.len() - 1;
++        let mark = |core: &mut DocumentCore| {
++            core.pagination[last]
++                .pre_emitted_host_heights
++                .insert(MARK, 1.0);
++        };
++        let kept = |core: &DocumentCore| {
++            core.pagination[last]
++                .pre_emitted_host_heights
++                .contains_key(&MARK)
++        };
++        mark(&mut core);
++        core.insert_text_native(0, 1, 0, "상관없는 글자").unwrap();
++        let _ = core.page_count();
++        assert!(
++            kept(&core),
++            "the last section was laid out again for unrelated text"
++        );
++        let ci = endnote_index(&core);
++        core.insert_text_in_footnote_native(0, 3, ci, 0, 0, "고친 미주 ")
++            .unwrap();
++        let _ = core.page_count();
++        assert!(
++            !kept(&core),
++            "an endnote edit lays the last section out again"
++        );
++        assert_eq!(pages(&core), fresh_pages(&core));
++        mark(&mut core);
++        // A paragraph inserted before the endnote moves it: its position is part of the signature.
++        core.split_paragraph_native(0, 0, 0, None).unwrap();
++        let _ = core.page_count();
++        assert!(
++            !kept(&core),
++            "a moved endnote lays the last section out again"
++        );
++        assert_eq!(pages(&core), fresh_pages(&core));
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -11037,3 +11141,81 @@ mod hwpcraft_line_number_tests {
+         assert!(x < body_left - 15.0, "{x} vs {body_left}");
+     }
+ }
++
++/// [HwpCraft 0056] 구역의 문서 끝 미주 서명: 미주가 놓인 자리(문단, 컨트롤, 표 셀 안이면 그
++/// 경로), 번호와 장식, 본문 문단(글자·글자 모양·문단 모양·컨트롤 수), 구역의 미주 모양.
++/// 미주가 문서 끝에 모이지 않거나 하나도 없으면 `None`. 둘째 값은 미주 본문에 개체(수식·그림·
++/// 표 등)가 있는가: 개체의 내용은 서명에 넣지 않으므로, 그런 구역이 바뀌면 늘 다시 조판한다.
++fn document_end_endnote_signature(
++    section: &crate::model::document::Section,
++) -> (Option<u64>, bool) {
++    use std::hash::{Hash, Hasher};
++    fn walk(
++        paragraphs: &[crate::model::paragraph::Paragraph],
++        path: &mut Vec<usize>,
++        hasher: &mut std::collections::hash_map::DefaultHasher,
++        any: &mut bool,
++        with_objects: &mut bool,
++    ) {
++        if path.len() > 256 {
++            return;
++        }
++        for (pi, para) in paragraphs.iter().enumerate() {
++            for (ci, ctrl) in para.controls.iter().enumerate() {
++                match ctrl {
++                    Control::Endnote(note) => {
++                        *any = true;
++                        (&*path, pi, ci).hash(hasher);
++                        (note.number, note.before_decoration_letter).hash(hasher);
++                        (note.after_decoration_letter, note.number_shape).hash(hasher);
++                        for p in &note.paragraphs {
++                            // 미주 번호(자동 번호)·필드·책갈피는 글자 축의 자리표일 뿐 개체가 아니다.
++                            *with_objects |= p.controls.iter().any(|c| {
++                                !matches!(
++                                    c,
++                                    Control::AutoNumber(_)
++                                        | Control::NewNumber(_)
++                                        | Control::Field(_)
++                                        | Control::Bookmark(_)
++                                )
++                            });
++                            p.text.hash(hasher);
++                            (p.para_shape_id, p.controls.len()).hash(hasher);
++                            for cs in &p.char_shapes {
++                                (cs.start_pos, cs.char_shape_id).hash(hasher);
++                            }
++                        }
++                    }
++                    Control::Table(table) => {
++                        for (cell_index, cell) in table.cells.iter().enumerate() {
++                            path.extend([pi, ci, cell_index]);
++                            walk(&cell.paragraphs, path, hasher, any, with_objects);
++                            path.truncate(path.len() - 3);
++                        }
++                    }
++                    _ => {}
++                }
++            }
++        }
++    }
++    if !matches!(
++        section.section_def.endnote_shape.placement,
++        crate::model::footnote::FootnotePlacement::EachColumn
++    ) {
++        return (None, false);
++    }
++    let mut hasher = std::collections::hash_map::DefaultHasher::new();
++    let (mut any, mut with_objects) = (false, false);
++    walk(
++        &section.paragraphs,
++        &mut Vec::new(),
++        &mut hasher,
++        &mut any,
++        &mut with_objects,
++    );
++    let signature = any.then(|| {
++        format!("{:?}", section.section_def.endnote_shape).hash(&mut hasher);
++        hasher.finish()
++    });
++    (signature, with_objects)
++}

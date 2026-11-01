@@ -1,0 +1,283 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 381694c..ef85d33 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -4457,21 +4457,23 @@ mod hwpcraft_session_edit_scope_tests {
+         core.delete_text_native(0, last, end, 1).expect("delete");
+         assert!(core.document().layout_profile().session_edited());
+         assert_eq!(pages(&core), opened);
++        let paragraphs = &core.document().sections[0].paragraphs;
++        assert!(paragraphs[last].edited_in_session);
++        assert!(!paragraphs[..last].iter().any(|p| p.edited_in_session));
+         let profile = core.document().section_layout_profile(0);
+-        assert!(!profile.at_paragraph(0).session_edited());
+-        assert!(profile.at_paragraph(last).session_edited());
++        assert!(!profile.at_paragraph(false).session_edited());
++        assert!(profile.at_paragraph(true).session_edited());
+ 
+-        // A paragraph near the top: the rules apply from there on.
++        // A paragraph near the top: the rules apply to it, not to the ones after it.
+         core.insert_text_native(0, 7, 0, "가").expect("insert");
+-        let profile = core.document().section_layout_profile(0);
+-        assert!(!profile.at_paragraph(6).session_edited());
+-        assert!(profile.at_paragraph(7).session_edited());
++        let paragraphs = &core.document().sections[0].paragraphs;
++        assert!(paragraphs[7].edited_in_session && !paragraphs[8].edited_in_session);
+     }
+ 
+     /// A caller that changes a paragraph through `document_mut` and lays it out again
+     /// with `relayout_paragraph_native`, or hands back a changed copy with
+     /// `set_document`, marks it as the edit commands mark theirs, so the session-edit
+-    /// rules cover it after an edit further down.
++    /// rules cover it.
+     #[test]
+     fn paragraphs_changed_through_the_model_are_marked() {
+         let mut core =
+@@ -4491,9 +4493,6 @@ mod hwpcraft_session_edit_scope_tests {
+                 .collect()
+         };
+         assert_eq!(edited(&core), [9, last]);
+-        let profile = core.document().section_layout_profile(0);
+-        assert!(!profile.at_paragraph(8).session_edited());
+-        assert!(profile.at_paragraph(9).session_edited());
+ 
+         let mut doc = core.document().clone();
+         doc.sections[0].paragraphs[3].para_shape_id = shape;
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 0cb3285..c3c4671 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -5453,8 +5453,8 @@ impl DocumentCore {
+                 }
+             };
+ 
+-            // [HwpCraft] This section's profile: the session-edit rules start at its
+-            // first paragraph an edit laid out again (`Document::section_layout_profile`).
++            // [HwpCraft] This section's profile: the session-edit rules apply to the
++            // paragraphs an edit laid out again (`Document::section_layout_profile`).
+             let section_profile = self.section_effective_layout_profile(idx);
+             measurer.set_section_profile(section_profile);
+ 
+diff --git a/src/model/document.rs b/src/model/document.rs
+index 5e6dda2..b8d00db 100644
+--- a/src/model/document.rs
++++ b/src/model/document.rs
+@@ -440,11 +440,13 @@ impl Document {
+     /// coordinates stale. Before this, one edited section turned them off for the whole
+     /// document, so typing one character anywhere moved unedited earlier pages (a page
+     /// head table by 8–14 px in about a third of the HWP samples) and a saved HWP opened
+-    /// as it did before the edit. They now apply only to an edited section, from its
+-    /// first body paragraph an edit laid out again (`Paragraph::edited_in_session`,
+-    /// [`LayoutCompatibilityProfile::at_paragraph`]). An edited section without such a
+-    /// paragraph (an edit that laid no paragraph out again, or one undone) keeps the
+-    /// rules throughout, as before.
++    /// as it did before the edit. They now apply only to the body paragraphs an edit
++    /// laid out again (`Paragraph::edited_in_session`,
++    /// [`LayoutCompatibilityProfile::at_paragraph`]); the paragraphs after them keep
++    /// the stored rules, as they get them when the saved file is read back (the
++    /// ladder below an edit is shifted, its row relations kept). An edited section
++    /// without such a paragraph (an edit that laid no paragraph out again, or one
++    /// undone) keeps the rules throughout, as before.
+     pub fn section_layout_profile(
+         &self,
+         section_index: usize,
+@@ -459,12 +461,7 @@ impl Document {
+         if section.raw_provenance.is_none() || section.raw_stream.is_some() {
+             return profile.with_session_edited(false);
+         }
+-        let start = section
+-            .paragraphs
+-            .iter()
+-            .position(|p| p.edited_in_session)
+-            .unwrap_or(0);
+-        profile.with_session_edit_start(start)
++        profile.with_session_edits(section.paragraphs.iter().any(|p| p.edited_in_session))
+     }
+ 
+     /// 외부 이미지 binDataId가 이미 로드되었는지 확인한다.
+diff --git a/src/model/paragraph.rs b/src/model/paragraph.rs
+index eefe35a..327284d 100644
+--- a/src/model/paragraph.rs
++++ b/src/model/paragraph.rs
+@@ -146,7 +146,7 @@ pub struct Paragraph {
+     /// [HwpCraft] An edit in this session laid this paragraph, or something inside
+     /// it, out again (`DocumentCore::mark_paragraph_edited_in_session`). Never
+     /// serialized: a saved file opens with every paragraph as stored. The
+-    /// session-edit layout rules start at the first such paragraph of a section
++    /// session-edit layout rules apply to such paragraphs
+     /// (`Document::section_layout_profile`).
+     #[serde(skip_serializing)]
+     pub edited_in_session: bool,
+diff --git a/src/model/provenance.rs b/src/model/provenance.rs
+index 5659fe4..2a72dcb 100644
+--- a/src/model/provenance.rs
++++ b/src/model/provenance.rs
+@@ -63,11 +63,11 @@ pub struct LayoutCompatibilityProfile {
+     /// 저장 시점 형상 전용 보정(선언 높이 fit-down 등)은 편집 문서에서 꺼야 한다 —
+     /// 한글 편집기도 편집 중에는 측정 기반으로 재조판한다.
+     session_edited: bool,
+-    /// [HwpCraft] The first body paragraph of the section an edit laid out again
+-    /// (`Document::section_layout_profile`). The paragraphs before it hold the rows
+-    /// and geometry they were stored with, so the stored-geometry rules still apply
+-    /// to them; see [`Self::at_paragraph`]. `None` for a whole-document profile.
+-    session_edit_start: Option<usize>,
++    /// [HwpCraft] An edited section's profile (`Document::section_layout_profile`):
++    /// `Some(true)` when the session-edit rules apply only to the paragraphs an edit
++    /// laid out again, `Some(false)` when to the whole section; see
++    /// [`Self::at_paragraph`]. `None` for a whole-document profile.
++    session_edits_by_paragraph: Option<bool>,
+ }
+ 
+ impl LayoutCompatibilityProfile {
+@@ -89,7 +89,7 @@ impl LayoutCompatibilityProfile {
+             native_hwp5_layout,
+             hangul2024_layout: false,
+             session_edited: false,
+-            session_edit_start: None,
++            session_edits_by_paragraph: None,
+         }
+     }
+ 
+@@ -105,19 +105,20 @@ impl LayoutCompatibilityProfile {
+         self.session_edited
+     }
+ 
+-    /// [HwpCraft] An edited section's profile: edits begin at body paragraph `start`.
+-    pub(crate) fn with_session_edit_start(mut self, start: usize) -> Self {
++    /// [HwpCraft] An edited section's profile: the session-edit rules apply to the
++    /// paragraphs an edit laid out again (`by_paragraph`) or to the whole section.
++    pub(crate) fn with_session_edits(mut self, by_paragraph: bool) -> Self {
+         self.session_edited = true;
+-        self.session_edit_start = Some(start);
++        self.session_edits_by_paragraph = Some(by_paragraph);
+         self
+     }
+ 
+-    /// [HwpCraft] The profile for body paragraph `para_index` of the section: the
+-    /// session-edit rules apply from the first paragraph an edit laid out again. A
+-    /// profile without an edit start is returned as it is.
+-    pub(crate) fn at_paragraph(mut self, para_index: usize) -> Self {
+-        if let Some(start) = self.session_edit_start {
+-            self.session_edited = para_index >= start;
++    /// [HwpCraft] The profile for a body paragraph of the section, `edited` when an
++    /// edit laid it out again (`Paragraph::edited_in_session`). A profile that is not
++    /// an edited section's is returned as it is.
++    pub(crate) fn at_paragraph(mut self, edited: bool) -> Self {
++        if self.session_edits_by_paragraph == Some(true) {
++            self.session_edited = edited;
+         }
+         self
+     }
+diff --git a/src/renderer/height_measurer.rs b/src/renderer/height_measurer.rs
+index 5766908..b443bb8 100644
+--- a/src/renderer/height_measurer.rs
++++ b/src/renderer/height_measurer.rs
+@@ -1709,7 +1709,7 @@ impl HeightMeasurer {
+     }
+ 
+     /// [HwpCraft] Measure the next section with its own profile: the session-edit
+-    /// rules start at its first paragraph an edit laid out again
++    /// rules apply to the paragraphs an edit laid out again
+     /// (`Document::section_layout_profile`).
+     pub(crate) fn set_section_profile(
+         &self,
+@@ -1719,11 +1719,11 @@ impl HeightMeasurer {
+         self.session_edited.set(profile.session_edited());
+     }
+ 
+-    /// [HwpCraft] The session-edit rules for body paragraph `para_index`.
+-    fn enter_paragraph(&self, para_index: usize) {
++    /// [HwpCraft] The session-edit rules for the body paragraph `para` measured next.
++    fn enter_paragraph(&self, para: &Paragraph) {
+         if let Some(profile) = self.session_profile.get() {
+             self.session_edited
+-                .set(profile.at_paragraph(para_index).session_edited());
++                .set(profile.at_paragraph(para.edited_in_session).session_edited());
+         }
+     }
+ 
+@@ -1903,7 +1903,7 @@ impl HeightMeasurer {
+         let mut measured_tables = Vec::new();
+ 
+         for (para_idx, para) in paragraphs.iter().enumerate() {
+-            self.enter_paragraph(para_idx);
++            self.enter_paragraph(para);
+             let comp = composed.get(para_idx);
+ 
+             // 블록 표 컨트롤 감지 (일반 표 + treat_as_char 블록형)
+@@ -4939,7 +4939,7 @@ impl HeightMeasurer {
+         let mut measured_tables = Vec::new();
+ 
+         for (para_idx, para) in paragraphs.iter().enumerate() {
+-            self.enter_paragraph(para_idx);
++            self.enter_paragraph(para);
+             let comp = composed.get(para_idx);
+ 
+             // 블록 표 컨트롤 감지 (일반 표 + treat_as_char 블록형)
+@@ -5003,7 +5003,7 @@ impl HeightMeasurer {
+         let mut measured_tables = Vec::new();
+ 
+         for (para_idx, para) in paragraphs.iter().enumerate() {
+-            self.enter_paragraph(para_idx);
++            self.enter_paragraph(para);
+             let is_dirty = dirty_bits.get(para_idx).copied().unwrap_or(true);
+ 
+             if !is_dirty {
+diff --git a/src/renderer/layout.rs b/src/renderer/layout.rs
+index 2550324..8c83d48 100644
+--- a/src/renderer/layout.rs
++++ b/src/renderer/layout.rs
+@@ -3633,7 +3633,7 @@ pub struct LayoutEngine {
+     /// hwpx_source Cell 2개 통합).
+     profile: std::cell::Cell<crate::model::provenance::LayoutCompatibilityProfile>,
+     /// [HwpCraft] The profile of the section being laid out; `profile` is set from it
+-    /// for each body item (`LayoutCompatibilityProfile::at_paragraph`).
++    /// for each body item's paragraph (`LayoutCompatibilityProfile::at_paragraph`).
+     section_profile: std::cell::Cell<crate::model::provenance::LayoutCompatibilityProfile>,
+     /// HWP3 원본 및 HWP3-origin HWP5 변환본의 본문 흐름 spacing_before 보정 여부.
+     use_hwp3_origin_flow_spacing_before: std::cell::Cell<bool>,
+@@ -4404,8 +4404,8 @@ impl LayoutEngine {
+     }
+ 
+     /// [HwpCraft] Lay out a page of a section with its own profile
+-    /// (`Document::section_layout_profile`): the session-edit rules start at the
+-    /// section's first paragraph an edit laid out again.
++    /// (`Document::section_layout_profile`): the session-edit rules apply to the
++    /// paragraphs an edit laid out again.
+     pub(crate) fn set_section_layout_profile(
+         &self,
+         profile: crate::model::provenance::LayoutCompatibilityProfile,
+@@ -8060,10 +8060,13 @@ impl LayoutEngine {
+                     continue;
+                 }
+             };
+-            // [HwpCraft] The session-edit rules start at the section's first paragraph an
+-            // edit laid out again (`LayoutCompatibilityProfile::at_paragraph`).
++            // [HwpCraft] The session-edit rules apply to the paragraphs an edit laid out
++            // again (`LayoutCompatibilityProfile::at_paragraph`).
+             if !col_content.endnote_flow {
+-                let profile = self.section_profile.get().at_paragraph(item_para);
++                let profile = self
++                    .section_profile
++                    .get()
++                    .at_paragraph(paragraphs.get(item_para).is_some_and(|p| p.edited_in_session));
+                 self.profile.set(profile);
+                 hcursor.session_edited = profile.session_edited();
+             }
+diff --git a/src/renderer/typeset/section.rs b/src/renderer/typeset/section.rs
+index 754ee49..ecb7a14 100644
+--- a/src/renderer/typeset/section.rs
++++ b/src/renderer/typeset/section.rs
+@@ -174,9 +174,9 @@ impl TypesetEngine {
+ 
+         let section_profile = profile;
+         for (para_idx, para) in paragraphs.iter().enumerate() {
+-            // [HwpCraft] The session-edit rules start at the first paragraph an edit
+-            // laid out again (`LayoutCompatibilityProfile::at_paragraph`).
+-            let profile = section_profile.at_paragraph(para_idx);
++            // [HwpCraft] The session-edit rules apply to the paragraphs an edit laid
++            // out again (`LayoutCompatibilityProfile::at_paragraph`).
++            let profile = section_profile.at_paragraph(para.edited_in_session);
+             self.profile.set(profile);
+             st.set_paragraph_profile(profile);
+             // [Task #1753] 지연 이월 표 직전에 선행 채움(prefill)으로 이미 배치된 문단 스킵.

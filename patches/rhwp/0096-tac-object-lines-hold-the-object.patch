@@ -1,0 +1,342 @@
+diff --git a/src/document_core/commands/object_ops/shape.rs b/src/document_core/commands/object_ops/shape.rs
+index c9f311a..0263f38 100644
+--- a/src/document_core/commands/object_ops/shape.rs
++++ b/src/document_core/commands/object_ops/shape.rs
+@@ -3393,3 +3393,174 @@ mod tac_shape_line_height_tests {
+         assert_eq!(boxes(&core), before);
+     }
+ }
++
++#[cfg(test)]
++mod tac_object_line_layout_tests {
++    //! 글자처럼 취급한 그림·도형이 있는 줄의 높이는 개체의 점유 높이(개체 + 위아래 바깥 여백)와
++    //! 글자 중 큰 값이고, 기준선은 그 줄 높이의 0.85 다 — 한글이 저장한 줄이 그 값이다. 저장
++    //! 줄이 없는 문단(줄 정보 없이 쓴 HWPX)의 조판과 렌더, 저장 줄이 있는 문단의 렌더가 모두
++    //! 같은 줄을 쓴다. 기대값은 한글 저장 줄(`LineSeg`)에서 온다.
++    use super::*;
++    use crate::renderer::render_tree::{RenderNode, RenderNodeType};
++
++    const HWP5: &str = "samples/HWP5-nopassword-123456.hwp";
++
++    fn px(hu: i32) -> f64 {
++        hu as f64 * 96.0 / 7200.0
++    }
++
++    fn open(path: &str, keep_rows: bool) -> DocumentCore {
++        let data = std::fs::read(path).unwrap_or_else(|e| panic!("sample {path}: {e}"));
++        DocumentCore::from_bytes_prepared(&data, None, |doc| {
++            if !keep_rows {
++                for section in &mut doc.sections {
++                    for para in &mut section.paragraphs {
++                        para.line_segs.clear();
++                    }
++                }
++            }
++            Ok(())
++        })
++        .unwrap()
++    }
++
++    /// Typeset height of body paragraph `para` of section 0 (sum of its line heights, px).
++    fn typeset_height(core: &DocumentCore, para: usize) -> f64 {
++        let pages = core.dump_page_items_json(None);
++        pages
++            .as_array()
++            .into_iter()
++            .flatten()
++            .filter(|page| page["section"].as_u64() == Some(0))
++            .flat_map(|page| page["columns"].as_array().into_iter().flatten())
++            .flat_map(|col| col["items"].as_array().into_iter().flatten())
++            .find(|item| {
++                item["kind"] == "fullParagraph" && item["paraIndex"].as_u64() == Some(para as u64)
++            })
++            .and_then(|item| item["height"]["lineHeightSum"].as_f64())
++            .unwrap_or_else(|| panic!("paragraph {para} is not laid out whole"))
++    }
++
++    /// Drawn body lines of paragraph `para` of section 0: (top, height, baseline) px.
++    fn drawn_lines(core: &DocumentCore, para: usize) -> Vec<(f64, f64, f64)> {
++        fn walk(node: &RenderNode, para: usize, out: &mut Vec<(f64, f64, f64)>) {
++            if let RenderNodeType::TextLine(line) = &node.node_type {
++                if line.section_index == Some(0)
++                    && line.para_index == Some(para)
++                    && line.caption_owner.is_none()
++                {
++                    out.push((node.bbox.y, line.line_height, line.baseline));
++                }
++            }
++            // A text box draws its own paragraphs; they are not lines of the body paragraph.
++            if matches!(node.node_type, RenderNodeType::TextBox) {
++                return;
++            }
++            for child in &node.children {
++                walk(child, para, out);
++            }
++        }
++        for page in 0..core.page_count() {
++            let tree = core.build_page_render_tree(page).unwrap();
++            let mut out = Vec::new();
++            walk(&tree.root, para, &mut out);
++            if !out.is_empty() {
++                return out;
++            }
++        }
++        panic!("paragraph {para} is not drawn");
++    }
++
++    #[test]
++    fn a_rowless_paragraph_lays_text_and_an_inline_shape_out_as_hangul_stored_it() {
++        // p12..22: a tab, a number and a treat-as-character rectangle taller than the text.
++        let stored = open(HWP5, true);
++        let fresh = open(HWP5, false);
++        for para in 12..=22 {
++            let rows = &stored.document.sections[0].paragraphs[para].line_segs;
++            let hangul: f64 = rows.iter().map(|s| px(s.line_height)).sum();
++            let ours = typeset_height(&fresh, para);
++            assert!(
++                (ours - hangul).abs() < 0.5,
++                "p{para}: typeset {ours:.1} px, Hangul stored {hangul:.1} px"
++            );
++            let lines = drawn_lines(&fresh, para);
++            assert_eq!(lines.len(), rows.len(), "p{para}: {lines:?}");
++            let (_, height, baseline) = lines[0];
++            assert!(
++                (height - px(rows[0].line_height)).abs() < 0.5
++                    && (baseline - px(rows[0].baseline_distance)).abs() < 0.5,
++                "p{para}: drawn line {height:.1}/{baseline:.1} px, Hangul {:.1}/{:.1} px",
++                px(rows[0].line_height),
++                px(rows[0].baseline_distance)
++            );
++        }
++    }
++
++    #[test]
++    fn a_rowless_inline_picture_line_holds_the_picture_and_its_outer_margins() {
++        // p14: a 22308-unit picture with 852-unit outer margins; Hangul's line is 24012.
++        let path = "samples/hwp3-sample11-hwpx.hwpx";
++        let stored = open(path, true);
++        let rows = &stored.document.sections[0].paragraphs[14].line_segs;
++        assert_eq!(rows[0].line_height, 24012, "the sample's Hangul line");
++        let ours = typeset_height(&open(path, false), 14);
++        assert!(
++            (ours - px(24012)).abs() < 0.5,
++            "typeset {ours:.1} px, Hangul {:.1} px",
++            px(24012)
++        );
++    }
++
++    #[test]
++    fn a_stored_line_holding_text_and_a_taller_inline_shape_is_drawn_at_its_stored_height() {
++        let core = open(HWP5, true);
++        for para in 12..=22 {
++            let row = &core.document.sections[0].paragraphs[para].line_segs[0];
++            let (_, height, baseline) = drawn_lines(&core, para)[0];
++            assert!(
++                (height - px(row.line_height)).abs() < 0.5
++                    && (baseline - px(row.baseline_distance)).abs() < 0.5,
++                "p{para}: drawn {height:.1}/{baseline:.1} px, stored {:.1}/{:.1} px",
++                px(row.line_height),
++                px(row.baseline_distance)
++            );
++        }
++    }
++
++    #[test]
++    fn the_lines_after_an_inserted_inline_shape_are_drawn_below_it() {
++        let text = "글자처럼 취급한 개체 주변 본문 흐름 확인용 문장입니다. ".repeat(8);
++        for kind in ["rectangle", "textbox"] {
++            let mut core = DocumentCore::new_empty();
++            core.create_blank_document_native().unwrap();
++            core.insert_text_native(0, 0, 0, &text).unwrap();
++            core.create_shape_control_native(
++                0,
++                0,
++                10,
++                11339,
++                7654,
++                0,
++                0,
++                true,
++                "TopAndBottom",
++                kind,
++                false,
++                false,
++                &[],
++            )
++            .unwrap();
++            let lines = drawn_lines(&core, 0);
++            assert!(lines.len() >= 3, "{kind}: {lines:?}");
++            let (top, _, _) = lines[0];
++            for (i, (y, _, _)) in lines.iter().enumerate().skip(1) {
++                assert!(
++                    *y >= top + px(7654) - 0.5,
++                    "{kind}: line {i} at {y:.1} px is drawn inside the shape ({top:.1} + {:.1})",
++                    px(7654)
++                );
++            }
++        }
++    }
++}
+diff --git a/src/renderer/composer.rs b/src/renderer/composer.rs
+index 7c389ff..6be7250 100644
+--- a/src/renderer/composer.rs
++++ b/src/renderer/composer.rs
+@@ -3060,7 +3060,12 @@ pub(crate) fn recompose_stored_lines_in_frame_with_known_square_band(
+         // 그 폭을 인라인 토큰으로 계상하므로 그림과 같은 축이다. 글자 없는 host 는 제외한다:
+         // 줄을 나눌 글자가 없고 표 자리 계약은 다른 경로가 갖는다.
+         || (para.text.chars().any(|c| !c.is_whitespace())
+-            && line_breaking::supports_tac_table_band_frame_controls(para));
++            && line_breaking::supports_tac_table_band_frame_controls(para))
++        // [HwpCraft 0096] 저장 줄이 **아예 없는** 글자처럼 취급 그림·도형 host 는 이 채움이 줄의
++        // 유일한 소유자다. RHWP 가 만든 합성 줄(태그 bit31)이 있는 문단은 이미 줄 높이가 정해져
++        // 있으므로 받지 않는다.
++        || (para.line_segs.is_empty()
++            && line_breaking::supports_tac_object_frame_controls(para));
+     if !paragraph_box.is_usable() || !frame_admits_controls {
+         return None;
+     }
+@@ -3489,6 +3494,14 @@ pub fn recompose_cell_lines_in_frame(
+             &[],
+         )
+     } else {
++        // [HwpCraft 0096] RHWP's own rows of a treat-as-character picture/shape host stay.
++        // They already hold the object (issue2004's cell image stack: the synthetic row is
++        // the picture height, and the cell matches Hangul's 870.9 px); clearing them would
++        // hand the copy to the NO_LS frame fill, which now owns such hosts and adds the
++        // style's line spacing (+600 HU per picture).
++        if has_synthetic_line_segs && line_breaking::supports_tac_object_frame_controls(para) {
++            return;
++        }
+         // NO_LS is the arm this owner normally serves. A synthetic single row
+         // is not a source record to reproduce, so clear it on an isolated copy.
+         let mut rebuild_input = para.clone();
+diff --git a/src/renderer/composer/line_breaking.rs b/src/renderer/composer/line_breaking.rs
+index 5ca5b59..c663619 100644
+--- a/src/renderer/composer/line_breaking.rs
++++ b/src/renderer/composer/line_breaking.rs
+@@ -2658,14 +2658,28 @@ fn tac_picture_caption_extent_hwp(pic: &crate::model::image::Picture) -> i32 {
+     i32::from(cap.spacing).saturating_add(height)
+ }
+ 
++/// 글자처럼 취급 그림·도형이 줄에서 차지하는 세로 바깥 여백(위+아래).
++///
++/// 한글 저장 줄의 높이는 개체 높이에 이 여백을 더한 값이다
++/// (hwp3-sample11-hwpx.hwpx 14문단: 그림 22308 + outMargin 852·852 → 줄 24012).
++fn tac_object_vertical_margin_hwp(common: &crate::model::shape::CommonObjAttr) -> i32 {
++    i32::from(common.margin.top).saturating_add(i32::from(common.margin.bottom))
++}
++
+ fn inline_control_line_height_hwp(para: &Paragraph) -> Option<i32> {
+     para.controls
+         .iter()
+         .filter_map(|ctrl| match ctrl {
+-            Control::Picture(pic) if pic.common.treat_as_char => {
+-                Some((pic.common.height as i32).saturating_add(tac_picture_caption_extent_hwp(pic)))
+-            }
+-            Control::Shape(shape) if shape.common().treat_as_char => Some(shape.flow_height_hu()),
++            Control::Picture(pic) if pic.common.treat_as_char => Some(
++                (pic.common.height as i32)
++                    .saturating_add(tac_picture_caption_extent_hwp(pic))
++                    .saturating_add(tac_object_vertical_margin_hwp(&pic.common)),
++            ),
++            Control::Shape(shape) if shape.common().treat_as_char => Some(
++                shape
++                    .flow_height_hu()
++                    .saturating_add(tac_object_vertical_margin_hwp(shape.common())),
++            ),
+             Control::Table(table) if table.common.treat_as_char => Some(table.common.height as i32),
+             Control::Equation(eq) if eq.common.treat_as_char => {
+                 Some(crate::renderer::equation::flow_height_hwp(eq) as i32)
+@@ -2681,11 +2695,15 @@ fn inline_control_size_hwp(ctrl: &Control) -> Option<(i32, i32)> {
+     let (width, height) = match ctrl {
+         Control::Picture(pic) if pic.common.treat_as_char => (
+             pic.common.width as i32,
+-            (pic.common.height as i32).saturating_add(tac_picture_caption_extent_hwp(pic)),
++            (pic.common.height as i32)
++                .saturating_add(tac_picture_caption_extent_hwp(pic))
++                .saturating_add(tac_object_vertical_margin_hwp(&pic.common)),
+         ),
+         Control::Shape(shape) if shape.common().treat_as_char => (
+             (shape.common().width as i32).max(shape.shape_attr().current_width as i32),
+-            shape.flow_height_hu(),
++            shape
++                .flow_height_hu()
++                .saturating_add(tac_object_vertical_margin_hwp(shape.common())),
+         ),
+         Control::Table(table) if table.common.treat_as_char => {
+             // [#5785 후속] 선언 폭 우선 — 원시 열 합은 행별 구획이 다른 표에서 과대집계된다.
+@@ -2969,6 +2987,28 @@ pub(super) fn supports_tac_table_band_frame_controls(para: &Paragraph) -> bool {
+     tac_tables == 1
+ }
+ 
++/// 저장 줄이 없는 문단의 **글자처럼 취급 그림·도형** host 도 프레임이 받는다.
++///
++/// 줄이 없으면 이 채움이 줄 경계와 줄 높이의 유일한 소유자다. 사양하면 45자 합성 줄
++/// (줄 높이 400)이 남아 조판과 렌더가 각자 글자 높이로만 줄을 다시 세우고, 개체 높이는
++/// 어느 쪽에도 들어가지 않는다 — 글자보다 높은 개체가 아래 줄을 덮는다. 채움은 개체를
++/// 인라인 토큰(`inline_control_size_hwp`)으로 싣고 그 줄의 높이를 개체 점유 높이로
++/// 올린다(`apply_inline_control_frame_height`). 한글 저장 줄과 같은 규칙이다
++/// (HWP5-nopassword-123456.hwp 12문단: 글자 + 도형 2328 → 줄 2328/2328/1979).
++pub(super) fn supports_tac_object_frame_controls(para: &Paragraph) -> bool {
++    let mut tac_objects = 0usize;
++    for control in &para.controls {
++        match control {
++            Control::Picture(picture) if picture.common.treat_as_char => tac_objects += 1,
++            Control::Shape(shape) if shape.common().treat_as_char => tac_objects += 1,
++            Control::Equation(equation) if equation.common.treat_as_char => {}
++            other if control_is_width_neutral_marker(other) => {}
++            _ => return false,
++        }
++    }
++    tac_objects > 0
++}
++
+ /// 어울림 띠 host 의 통제: 그림 띠와 같되 비-TAC 그리기 개체(글상자 포함)도 한 개까지 받는다.
+ /// 일반 채움 경로는 [`supports_picture_band_frame_controls`] 그대로다 — 도형 문단의 저장 줄
+ /// 소유권은 띠가 증명할 때만 바뀐다.
+@@ -3453,6 +3493,7 @@ fn layout_paragraph_in_frame_impl(
+     if !supports_picture_band_frame_controls(para)
+         && !supports_cached_body_frame_controls(para)
+         && !(para.line_segs.is_empty() && supports_tac_table_band_frame_controls(para))
++        && !(para.line_segs.is_empty() && supports_tac_object_frame_controls(para))
+         && !(frame.side_flow_band && supports_side_flow_band_controls(para))
+     {
+         return None;
+@@ -3955,7 +3996,11 @@ pub(crate) fn resolve_stored_line_segs_in_frame(
+     // 거절하면 45자 합성 줄이 그대로 남아 표가 자기 줄을 못 얻는다(distribution_doc 3쪽).
+     let tac_table_host_fill =
+         para.line_segs.is_empty() && supports_tac_table_band_frame_controls(para);
+-    if !supports_picture_band_frame_controls(para) && !tac_table_host_fill {
++    // 저장 줄 없는 글자처럼 취급 그림·도형 host 도 아래 NO_LS 채움이 유일한 소유자다.
++    let tac_object_host_fill =
++        para.line_segs.is_empty() && supports_tac_object_frame_controls(para);
++    if !supports_picture_band_frame_controls(para) && !tac_table_host_fill && !tac_object_host_fill
++    {
+         if !supports_cached_body_frame_controls(para) || (!stale && !para.line_segs.is_empty()) {
+             return None;
+         }
+diff --git a/src/renderer/layout/paragraph_layout.rs b/src/renderer/layout/paragraph_layout.rs
+index 979c8c4..ce037c1 100644
+--- a/src/renderer/layout/paragraph_layout.rs
++++ b/src/renderer/layout/paragraph_layout.rs
+@@ -5500,6 +5500,11 @@ impl LayoutEngine {
+                 // 행 높이 측정은 저장 lh 를 믿으므로 배치도 같은 값을 써야 맞는다.
+                 && cell_ctx.is_none()
+                 && raw_lh > max_fs * 1.5
++                // [HwpCraft 0096] 글자가 있는 줄은 접지 않는다. 한글이 저장한 그 줄의 높이와
++                // 기준선(줄 높이 × 0.85)이 곧 한글이 그린 줄이다(HWP5-nopassword-123456.hwp
++                // 12문단: 2328/1979). 접으면 바닥값은 문단 끝만 맞춰, 여러 줄 문단에서는 도형
++                // 다음 줄들이 도형 아래에 그려진다. 개체만 있는 줄은 아래 짝(#1116)을 유지한다.
++                && runs_all_whitespace
+             {
+                 // Shape와 텍스트가 같은 줄에 있으면 Shape 높이가 line_height에 포함된다.
+                 // [#1842] 셀 내부에서 max_fs=0(텍스트 없는 tac-전용 줄)이면 이 보정의
+@@ -5848,6 +5853,8 @@ impl LayoutEngine {
+             let text_y = if has_tac_shape
+                 && !empty_tac_guide_has_explicit_shape_height
+                 && raw_lh > max_fs * 1.5
++                // 줄 높이 선택과 같은 조건이어야 한다 — 글자가 있는 줄은 접지 않았다.
++                && runs_all_whitespace
+             {
+                 // raw_lh는 Shape 높이 포함 원본 줄 높이, line_height는 폰트 기반 보정 높이
+                 // 텍스트를 Shape 하단 근처로 이동 (Shape 높이 - 폰트 줄 높이)

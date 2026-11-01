@@ -150,6 +150,8 @@ impl HwpApp {
                     object_dialogs::ObjectDialog::equation(),
                 ))
             }
+            // The 수식 편집기 with "a+b" selected in the preview, as a drag leaves it.
+            "equation-selection" => self.open_equation_editor_selecting(1, 4),
             "objects" => {
                 self.feature_dialog = Some(feature_dialogs::FeatureDialog::Object(
                     object_dialogs::ObjectDialog::Objects,
@@ -271,6 +273,9 @@ impl HwpApp {
                 .insert(egui::TextStyle::Body, egui::FontId::proportional(12.0));
             s.text_styles
                 .insert(egui::TextStyle::Button, egui::FontId::proportional(12.0));
+            // egui's 9 px small text is unreadable in Korean; dialog hints use it.
+            s.text_styles
+                .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
             s.visuals.panel_fill = Color32::WHITE;
             s.visuals.selection.bg_fill = Color32::from_rgb(196, 219, 255);
         });
@@ -907,6 +912,17 @@ impl HwpApp {
                 Color32::from_rgba_unmultiplied(66, 133, 244, 65),
             );
         }
+        // A picked cell block of a nested table.
+        for [x, y, w, h] in self.session.nested_block_rects(page).unwrap_or_default() {
+            ui.painter().rect_filled(
+                Rect::from_min_size(
+                    rect.min + Vec2::new(x as f32, y as f32) * self.zoom,
+                    Vec2::new(w as f32, h as f32) * self.zoom,
+                ),
+                0.0,
+                Color32::from_rgba_unmultiplied(66, 133, 244, 65),
+            );
+        }
         if self.session.nested_caret().is_some() {
             for r in self.session.nested_selection_rects().unwrap_or_default() {
                 if r["pageIndex"].as_u64() != Some(u64::from(page)) {
@@ -929,6 +945,16 @@ impl HwpApp {
                 let pos = (p - rect.min) / s.zoom;
                 s.session.hit_test(page, pos.x as f64, pos.y as f64)
             };
+            // A drag that starts in a nested cell or text box puts the nested caret at
+            // the press point first, so the drag selects from there (over paragraphs).
+            if response.drag_started()
+                && !ctx.input(|i| i.modifiers.shift)
+                && let Some(o) = ctx.input(|i| i.pointer.press_origin())
+                && hit(self, o).is_err()
+            {
+                let pos = (o - rect.min) / self.zoom;
+                self.nested_click(page, pos.x as f64, pos.y as f64, false);
+            }
             if (response.clicked() || response.dragged())
                 && let Some(p) = response.interact_pointer_pos()
             {
@@ -984,17 +1010,33 @@ impl HwpApp {
         let x = caret["x"].as_f64().unwrap_or(0.0) as f32 * self.zoom + rect.min.x;
         let y = caret["y"].as_f64().unwrap_or(0.0) as f32 * self.zoom + rect.min.y;
         let height = caret["height"].as_f64().unwrap_or(16.0) as f32 * self.zoom;
-        let caret_rect = Rect::from_min_size(
-            Pos2::new(x, y),
-            Vec2::new(
-                if self.session.overwrite {
-                    height * 0.5
-                } else {
-                    2.0
-                },
-                height,
-            ),
-        );
+        // In a vertical section (세로쓰기) the caret lies across the column.
+        let caret_rect = if caret["vertical"] == true {
+            let width = caret["width"].as_f64().unwrap_or(16.0) as f32 * self.zoom;
+            Rect::from_min_size(
+                Pos2::new(x, y),
+                Vec2::new(
+                    width,
+                    if self.session.overwrite {
+                        width * 0.5
+                    } else {
+                        2.0
+                    },
+                ),
+            )
+        } else {
+            Rect::from_min_size(
+                Pos2::new(x, y),
+                Vec2::new(
+                    if self.session.overwrite {
+                        height * 0.5
+                    } else {
+                        2.0
+                    },
+                    height,
+                ),
+            )
+        };
         if follow {
             ui.scroll_to_rect(caret_rect.expand(24.0), None);
         }

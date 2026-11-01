@@ -1,0 +1,202 @@
+diff --git a/src/document_core/queries/vertical_cursor.rs b/src/document_core/queries/vertical_cursor.rs
+index 7ba5ab5..efa8db2 100644
+--- a/src/document_core/queries/vertical_cursor.rs
++++ b/src/document_core/queries/vertical_cursor.rs
+@@ -40,6 +40,8 @@ impl DocumentCore {
+                         composed,
+                         &page.layout.body_area,
+                         self.dpi,
++                        &self.styles,
++                        self.section_is_vertical(section_idx).unwrap_or(1),
+                     ),
+                 )
+             })
+diff --git a/src/renderer/layout/vertical_body.rs b/src/renderer/layout/vertical_body.rs
+index c5af86b..0caa317 100644
+--- a/src/renderer/layout/vertical_body.rs
++++ b/src/renderer/layout/vertical_body.rs
+@@ -8,6 +8,9 @@
+ //! 괄호·줄표 등)는 90도 돌려 그린다(세로 형태 문자가 있으면 그 문자). 표·그림·각주 같은
+ //! 개체는 아직 그리지 않는다(README 한계). 열의 자리(`vertical_page_columns`)와 열 안 글자
+ //! 경계(`vertical_line_offsets`)는 캐럿·누른 자리 찾기(HwpCraft 0090)도 같이 쓴다.
++//! 문단 정렬(HwpCraft 0099)은 열 안의 시작 자리로 반영한다: 가운데 정렬은 남는 길이의 반,
++//! 오른쪽 정렬은 남는 길이 전부만큼 열 위에서 내려 시작한다. 열의 `top` 을 내리므로 그리기와
++//! 캐럿·누른 자리가 함께 따른다.
+ 
+ use super::super::composer::{ComposedLine, ComposedParagraph};
+ use super::super::hwpunit_to_px;
+@@ -20,13 +23,15 @@ use super::text_measurement::{
+ };
+ use super::LayoutEngine;
+ use crate::model::paragraph::Paragraph;
++use crate::model::style::Alignment;
+ 
+ /// 세로 구역 쪽의 열 하나: 어느 문단의 몇째 줄이고, 쪽 위에서 어디에 놓이는가.
+ #[derive(Debug, Clone, Copy, PartialEq)]
+ pub(crate) struct VerticalColumn {
+     pub para_index: usize,
+     pub line_index: usize,
+-    /// 열 왼쪽 x 와 너비(줄 높이), 열 위 y 와 길이(본문 높이).
++    /// 열 왼쪽 x 와 너비(줄 높이), 첫 글자의 위 y 와 거기서 본문 끝까지의 길이. 정렬이
++    /// 가운데·오른쪽이면 `top` 은 본문 위보다 아래다(HwpCraft 0099).
+     pub x: f64,
+     pub width: f64,
+     pub top: f64,
+@@ -45,6 +50,8 @@ pub(crate) fn vertical_page_columns(
+     composed: &[ComposedParagraph],
+     body: &LayoutRect,
+     dpi: f64,
++    styles: &ResolvedStyleSet,
++    text_direction: u8,
+ ) -> Vec<VerticalColumn> {
+     let mut columns = Vec::new();
+     let mut x_right = body.x + body.width;
+@@ -74,13 +81,20 @@ pub(crate) fn vertical_page_columns(
+                 } else {
+                     comp.lines[line_index + 1].char_start.min(text_len)
+                 };
++                let lead = vertical_align_lead(
++                    line,
++                    styles,
++                    text_direction,
++                    comp.para_style_id,
++                    body.height,
++                );
+                 columns.push(VerticalColumn {
+                     para_index,
+                     line_index,
+                     x: x_right - width,
+                     width,
+-                    top: body.y,
+-                    length: body.height,
++                    top: body.y + lead,
++                    length: body.height - lead,
+                     char_start: line.char_start,
+                     char_end,
+                     last_line,
+@@ -92,6 +106,36 @@ pub(crate) fn vertical_page_columns(
+     columns
+ }
+ 
++/// 정렬에 따라 열 위에서 첫 글자까지 내리는 거리(HwpCraft 0099): 가운데 정렬은 남는 길이의
++/// 반, 오른쪽 정렬은 남는 길이 전부. 줄 끝 공백은 글자 길이에 넣지 않는다. 왼쪽·양쪽·배분·
++/// 나눔 정렬은 0 — 열 위부터 놓는다.
++fn vertical_align_lead(
++    line: &ComposedLine,
++    styles: &ResolvedStyleSet,
++    text_direction: u8,
++    para_style_id: u16,
++    length: f64,
++) -> f64 {
++    let alignment = styles
++        .para_styles
++        .get(para_style_id as usize)
++        .map(|s| s.alignment)
++        .unwrap_or_default();
++    let factor = match alignment {
++        Alignment::Center => 0.5,
++        Alignment::Right => 1.0,
++        _ => return 0.0,
++    };
++    let offsets = vertical_line_offsets(line, styles, text_direction);
++    let chars: Vec<char> = line.runs.iter().flat_map(|r| r.text.chars()).collect();
++    let mut end = chars.len();
++    while end > 0 && chars[end - 1].is_whitespace() {
++        end -= 1;
++    }
++    let used = offsets.get(end).copied().unwrap_or(0.0);
++    ((length - used) * factor).max(0.0)
++}
++
+ /// 열 안 글자 경계: 글자 i 의 위 끝(열 위에서 잰 거리), 마지막은 열의 글자 끝. 글자 수 + 1 개.
+ pub(crate) fn vertical_line_offsets(
+     line: &ComposedLine,
+@@ -147,6 +191,8 @@ impl LayoutEngine {
+             composed,
+             &layout.body_area,
+             self.dpi,
++            styles,
++            direction,
+         );
+         for col in columns {
+             let comp = &composed[col.para_index];
+@@ -264,4 +310,79 @@ mod tests {
+         assert!(runs[58].1 < runs[0].1);
+         assert_eq!(runs[58].2, runs[0].2);
+     }
++
++    fn vertical_runs(core: &DocumentCore) -> Vec<(usize, f64, f64, f64)> {
++        let tree = core.build_page_render_tree(0).unwrap();
++        let mut runs = Vec::new();
++        fn walk(node: &RenderNode, out: &mut Vec<(usize, f64, f64, f64)>) {
++            if let RenderNodeType::TextRun(run) = &node.node_type {
++                if run.is_vertical {
++                    out.push((
++                        run.char_start.unwrap_or(0),
++                        node.bbox.x,
++                        node.bbox.y,
++                        node.bbox.y + node.bbox.height,
++                    ));
++                }
++            }
++            for child in &node.children {
++                walk(child, out);
++            }
++        }
++        walk(&tree.root, &mut runs);
++        runs.sort_by_key(|r| r.0);
++        runs
++    }
++
++    /// 가운데 정렬 문단은 열 가운데에, 오른쪽 정렬은 열 아래 끝에 붙어 놓이고, 캐럿과 누른 자리도
++    /// 그 글자를 따른다. 꽉 찬 열(첫 열)은 정렬과 상관없이 맨 위부터다(HwpCraft 0099).
++    #[test]
++    fn vertical_alignment_moves_the_text_along_its_column() {
++        let left = vertical("가나다");
++        let base = vertical_runs(&left);
++        let (top, bottom) = {
++            let page = &left.pagination[0].pages[0].layout.body_area;
++            (page.y, page.y + page.height)
++        };
++        assert!((base[0].2 - top).abs() < 0.01, "{base:?}");
++
++        let mut centre = vertical("가나다");
++        centre
++            .apply_para_format_native(0, 0, r#"{"alignment":"center"}"#)
++            .unwrap();
++        let runs = vertical_runs(&centre);
++        let above = runs[0].2 - top;
++        let below = bottom - runs[2].3;
++        assert!(above > 100.0 && (above - below).abs() < 1.0, "{runs:?}");
++        let caret: serde_json::Value =
++            serde_json::from_str(&centre.get_cursor_rect_native(0, 0, 1).unwrap()).unwrap();
++        assert!(
++            (caret["y"].as_f64().unwrap() - runs[1].2).abs() < 0.2,
++            "{caret}"
++        );
++        let hit: serde_json::Value = serde_json::from_str(
++            &centre
++                .hit_test_native(0, runs[2].1 + 2.0, runs[2].2 + 1.0)
++                .unwrap(),
++        )
++        .unwrap();
++        assert_eq!(hit["charOffset"], 2, "{hit}");
++
++        let mut right = vertical("가나다");
++        right
++            .apply_para_format_native(0, 0, r#"{"alignment":"right"}"#)
++            .unwrap();
++        let runs = vertical_runs(&right);
++        assert!((bottom - runs[2].3).abs() < 0.01, "{runs:?}");
++
++        let mut full = vertical(&"가".repeat(60));
++        full.apply_para_format_native(0, 0, r#"{"alignment":"center"}"#)
++            .unwrap();
++        let runs = vertical_runs(&full);
++        // 꽉 찬 열은 남는 길이(한 글자 미만)의 반만 내려온다.
++        let slack = bottom - top - (runs[57].3 - runs[0].2);
++        assert!(slack < runs[0].3 - runs[0].2, "{slack} {runs:?}");
++        assert!((runs[0].2 - top - slack / 2.0).abs() < 0.01, "{runs:?}");
++        assert!(runs[58].2 > top + 100.0, "{runs:?}");
++    }
+ }

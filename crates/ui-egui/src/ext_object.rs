@@ -34,44 +34,152 @@ struct FieldInsert {
     name: String,
     memo: String,
 }
-/// 양식 개체 넣기 draft: one kind, the fields that kind takes.
-struct FormInsert {
+/// 양식 개체 넣기 and 양식 개체 속성: the properties Hangul's dialog edits.
+struct FormDialog {
+    /// None: insert at the caret (form.insert); Some: change this object (form.properties).
+    at: Option<Value>,
     /// form.insert kind: check_box | edit | combo_box | radio_button | push_button
     kind: &'static str,
+    name: String,
     caption: String,
-    checked: bool,
     text: String,
     /// Combo box items, one per line.
     items: String,
+    checked: bool,
     group: String,
-    name: String,
+    /// Empty: the document's default character shape (insert only).
+    font_face: String,
+    /// pt as typed; empty keeps the document's default size (insert only).
+    font_size: String,
+    fore: [u8; 3],
+    back: [u8; 3],
+    frame: bool,
+    width_mm: f64,
+    height_mm: f64,
+    enabled: bool,
+    printable: bool,
+    edit_enable: bool,
+    read_only: bool,
+    multi_line: bool,
+    number_only: bool,
+    max_length: u32,
+    password_char: String,
+    /// The values the dialog opened with: only keys that differ are sent.
+    original: Value,
 }
-impl FormInsert {
+const FORM_KINDS: [&str; 5] = [
+    "check_box",
+    "edit",
+    "combo_box",
+    "radio_button",
+    "push_button",
+];
+fn rgb_of(hex: &str) -> [u8; 3] {
+    let v = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0);
+    [(v >> 16) as u8, (v >> 8) as u8, v as u8]
+}
+fn hex_of(rgb: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
+}
+impl FormDialog {
+    /// A new object of `kind` with the engine's defaults for it (form_insert.rs).
     fn new(kind: &'static str) -> Self {
-        let caption = match kind {
-            "check_box" => "선택 상자",
-            "radio_button" => "라디오 단추",
-            "push_button" => "명령 단추",
-            _ => "",
+        let (caption, (width_mm, height_mm), back) = match kind {
+            "check_box" => ("선택 상자", (35.0, 7.0), [255; 3]),
+            "radio_button" => ("라디오 단추", (30.0, 7.0), [255; 3]),
+            "push_button" => ("명령 단추", (25.0, 7.0), [240; 3]),
+            "combo_box" => ("", (21.37, 5.12), [240; 3]),
+            _ => ("", (25.0, 7.0), [240; 3]),
         };
-        Self {
+        let mut d = Self {
+            at: None,
             kind,
+            name: String::new(),
             caption: caption.into(),
-            checked: false,
             text: String::new(),
             items: String::new(),
+            checked: false,
             group: String::new(),
-            name: String::new(),
+            font_face: String::new(),
+            font_size: String::new(),
+            fore: [0; 3],
+            back,
+            frame: true,
+            width_mm,
+            height_mm,
+            enabled: true,
+            printable: true,
+            edit_enable: true,
+            read_only: false,
+            multi_line: false,
+            number_only: false,
+            max_length: i32::MAX as u32,
+            password_char: String::new(),
+            original: Value::Null,
+        };
+        d.original = d.values();
+        d
+    }
+    /// An existing object, from form.properties.get.
+    fn from_properties(v: &Value) -> Self {
+        let kind = FORM_KINDS
+            .into_iter()
+            .find(|k| v["kind"] == *k)
+            .unwrap_or("push_button");
+        let s = |k: &str| v[k].as_str().unwrap_or("").to_owned();
+        let b = |k: &str, default: bool| v[k].as_bool().unwrap_or(default);
+        let items: Vec<String> = v["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i.as_str().map(str::to_owned))
+            .collect();
+        let size = v["font_size"].as_f64().unwrap_or(10.0);
+        let mut d = Self {
+            at: Some(v["at"].clone()),
+            kind,
+            name: s("name"),
+            caption: s("caption"),
+            text: s("text"),
+            items: items.join("\n"),
+            checked: b("checked", false),
+            group: s("group"),
+            font_face: s("font_face"),
+            font_size: format!("{}", (size * 10.0).round() / 10.0),
+            fore: rgb_of(&s("fore_color")),
+            back: rgb_of(&s("back_color")),
+            frame: b("frame", true),
+            width_mm: v["width_mm"].as_f64().unwrap_or(25.0),
+            height_mm: v["height_mm"].as_f64().unwrap_or(7.0),
+            enabled: b("enabled", true),
+            printable: b("printable", true),
+            edit_enable: b("edit_enable", true),
+            read_only: b("read_only", false),
+            multi_line: b("multi_line", false),
+            number_only: b("number_only", false),
+            max_length: v["max_length"].as_u64().unwrap_or(i32::MAX as u64) as u32,
+            password_char: s("password_char"),
+            original: Value::Null,
+        };
+        d.original = d.values();
+        d
+    }
+    fn kind_label(&self) -> &'static str {
+        match self.kind {
+            "check_box" => "선택 상자",
+            "edit" => "입력 상자",
+            "combo_box" => "콤보 상자",
+            "radio_button" => "라디오 단추",
+            _ => "명령 단추",
         }
     }
-    fn title(&self) -> &'static str {
-        match self.kind {
-            "check_box" => "양식 개체 넣기 - 선택 상자",
-            "edit" => "양식 개체 넣기 - 입력 상자",
-            "combo_box" => "양식 개체 넣기 - 콤보 상자",
-            "radio_button" => "양식 개체 넣기 - 라디오 단추",
-            _ => "양식 개체 넣기 - 명령 단추",
-        }
+    fn title(&self) -> String {
+        let what = if self.at.is_some() {
+            "양식 개체 속성"
+        } else {
+            "양식 개체 넣기"
+        };
+        format!("{what} - {}", self.kind_label())
     }
     /// The engine's automatic name for this kind ("ComboBox1" …).
     fn name_hint(&self) -> String {
@@ -92,9 +200,23 @@ impl FormInsert {
             .map(str::to_owned)
             .collect()
     }
-    /// Why 넣기 is grey, if it is.
+    fn size_pt(&self) -> Option<f64> {
+        self.font_size.trim().parse::<f64>().ok()
+    }
+    /// Why 넣기/설정 is grey, if it is.
     fn grey(&self) -> Option<&'static str> {
-        if self.kind == "combo_box"
+        if self.at.is_some() && self.name.trim().is_empty() {
+            return Some("개체 이름을 넣으세요.");
+        }
+        if !self.font_size.trim().is_empty()
+            && !self
+                .size_pt()
+                .is_some_and(|pt| (1.0..=4096.0).contains(&pt))
+        {
+            return Some("글자 크기는 1–4096 pt입니다.");
+        }
+        if self.at.is_none()
+            && self.kind == "combo_box"
             && !self.text.trim().is_empty()
             && !self.item_list().iter().any(|i| i == self.text.trim())
         {
@@ -102,32 +224,201 @@ impl FormInsert {
         }
         None
     }
-    /// form.insert parameters for this draft.
-    fn params(&self) -> Value {
-        let mut p = json!({"kind": self.kind});
+    /// Every property of this kind as form.properties names it.
+    fn values(&self) -> Value {
+        let mut v = json!({
+            "enabled": self.enabled,
+            "printable": self.printable,
+            "frame": self.frame,
+            "width_mm": (self.width_mm * 100.0).round() / 100.0,
+            "height_mm": (self.height_mm * 100.0).round() / 100.0,
+            "fore_color": hex_of(self.fore),
+            "back_color": hex_of(self.back),
+        });
+        if !self.name.trim().is_empty() {
+            v["name"] = json!(self.name.trim());
+        }
+        if !self.font_face.trim().is_empty() {
+            v["font_face"] = json!(self.font_face.trim());
+        }
+        if let Some(pt) = self.size_pt() {
+            v["font_size"] = json!(pt);
+        }
         match self.kind {
-            "check_box" | "radio_button" | "push_button" => {
-                p["caption"] = json!(self.caption);
+            "check_box" | "radio_button" | "push_button" => v["caption"] = json!(self.caption),
+            _ => v["text"] = json!(self.text.trim()),
+        }
+        if matches!(self.kind, "check_box" | "radio_button") {
+            v["checked"] = json!(self.checked);
+        }
+        match self.kind {
+            "radio_button" => v["group"] = json!(self.group.trim()),
+            "combo_box" => {
+                v["items"] = json!(self.item_list());
+                v["edit_enable"] = json!(self.edit_enable);
             }
-            _ => {
-                if !self.text.trim().is_empty() {
-                    p["text"] = json!(self.text.trim());
+            "edit" => {
+                v["read_only"] = json!(self.read_only);
+                v["multi_line"] = json!(self.multi_line);
+                v["number_only"] = json!(self.number_only);
+                v["max_length"] = json!(self.max_length);
+                v["password_char"] = json!(self.password_char);
+            }
+            _ => {}
+        }
+        v
+    }
+    /// form.insert or form.properties parameters: the values that changed.
+    fn params(&self) -> Value {
+        let mut p = serde_json::Map::new();
+        for (key, value) in self.values().as_object().into_iter().flatten() {
+            if self.original.get(key) != Some(value) {
+                p.insert(key.clone(), value.clone());
+            }
+        }
+        match &self.at {
+            Some(at) => p.insert("at".into(), at.clone()),
+            None => p.insert("kind".into(), json!(self.kind)),
+        };
+        Value::Object(p)
+    }
+}
+/// The fields of [`FormDialog`]: 기본, 글자, 모양 and 상태 as in Hangul's dialog.
+fn form_dialog_body(ui: &mut egui::Ui, d: &mut FormDialog) {
+    let field = 330.0;
+    chrome::section(ui, "기본");
+    egui::Grid::new("form-dialog-basic")
+        .num_columns(2)
+        .spacing([10.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("개체 이름(N)");
+            let hint = d.name_hint();
+            let name = ui.add(
+                egui::TextEdit::singleline(&mut d.name)
+                    .hint_text(hint)
+                    .desired_width(field),
+            );
+            chrome::first_focus(&name);
+            ui.end_row();
+            match d.kind {
+                "check_box" | "radio_button" | "push_button" => {
+                    ui.label("글(C)");
+                    ui.add(egui::TextEdit::singleline(&mut d.caption).desired_width(field));
+                    ui.end_row();
+                }
+                "combo_box" => {
+                    ui.label("목록 항목(L)");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut d.items)
+                            .hint_text("한 줄에 하나")
+                            .desired_rows(3)
+                            .desired_width(field),
+                    );
+                    ui.end_row();
+                    ui.label("선택 값(V)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.text)
+                            .hint_text("목록 항목 중 하나 (비우면 선택 없음)")
+                            .desired_width(field),
+                    );
+                    ui.end_row();
+                }
+                _ => {
+                    ui.label("내용(T)");
+                    ui.add(egui::TextEdit::singleline(&mut d.text).desired_width(field));
+                    ui.end_row();
                 }
             }
+            if d.kind == "radio_button" {
+                ui.label("묶음 이름(G)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.group)
+                        .hint_text("같은 이름의 라디오 단추끼리 하나만 선택")
+                        .desired_width(field),
+                );
+                ui.end_row();
+            }
+            if matches!(d.kind, "check_box" | "radio_button") {
+                ui.label("");
+                ui.checkbox(&mut d.checked, "선택한 상태(S)");
+                ui.end_row();
+            }
+        });
+    chrome::section(ui, "글자");
+    ui.horizontal(|ui| {
+        ui.label("글꼴(F)");
+        crate::format_dialogs::font_combo(ui, "form-dialog-font", &mut d.font_face, 170.0);
+        ui.label("크기(Z)");
+        ui.add(
+            egui::TextEdit::singleline(&mut d.font_size)
+                .hint_text("기본")
+                .desired_width(40.0),
+        );
+        ui.label("pt");
+        ui.label("글자 색");
+        chrome::color_button_rgb(ui, &mut d.fore);
+    });
+    chrome::section(ui, "모양");
+    ui.horizontal(|ui| {
+        ui.label("너비(W)");
+        ui.add(
+            egui::DragValue::new(&mut d.width_mm)
+                .range(3.0..=200.0)
+                .speed(0.1)
+                .max_decimals(2)
+                .suffix(" mm"),
+        );
+        ui.label("높이(H)");
+        ui.add(
+            egui::DragValue::new(&mut d.height_mm)
+                .range(3.0..=200.0)
+                .speed(0.1)
+                .max_decimals(2)
+                .suffix(" mm"),
+        );
+        ui.label("배경 색");
+        chrome::color_button_rgb(ui, &mut d.back);
+    });
+    ui.checkbox(&mut d.frame, "테두리 그리기(B)");
+    chrome::section(ui, "상태");
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(&mut d.enabled, "사용할 수 있음(E)");
+        ui.checkbox(&mut d.printable, "인쇄(P)");
+        match d.kind {
+            "combo_box" => {
+                ui.checkbox(&mut d.edit_enable, "직접 입력(I)");
+            }
+            "edit" => {
+                ui.checkbox(&mut d.read_only, "읽기 전용(R)");
+                ui.checkbox(&mut d.multi_line, "여러 줄(M)");
+                ui.checkbox(&mut d.number_only, "숫자만(U)");
+            }
+            _ => {}
         }
-        if matches!(self.kind, "check_box" | "radio_button") && self.checked {
-            p["checked"] = json!(true);
+    });
+    if d.kind == "edit" {
+        ui.horizontal(|ui| {
+            ui.label("최대 글자 수");
+            ui.add(egui::DragValue::new(&mut d.max_length).range(1..=i32::MAX as u32));
+            ui.label("암호 문자");
+            ui.add(
+                egui::TextEdit::singleline(&mut d.password_char)
+                    .char_limit(1)
+                    .hint_text("없음")
+                    .desired_width(36.0),
+            );
+        });
+    }
+    let note = match d.kind {
+        "combo_box" => {
+            "목록 항목은 HWPX로 저장할 때만 남습니다(HWP는 한글 문서 스크립트에 둡니다)."
         }
-        if self.kind == "combo_box" {
-            p["items"] = json!(self.item_list());
-        }
-        if self.kind == "radio_button" && !self.group.trim().is_empty() {
-            p["group"] = json!(self.group.trim());
-        }
-        if !self.name.trim().is_empty() {
-            p["name"] = json!(self.name.trim());
-        }
-        p
+        "check_box" | "radio_button" => "배경 색은 파일에 저장되지만 화면에는 그리지 않습니다.",
+        _ => "",
+    };
+    if !note.is_empty() {
+        ui.add_space(4.0);
+        ui.label(RichText::new(note).small().weak());
     }
 }
 #[derive(Clone)]
@@ -222,7 +513,7 @@ pub(crate) struct State {
     /// Connector tool: the shape under the drag start and its connection point.
     connector_start: Option<(ObjectAddress, u32)>,
     field: Option<FieldInsert>,
-    form_insert: Option<FormInsert>,
+    form_dialog: Option<FormDialog>,
     forms: Option<Vec<FormDraft>>,
     picture: Option<PictureInsert>,
     properties: Option<Box<Properties>>,
@@ -314,7 +605,7 @@ fn css_rgb(v: &Value) -> [u8; 3] {
 fn css_field(ui: &mut egui::Ui, label: &str, v: &mut Value, key: &str) {
     ui.label(label);
     let mut c = css_rgb(&v[key]);
-    if egui::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
+    if chrome::color_button_rgb(ui, &mut c).changed() {
         v[key] = json!(format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]));
     }
 }
@@ -418,7 +709,7 @@ fn number_choice(ui: &mut egui::Ui, id: &str, v: &mut Value, key: &str, items: &
 fn color(ui: &mut egui::Ui, label: &str, v: &mut Value, key: &str) {
     ui.label(label);
     let mut c = bgr(&v[key]);
-    if egui::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
+    if chrome::color_button_rgb(ui, &mut c).changed() {
         v[key] = bgr_value(c);
     }
 }
@@ -754,19 +1045,11 @@ impl HwpApp {
                 });
             }
             "insert.form_object" => self.open_form_editor(),
-            "insert.form.check_box" => {
-                self.ext.object.form_insert = Some(FormInsert::new("check_box"))
-            }
-            "insert.form.edit" => self.ext.object.form_insert = Some(FormInsert::new("edit")),
-            "insert.form.combo_box" => {
-                self.ext.object.form_insert = Some(FormInsert::new("combo_box"))
-            }
-            "insert.form.radio_button" => {
-                self.ext.object.form_insert = Some(FormInsert::new("radio_button"))
-            }
-            "insert.form.push_button" => {
-                self.ext.object.form_insert = Some(FormInsert::new("push_button"))
-            }
+            "insert.form.check_box" => self.open_form_insert("check_box"),
+            "insert.form.edit" => self.open_form_insert("edit"),
+            "insert.form.combo_box" => self.open_form_insert("combo_box"),
+            "insert.form.radio_button" => self.open_form_insert("radio_button"),
+            "insert.form.push_button" => self.open_form_insert("push_button"),
             "chart.edit" => self.open_chart_editor(0),
             "insert.chart" => self.open_chart_creation(None),
             "memo.list" => self.ext.object.memos = true,
@@ -1248,10 +1531,22 @@ impl HwpApp {
         }
         if let Some(delta) = self.ext.object.moving.as_mut() {
             *delta += response.drag_delta() / self.zoom;
+        }
+        // 개체 이동 안내선: a floating object snaps to the page's lines (ext_shell).
+        let snapped = match (self.ext.object.moving, self.ext.object.selected) {
+            (Some(raw), Some(s)) if !s.inline => {
+                let skip: Vec<Rect> = self.ext.object.multi.iter().map(|m| m.bbox).collect();
+                let alt = response.ctx.input(|i| i.modifiers.alt);
+                Some(self.object_move_snapped(page, s.bbox, &skip, raw, alt))
+            }
+            (raw, _) => raw,
+        };
+        if let Some(delta) = self.ext.object.moving.as_mut() {
             consumed = true;
             if response.drag_stopped() {
-                let d = *delta;
+                let d = snapped.unwrap_or(*delta);
                 self.ext.object.moving = None;
+                self.clear_move_guides();
                 if let Some(s) = self.ext.object.selected
                     && d.length() > 1.0
                     && s.inline
@@ -1390,9 +1685,12 @@ impl HwpApp {
         };
         let to_screen_pos = |p: Pos2| rect.min + p.to_vec2() * self.zoom;
         let stroke = Stroke::new(1.0, chrome::Tokens::ACCENT);
+        if self.ext.object.moving.is_some() {
+            self.paint_move_guides(&painter, rect);
+        }
         for m in self.ext.object.multi.iter().filter(|m| m.page == page) {
             let mut r = to_screen(m.bbox);
-            if let Some(d) = self.ext.object.moving {
+            if let Some(d) = self.ext.object.moving.and(snapped) {
                 r = r.translate(d * self.zoom);
             }
             painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Outside);
@@ -1411,7 +1709,7 @@ impl HwpApp {
         }
         if let Some(s) = self.ext.object.selected.filter(|s| s.page == page) {
             let mut r = to_screen(preview.unwrap_or(s.bbox));
-            if let Some(d) = self.ext.object.moving {
+            if let Some(d) = self.ext.object.moving.and(snapped) {
                 r = r.translate(d * self.zoom);
             }
             if s.locked {
@@ -1881,6 +2179,7 @@ impl HwpApp {
             || self.ext.object.memos
             || self.ext.object.field.is_some()
             || self.ext.object.forms.is_some()
+            || self.ext.object.form_dialog.is_some()
             || self.ext.object.note_shape.is_some()
     }
     /// Startup views for captures.
@@ -1992,7 +2291,19 @@ impl HwpApp {
                 self.object_ext_dispatch("insert.field", ctx);
             }
             "form-edit" => self.open_form_editor(),
-            "form-insert" => self.ext.object.form_insert = Some(FormInsert::new("combo_box")),
+            "form-insert" => self.open_form_insert("combo_box"),
+            "form-properties" => {
+                // An input box with changed properties, opened in 양식 개체 속성.
+                let made = self.session.run(
+                    "form.insert",
+                    json!({"kind": "edit", "text": "홍길동", "font_face": "맑은 고딕",
+                        "font_size": 11, "back_color": "#fff2cc", "width_mm": 40.0}),
+                );
+                match made {
+                    Ok(made) => self.open_form_properties(made["at"].clone()),
+                    Err(e) => self.error = Some(e.to_string()),
+                }
+            }
             "note-shape" => self.open_note_shape(false),
             "object-align" => {
                 // Two floating drawing objects on page 1 selected, then 왼쪽 맞춤 applied.
@@ -2041,7 +2352,7 @@ impl HwpApp {
         self.chart_creation_dialog(ctx);
         self.memo_list_dialog(ctx);
         self.field_insert_dialog(ctx);
-        self.form_insert_dialog(ctx);
+        self.form_dialog(ctx);
         self.note_shape_dialog(ctx);
         self.form_editor_dialog(ctx);
     }
@@ -2096,97 +2407,82 @@ impl HwpApp {
             self.ext.object.field = Some(d);
         }
     }
-    /// 양식 개체 넣기: the fields of the chosen kind; inserts at the caret as a character.
-    fn form_insert_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut d) = self.ext.object.form_insert.take() else {
+    /// 양식 개체 넣기 / 양식 개체 속성: one object's properties; inserts at the caret
+    /// as a character, or changes the object in one undo step.
+    fn form_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.ext.object.form_dialog.take() else {
             return;
         };
         let (mut apply, mut close) = (false, false);
-        let r = chrome::modal("ext-form-insert").show(ctx, |ui| {
-            ui.set_width(460.0);
-            close = chrome::title(ui, d.title());
+        let r = chrome::modal("ext-form-dialog").show(ctx, |ui| {
+            ui.set_width(560.0);
+            close = chrome::title(ui, &d.title());
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
-                    ui.set_width(350.0);
-                    let first = match d.kind {
-                        "check_box" | "radio_button" | "push_button" => {
-                            chrome::section(ui, "글(C)");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut d.caption)
-                                    .desired_width(f32::INFINITY),
-                            )
-                        }
-                        "combo_box" => {
-                            chrome::section(ui, "목록 항목 (한 줄에 하나)(L)");
-                            ui.add(
-                                egui::TextEdit::multiline(&mut d.items)
-                                    .desired_rows(4)
-                                    .desired_width(f32::INFINITY),
-                            )
-                        }
-                        _ => {
-                            chrome::section(ui, "처음 내용(T)");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut d.text)
-                                    .desired_width(f32::INFINITY),
-                            )
-                        }
-                    };
-                    chrome::first_focus(&first);
-                    if d.kind == "combo_box" {
-                        chrome::section(ui, "선택 값(V)");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut d.text)
-                                .hint_text("목록 항목 중 하나 (비우면 선택 없음)")
-                                .desired_width(f32::INFINITY),
-                        );
-                    }
-                    if matches!(d.kind, "check_box" | "radio_button") {
-                        ui.checkbox(&mut d.checked, "선택한 상태로 넣기(S)");
-                    }
-                    if d.kind == "radio_button" {
-                        chrome::section(ui, "묶음 이름(G)");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut d.group)
-                                .hint_text("같은 이름의 라디오 단추끼리 하나만 선택")
-                                .desired_width(f32::INFINITY),
-                        );
-                    }
-                    let name_hint = d.name_hint();
-                    chrome::section(ui, "개체 이름(N)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut d.name)
-                            .hint_text(name_hint)
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.label(
-                        RichText::new(
-                            "커서 위치(본문 또는 표 셀)에 글자처럼 넣습니다. 값은 [입력 > 양식 개체 > 양식 개체 값 고치기]에서 바꿀 수 있습니다.",
-                        )
-                        .small()
-                        .weak(),
-                    );
+                    ui.set_width(450.0);
+                    form_dialog_body(ui, &mut d);
                 });
                 ui.vertical(|ui| {
-                    let (a, c) = chrome::actions(ui, d.grey(), "넣기(D)");
+                    let label = if d.at.is_some() {
+                        "설정(D)"
+                    } else {
+                        "넣기(D)"
+                    };
+                    let (a, c) = chrome::actions(ui, d.grey(), label);
                     apply = a;
                     close |= c;
                 });
             });
         });
         if apply {
-            close = self.submit_form_insert(&d);
+            close = self.submit_form_dialog(&d);
         }
         if !(close || r.should_close()) {
-            self.ext.object.form_insert = Some(d);
+            self.ext.object.form_dialog = Some(d);
         }
     }
-    fn submit_form_insert(&mut self, d: &FormInsert) -> bool {
-        let done = self.run("form.insert", d.params());
+    fn submit_form_dialog(&mut self, d: &FormDialog) -> bool {
+        let params = d.params();
+        if d.at.is_none() {
+            let done = self.run("form.insert", params);
+            if done {
+                self.message = "양식 개체를 넣었습니다.".into();
+            }
+            return done;
+        }
+        if params.as_object().is_some_and(|p| p.len() == 1) {
+            self.message = "바뀐 속성이 없습니다.".into();
+            return true;
+        }
+        let done = self.run("form.properties", params);
         if done {
-            self.message = "양식 개체를 넣었습니다.".into();
+            self.message = "양식 개체 속성을 고쳤습니다.".into();
         }
         done
+    }
+    /// 양식 개체 넣기 for `kind`, showing the font a new object takes: the document's
+    /// first character shape (CharShapeID 0).
+    fn open_form_insert(&mut self, kind: &'static str) {
+        let mut d = FormDialog::new(kind);
+        let info = &self.session.core.document().doc_info;
+        if let Some(shape) = info.char_shapes.first() {
+            d.font_face = info
+                .font_faces
+                .first()
+                .and_then(|faces| faces.get(usize::from(shape.font_ids[0])))
+                .map(|font| font.name.clone())
+                .unwrap_or_default();
+            d.font_size = format!("{}", f64::from(shape.base_size) / 100.0);
+        }
+        d.original = d.values();
+        self.ext.object.form_dialog = Some(d);
+    }
+    /// 양식 개체 속성 for the object at `at` (form.list's address).
+    pub(super) fn open_form_properties(&mut self, at: Value) {
+        let got = self.session.run("form.properties.get", json!({"at": at}));
+        if let Some(v) = self.result(got) {
+            self.ext.object.form_dialog = Some(FormDialog::from_properties(&v));
+        }
     }
     /// 양식 개체: value editor for the document's existing form objects.
     pub(super) fn open_form_editor(&mut self) {
@@ -2231,6 +2527,7 @@ impl HwpApp {
             (d.text.as_str(), d.checked, d.caption.as_str())
                 != (d.original.0.as_str(), d.original.1, d.original.2.as_str())
         };
+        let mut properties = None;
         let button = dialog(ctx, "양식 개체", 600.0, &["적용(D)", "닫기"], |ui| {
             if drafts.is_empty() {
                 notice(ui, "이 문서에 양식 개체가 없습니다.");
@@ -2258,6 +2555,9 @@ impl HwpApp {
                                     if changed(d) { " · 바뀜" } else { "" }
                                 ),
                             );
+                            if ui.small_button("속성…").clicked() {
+                                properties = Some(d.at.clone());
+                            }
                             match d.kind.as_str() {
                                 "Edit" | "ComboBox" => {
                                     ui.add(
@@ -2290,9 +2590,14 @@ impl HwpApp {
                 });
             notice(
                 ui,
-                "문서에 있는 양식 개체의 값과 캡션을 고칩니다. 새 양식 개체 넣기는 조판 엔진(RHWP)에 생성 기능이 없어 지원하지 않습니다.",
+                "문서에 있는 양식 개체의 값과 캡션을 고칩니다. 글꼴·색·크기 같은 속성은 [속성…], 새 양식 개체는 [입력 > 양식 개체]에서 넣습니다.",
             );
         });
+        if let Some(at) = properties {
+            // The properties dialog replaces the list, as Hangul's opens on its own.
+            self.open_form_properties(at);
+            return;
+        }
         let close = match button {
             Some(0) => {
                 let mut applied = 0;
@@ -2934,6 +3239,9 @@ pub(crate) struct EquationEditor {
     error: Option<String>,
     /// Script caret (Unicode scalars) shared by the preview and the script box.
     caret: usize,
+    /// Other end of a selection made by dragging over the preview (or in the script
+    /// box); `None` or equal to `caret` when nothing is selected.
+    anchor: Option<usize>,
     /// The preview took the last click: palette inserts go to `caret`.
     preview_focus: bool,
     preedit: String,
@@ -3231,6 +3539,16 @@ const FONTS: &[&str] = &["HancomEQN", "HYhwpEQ", "함초롬바탕"];
 
 impl HwpApp {
     /// Open the editor for a new equation or an existing one.
+    /// The new-equation editor with `start..end` of its script selected, as a drag over
+    /// the preview leaves it (`--view equation-selection`).
+    pub(crate) fn open_equation_editor_selecting(&mut self, start: usize, end: usize) {
+        self.open_equation_editor(None);
+        if let Some(d) = self.ext.object.equation.as_mut() {
+            d.anchor = Some(start);
+            d.caret = end;
+            d.preview_focus = true;
+        }
+    }
     pub(crate) fn open_equation_editor(&mut self, address: Option<ObjectAddress>) {
         let mut editor = EquationEditor {
             address,
@@ -3242,6 +3560,7 @@ impl HwpApp {
             original: None,
             error: None,
             caret: 0,
+            anchor: None,
             preview_focus: false,
             preedit: String::new(),
             layout: None,
@@ -3340,7 +3659,7 @@ impl HwpApp {
                                 .suffix(" pt"),
                         )
                         .on_hover_text("글자 크기");
-                        egui::color_picker::color_edit_button_srgb(ui, &mut d.color)
+                        chrome::color_button_rgb(ui, &mut d.color)
                             .on_hover_text("글자 색");
                         ui.separator();
                         macro_insert = equation_visual::macro_menu(
@@ -3406,10 +3725,13 @@ impl HwpApp {
                 .show(ui, |ui| {
                     let (rect, _) =
                         ui.allocate_exact_size(Vec2::new(740.0, 190.0), egui::Sense::hover());
-                    let response =
-                        ui.interact(rect, egui::Id::new("equation-preview"), egui::Sense::click());
+                    let response = ui.interact(
+                        rect,
+                        egui::Id::new("equation-preview"),
+                        egui::Sense::click_and_drag(),
+                    );
                     let response = response.on_hover_text(
-                        "수식을 누르면 그 자리에서 입력합니다. Tab: 다음 빈 칸, Shift+Tab: 이전 빈 칸",
+                        "수식을 누르면 그 자리에서 입력합니다. 끌면 그 부분을 고릅니다. Tab: 다음 빈 칸, Shift+Tab: 이전 빈 칸",
                     );
                     let mut dest = None;
                     if let Some((_, texture, size)) = &self.equation_preview {
@@ -3423,19 +3745,42 @@ impl HwpApp {
                         );
                         dest = Some(place);
                     }
+                    let to_layout = |p: Pos2, place: Rect, layout: &hwpcraft_engine::EquationLayout| {
+                        (
+                            f64::from((p.x - place.min.x) / place.width()) * layout.width,
+                            f64::from((p.y - place.min.y) / place.height()) * layout.height,
+                        )
+                    };
                     if response.clicked() {
                         response.request_focus();
                         d.preview_focus = true;
                         if let (Some(place), Some((_, layout)), Some(p)) =
                             (dest, &d.layout, response.interact_pointer_pos())
                         {
-                            let x = f64::from((p.x - place.min.x) / place.width()) * layout.width;
-                            let y =
-                                f64::from((p.y - place.min.y) / place.height()) * layout.height;
+                            let (x, y) = to_layout(p, place, layout);
                             if let Some(c) = equation_visual::hit(layout, x, y) {
                                 d.caret = c;
+                                d.anchor = None;
                                 preview_edit = true;
                             }
+                        }
+                    } else if response.dragged() {
+                        // Dragging selects the script of the pieces the drag box covers.
+                        response.request_focus();
+                        d.preview_focus = true;
+                        let from = ui.input(|i| i.pointer.press_origin());
+                        if let (Some(place), Some((_, layout)), Some(a), Some(b)) =
+                            (dest, &d.layout, from, response.interact_pointer_pos())
+                            && let Some((start, end)) = equation_visual::drag_range(
+                                layout,
+                                &d.script,
+                                to_layout(a, place, layout),
+                                to_layout(b, place, layout),
+                            )
+                        {
+                            d.anchor = Some(start);
+                            d.caret = end;
+                            preview_edit = true;
                         }
                     }
                     preview_id = Some(response.id);
@@ -3458,6 +3803,7 @@ impl HwpApp {
                             } else if equation_visual::apply_event(
                                 &mut d.script,
                                 &mut d.caret,
+                                &mut d.anchor,
                                 &slots,
                                 &event,
                             ) {
@@ -3469,7 +3815,8 @@ impl HwpApp {
                         d.preedit.clear();
                     }
                     if let (Some(place), Some((_, layout))) = (dest, &d.layout) {
-                        equation_visual::paint(ui.painter(), place, layout, d.caret, focused);
+                        let selected = equation_visual::selection(d.anchor, d.caret);
+                        equation_visual::paint(ui.painter(), place, layout, d.caret, selected, focused);
                         if focused {
                             let (x, y, h) = equation_visual::caret_line(layout, d.caret)
                                 .unwrap_or((0.0, 0.0, layout.height));
@@ -3518,8 +3865,11 @@ impl HwpApp {
                 d.preview_focus = false;
                 if let Some(r) = output.cursor_range {
                     d.caret = r.primary.index.0;
+                    d.anchor = Some(r.secondary.index.0);
                 }
             }
+            // The script box follows the preview's caret (egui keeps a selection only in
+            // the focused box, so a preview selection stays the preview's).
             if preview_edit && let Some(mut state) = egui::TextEdit::load_state(ctx, script_id) {
                 let caret = egui::text::CCursor::new(d.caret);
                 state
@@ -3547,6 +3897,7 @@ impl HwpApp {
                     .nth(at)
                     .map_or(d.script.len(), |(i, _)| i);
                 d.script.insert_str(byte, &snippet);
+                d.anchor = None;
                 // A template puts the caret in its first empty slot.
                 d.caret = at
                     + equation_visual::first_slot(&snippet).unwrap_or_else(|| snippet.chars().count());
@@ -4436,14 +4787,15 @@ impl HwpApp {
                                 }
                             });
                             if len >= 0 {
-                                // HWP stores the length in 16 bits (at most 32767 HWPUNIT).
+                                // A stored length longer than the range (Hangul's endnote
+                                // default is 14692344, drawn as wide as the column) stays
+                                // as it is until edited.
                                 let mut mm = len as f64 / HU_PER_MM;
                                 if ui
-                                    .add(egui::DragValue::new(&mut mm).range(0.0..=115.0).speed(0.5).fixed_decimals(1).suffix(" mm"))
+                                    .add(egui::DragValue::new(&mut mm).range(0.0..=600.0).clamp_existing_to_range(false).speed(0.5).fixed_decimals(1).suffix(" mm"))
                                     .changed()
                                 {
-                                    let hu = (mm * HU_PER_MM).round().min(f64::from(i16::MAX));
-                                    d.draft["separatorLength"] = json!(hu as i64);
+                                    d.draft["separatorLength"] = json!((mm * HU_PER_MM).round() as i64);
                                 }
                             } else {
                                 ui.label("");
@@ -4840,13 +5192,13 @@ mod tests {
             "push_button",
         ] {
             app.object_ext_dispatch(&format!("insert.form.{kind}"), &ctx);
-            assert!(app.ext.object.form_insert.is_some(), "{kind}: dialog opens");
+            assert!(app.ext.object.form_dialog.is_some(), "{kind}: dialog opens");
             let mut d = app
                 .ext
                 .object
-                .form_insert
+                .form_dialog
                 .take()
-                .unwrap_or_else(|| FormInsert::new(kind));
+                .unwrap_or_else(|| FormDialog::new(kind));
             match kind {
                 "edit" => d.text = "홍길동".into(),
                 "combo_box" => {
@@ -4862,7 +5214,7 @@ mod tests {
                 _ => {}
             }
             assert!(d.grey().is_none());
-            assert!(app.submit_form_insert(&d), "{kind}: {:?}", app.error);
+            assert!(app.submit_form_dialog(&d), "{kind}: {:?}", app.error);
         }
         let forms = app.session.run("form.list", json!({}))?;
         let kinds: Vec<_> = forms
@@ -4880,6 +5232,118 @@ mod tests {
         assert_eq!(forms[1]["text"], "홍길동");
         assert_eq!(forms[2]["text"], "2분기");
         assert_eq!(forms[3]["value"], 1);
+        Ok(())
+    }
+
+    /// 양식 개체 넣기 sends the properties set in the dialog with form.insert.
+    #[test]
+    fn form_insert_dialog_sends_the_properties() -> anyhow::Result<()> {
+        let mut app = crate::HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = app.ctx.clone();
+        app.object_ext_dispatch("insert.form.edit", &ctx);
+        let mut d = app.ext.object.form_dialog.take().expect("dialog opens");
+        // The defaults are the engine's, the font that of a new object: nothing but
+        // the kind goes to form.insert.
+        assert_eq!(d.params(), json!({"kind": "edit"}));
+        let mut fresh = hwpcraft_engine::Session::new()?;
+        let made = fresh.run("form.insert", json!({"kind": "edit"}))?;
+        let new = fresh.run("form.properties.get", json!({"at": made["at"]}))?;
+        assert_eq!(d.font_face, new["font_face"].as_str().unwrap_or("?"));
+        assert_eq!(d.size_pt(), new["font_size"].as_f64());
+        d.text = "1234".into();
+        d.font_face = "맑은 고딕".into();
+        d.font_size = "12".into();
+        d.read_only = true;
+        d.number_only = true;
+        d.back = [255, 242, 204];
+        d.width_mm = 40.0;
+        assert!(app.submit_form_dialog(&d), "{:?}", app.error);
+        let at = app.session.run("form.list", json!({}))?[0]["at"].clone();
+        let got = app.session.run("form.properties.get", json!({"at": at}))?;
+        assert_eq!(got["text"], "1234");
+        assert_eq!(got["font_face"], "맑은 고딕");
+        assert_eq!(got["font_size"], 12.0);
+        assert_eq!(got["read_only"], true);
+        assert_eq!(got["number_only"], true);
+        assert_eq!(got["back_color"], "#fff2cc");
+        assert_eq!(got["width_mm"], 40.0);
+        assert_eq!(got["height_mm"], 7.0, "untouched default");
+        Ok(())
+    }
+
+    /// 양식 개체 속성 opens on an object, sends only what changed with
+    /// form.properties (one undo step) and refuses bad values before the engine.
+    #[test]
+    fn form_properties_dialog_applies_through_the_engine() -> anyhow::Result<()> {
+        let mut app = crate::HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let made = app.session.run(
+            "form.insert",
+            json!({"kind": "radio_button", "caption": "아니요", "group": "응답", "checked": true}),
+        )?;
+        let other = app.session.run(
+            "form.insert",
+            json!({"kind": "radio_button", "caption": "예", "group": "응답"}),
+        )?;
+        app.open_form_properties(other["at"].clone());
+        let mut d = app
+            .ext
+            .object
+            .form_dialog
+            .take()
+            .expect("the dialog opens on the object");
+        assert_eq!(d.title(), "양식 개체 속성 - 라디오 단추");
+        assert_eq!((d.caption.as_str(), d.group.as_str()), ("예", "응답"));
+        // Unchanged: nothing is sent and the document stays as it is.
+        let generation = app.session.generation;
+        assert!(app.submit_form_dialog(&d));
+        assert_eq!(app.session.generation, generation);
+        d.caption = "네".into();
+        d.checked = true;
+        d.font_face = "맑은 고딕".into();
+        d.font_size = "12".into();
+        d.fore = [31, 78, 121];
+        d.frame = false;
+        d.height_mm = 8.0;
+        let params = d.params();
+        let mut keys: Vec<&String> = params
+            .as_object()
+            .map(|p| p.keys().collect())
+            .unwrap_or_default();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "at",
+                "caption",
+                "checked",
+                "font_face",
+                "font_size",
+                "fore_color",
+                "frame",
+                "height_mm"
+            ]
+        );
+        assert!(app.submit_form_dialog(&d), "{:?}", app.error);
+        assert_eq!(app.session.generation, generation + 1, "one undo step");
+        let got = app
+            .session
+            .run("form.properties.get", json!({"at": other["at"]}))?;
+        assert_eq!(got["caption"], "네");
+        assert_eq!(got["checked"], true);
+        assert_eq!(got["font_face"], "맑은 고딕");
+        assert_eq!(got["fore_color"], "#1f4e79");
+        assert_eq!(got["frame"], false);
+        assert_eq!(got["height_mm"], 8.0);
+        let first = app
+            .session
+            .run("form.properties.get", json!({"at": made["at"]}))?;
+        assert_eq!(first["checked"], false, "the group's other button clears");
+        // Values the engine would refuse grey 설정 instead.
+        d.font_size = "0".into();
+        assert!(d.grey().is_some());
+        d.font_size = "12".into();
+        d.name = " ".into();
+        assert!(d.grey().is_some());
         Ok(())
     }
 }

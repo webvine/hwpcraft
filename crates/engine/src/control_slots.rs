@@ -10,7 +10,7 @@
 //! marker has a slot but no control; `remove_field` takes both markers out.
 use crate::ext_format::open_control_slot;
 use hwpcraft_doc::model::control::Control;
-use hwpcraft_doc::model::paragraph::Paragraph;
+use hwpcraft_doc::model::paragraph::{FieldRange, OrphanFieldEnd, Paragraph};
 
 const CTRL_UNITS: u32 = 8;
 
@@ -83,6 +83,32 @@ fn put(para: &mut Paragraph, ci: usize, control: Control, record: Option<Vec<u8>
     }
     para.has_para_text = true;
     para.invalidate_layout_inputs();
+}
+
+/// Wrap characters `start..end` of `para` in the field whose begin control is `field`: the
+/// control in front of `start` and the end marker's slot in front of `end`, with its
+/// field range, as RHWP lays a hyperlink out. Returns the control index.
+pub(crate) fn wrap_field(para: &mut Paragraph, start: usize, end: usize, field: Control) -> usize {
+    // Counted before the end slot opens: the stream gap of a field end has no control and
+    // must not be taken for one while the range that names it is not there yet.
+    let ci = para
+        .control_text_positions()
+        .iter()
+        .filter(|p| **p <= start)
+        .count()
+        .min(para.controls.len());
+    open_control_slot(para, end);
+    open_control_slot(para, start);
+    put(para, ci, field, None);
+    para.field_ranges.push(FieldRange {
+        start_char_idx: start,
+        end_char_idx: end,
+        control_idx: ci,
+        ..Default::default()
+    });
+    para.field_ranges
+        .sort_by_key(|r| (r.start_char_idx, r.control_idx));
+    ci
 }
 
 /// Take control `ci` out of `para` and close its slot (the inverse of `insert_control`).
@@ -165,4 +191,43 @@ fn close_slot_before(para: &mut Paragraph, pos: usize) {
             *p -= CTRL_UNITS;
         }
     }
+}
+
+/// Make field range `range` end in a later paragraph: its end slot and range leave `para`,
+/// whose begin control then stays open to the paragraph's end (Hangul's multi-paragraph
+/// field). Returns the range taken out; `open_field_end` puts the end where it now goes.
+pub(crate) fn take_field_end(para: &mut Paragraph, range: usize) -> FieldRange {
+    let field = para.field_ranges.remove(range);
+    close_slot_before(para, field.end_char_idx);
+    para.invalidate_layout_inputs();
+    field
+}
+
+/// Put the end marker of a field that began in an earlier paragraph in front of
+/// character `offset`, with its 8-unit slot.
+pub(crate) fn open_field_end(para: &mut Paragraph, offset: usize, end: OrphanFieldEnd) {
+    open_control_slot(para, offset);
+    let at = para
+        .orphan_field_ends
+        .iter()
+        .position(|o| o.char_idx > offset)
+        .unwrap_or(para.orphan_field_ends.len());
+    para.orphan_field_ends.insert(
+        at,
+        OrphanFieldEnd {
+            char_idx: offset,
+            ..end
+        },
+    );
+    para.has_para_text = true;
+    para.invalidate_layout_inputs();
+}
+
+/// Take end marker `index` of a field that began in an earlier paragraph out of `para`,
+/// with its slot.
+pub(crate) fn remove_field_end(para: &mut Paragraph, index: usize) -> OrphanFieldEnd {
+    let end = para.orphan_field_ends.remove(index);
+    close_slot_before(para, end.char_idx);
+    para.invalidate_layout_inputs();
+    end
 }

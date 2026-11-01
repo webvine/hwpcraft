@@ -149,13 +149,111 @@ impl HwpApp {
         Some(self.result(r).is_some())
     }
 
-    /// `format.character` / `format.paragraph` run by id, for `nested_command`.
+    /// `format.character` / `format.paragraph` run by id, for `nested_command`, and
+    /// the ribbon's row / column edits (`table.edit`) for a nested table.
     pub(crate) fn nested_run(&mut self, id: &str, params: &Value) -> Option<bool> {
         match id {
             "format.character" => self.nested_command(&Command::Character(params.clone())),
             "format.paragraph" => self.nested_command(&Command::Paragraph(params.clone())),
+            "table.edit" => self.nested_table_edit(params["action"].as_str()?),
             _ => None,
         }
+    }
+
+    /// The nested table under the caret: (address, control, row, col, row span, col span)
+    /// of the caret's cell.
+    fn nested_cell(&self) -> Option<(Value, usize, u64, u64, u64, u64)> {
+        let (host, control, cell) = self.session.nested_table_cell()?;
+        let info = self.session.nested_table_info(&host, control).ok()?;
+        let address = serde_json::to_value(&host).ok()?;
+        let c = info["cells"]
+            .as_array()?
+            .iter()
+            .find(|c| c["index"] == cell)?;
+        let n = |k: &str| c[k].as_u64();
+        Some((
+            address,
+            control,
+            n("row")?,
+            n("col")?,
+            n("rowSpan")?.max(1),
+            n("colSpan")?.max(1),
+        ))
+    }
+
+    /// Run a context.table.* edit on the nested table, then keep the caret only where
+    /// it still exists.
+    fn nested_table_run(&mut self, id: &str, params: Value) -> bool {
+        let r = self.session.run(id, params);
+        let ok = self.result(r).is_some();
+        self.session.clear_nested_block();
+        self.session.revalidate_nested();
+        ok
+    }
+
+    /// Row / column edits of the ribbon on the nested table holding the caret.
+    fn nested_table_edit(&mut self, action: &str) -> Option<bool> {
+        let (address, control, row, col, rows, cols) = self.nested_cell()?;
+        let base = json!({"address": address, "control": control});
+        let with = |extra: Value| {
+            let mut p = base.clone();
+            for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+                p[k] = v;
+            }
+            p
+        };
+        let (id, params) = match action {
+            "row_above" => (
+                "context.table.insert_row",
+                with(json!({"row": row, "below": false})),
+            ),
+            "row_below" => (
+                "context.table.insert_row",
+                with(json!({"row": row + rows - 1, "below": true})),
+            ),
+            "column_left" => (
+                "context.table.insert_column",
+                with(json!({"col": col, "right": false})),
+            ),
+            "column_right" => (
+                "context.table.insert_column",
+                with(json!({"col": col + cols - 1, "right": true})),
+            ),
+            "delete_row" => ("context.table.delete_row", with(json!({"row": row}))),
+            "delete_column" => ("context.table.delete_column", with(json!({"col": col}))),
+            _ => {
+                self.message = "이 표 편집은 표 안의 표에서 아직 쓸 수 없습니다.".into();
+                return Some(false);
+            }
+        };
+        Some(self.nested_table_run(id, params))
+    }
+
+    /// Ribbon / key table commands for the nested table holding the caret: merging the
+    /// picked cell block and splitting the caret's cell. `None` leaves them to the body.
+    pub(crate) fn nested_table_dispatch(&mut self, id: &str) -> Option<bool> {
+        if !matches!(id, "table.merge" | "table.split") {
+            return None;
+        }
+        let (address, control, row, col, ..) = self.nested_cell()?;
+        Some(match id {
+            "table.merge" => {
+                let Some(block) = self.session.nested_block().cloned() else {
+                    self.message = "합칠 셀을 끌거나 Shift+클릭으로 먼저 고르세요.".into();
+                    return Some(true);
+                };
+                let range = serde_json::to_value(block.range).unwrap_or_default();
+                self.nested_table_run(
+                    "context.table.merge",
+                    json!({"address": address, "control": control, "range": range}),
+                )
+            }
+            _ => self.nested_table_run(
+                "context.table.split",
+                json!({"address": address, "control": control, "row": row, "col": col,
+                       "rows": 1, "columns": 2}),
+            ),
+        })
     }
 
     /// Double / triple click while the nested caret is active: the word or paragraph.
@@ -387,6 +485,136 @@ mod tests {
         frame(&mut a, vec![key(Key::Escape)]);
         assert!(a.session.nested_caret().is_none());
         assert!(a.error.is_none(), "{:?}", a.error);
+        Ok(())
+    }
+
+    /// Dragging from one cell of a nested table into the next picks a cell block;
+    /// the ribbon's merge joins it, and its row edits work on the nested table.
+    #[test]
+    fn a_drag_over_nested_cells_picks_a_block_the_ribbon_merges() -> anyhow::Result<()> {
+        let (mut a, target, point) = nested_table()?;
+        frame(&mut a, vec![]);
+        frame(&mut a, click(point));
+        // The screen point of the second cell of the same nested table.
+        let mut second = target.clone();
+        if let Some(ContextStep::TableCell { cell, .. }) = second.path.last_mut() {
+            *cell = 1;
+        }
+        a.session
+            .set_nested(hwpcraft_engine::NestedCaret::at(second, 0), false)?;
+        let r = a.session.nested_caret_rect()?;
+        let end = Pos2::new(50.0, 50.0)
+            + Vec2::new(
+                r["x"].as_f64().unwrap_or(0.0) as f32 + 2.0,
+                (r["y"].as_f64().unwrap_or(0.0) + r["height"].as_f64().unwrap_or(0.0) / 2.0) as f32,
+            ) * a.zoom;
+        frame(&mut a, vec![key(Key::Escape)]);
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame_after(
+            &mut a,
+            vec![Event::PointerMoved(point), button(point, true)],
+            0.02,
+        );
+        for k in 1..=6 {
+            let p = point + (end - point) * (k as f32 / 6.0);
+            frame_after(&mut a, vec![Event::PointerMoved(p)], 0.02);
+        }
+        frame_after(&mut a, vec![button(end, false)], 0.02);
+        assert!(a.error.is_none(), "{:?}", a.error);
+        let block = a.session.nested_block().cloned().expect("a cell block");
+        assert_eq!(
+            (
+                block.range.start_row,
+                block.range.start_col,
+                block.range.end_row,
+                block.range.end_col
+            ),
+            (0, 0, 0, 1)
+        );
+        assert!(!a.session.nested_block_rects(0)?.is_empty());
+
+        let ctx = a.ctx.clone();
+        assert!(a.table_ext_dispatch("table.merge", &ctx));
+        assert!(a.error.is_none(), "{:?}", a.error);
+        let info = a.session.nested_table_info(&block.host, block.control)?;
+        let first = info["cells"]
+            .as_array()
+            .and_then(|c| c.iter().find(|c| c["row"] == 0 && c["col"] == 0).cloned())
+            .unwrap_or_default();
+        assert_eq!(first["colSpan"], 2, "{info}");
+        assert!(a.session.nested_block().is_none());
+
+        // With the caret back in the nested table, a ribbon row edit adds a row there.
+        frame(&mut a, click(point));
+        assert!(a.run("table.edit", json!({"action": "row_below"})));
+        let info = a.session.nested_table_info(&block.host, block.control)?;
+        assert_eq!(info["rows"], 3, "{info}");
+        Ok(())
+    }
+
+    /// Dragging in a nested cell selects from the press point, over its paragraphs.
+    #[test]
+    fn dragging_in_a_nested_cell_selects_over_paragraphs() -> anyhow::Result<()> {
+        let (mut a, target, point) = nested_table()?;
+        frame(&mut a, vec![]);
+        frame(&mut a, click(point));
+        frame(
+            &mut a,
+            vec![
+                Event::Text("첫째".into()),
+                key(Key::Enter),
+                Event::Text("둘째".into()),
+            ],
+        );
+        let second = a
+            .session
+            .nested_caret()
+            .map(|c| c.address.clone())
+            .expect("caret");
+        let screen = |a: &mut HwpApp, address: &ContextAddress, offset: usize| {
+            a.session
+                .set_nested(
+                    hwpcraft_engine::NestedCaret::at(address.clone(), offset),
+                    false,
+                )
+                .expect("caret");
+            let r = a.session.nested_caret_rect().expect("rect");
+            let x = r["x"].as_f64().unwrap_or(0.0) as f32;
+            let y =
+                (r["y"].as_f64().unwrap_or(0.0) + r["height"].as_f64().unwrap_or(0.0) / 2.0) as f32;
+            Pos2::new(50.0, 50.0) + Vec2::new(x, y) * a.zoom
+        };
+        let start = screen(&mut a, &target, 0) + Vec2::new(1.0, 0.0);
+        let end = screen(&mut a, &second, 2) + Vec2::new(1.0, 0.0);
+        frame(&mut a, vec![key(Key::Escape)]);
+        assert!(a.session.nested_caret().is_none());
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame_after(
+            &mut a,
+            vec![Event::PointerMoved(start), button(start, true)],
+            0.02,
+        );
+        for k in 1..=6 {
+            let p = start + (end - start) * (k as f32 / 6.0);
+            frame_after(&mut a, vec![Event::PointerMoved(p)], 0.02);
+        }
+        frame_after(&mut a, vec![button(end, false)], 0.02);
+        assert!(a.error.is_none(), "{:?}", a.error);
+        assert_eq!(
+            a.session.nested_selected_text()?,
+            "첫째
+둘째"
+        );
         Ok(())
     }
 

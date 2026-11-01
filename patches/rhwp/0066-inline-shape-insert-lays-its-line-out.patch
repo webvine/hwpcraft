@@ -1,0 +1,196 @@
+diff --git a/src/document_core/commands/object_ops/shape.rs b/src/document_core/commands/object_ops/shape.rs
+index e784eb0..c9f311a 100644
+--- a/src/document_core/commands/object_ops/shape.rs
++++ b/src/document_core/commands/object_ops/shape.rs
+@@ -1550,6 +1550,13 @@ impl DocumentCore {
+         }
+         self.shift_active_field_for_control_insert(section_idx, para_idx, insert_ctrl_idx);
+ 
++        // 글자처럼 취급한 도형은 글줄 흐름에 참여한다: 수식 삽입처럼 이 문단의 줄을 다시
++        // 나눠 개체가 놓인 줄의 높이에 개체를 반영한다. 종전에는 글자만으로 잰 저장 줄이
++        // 그대로 남아 뒤 줄이 개체 밑에 그려졌다. 떠 있는 도형은 저장 줄을 그대로 둔다.
++        if treat_as_char {
++            self.reflow_paragraph(section_idx, para_idx);
++        }
++
+         // 리플로우 + 페이지네이션
+         self.recompose_section(section_idx);
+         self.paginate_if_needed();
+@@ -3212,3 +3219,177 @@ mod char_shape_inherit_tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++mod tac_shape_line_height_tests {
++    //! 글자처럼 취급한 도형·글상자를 문단에 넣으면 그 줄이 개체 높이만큼 커지고 뒤 줄이 그
++    //! 아래로 내려간다(그림·수식 삽입과 같은 규칙). 떠 있는 도형은 글줄 흐름에 참여하지 않으므로
++    //! 저장 줄을 바꾸지 않는다.
++    use super::*;
++    use crate::model::control::Control;
++    use crate::model::paragraph::LineSeg;
++
++    const TEXT: &str = "글자처럼 취급한 개체 주변 본문 흐름 확인용 문장입니다. 글자처럼 취급한 개체 주변 본문 흐름 확인용 문장입니다. 글자처럼 취급한 개체 주변 본문 흐름 확인용 문장입니다. 글자처럼 취급한 개체 주변 본문 흐름 확인용 문장입니다. 글자처럼 취급한 개체 주변 본문 흐름 확인용 문장입니다.";
++    const W: u32 = 11339; // 40 mm
++    const H: u32 = 7654; // 27 mm
++
++    fn paragraph_of_lines() -> DocumentCore {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        core.insert_text_native(0, 0, 0, TEXT).unwrap();
++        assert!(
++            segs(&core).len() >= 3,
++            "the fixture paragraph spans several lines"
++        );
++        core
++    }
++
++    fn segs(core: &DocumentCore) -> Vec<LineSeg> {
++        core.document.sections[0].paragraphs[0].line_segs.clone()
++    }
++
++    fn insert(core: &mut DocumentCore, treat_as_char: bool, wrap: &str, kind: &str) {
++        core.create_shape_control_native(
++            0,
++            0,
++            10,
++            W,
++            H,
++            0,
++            0,
++            treat_as_char,
++            wrap,
++            kind,
++            false,
++            false,
++            &[],
++        )
++        .unwrap();
++    }
++
++    #[test]
++    fn an_inline_shape_raises_its_line_and_pushes_the_next_lines_down() {
++        for kind in ["rectangle", "textbox", "ellipse"] {
++            let mut core = paragraph_of_lines();
++            insert(&mut core, true, "TopAndBottom", kind);
++            let s = segs(&core);
++            // Offset 10 sits on the first line: that line holds the object.
++            assert!(
++                s[0].line_height >= H as i32,
++                "{kind}: first line {} < object {H}",
++                s[0].line_height
++            );
++            assert!(
++                s[1].vertical_pos >= s[0].vertical_pos + H as i32,
++                "{kind}: second line at {} starts inside the object ({} + {H})",
++                s[1].vertical_pos,
++                s[0].vertical_pos
++            );
++        }
++    }
++
++    /// Hangul's stored lines of a paragraph holding a treat-as-character shape, and the
++    /// lines after deleting that shape and inserting one of the same size at its place.
++    fn hangul_and_reinserted(
++        path: &str,
++        para: usize,
++        ctrl: usize,
++    ) -> (Vec<(i32, i32)>, Vec<(i32, i32)>, i32) {
++        let data = std::fs::read(path).unwrap_or_else(|e| panic!("sample {path}: {e}"));
++        let mut core = DocumentCore::from_bytes(&data).unwrap();
++        let p = &core.document.sections[0].paragraphs[para];
++        let Some(Control::Shape(shape)) = p.controls.get(ctrl) else {
++            panic!("{path}: paragraph {para} control {ctrl} is not a shape");
++        };
++        assert!(
++            shape.common().treat_as_char,
++            "{path}: the sample shape is treated as a character"
++        );
++        let (w, h) = (shape.common().width, shape.flow_height_hu() as u32);
++        let offset = crate::document_core::helpers::find_control_text_positions(p)[ctrl];
++        let lines = |core: &DocumentCore| -> Vec<(i32, i32)> {
++            core.document.sections[0].paragraphs[para]
++                .line_segs
++                .iter()
++                .map(|s| (s.vertical_pos, s.line_height))
++                .collect()
++        };
++        let hangul = lines(&core);
++        core.delete_shape_control_native(0, para, ctrl).unwrap();
++        core.create_shape_control_native(
++            0,
++            para,
++            offset,
++            w,
++            h,
++            0,
++            0,
++            true,
++            "TopAndBottom",
++            "rectangle",
++            false,
++            false,
++            &[],
++        )
++        .unwrap();
++        (hangul, lines(&core), h as i32)
++    }
++
++    #[test]
++    fn a_reinserted_inline_shape_lays_its_line_out_as_hangul_stored_it() {
++        for (path, para, ctrl) in [
++            ("samples/table-vpos-01.hwp", 33, 0),
++            (
++                "samples/issue2559/1341000_research_report_footnotes.hwp",
++                965,
++                0,
++            ),
++            (
++                "samples/issue2559/1341000_research_report_footnotes.hwp",
++                973,
++                0,
++            ),
++        ] {
++            let (hangul, ours, h) = hangul_and_reinserted(path, para, ctrl);
++            assert_eq!(
++                ours.len(),
++                hangul.len(),
++                "{path} p{para}: {ours:?} vs {hangul:?}"
++            );
++            // Each of these paragraphs is one line holding the object. Hangul's stored line
++            // also covers the original object's caption and outer margins, which the inserted
++            // rectangle does not have: the line is at least the object and at most Hangul's.
++            let (line, stored) = (ours[0].1, hangul[0].1);
++            assert!(
++                (h..=stored).contains(&line),
++                "{path} p{para}: line {line} not within object {h} ..= Hangul {stored}"
++            );
++        }
++        // A bare polygon (no caption, no margins): the same lines as Hangul stored.
++        let (hangul, ours, _) = hangul_and_reinserted("samples/table-vpos-01.hwp", 33, 0);
++        assert_eq!(ours, hangul);
++    }
++
++    /// Line boxes only: the control's 8-unit slot moves the text starts of later lines.
++    fn boxes(core: &DocumentCore) -> Vec<(i32, i32, i32, i32)> {
++        segs(core)
++            .iter()
++            .map(|s| {
++                (
++                    s.vertical_pos,
++                    s.line_height,
++                    s.text_height,
++                    s.baseline_distance,
++                )
++            })
++            .collect()
++    }
++
++    #[test]
++    fn a_floating_shape_leaves_the_stored_lines_alone() {
++        let mut core = paragraph_of_lines();
++        let before = boxes(&core);
++        insert(&mut core, false, "InFrontOfText", "rectangle");
++        assert_eq!(boxes(&core), before);
++    }
++}

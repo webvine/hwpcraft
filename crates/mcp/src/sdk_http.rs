@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderValue, Method, Request, StatusCode, header},
+    http::{Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
@@ -25,11 +25,8 @@ use tokio_util::sync::CancellationToken;
 const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MIN_TOKEN_CHARS: usize = 32;
 const REJECTED_BODY_DRAIN_BYTES: usize = 64 * 1024;
-/// Largest answer to an unversioned request that is inspected; such answers are
-/// short JSON-RPC errors, anything larger is replaced.
-const UNVERSIONED_REPLY_BYTES: usize = 64 * 1024;
-const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
-
+/// How long a rejected request may take to send that small body.
+const REJECTED_BODY_DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 /// Shared secret every HTTP request presents as `Authorization: Bearer <token>`.
 #[derive(Clone)]
 pub(crate) struct AuthToken(Arc<str>);
@@ -61,6 +58,18 @@ impl AuthToken {
 pub(crate) fn load_or_create_token(path: &Path) -> Result<AuthToken> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
+            // Like an SSH key: a token other users can read is no secret.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(path)?.permissions().mode();
+                ensure!(
+                    mode & 0o077 == 0,
+                    "MCP HTTP token file {} can be read by other users (mode {:o}); run chmod 600 on it",
+                    path.display(),
+                    mode & 0o777
+                );
+            }
             return AuthToken::new(&text)
                 .with_context(|| format!("invalid MCP HTTP token file {}", path.display()));
         }
@@ -115,7 +124,13 @@ async fn require_token(
     // Read a small unread body before answering: closing a socket with unread
     // request bytes makes some systems (macOS) reset the connection, and the
     // client would see a reset instead of the 401. Larger bodies are not read.
-    let _ = axum::body::to_bytes(request.into_body(), REJECTED_BODY_DRAIN_BYTES).await;
+    // Bounded in time too: a client without the token must not hold the
+    // connection open by trickling bytes.
+    let _ = tokio::time::timeout(
+        REJECTED_BODY_DRAIN_TIME,
+        axum::body::to_bytes(request.into_body(), REJECTED_BODY_DRAIN_BYTES),
+    )
+    .await;
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, "Bearer")],
@@ -123,47 +138,72 @@ async fn require_token(
         .into_response()
 }
 
-/// A server that supports only MCP 2026-07-28 MUST reject a POST without the
-/// `MCP-Protocol-Version` header with `400 Bad Request` (Streamable HTTP, server
-/// validation). The SDK treats such a request as legacy and answers HTTP 200, for
-/// example `-32022` to a 2025 client's `initialize`. Keep the SDK's JSON-RPC
-/// error, which names the supported version, and correct only the status; any
-/// other answer becomes a `-32020` header error. Origin, Host and size checks
-/// still run first in the SDK, so their 403/413 answers are unchanged.
-async fn require_protocol_version(request: Request<Body>, next: Next) -> Response {
-    let unversioned = request.method() == Method::POST
-        && !request.headers().contains_key(PROTOCOL_VERSION_HEADER);
+/// Most 2025-era sessions (`initialize` over HTTP) kept at once. Each holds a
+/// session worker; one is dropped after 5 minutes without requests (the SDK's
+/// keep-alive), or when its client sends DELETE.
+pub(crate) const MAX_LEGACY_SESSIONS: usize = 64;
+
+/// Refuse a new 2025-era session once [`MAX_LEGACY_SESSIONS`] are open. A request
+/// that may open one is a POST without `Mcp-Session-Id` that is not a 2026-07-28
+/// request (those always name their version and never open a session).
+async fn limit_legacy_sessions(
+    State(sessions): State<Arc<LocalSessionManager>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let headers = request.headers();
+    let opens_session = request.method() == axum::http::Method::POST
+        && !headers.contains_key("mcp-session-id")
+        && headers
+            .get("mcp-protocol-version")
+            .and_then(|value| value.to_str().ok())
+            .is_none_or(|version| version < "2026-07-28");
+    if opens_session && sessions.sessions.read().await.len() >= MAX_LEGACY_SESSIONS {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({"jsonrpc":"2.0","id":null,"error":{
+                "code": crate::document_subscriptions::SUBSCRIPTION_CAPACITY_REACHED,
+                "message": format!("too many MCP sessions ({MAX_LEGACY_SESSIONS}); close one (DELETE) or wait 5 minutes for idle ones to end"),
+                "data": {"limit": MAX_LEGACY_SESSIONS}}})
+            .to_string(),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// The SDK answers a JSON body it cannot decode with 415 Unsupported Media Type.
+/// The media type was right; the body was not. Answer as JSON-RPC (and stdio) do:
+/// 400 with -32700 Parse error, or -32600 for valid JSON that is no message (a
+/// batch array, for example).
+async fn json_rpc_body_errors(request: Request<Body>, next: Next) -> Response {
+    let json = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("application/json"));
     let response = next.run(request).await;
-    if !unversioned || response.status() != StatusCode::OK {
+    if !json || response.status() != StatusCode::UNSUPPORTED_MEDIA_TYPE {
         return response;
     }
-    let (mut parts, body) = response.into_parts();
-    let bytes = axum::body::to_bytes(body, UNVERSIONED_REPLY_BYTES)
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .unwrap_or_default();
-    let reply: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-    let body = if reply.get("error").is_some() {
-        bytes
+    let reason = String::from_utf8_lossy(&body);
+    let (code, message) = if reason.contains("unrecognized JSON-RPC message") {
+        (-32600, "Invalid Request")
     } else {
-        serde_json::to_vec(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": reply.get("id").cloned().unwrap_or(serde_json::Value::Null),
-            "error": {
-                "code": -32020,
-                "message": "MCP-Protocol-Version header is required; this server supports only MCP 2026-07-28",
-                "data": {"supported": ["2026-07-28"]}
-            }
-        }))
-        .unwrap_or_default()
-        .into()
+        (-32700, "Parse error")
     };
-    parts.status = StatusCode::BAD_REQUEST;
-    parts.headers.remove(header::CONTENT_LENGTH);
-    parts.headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    Response::from_parts(parts, Body::from(body))
+    (
+        StatusCode::BAD_REQUEST,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({"jsonrpc":"2.0","id":null,
+            "error":{"code":code,"message":message,"data":{"reason":reason}}})
+        .to_string(),
+    )
+        .into_response()
 }
 
 pub(crate) async fn serve<H: ServerHandler + Clone>(
@@ -219,8 +259,10 @@ where
     // this server's own origin, which no other site can claim and which serves
     // no pages; every other origin, including other local ports, gets 403.
     let allowed_origins = allowed_hosts.clone().map(|host| format!("http://{host}"));
+    // 2025-era clients (Codex and others) open with `initialize` and get a session
+    // (`Mcp-Session-Id`); 2026-07-28 requests stay stateless with per-request _meta.
     let config = StreamableHttpServerConfig::default()
-        .with_legacy_session_mode(false)
+        .with_legacy_session_mode(true)
         .with_stateless_protocol_metadata_required(true)
         .with_json_response(true)
         .with_allowed_hosts(allowed_hosts)
@@ -230,16 +272,18 @@ where
         // and chunked transfer cannot bypass this limit.
         .with_max_request_body_bytes(MAX_REQUEST_BODY_BYTES)
         .with_cancellation_token(shutdown.child_token());
-    let transport = StreamableHttpService::new(
-        move || Ok(service.clone()),
-        LocalSessionManager::default().into(),
-        config,
-    );
+    let sessions = Arc::new(LocalSessionManager::default());
+    let transport =
+        StreamableHttpService::new(move || Ok(service.clone()), sessions.clone(), config);
     // Authentication runs before routing, so unauthenticated callers learn nothing
     // about paths, methods or protocol versions.
     let router = axum::Router::new()
         .nest_service("/mcp", transport)
-        .layer(middleware::from_fn(require_protocol_version))
+        .layer(middleware::from_fn(json_rpc_body_errors))
+        .layer(middleware::from_fn_with_state(
+            sessions,
+            limit_legacy_sessions,
+        ))
         .layer(middleware::from_fn_with_state(token, require_token));
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown.cancelled_owned())
@@ -277,7 +321,12 @@ mod tests {
 
     impl ServerHandler for Probe {
         fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-            Cow::Borrowed(&[ProtocolVersion::V_2026_07_28])
+            Cow::Borrowed(&[
+                ProtocolVersion::V_2025_03_26,
+                ProtocolVersion::V_2025_06_18,
+                ProtocolVersion::V_2025_11_25,
+                ProtocolVersion::V_2026_07_28,
+            ])
         }
 
         fn get_info(&self) -> ServerConfig {
@@ -541,6 +590,10 @@ mod tests {
                 std::fs::metadata(&path)?.permissions().mode() & 0o777,
                 0o600
             );
+            // A token file others can read is refused, not used.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+            assert!(load_or_create_token(&path).is_err());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         }
         let short = dir.path().join("short");
         std::fs::write(&short, "too-short")?;
@@ -577,7 +630,10 @@ mod tests {
             let body = reply.json()?;
             assert_eq!(body["id"], "http-own");
             assert_eq!(body["result"]["resultType"], "complete");
-            assert_eq!(body["result"]["supportedVersions"], json!(["2026-07-28"]));
+            assert_eq!(
+                body["result"]["supportedVersions"],
+                json!(["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"])
+            );
         }
         let address = server.address;
         server.finish().await?;
@@ -593,8 +649,10 @@ mod tests {
             server.request("GET", "/missing", &[], &[]).await?.status,
             404
         );
+        // GET and DELETE belong to 2025 sessions; without one they are refused.
         for method in ["GET", "DELETE"] {
-            assert_eq!(server.request(method, "/mcp", &[], &[]).await?.status, 405);
+            let status = server.request(method, "/mcp", &[], &[]).await?.status;
+            assert!(matches!(status, 400 | 404 | 405), "{method}: {status}");
         }
         assert_eq!(
             server.request("POST", "/mcp", &[], &bytes).await?.status,
@@ -620,8 +678,15 @@ mod tests {
                 &serde_json::to_vec(&old)?,
             )
             .await?;
-        assert_eq!(reply.status, 400);
-        assert_eq!(reply.json()?["error"]["code"], -32022);
+        // Discovery answers whatever version asks, listing what this server speaks.
+        assert_eq!(reply.status, 200);
+        let versions = reply.json()?["result"]["supportedVersions"].clone();
+        assert!(
+            versions
+                .as_array()
+                .is_some_and(|v| v.contains(&json!("2025-06-18"))),
+            "{versions}"
+        );
         let reply = server
             .request(
                 "POST",
@@ -635,44 +700,156 @@ mod tests {
         server.finish().await
     }
 
+    /// A 2025-era client (Codex CLI 0.164 sends 2025-06-18): `initialize` without the
+    /// version header or `_meta` gets that version and a session; the session's
+    /// requests then work without per-request metadata.
     #[tokio::test]
-    async fn requests_without_protocol_version_header_are_bad_requests() -> Result<()> {
-        let server = Running::start().await?;
-        // A 2025-era client's handshake: no MCP-Protocol-Version header, no _meta.
-        let legacy = json!({"jsonrpc":"2.0","id":7,"method":"initialize","params":{
-            "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"legacy","version":"1"}}});
-        let reply = server
-            .request("POST", "/mcp", &[], &serde_json::to_vec(&legacy)?)
-            .await?;
-        assert_eq!(reply.status, 400);
-        let body = reply.json()?;
-        assert_eq!(body["id"], 7, "{body}");
-        let code = body["error"]["code"].as_i64();
-        assert!(matches!(code, Some(-32022 | -32020)), "{body}");
-        assert!(body.to_string().contains("2026-07-28"), "{body}");
-        // Other legacy-shaped requests are rejected the same way.
-        for method in ["ping", "tools/list"] {
-            let legacy = json!({"jsonrpc":"2.0","id":8,"method":method,"params":{}});
-            let reply = server
-                .request("POST", "/mcp", &[], &serde_json::to_vec(&legacy)?)
-                .await?;
-            assert_eq!(reply.status, 400, "{method}");
-            assert!(reply.json()?["error"]["code"].is_i64(), "{method}");
+    async fn a_2025_client_initializes_and_calls_tools_in_a_session() -> Result<()> {
+        // A 2025 session may answer as an SSE stream: take its JSON-RPC message.
+        fn payload(reply: &Reply) -> Result<Value> {
+            if let Ok(value) = serde_json::from_slice(&reply.body) {
+                return Ok(value);
+            }
+            let text = String::from_utf8_lossy(&reply.body);
+            text.lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(str::trim)
+                .find_map(|data| serde_json::from_str::<Value>(data).ok())
+                .ok_or_else(|| anyhow::anyhow!("no JSON-RPC message in {text:?}"))
         }
-        // Earlier checks keep their own answers.
-        let mut origin = vec![("Origin", "https://attacker.invalid")];
+        let server = Running::start().await?;
+        for version in ["2025-06-18", "2025-11-25", "2025-03-26"] {
+            let initialize = json!({"jsonrpc":"2.0","id":7,"method":"initialize","params":{
+                "protocolVersion":version,"capabilities":{},"clientInfo":{"name":"legacy","version":"1"}}});
+            let reply = server
+                .request("POST", "/mcp", &[], &serde_json::to_vec(&initialize)?)
+                .await?;
+            assert_eq!(reply.status, 200, "{version}");
+            let session = reply
+                .headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("mcp-session-id")
+                        .then(|| value.trim().to_owned())
+                })
+                .ok_or_else(|| anyhow::anyhow!("{version}: no session in {}", reply.headers))?;
+            let body = payload(&reply)?;
+            assert_eq!(body["result"]["protocolVersion"], version, "{body}");
+            let in_session = [
+                ("Mcp-Session-Id", session.as_str()),
+                ("MCP-Protocol-Version", version),
+            ];
+            let initialized = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+            let reply = server
+                .request(
+                    "POST",
+                    "/mcp",
+                    &in_session,
+                    &serde_json::to_vec(&initialized)?,
+                )
+                .await?;
+            assert_eq!(reply.status, 202, "{version}");
+            let call = json!({"jsonrpc":"2.0","id":8,"method":"tools/call",
+                "params":{"name":"own","arguments":{}}});
+            let reply = server
+                .request("POST", "/mcp", &in_session, &serde_json::to_vec(&call)?)
+                .await?;
+            assert_eq!(reply.status, 200, "{version}");
+            let body = payload(&reply)?;
+            assert_eq!(
+                body["result"]["content"][0]["text"], "own HTTP fixture",
+                "{version}: {body}"
+            );
+            let reply = server.request("DELETE", "/mcp", &in_session, &[]).await?;
+            assert!(
+                matches!(reply.status, 200 | 202 | 204),
+                "{version}: {}",
+                reply.status
+            );
+        }
+        // The browser-origin check still runs first.
+        let initialize = json!({"jsonrpc":"2.0","id":9,"method":"initialize","params":{
+            "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"x","version":"1"}}});
+        let origin = [("Origin", "https://attacker.invalid")];
         assert_eq!(
             server
-                .request("POST", "/mcp", &origin, &serde_json::to_vec(&legacy)?)
+                .request("POST", "/mcp", &origin, &serde_json::to_vec(&initialize)?)
                 .await?
                 .status,
             403
         );
-        origin.clear();
-        assert_eq!(
-            server.request("GET", "/mcp", &origin, &[]).await?.status,
-            405
+        server.finish().await
+    }
+
+    /// At most 64 2025-era sessions at once: the next `initialize` is refused with
+    /// 503 and -31503 until one is closed (MCP 2nd review B-D8).
+    #[tokio::test]
+    async fn legacy_sessions_are_capped() -> Result<()> {
+        let server = Running::start().await?;
+        let initialize = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18","capabilities":{},
+                "clientInfo":{"name":"many","version":"1"}}}))?;
+        let session = |reply: &Reply| {
+            reply.headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("mcp-session-id")
+                    .then(|| value.trim().to_owned())
+            })
+        };
+        let mut first = None;
+        for n in 0..MAX_LEGACY_SESSIONS {
+            let reply = server.request("POST", "/mcp", &[], &initialize).await?;
+            assert_eq!(reply.status, 200, "session {n}");
+            first = first.or(session(&reply));
+        }
+        let refused = server.request("POST", "/mcp", &[], &initialize).await?;
+        assert_eq!(refused.status, 503);
+        assert_eq!(refused.json()?["error"]["code"], -31503);
+        // 2026-07-28 requests open no session and still work.
+        let modern = server
+            .request(
+                "POST",
+                "/mcp",
+                &headers("server/discover"),
+                &serde_json::to_vec(&request("server/discover"))?,
+            )
+            .await?;
+        assert_eq!(modern.status, 200);
+        let first = first.ok_or_else(|| anyhow::anyhow!("no session id"))?;
+        let closed = server
+            .request("DELETE", "/mcp", &[("Mcp-Session-Id", first.as_str())], &[])
+            .await?;
+        assert!(
+            matches!(closed.status, 200 | 202 | 204),
+            "{}",
+            closed.status
         );
+        let again = server.request("POST", "/mcp", &[], &initialize).await?;
+        assert_eq!(again.status, 200);
+        server.finish().await
+    }
+
+    /// A broken JSON body is a JSON-RPC parse error (400, -32700), and a JSON array
+    /// an invalid request (-32600), not 415 (MCP 2nd review D4).
+    #[tokio::test]
+    async fn malformed_json_bodies_are_json_rpc_errors() -> Result<()> {
+        let server = Running::start().await?;
+        for (body, code) in [
+            (br#"{"jsonrpc":"2.0","id":1,"method":"#.to_vec(), -32700),
+            (
+                serde_json::to_vec(&json!([request("server/discover")]))?,
+                -32600,
+            ),
+        ] {
+            let reply = server
+                .request("POST", "/mcp", &headers("server/discover"), &body)
+                .await?;
+            assert_eq!(reply.status, 400, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(reply.json()?["error"]["code"], code);
+        }
         server.finish().await
     }
 
