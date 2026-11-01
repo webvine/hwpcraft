@@ -924,18 +924,32 @@ mod tests {
             let reply = server.request("POST", "/mcp", &origin, &bytes).await?;
             assert_eq!(reply.status, status, "{value}");
         }
+        // These are refused before the body is read. Closing a socket with unread
+        // request bytes makes some systems (macOS) reset the connection instead
+        // of sending the status: either way the request was not served.
+        let refused = |reply: Result<Reply>, status: u16| -> Result<()> {
+            match reply {
+                Ok(reply) => assert_eq!(reply.status, status),
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset)
+                    }) => {}
+                Err(error) => return Err(error),
+            }
+            Ok(())
+        };
         let mut host = headers("server/discover").to_vec();
         host.push(("Host", "attacker.invalid"));
-        let rejected = server.request("POST", "/mcp", &host, &bytes).await?;
-        assert_eq!(rejected.status, 403);
+        refused(server.request("POST", "/mcp", &host, &bytes).await, 403)?;
         let oversized = vec![b' '; MAX_REQUEST_BODY_BYTES + 1];
-        assert_eq!(
+        refused(
             server
                 .request("POST", "/mcp", &headers("server/discover"), &oversized)
-                .await?
-                .status,
-            413
-        );
+                .await,
+            413,
+        )?;
         server.finish().await
     }
 
