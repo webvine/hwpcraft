@@ -1,6 +1,25 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use anyhow::{Result, anyhow};
 use hwpcraft_doc::DocumentCore;
+#[cfg(windows)]
+pub mod print_windows;
+
+/// The mouse pointer in screen pixels, for telling where files dragged in from
+/// another program are over the window: winit 0.30 reports no position while they
+/// are dragged or when they are dropped. `None` outside Windows or if Windows
+/// cannot tell.
+pub fn cursor_screen_position() -> Option<(i32, i32)> {
+    #[cfg(windows)]
+    {
+        let mut p = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        // SAFETY: GetCursorPos only writes the POINT it is handed.
+        #[allow(unsafe_code)]
+        let ok = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p) };
+        (ok != 0).then_some((p.x, p.y))
+    }
+    #[cfg(not(windows))]
+    None
+}
 mod screen_images;
 pub use screen_images::Stats as ScreenImageStats;
 pub struct Renderer {
@@ -247,6 +266,11 @@ impl Renderer {
     }
     pub fn svg(&self, svg: &str, scale: f32) -> Result<Page> {
         self.cached(svg, scale, false)
+    }
+    /// A sheet for the printer at `scale` (printer dpi / 96, up to 600 dpi): drawn once,
+    /// so it is not kept with the screen's recent pages nor held to their 2x.
+    pub fn print_raster(&self, svg: &str, scale: f32) -> Result<Page> {
+        self.rasterize(svg, scale.clamp(0.25, 6.25), false)
     }
     /// Like [`Renderer::svg`] for the document canvas: large embedded images are drawn
     /// from pre-rendered stand-ins that give the same pixels (measured largest channel

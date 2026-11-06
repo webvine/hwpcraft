@@ -133,12 +133,12 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "page.header_footer.text.get",
-        "header: bool, apply_to: both|odd|even(기본 both). 결과: exists, text, fields [{offset, kind}].",
+        "header: bool, apply_to: both|odd|even(기본 both). 결과: exists, text, fields [{offset, kind}], lossless, lossy. lossless가 false면 page.header_footer.text로 바꿀 때 사라지는 것(lossy: 그림·표·도형·글상자·수식·개체·여러 문단·여러 글자 모양·탭·줄 바꿈)이 있어 그 명령은 거절되고, text·fields는 첫 문단만 보여 줍니다.",
         r#"{"header":true,"apply_to":"both"}"#,
     ),
     (
         "page.header_footer.text",
-        "header: bool, apply_to: both|odd|even, text: 한 줄, fields: [{offset, kind: page_number|total_pages|file_name}]를 글 오프셋에 넣습니다.",
+        "header: bool, apply_to: both|odd|even, text: 한 줄, fields: [{offset, kind: page_number|total_pages|file_name}]를 글 오프셋에 넣습니다. 머리말/꼬리말을 새로 만들되 문단 모양과 글자 모양은 그대로 둡니다. page.header_footer.text.get의 lossless가 false인 머리말/꼬리말(그림·표, 여러 문단 등)은 거절하니 context.v2.*로 고치세요.",
         r#"{"header":true,"apply_to":"both","text":"보고서 ","fields":[{"offset":4,"kind":"page_number"}]}"#,
     ),
     (
@@ -193,7 +193,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "page.header_footer.list",
-        "매개 변수 없음. 지금 구역의 머리말·꼬리말.",
+        "매개 변수 없음. 문서의 머리말·꼬리말 items[{sectionIdx, isHeader, applyTo, label, header_footer{paragraph, control}, objects[{kind, address}]}]. objects의 address는 본문 개체 명령에 그대로 씁니다(page.header_footer.object.list와 같음).",
         "{}",
     ),
     (
@@ -333,7 +333,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "file.print_pdf",
-        "path(.pdf), pages: all|current|to_current|from_current 또는 1,3,5-7 같은 목록, current: current 계열 범위에 쓰는 캐럿 쪽(0부터). 인쇄 상세(선택): oddEven all|odd|even, reverse, copies 1–99와 collate(기본 true), nUp 1|2|4|8(한 장에 쪽 수), watermark {text 1–40자, opacity 0.05–0.6}(대각선으로 찍음, 문서에는 저장 안 함). 결과 sheets는 PDF 쪽 수.",
+        "path(.pdf), pages: all|current|to_current|from_current|section 또는 1,3,5-7 같은 목록, current: current 계열 범위에 쓰는 캐럿 쪽(0부터). section은 캐럿이 있는 구역의 쪽(현재 구역). 인쇄 상세(선택): oddEven all|odd|even, reverse, copies 1–99와 collate(기본 true), nUp 1|2|4|8(한 장에 쪽 수), watermark {text 1–40자, opacity 0.05–0.6}(대각선으로 찍음, 문서에는 저장 안 함). 결과 sheets는 PDF 쪽 수.",
         r#"{"path":"print.pdf","pages":"1,3,5-7","current":0,"nUp":2,"watermark":{"text":"대외비"}}"#,
     ),
     (
@@ -1613,7 +1613,8 @@ impl Session {
                 #[serde(deny_unknown_fields, rename_all = "camelCase")]
                 struct Print {
                     path: std::path::PathBuf,
-                    /// "all", "current", "to_current", "from_current" or a list like "1,3,5-7".
+                    /// "all", "current", "to_current", "from_current", "section" or a
+                    /// list like "1,3,5-7".
                     pages: String,
                     #[serde(default)]
                     current: u32,
@@ -1640,8 +1641,7 @@ impl Session {
                     watermark: p.watermark,
                 };
                 layout.validate()?;
-                let count = self.page_count()?;
-                let pages = print_pages(&p.pages, p.current, count)?;
+                let pages = self.print_pdf_pages(&p.pages, p.current)?;
                 let (bytes, sheets) = if layout == PrintLayout::default() {
                     (self.render_pdf(&pages)?, pages.len())
                 } else {
@@ -2029,7 +2029,8 @@ impl Session {
             left_mm: left,
             right_mm: (paper_w - left - total_w).max(0.0),
             top_mm: top,
-            // A little slack so the last row is never pushed to a second page.
+            // Slack for the empty paragraph after the table (a 1 pt line, see
+            // `shrink_label_tail`), so the sheet stays one page when it is read back.
             bottom_mm: (paper_h - top - total_h - 1.0).max(0.0),
             header_mm: 0.0,
             footer_mm: 0.0,
@@ -2054,6 +2055,12 @@ impl Session {
                 "column_widths_mm": widths,
             }),
         )?;
+        // Labels fill the body to the millimetre: the table has no outer margin, or its
+        // box (table plus margins) would not fit the page.
+        sheet.run(
+            "table.properties",
+            json!({"props": {"outerLeft": 0, "outerRight": 0, "outerTop": 0, "outerBottom": 0}}),
+        )?;
         let none = json!({"type": 0, "width": 0, "color": "#000000"});
         sheet.run(
             "table.cell_properties",
@@ -2065,6 +2072,7 @@ impl Session {
                 },
             }),
         )?;
+        sheet.shrink_label_tail()?;
         // A new document: no file yet, nothing to save.
         sheet.saved_revision = sheet.revision;
         sheet.generation += self.generation + 1;
@@ -2357,6 +2365,10 @@ impl Session {
                     "column_widths_mm": widths,
                 }),
             )?;
+            s.run(
+                "table.properties",
+                json!({"props": {"outerLeft": 0, "outerRight": 0, "outerTop": 0, "outerBottom": 0}}),
+            )?;
             let none = json!({"type": 0, "width": 0, "color": "#000000"});
             s.run(
                 "table.cell_properties",
@@ -2368,9 +2380,35 @@ impl Session {
                     },
                 }),
             )?;
-            Ok(())
+            s.shrink_label_tail()
         })?;
         Ok(json!({ "pages": self.page_count()? }))
+    }
+
+    /// The empty paragraph after a label table (the document's last) set to 1 pt type on
+    /// a fixed 1 pt line, the caret kept where it was. A 10 pt line needs about 6 mm below
+    /// the labels; a sheet whose labels leave less (centred rows over 285 mm) would
+    /// otherwise gain an empty second page. A fixed line alone is not enough: the line
+    /// still takes the type's height.
+    fn shrink_label_tail(&mut self) -> Result<()> {
+        let keep = self.cursor;
+        let section = self.core.document().sections.len() - 1;
+        let paragraph = self.core.document().sections[section].paragraphs.len() - 1;
+        self.select(
+            Cursor {
+                section,
+                paragraph,
+                offset: 0,
+                ..Cursor::default()
+            },
+            false,
+        )?;
+        self.run(
+            "format.paragraph",
+            json!({"lineSpacingType": "Fixed", "lineSpacing": 100, "spacingBefore": 0, "spacingAfter": 0}),
+        )?;
+        self.run("format.character", json!({"fontSize": 100}))?;
+        self.select(keep, false)
     }
 
     /// Write the document to `path` (.hwp/.hwpx, same bytes as [`Session::save`]) without
@@ -2598,9 +2636,11 @@ impl Session {
         if prep.ready() != prep.total() || prep.total() != pages.len() {
             bail!("PDF 쪽 준비가 끝나지 않았습니다.");
         }
+        // Bookmarks point at pages; only an unchanged page order keeps them right.
+        let meta = self.pdf_meta_for(pages, *layout == PrintLayout::default())?;
         let (svgs, links) = prep.into_parts();
         let (svgs, links) = layout.apply(pages, svgs, links)?;
-        Ok(PdfJob::from_svgs(svgs, links))
+        Ok(PdfJob::from_svgs(svgs, links, meta))
     }
 
     /// 미리 보기: sheet `sheet` of the whole document printed with `layout` (one copy),
@@ -2623,12 +2663,20 @@ impl Session {
     }
 
     fn header_footer_list(&self) -> Result<Value> {
-        Ok(serde_json::from_str(
+        let mut list: Value = serde_json::from_str(
             &self
                 .core
                 .get_header_footer_list_native(self.cursor.section, true, 0)
                 .map_err(err)?,
-        )?)
+        )?;
+        // Both list the document's headers and footers in document order.
+        if let Some(items) = list["items"].as_array_mut() {
+            for (item, entry) in items.iter_mut().zip(self.hf_list_entries()) {
+                item["header_footer"] = entry["header_footer"].clone();
+                item["objects"] = entry["objects"].clone();
+            }
+        }
+        Ok(list)
     }
 
     /// First 쪽 번호 위치 control of the cursor's section.
@@ -2893,7 +2941,7 @@ pub struct ViewMarks {
 }
 
 /// A header field: an RHWP marker field (`Ok(Ok(code))`) or a date field (`Ok(Err(command))`).
-fn hf_field(kind: &str) -> Result<std::result::Result<u8, &'static str>> {
+pub(crate) fn hf_field(kind: &str) -> Result<std::result::Result<u8, &'static str>> {
     if let Some((_, command)) = HF_DATE_FIELDS.iter().find(|(k, _)| *k == kind) {
         return Ok(Err(command));
     }
@@ -2949,7 +2997,7 @@ impl Session {
     }
 
     /// First paragraph of the header/footer `(section, header, apply)`; `None` when absent.
-    fn hf_paragraph(&self, header: bool, apply: u8) -> Result<Option<&Paragraph>> {
+    fn hf_paragraphs(&self, header: bool, apply: u8) -> Result<Option<&[Paragraph]>> {
         let info: Value = serde_json::from_str(
             &self
                 .core
@@ -2978,19 +3026,58 @@ impl Session {
             Some(Control::Footer(f)) => &f.paragraphs,
             _ => bail!("머리말/꼬리말을 찾지 못했습니다."),
         };
-        if paragraphs.len() != 1 {
-            bail!("여러 문단으로 된 머리말/꼬리말은 이 창에서 고칠 수 없습니다.");
-        }
-        Ok(paragraphs.first())
+        Ok(Some(paragraphs))
     }
 
     /// Text and field markers of a header/footer: `{exists, text, fields:[{offset, kind}]}`.
     /// `text` has the markers removed; each field offset refers to that text.
     fn header_footer_fields(&self, header: bool, apply: u8) -> Result<Value> {
-        let Some(p) = self.hf_paragraph(header, apply)? else {
-            return Ok(json!({"exists": false, "text": "", "fields": [], "applyTo": apply}));
+        let Some(paragraphs) = self.hf_paragraphs(header, apply)? else {
+            return Ok(
+                json!({"exists": false, "text": "", "fields": [], "applyTo": apply, "lossless": true, "lossy": []}),
+            );
+        };
+        let Some(p) = paragraphs.first() else {
+            return Ok(
+                json!({"exists": true, "text": "", "fields": [], "applyTo": apply, "lossless": true, "lossy": []}),
+            );
         };
         use hwpcraft_doc::model::control::{AutoNumberType, FieldType};
+        // What `page.header_footer.text` (one line of text and fields, rebuilt from
+        // scratch) would lose.
+        let mut lossy: Vec<&str> = Vec::new();
+        if paragraphs.len() > 1 {
+            lossy.push("여러 문단");
+        }
+        let mut char_shapes: Vec<u32> = p.char_shapes.iter().map(|c| c.char_shape_id).collect();
+        char_shapes.dedup();
+        if char_shapes.len() > 1 {
+            lossy.push("여러 글자 모양");
+        }
+        for control in paragraphs.iter().flat_map(|p| &p.controls) {
+            lossy.push(match control {
+                Control::AutoNumber(a)
+                    if matches!(
+                        a.number_type,
+                        AutoNumberType::Page | AutoNumberType::TotalPage
+                    ) =>
+                {
+                    continue;
+                }
+                Control::Field(f)
+                    if f.field_type == FieldType::Path
+                        || (f.field_type == FieldType::Summary
+                            && HF_DATE_FIELDS.iter().any(|(_, c)| *c == f.command)) =>
+                {
+                    continue;
+                }
+                Control::Picture(_) => "그림",
+                Control::Table(_) => "표",
+                Control::Shape(_) => "도형·글상자",
+                Control::Equation(_) => "수식",
+                _ => "개체",
+            });
+        }
         // Freshly inserted fields are marker characters; after a save RHWP lowers them to
         // AutoNumber controls (placeholder space) and a path Field wrapping the file name.
         let positions = p.control_text_positions();
@@ -3077,14 +3164,19 @@ impl Session {
                     offset,
                     kind: (*kind).to_owned(),
                 }),
-                None if c.is_control() => {}
+                None if c.is_control() => lossy.push("탭·줄 바꿈"),
                 None => {
                     text.push(c);
                     offset += 1;
                 }
             }
         }
-        Ok(json!({"exists": true, "text": text, "fields": fields, "applyTo": apply}))
+        let mut seen = std::collections::HashSet::new();
+        lossy.retain(|why| seen.insert(*why));
+        Ok(
+            json!({"exists": true, "text": text, "fields": fields, "applyTo": apply,
+            "lossless": lossy.is_empty(), "lossy": lossy}),
+        )
     }
 
     /// Delete the section's header or footer for `apply` (0 both, 1 even, 2 odd). RHWP's
@@ -3138,7 +3230,32 @@ impl Session {
         fields.sort_by_key(|f| std::cmp::Reverse((f.0, f.1)));
         let apply = apply_code(&p.apply_to)?;
         self.require_body()?;
-        let exists = self.hf_paragraph(p.header, apply)?.is_some();
+        let current = self.header_footer_fields(p.header, apply)?;
+        if current["lossless"] == false {
+            let lossy: Vec<&str> = current["lossy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            bail!(
+                "{}에 글 한 줄로 바꾸면 사라지는 것이 있습니다({}). 문서 영역 편집(context.v2.*)으로 고치세요.",
+                if p.header { "머리말" } else { "꼬리말" },
+                lossy.join("·")
+            );
+        }
+        let exists = current["exists"] == true;
+        // The rebuilt paragraph takes the old one's paragraph shape and (single) character
+        // shape, so alignment and font survive the rewrite.
+        let shapes = self
+            .hf_paragraphs(p.header, apply)?
+            .and_then(<[Paragraph]>::first)
+            .map(|p| {
+                (
+                    p.para_shape_id,
+                    p.char_shapes.first().map(|c| c.char_shape_id),
+                )
+            });
         let header = p.header;
         let text = p.text.clone();
         self.transaction(|s| {
@@ -3168,15 +3285,61 @@ impl Session {
                     }
                 }
             }
+            if let Some((para_shape, char_shape)) = shapes {
+                s.restore_hf_shapes(section, header, apply, para_shape, char_shape)?;
+            }
             Ok(())
         })
+    }
+
+    /// Give the section's header or footer paragraph `para_shape` and, when given,
+    /// `char_shape` for all of its text.
+    fn restore_hf_shapes(
+        &mut self,
+        section: usize,
+        header: bool,
+        apply: u8,
+        para_shape: u16,
+        char_shape: Option<u32>,
+    ) -> Result<()> {
+        let info: Value = serde_json::from_str(
+            &self
+                .core
+                .get_header_footer_native(section, header, apply)
+                .map_err(err)?,
+        )?;
+        let index = |k: &str| info[k].as_u64().and_then(|v| usize::try_from(v).ok());
+        let (Some(pi), Some(ci)) = (index("paraIndex"), index("controlIndex")) else {
+            bail!("머리말/꼬리말을 찾지 못했습니다.");
+        };
+        let sec = &mut self.core.document_mut().sections[section];
+        let paragraph = match sec
+            .paragraphs
+            .get_mut(pi)
+            .and_then(|p| p.controls.get_mut(ci))
+        {
+            Some(Control::Header(h)) => h.paragraphs.first_mut(),
+            Some(Control::Footer(f)) => f.paragraphs.first_mut(),
+            _ => None,
+        }
+        .ok_or_else(|| anyhow!("머리말/꼬리말을 찾지 못했습니다."))?;
+        paragraph.para_shape_id = para_shape;
+        if let Some(id) = char_shape {
+            paragraph.char_shapes = vec![hwpcraft_doc::model::paragraph::CharShapeRef {
+                start_pos: 0,
+                char_shape_id: id,
+            }];
+        }
+        paragraph.invalidate_layout_inputs();
+        sec.raw_stream = None;
+        self.refresh_layout()
     }
 
     /// A date field (`command` `$createtime` or `$modifiedtime`) at character `offset` of
     /// the section's header or footer paragraph, showing the time as the body's date
     /// fields do. RHWP has no field insertion for header paragraphs: the text goes in
     /// through RHWP, the field markers through `control_slots::wrap_field`.
-    fn insert_hf_date_field(
+    pub(crate) fn insert_hf_date_field(
         &mut self,
         section: usize,
         header: bool,
@@ -4084,15 +4247,30 @@ impl Session {
         range: &str,
         current: u32,
     ) -> Result<(Vec<u32>, crate::rendering::PdfJob)> {
-        let pages = print_pages(range, current, self.page_count()?)?;
+        let pages = self.print_pdf_pages(range, current)?;
         let job = self.pdf_job(&pages)?;
         Ok((pages, job))
     }
 
     /// 0-based pages of a Hangul 인쇄 범위 (`print_pages` names) in this document, for a
     /// PDF prepared a few pages per frame (`Session::pdf_prepare`).
+    /// `section` (현재 구역) is every page of the caret's section, from the page it starts
+    /// on (a section that starts mid-page shares that page) to the last page starting in it.
     pub fn print_pdf_pages(&self, range: &str, current: u32) -> Result<Vec<u32>> {
-        print_pages(range, current, self.page_count()?)
+        if range != "section" {
+            return print_pages(range, current, self.page_count()?);
+        }
+        let starts = self.page_starts()?;
+        let section = self.cursor.section;
+        let first = starts
+            .partition_point(|start| *start <= (section, 0))
+            .saturating_sub(1);
+        let end = starts.partition_point(|start| start.0 <= section);
+        let pages: Vec<u32> = (first..end.max(first + 1)).map(|p| p as u32).collect();
+        if pages.is_empty() {
+            bail!("인쇄할 쪽이 없습니다.");
+        }
+        Ok(pages)
     }
 
     /// The selected block as its own session, for a PDF prepared a few pages per frame.

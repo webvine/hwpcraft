@@ -152,9 +152,25 @@ pub(crate) fn json_size(value: &Value) -> usize {
     count.0
 }
 
+/// A tool result. Only the data is kept here: the text block clients read is
+/// written once, from the final structured content (`sdk_service::tool_result`).
 pub(crate) fn result(value: Value, is_error: bool) -> Value {
-    let text = value.to_string();
-    json!({"content":[{"type":"text","text":text}],"isError":is_error,PARSED:value})
+    json!({"content":[],"isError":is_error,PARSED:value})
+}
+
+/// The data of a tool result: what [`result`] keeps, else the JSON its text block
+/// holds (a text that is not JSON as `{"message": text}`).
+pub(crate) fn take_data(mut raw: Value) -> Value {
+    if let Some(data) = raw.as_object_mut().and_then(|map| map.remove(PARSED)) {
+        return data;
+    }
+    let text = raw["content"]
+        .as_array()
+        .and_then(|blocks| blocks.iter().find_map(|block| block["text"].as_str()));
+    match text {
+        Some(text) => serde_json::from_str(text).unwrap_or_else(|_| json!({"message":text})),
+        None => Value::Null,
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

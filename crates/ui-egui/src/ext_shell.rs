@@ -370,6 +370,8 @@ pub(crate) struct State {
     blank: Option<(Option<(Color32, Color32)>, egui::TextureHandle)>,
     /// Selected object kind last frame, to open its context tab once.
     pub object_kind: Option<&'static str>,
+    /// A header table was picked last frame (the 표 tab opened for it).
+    pub hf_table_tab: bool,
     /// 문단 부호 · 조판 부호 · 투명 선 (screen only; re-applied after a document is replaced).
     pub marks: [bool; 3],
     marks_applied: u64,
@@ -454,13 +456,18 @@ pub(crate) struct State {
     ),
     /// Caret page for one generation, so the queue starts where the user types.
     caret_page: Option<(u64, u32)>,
-    /// Print request waiting for its background PDF: file, copies, page count.
-    print_after: Option<(PathBuf, u32, usize)>,
+    /// Print request waiting for its background PDF: file, copies, collate, page count.
+    print_after: Option<(PathBuf, u32, bool, usize)>,
     /// The OS printers once listed (default first), and the list on its way.
     printers: Option<Vec<crate::platform::Printer>>,
     printers_rx: Option<std::sync::mpsc::Receiver<Vec<crate::platform::Printer>>>,
     /// The printer chosen in 인쇄 (`None`: the OS default one).
     printer: Option<String>,
+    /// A print job going straight to the printer (Windows, GDI) on a worker thread.
+    print_worker: Option<PrintWorker>,
+    /// Where a direct print writes instead of the device (a virtual printer's file).
+    /// Tests set it; a test without it (and a named printer) never reaches a device.
+    print_to_file: Option<PathBuf>,
     /// 인쇄 상세 for the next PDF preparation started by the print dialog.
     next_print_layout: Option<hwpcraft_engine::PrintLayout>,
     /// A PDF whose pages are being prepared a slice per frame.
@@ -501,6 +508,7 @@ impl Default for State {
             raster_svg_pass: None,
             blank: None,
             object_kind: None,
+            hf_table_tab: false,
             marks: [false; 3],
             marks_applied: u64::MAX,
             recent: Vec::new(),
@@ -550,6 +558,8 @@ impl Default for State {
             printers_rx: None,
             printer: None,
             next_print_layout: None,
+            print_worker: None,
+            print_to_file: None,
             pdf_preparing: None,
             pdf_budget: PDF_PREPARE_BUDGET,
         }
@@ -568,6 +578,9 @@ fn parse_hex(v: &serde_json::Value) -> Option<Color32> {
 impl HwpApp {
     /// `Some(enabled)` when this module owns the ribbon/menu command id.
     pub(crate) fn shell_ext_enabled(&self, id: &str) -> Option<bool> {
+        if let Some(enabled) = self.hf_ext_enabled(id) {
+            return Some(enabled);
+        }
         let body = self.session.cursor.cell.is_none();
         Some(match id {
             "view.zoom_100"
@@ -671,6 +684,9 @@ impl HwpApp {
     }
     /// Check state of toggle commands shown as check boxes or pressed buttons.
     pub(crate) fn shell_ext_checked(&self, id: &str) -> bool {
+        if id.starts_with("page.hf.") {
+            return self.hf_ext_checked(id);
+        }
         match id {
             "view.status_bar" => self.ext.shell.show_status_bar,
             "view.doc_tabs" => self.ext.shell.show_doc_tabs,
@@ -697,6 +713,9 @@ impl HwpApp {
     }
     /// Return true when the command id was handled.
     pub(crate) fn shell_ext_dispatch(&mut self, id: &str, ctx: &egui::Context) -> bool {
+        if self.hf_ext_dispatch(id) {
+            return true;
+        }
         if id.starts_with("macro.") {
             return self.macro_dispatch(id);
         }
@@ -1450,6 +1469,18 @@ impl HwpApp {
     }
     /// Start-up `--view` names owned by this module.
     pub(crate) fn shell_ext_view(&mut self, name: &str) -> bool {
+        // Editing page 1's header or footer on the page (made if missing).
+        if let Some(footer) = match name {
+            "hf-header" => Some(false),
+            "hf-footer" => Some(true),
+            _ => None,
+        } {
+            let r = self.session.hf_page_target(0, footer);
+            if let Some(hit) = self.result(r) {
+                self.hf_open(hit, 0, None);
+            }
+            return true;
+        }
         if let Some(id) = name.strip_prefix("tooltip-") {
             let Some(tab) = self.ribbon_tab_of(id) else {
                 return false;
@@ -2124,7 +2155,7 @@ impl HwpApp {
             });
             note(
                 ui,
-                "선택한 쪽을 PDF로 만든 뒤 고른 프린터로 보냅니다(Windows는 PDF 프로그램의 인쇄 기능을 씀). 그 프로그램이 인쇄를 받지 않으면 PDF를 열어 줍니다.",
+                "Windows는 고른 프린터로 바로 보냅니다(프린터 해상도, 최대 300 dpi; 쪽 크기가 표준 용지면 그 용지로, 용지보다 크면 맞춰 줄임). macOS·Linux는 PDF를 만들어 lp로 보냅니다. 보내지 못하면 PDF를 열어 줍니다.",
             );
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
@@ -2139,7 +2170,7 @@ impl HwpApp {
                             ui.radio_value(range, 1, "현재 쪽");
                             ui.radio_value(range, 3, "현재까지");
                             ui.end_row();
-                            ui.add_enabled(false, egui::RadioButton::new(false, "현재 구역"));
+                            ui.radio_value(range, 5, "현재 구역");
                             ui.radio_value(range, 4, "현재부터");
                             ui.end_row();
                             ui.radio_value(range, 2, "일부분");
@@ -2249,7 +2280,14 @@ impl HwpApp {
     }
     /// Returns true to keep the dialog open (cancelled save or failure).
     fn print(&mut self, range: usize, pages: &str, copies: u32, to_file: bool) -> bool {
-        let range_name = ["all", "current", pages, "to_current", "from_current"][range.min(4)];
+        let range_name = [
+            "all",
+            "current",
+            pages,
+            "to_current",
+            "from_current",
+            "section",
+        ][range.min(5)];
         let target = if to_file {
             match rfd::FileDialog::new()
                 .add_filter("PDF", &["pdf"])
@@ -2297,12 +2335,14 @@ impl HwpApp {
             self.ext.shell.printers = Some(Vec::new());
         }
     }
-    /// After the background PDF for a print request is written, hand it to the printer.
+    /// After the background PDF for a print request is written, hand it to the printer;
+    /// report a direct print when its worker is done.
     fn shell_print_when_ready(&mut self) {
+        self.poll_direct_print();
         if self.pdf.busy() {
             return;
         }
-        let Some((target, copies, count)) = self.ext.shell.print_after.take() else {
+        let Some((target, copies, collate, count)) = self.ext.shell.print_after.take() else {
             return;
         };
         if !target.is_file() {
@@ -2310,7 +2350,7 @@ impl HwpApp {
             return;
         }
         let printer = self.ext.shell.printer.clone();
-        match crate::platform::print_pdf(&target, copies, printer.as_deref()) {
+        match crate::platform::print_pdf(&target, copies, collate, printer.as_deref()) {
             crate::platform::PrintOutcome::Printed => {
                 let to = printer.map_or("기본 프린터".to_owned(), |p| format!("[{p}]"));
                 self.message = format!("{count}쪽을 {copies}부 {to}로 보냈습니다.");
@@ -3596,6 +3636,14 @@ pub(crate) fn serialize_recent(list: &[PathBuf]) -> String {
 
 /// Alt key tips per tab (Hangul-style Alt letters): (tab, letter, command id).
 pub(crate) const ALT_KEYS: &[(usize, char, &str)] = &[
+    (13, 'C', "page.hf.close"),
+    (13, 'P', "page.hf.prev"),
+    (13, 'N', "page.hf.next"),
+    (13, 'S', "page.hf.switch"),
+    (13, 'B', "page.hf.both"),
+    (13, 'O', "page.hf.odd"),
+    (13, 'E', "page.hf.even"),
+    (13, 'H', "page.hide"),
     (1, 'T', "edit.cut"),
     (1, 'C', "edit.copy"),
     (1, 'P', "edit.paste"),
@@ -3895,6 +3943,7 @@ impl HwpApp {
     }
     /// Per-frame bookkeeping: recent documents and view marks that follow document replacement.
     fn shell_ext_frame(&mut self) {
+        self.hf_frame();
         if !self.ext.shell.recent_loaded {
             self.ext.shell.recent_loaded = true;
             if let Some(text) = recent_file().and_then(|p| std::fs::read_to_string(p).ok()) {
@@ -4081,6 +4130,15 @@ impl HwpApp {
     /// AI 편집 패널 dock: the window's right edge, outside the memo pane and the
     /// scroll rail, above the status bar. Its width is remembered once a drag ends.
     pub(crate) fn ai_panel_dock(&mut self, ui: &mut egui::Ui) {
+        self.ai_panel_dock_with(ui, |app, ui| app.ai_panel_ui(ui));
+    }
+
+    /// [`Self::ai_panel_dock`] with the panel's contents from `body` (tests).
+    fn ai_panel_dock_with(
+        &mut self,
+        ui: &mut egui::Ui,
+        body: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) {
         if self.ai_panel_take_close() {
             self.set_ai_panel_open(false);
         }
@@ -4106,7 +4164,20 @@ impl HwpApp {
             .default_size((saved as f32).min(room))
             .size_range(least..=room)
             .resizable(true)
-            .show(ui, |ui| self.ai_panel_ui(ui));
+            .show(ui, |ui| {
+                // The contents draw in a child held to the panel and clipped to it: a row
+                // wider than the panel (a long line that does not wrap) would otherwise
+                // widen the panel past the window and leave the document the whole width.
+                let rect = ui.available_rect_before_wrap();
+                let mut inside = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                inside.set_clip_rect(ui.clip_rect().intersect(rect));
+                body(self, &mut inside);
+                ui.allocate_rect(rect, egui::Sense::hover());
+            });
         let width =
             (shown.response.rect.width().round() as u32).clamp(*range.start(), *range.end());
         let held_back = saved as f32 > room && width as f32 >= room - 1.0;
@@ -4706,6 +4777,28 @@ impl HwpApp {
         let Some(v) = self.result(r) else {
             return;
         };
+        // Pictures, tables, several paragraphs or mixed fonts would be lost in this
+        // one-line editor (`page.header_footer.text` refuses such a rewrite too).
+        if v["lossless"] == false {
+            let lost: Vec<&str> = v["lossy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            let name = if is_header { "머리말" } else { "꼬리말" };
+            if matches!(
+                self.feature_dialog,
+                Some(super::feature_dialogs::FeatureDialog::HeaderFooter { .. })
+            ) {
+                self.feature_dialog = None;
+            }
+            self.error = Some(format!(
+                "이 {name}에는 이 창에서 고치면 사라지는 것이 있어 창을 열지 않습니다({}).",
+                lost.join("·")
+            ));
+            return;
+        }
         let fields: Vec<(usize, String)> = v["fields"]
             .as_array()
             .into_iter()
@@ -5937,6 +6030,46 @@ mod tests {
             parse_recent(&format!("\n  \n{docs}/a.hwp\n")),
             vec![PathBuf::from(format!("{docs}/a.hwp"))]
         );
+    }
+
+    /// 머리말/꼬리말 창은 글 한 줄과 필드만 고칩니다. 그림이 있거나 여러 문단인
+    /// 머리말·꼬리말은 창을 열지 않고 무엇이 사라지는지 알려 줍니다(열린 창도 닫음).
+    /// 글 한 줄인 것은 예전처럼 열립니다.
+    #[test]
+    fn the_header_footer_editor_refuses_what_it_would_lose() -> anyhow::Result<()> {
+        use hwpcraft_doc::model::control::Control;
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        a.session.run("text.insert", json!({"text": "본문"}))?;
+        a.session
+            .run("page.footer", json!({"apply_to": "both", "template": 2}))?;
+        a.open_header_footer_editor(false, 0);
+        assert!(a.error.is_none(), "{:?}", a.error);
+        assert!(matches!(
+            a.feature_dialog,
+            Some(super::super::feature_dialogs::FeatureDialog::HeaderFooter {
+                is_header: false,
+                ..
+            })
+        ));
+        let footer = a.session.core.document_mut().sections[0]
+            .paragraphs
+            .iter_mut()
+            .flat_map(|p| p.controls.iter_mut())
+            .find_map(|c| match c {
+                Control::Footer(f) => Some(f),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("no footer"))?;
+        let second = footer.paragraphs[0].clone();
+        footer.paragraphs.push(second);
+        a.open_header_footer_editor(false, 0);
+        assert!(a.feature_dialog.is_none());
+        let error = a.error.take().unwrap_or_default();
+        assert!(
+            error.contains("꼬리말") && error.contains("여러 문단"),
+            "{error}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -7176,6 +7309,11 @@ impl HwpApp {
         scale: f32,
         mut texture: egui::TextureHandle,
     ) -> bool {
+        // Typing in a header or footer edited on the page changes rows other than the
+        // body caret paragraph's.
+        if self.session.hf_target().is_some() {
+            return false;
+        }
         let Some(before) = self.ext.shell.caret_extent else {
             return false;
         };
@@ -7421,6 +7559,29 @@ mod redraw_tests {
         Ok(())
     }
 
+    /// Typing in a header edited on the page draws the whole page: the body caret
+    /// paragraph's band would leave the header as it was (a release build has no
+    /// full-render check to catch it).
+    #[test]
+    fn typing_in_a_header_redraws_the_whole_page() -> anyhow::Result<()> {
+        let mut a = typing_app()?;
+        let target = hwpcraft_engine::HfTarget {
+            section: 0,
+            footer: false,
+            apply_to: hwpcraft_engine::HfApply::Both,
+        };
+        a.session.hf_enter(target, 0)?;
+        pass(&mut a, &[0]);
+        for _ in 0..3 {
+            a.session.hf_insert("가")?;
+            pass(&mut a, &[0]);
+        }
+        assert_eq!(a.ext.shell.band_rejected, 0, "no band was tried");
+        assert_eq!(a.ext.shell.band_redraws, 0);
+        assert_eq!(a.ext.shell.page_drawn.get(&0), Some(&a.session.generation));
+        Ok(())
+    }
+
     /// A change that adds a line or a paragraph draws the whole page.
     #[test]
     fn new_lines_and_paragraphs_redraw_the_whole_page() -> anyhow::Result<()> {
@@ -7641,10 +7802,186 @@ impl PdfPreparing {
     }
 }
 
+/// A direct print on its worker thread (Windows).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct PrintWorker {
+    printer: String,
+    done: std::sync::mpsc::Receiver<DirectPrint>,
+}
+
+/// How a direct print ended.
+#[cfg_attr(not(windows), allow(dead_code))]
+enum DirectPrint {
+    /// Sheets sent (copies included), and how many were scaled down to the paper.
+    Printed {
+        sheets: usize,
+        fitted: usize,
+    },
+    /// The printer refused (why); the pages were written as a PDF to open instead.
+    Opened(PathBuf, String),
+    Failed(String),
+}
+
 impl HwpApp {
+    /// The printer a print goes to directly: on Windows the one chosen in 인쇄 or else
+    /// the OS default (once the printer list has come in). `None` sends the print PDF
+    /// to the OS instead, as on macOS and Linux. Tests print only to a named printer
+    /// with a file to write.
+    fn direct_printer(&self) -> Option<String> {
+        if !cfg!(windows) {
+            return None;
+        }
+        if cfg!(test)
+            && (self.ext.shell.printer.is_none() || self.ext.shell.print_to_file.is_none())
+        {
+            return None;
+        }
+        self.ext.shell.printer.clone().or_else(|| {
+            self.ext
+                .shell
+                .printers
+                .as_ref()?
+                .iter()
+                .find(|p| p.default)
+                .map(|p| p.name.clone())
+        })
+    }
+
+    /// Send `job`'s sheets to `printer` on a worker thread; if the printer refuses, the
+    /// worker writes the PDF to `fallback` to be opened. True when started.
+    #[cfg(windows)]
+    fn begin_direct_print(
+        &mut self,
+        job: hwpcraft_engine::PdfJob,
+        printer: String,
+        copies: u32,
+        collate: bool,
+        fallback: PathBuf,
+    ) -> bool {
+        let output = self.ext.shell.print_to_file.clone();
+        let title = self
+            .session
+            .path
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .map_or("HwpCraft 문서".to_owned(), |n| {
+                n.to_string_lossy().into_owned()
+            });
+        let count = job.page_count();
+        let (tx, done) = std::sync::mpsc::channel();
+        let name = printer.clone();
+        let spawned = std::thread::Builder::new()
+            .name("hwpcraft-print".into())
+            .spawn(move || {
+                use hwpcraft_render::print_windows::{PrintRequest, print_sheets};
+                let request = PrintRequest {
+                    printer: &name,
+                    title: &title,
+                    output: output.as_deref(),
+                    copies,
+                    collate,
+                };
+                let renderer = hwpcraft_render::Renderer::default();
+                let result = match print_sheets(&renderer, &request, job.sheets()) {
+                    Ok(p) => DirectPrint::Printed {
+                        sheets: p.sheets,
+                        fitted: p.fitted,
+                    },
+                    Err(refused) => match job
+                        .convert()
+                        .and_then(|bytes| hwpcraft_formats::atomic_write(&fallback, &bytes))
+                    {
+                        Ok(()) => DirectPrint::Opened(fallback, format!("{refused:#}")),
+                        Err(e) => DirectPrint::Failed(format!("{refused:#} / {e:#}")),
+                    },
+                };
+                let _ = tx.send(result);
+            });
+        if spawned.is_err() {
+            self.error = Some("인쇄 작업을 시작하지 못했습니다.".into());
+            return false;
+        }
+        self.ext.shell.print_worker = Some(PrintWorker { printer, done });
+        self.message = format!("{count}장을 프린터로 보내는 중…");
+        true
+    }
+    #[cfg(not(windows))]
+    fn begin_direct_print(
+        &mut self,
+        _: hwpcraft_engine::PdfJob,
+        _: String,
+        _: u32,
+        _: bool,
+        _: PathBuf,
+    ) -> bool {
+        false
+    }
+
+    /// A direct print is on its way to the printer.
+    pub(crate) fn printing(&self) -> bool {
+        self.ext.shell.print_worker.is_some()
+    }
+
+    /// Report a finished direct print; keep frames coming while it runs. A close asked
+    /// for during the print happens now if it printed; after a failure or a PDF opened
+    /// instead, the window stays so the message can be read.
+    fn poll_direct_print(&mut self) {
+        let Some(worker) = self.ext.shell.print_worker.as_ref() else {
+            return;
+        };
+        let result = match worker.done.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.ctx
+                    .request_repaint_after(std::time::Duration::from_millis(200));
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                DirectPrint::Failed("인쇄 작업이 비정상적으로 끝났습니다.".into())
+            }
+        };
+        let printer = worker.printer.clone();
+        self.ext.shell.print_worker = None;
+        let printed = matches!(result, DirectPrint::Printed { .. });
+        match result {
+            DirectPrint::Printed { sheets, fitted } => {
+                let fitted = if fitted > 0 {
+                    format!(" 용지보다 큰 {fitted}장은 용지에 맞춰 줄였습니다.")
+                } else {
+                    String::new()
+                };
+                self.message = format!("{sheets}장을 [{printer}]로 보냈습니다.{fitted}");
+            }
+            DirectPrint::Opened(path, why) => {
+                if crate::platform::open_with_default_app(&path) {
+                    self.message = format!(
+                        "[{printer}]로 바로 보내지 못해({why}) PDF를 기본 보기 프로그램으로 열었습니다. 거기서 인쇄하세요."
+                    );
+                } else {
+                    self.error = Some(format!(
+                        "[{printer}]로 보내지 못했고({why}) PDF도 열지 못했습니다. 'PDF 저장'으로 저장한 뒤 인쇄하세요."
+                    ));
+                }
+            }
+            DirectPrint::Failed(e) => {
+                self.error = Some(format!("인쇄하지 못했습니다: {e}"));
+            }
+        }
+        if !self.pdf.busy() && self.pdf.take_close_after() {
+            if printed {
+                self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.message
+                    .push_str(" 창은 닫지 않았습니다. 다시 닫기를 누르면 닫힙니다.");
+            }
+        }
+    }
+
     /// A PDF is being prepared or converted; a new one is refused until it is done.
     pub(crate) fn pdf_busy(&self) -> bool {
-        self.pdf.busy() || self.ext.shell.pdf_preparing.is_some()
+        self.pdf.busy()
+            || self.ext.shell.pdf_preparing.is_some()
+            || self.ext.shell.print_worker.is_some()
     }
 
     /// Start a PDF of `pages`: the pages are prepared a slice per frame (progress in
@@ -7735,12 +8072,19 @@ impl HwpApp {
                 let Some(pdf) = self.result(finished) else {
                     return false;
                 };
+                if let Some(copies) = job.print
+                    && let Some(printer) = self.direct_printer()
+                {
+                    let collate = job.layout.as_ref().is_none_or(|l| l.collate);
+                    return self.begin_direct_print(pdf, printer, copies, collate, job.path);
+                }
                 let count = pdf.page_count();
                 if !self.begin_pdf_export(count, job.path.clone(), move || pdf.convert()) {
                     return false;
                 }
                 if let Some(copies) = job.print {
-                    self.ext.shell.print_after = Some((job.path, copies, count));
+                    let collate = job.layout.as_ref().is_none_or(|l| l.collate);
+                    self.ext.shell.print_after = Some((job.path, copies, collate, count));
                 }
                 true
             }
@@ -7927,7 +8271,7 @@ mod pdf_tests {
         assert!(a.error.as_deref().is_some_and(|e| e.contains("진행 중")));
         a.error = None;
         // A print request whose file never appears is dropped, never sent.
-        a.ext.shell.print_after = Some((dir.join("missing.pdf"), 1, 1));
+        a.ext.shell.print_after = Some((dir.join("missing.pdf"), 1, true, 1));
         a.shell_print_when_ready();
         assert!(
             a.ext.shell.print_after.is_some(),
@@ -7940,6 +8284,128 @@ mod pdf_tests {
             "dropped once the slot is free"
         );
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// 인쇄 to a printer on Windows sends the prepared sheets straight to it (here the
+    /// virtual Microsoft Print to PDF writing a file; skipped where it is missing), with
+    /// copies collated, and reports how many sheets went where. Nothing is sent without
+    /// a named printer and a file in a test.
+    #[cfg(windows)]
+    #[test]
+    fn printing_on_windows_sends_the_sheets_straight_to_the_printer() -> anyhow::Result<()> {
+        const PRINTER: &str = "Microsoft Print to PDF";
+        if !crate::platform::printers()
+            .iter()
+            .any(|p| p.name == PRINTER)
+        {
+            eprintln!("{PRINTER} is not installed; skipped");
+            return Ok(());
+        }
+        let dir = tempfile_dir("direct-print")?;
+        let mut a = three_pages()?;
+        let out = dir.join("printed.pdf");
+        let _ = std::fs::remove_file(&out);
+        // No named printer: the test keeps the PDF path and never reaches a device.
+        assert_eq!(a.direct_printer(), None);
+        a.ext.shell.printer = Some(PRINTER.into());
+        a.ext.shell.print_to_file = Some(out.clone());
+        let fallback = dir.join("fallback.pdf");
+        assert!(a.start_print_pdf(fallback.clone(), "all", 2, false));
+        wait(&mut a);
+        assert!(a.error.is_none(), "{:?}", a.error);
+        assert!(
+            a.message
+                .contains(&format!("6장을 [{PRINTER}]로 보냈습니다")),
+            "{}",
+            a.message
+        );
+        assert!(
+            !fallback.exists(),
+            "no PDF made when the printer took the job"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut bytes = Vec::new();
+        while std::time::Instant::now() < deadline {
+            bytes = std::fs::read(&out).unwrap_or_default();
+            if bytes.windows(5).any(|w| w == b"%%EOF") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let pages = text
+            .match_indices("/Type")
+            .filter(|(at, _)| {
+                let rest = text[at + 5..].trim_start();
+                rest.starts_with("/Page") && !rest.starts_with("/Pages")
+            })
+            .count();
+        assert_eq!(pages, 6, "three pages, two copies");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Closing the window while a direct print runs waits for it with its own message.
+    /// When the print went out the window then closes; when it failed it stays, so the
+    /// error can be read (no printer involved: the worker's result is sent by hand).
+    #[test]
+    fn closing_during_a_direct_print_waits_for_it() -> anyhow::Result<()> {
+        for result in [
+            DirectPrint::Printed {
+                sheets: 3,
+                fitted: 1,
+            },
+            DirectPrint::Failed("용지 없음".into()),
+        ] {
+            let printed = matches!(result, DirectPrint::Printed { .. });
+            let mut a = three_pages()?;
+            let (tx, done) = std::sync::mpsc::channel();
+            a.ext.shell.print_worker = Some(PrintWorker {
+                printer: "가상 프린터".into(),
+                done,
+            });
+            assert!(a.printing() && a.pdf_busy());
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let ctx = a.ctx.clone();
+            let mut held = false;
+            let mut output = ctx.run_ui(input, |_| held = a.hold_close_for_pdf(&ctx));
+            output.textures_delta.clear();
+            assert!(held, "the close waits for the print");
+            assert!(a.message.contains("인쇄를 마치는 중"), "{}", a.message);
+            tx.send(result)?;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_| a.poll_direct_print());
+            output.textures_delta.clear();
+            assert!(!a.printing());
+            let closed = output.viewport_output.values().any(|v| {
+                v.commands
+                    .iter()
+                    .any(|c| matches!(c, egui::ViewportCommand::Close))
+            });
+            assert_eq!(closed, printed, "closes only after a print that went out");
+            if printed {
+                assert!(
+                    a.message.contains("3장을 [가상 프린터]로 보냈습니다")
+                        && a.message.contains("1장은 용지에 맞춰 줄였습니다"),
+                    "{}",
+                    a.message
+                );
+            } else {
+                assert!(
+                    a.error.as_deref().is_some_and(|e| e.contains("용지 없음")),
+                    "{:?}",
+                    a.error
+                );
+                assert!(a.message.contains("창은 닫지 않았습니다"), "{}", a.message);
+            }
+            assert!(!a.pdf.take_close_after(), "the held close was used up");
+        }
         Ok(())
     }
 
@@ -8400,6 +8866,52 @@ mod dialog_tests {
         );
         let wide = remaining(&mut a, 1600.0);
         assert!(wide <= 1600.0 - 560.0, "{wide}");
+        Ok(())
+    }
+
+    /// 패널 안에 패널보다 넓은 줄(줄바꿈되지 않는 긴 글)이 있어도 패널은 제 폭을 지키고
+    /// 문서 화면을 밀어내지 않습니다(0.21에서 긴 답의 목록 줄이 그랬음).
+    #[test]
+    fn a_row_wider_than_the_ai_panel_does_not_push_the_document() -> anyhow::Result<()> {
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let ctx = a.ctx.clone();
+        let remaining = |a: &mut HwpApp, wide: bool| {
+            let mut width = 0.0;
+            for i in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1918.0, 1000.0))),
+                    time: Some(f64::from(i)),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    a.ai_panel_dock_with(ui, |_, ui| {
+                        // Like the real panel, whose conversation fills its width.
+                        ui.allocate_space(Vec2::new(ui.available_width(), 20.0));
+                        if wide {
+                            ui.horizontal_top(|ui| {
+                                ui.label("•");
+                                ui.add(
+                                    egui::Label::new("긴 목록 줄 ".repeat(120))
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                );
+                            });
+                        }
+                    });
+                    width = ui.available_rect_before_wrap().width();
+                });
+                output.textures_delta.clear();
+            }
+            width
+        };
+        a.ext.shell.settings.ai_panel_open = true;
+        a.ext.shell.settings.ai_panel_width = 560;
+        let plain = remaining(&mut a, false);
+        assert!((plain - (1918.0 - 560.0)).abs() < 12.0, "{plain}");
+        let with_wide_row = remaining(&mut a, true);
+        assert!(
+            (with_wide_row - plain).abs() < 1.0,
+            "{plain} {with_wide_row}"
+        );
         Ok(())
     }
 

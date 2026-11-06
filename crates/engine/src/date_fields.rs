@@ -47,6 +47,11 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
 
 const SUMMARY_STREAM: &str = "\u{5}HwpSummaryInformation";
 const CONTENT_HPF: &str = "Contents/content.hpf";
+/// Summary-information text properties (PIDSI_TITLE, _SUBJECT, _AUTHOR, _KEYWORDS).
+const PID_TITLE: u32 = 2;
+const PID_SUBJECT: u32 = 3;
+const PID_AUTHOR: u32 = 4;
+const PID_KEYWORDS: u32 = 5;
 const PID_CREATED: u32 = 12;
 const PID_SAVED: u32 = 13;
 const VT_FILETIME: u32 = 0x40;
@@ -153,6 +158,76 @@ fn filetime_slot(data: &[u8], pid: u32) -> Option<usize> {
         let at = section + u32_at(data, entry + 4)? as usize;
         (u32_at(data, at)? == VT_FILETIME && data.len() >= at + 12).then_some(at + 4)
     })
+}
+
+/// The text of `pid` in an OLE property set (first section): VT_LPWSTR, as Hangul
+/// writes it, or VT_LPSTR read as UTF-8.
+fn summary_text(data: &[u8], pid: u32) -> Option<String> {
+    if data.get(..2) != Some(&[0xFE, 0xFF]) || u32_at(data, 24)? == 0 {
+        return None;
+    }
+    let section = u32_at(data, 44)? as usize;
+    let count = u32_at(data, section + 4)? as usize;
+    let at = (0..count.min(4096)).find_map(|i| {
+        let entry = section + 8 + i * 8;
+        (u32_at(data, entry)? == pid).then_some(())?;
+        Some(section + u32_at(data, entry + 4)? as usize)
+    })?;
+    let len = u32_at(data, at + 4)? as usize;
+    let text = match u32_at(data, at)? {
+        0x1F => {
+            let bytes = data.get(at + 8..at + 8 + len.checked_mul(2)?)?;
+            let units: Vec<u16> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| u16::from_le_bytes(b))
+                .take_while(|&u| u != 0)
+                .collect();
+            String::from_utf16(&units).ok()?
+        }
+        0x1E => {
+            let bytes = data.get(at + 8..at + 8 + len)?;
+            let bytes = bytes.split(|&b| b == 0).next()?;
+            String::from_utf8(bytes.to_vec()).ok()?
+        }
+        _ => return None,
+    };
+    Some(text.trim().to_owned()).filter(|t| !t.is_empty())
+}
+
+/// XML text with the five predefined entities and character references decoded.
+fn xml_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let Some(end) = tail.find(';') else {
+            out.push_str(tail);
+            return out;
+        };
+        let entity = &tail[1..end];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => entity
+                .strip_prefix("#x")
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .or_else(|| entity.strip_prefix('#').and_then(|d| d.parse().ok()))
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(c) => out.push(c),
+            None => out.push_str(&tail[..=end]),
+        }
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn summary(doc: &Document) -> Option<&[u8]> {
@@ -264,6 +339,34 @@ impl Session {
             return (None, None);
         }
         (created, summary_time(data, PID_SAVED))
+    }
+
+    /// 문서 정보 (title, author, subject, keywords) as Hangul keeps it: HWPX
+    /// `content.hpf` metadata (`opf:title` and the `creator`, `subject` and `keyword`
+    /// meta) or the HWP summary information.
+    pub(crate) fn document_summary(&self) -> [Option<String>; 4] {
+        let doc = self.core.document();
+        if let Some(xml) = hpf(doc) {
+            let title = xml.find("<opf:title>").and_then(|at| {
+                let start = at + "<opf:title>".len();
+                let end = start + xml[start..].find("</opf:title>")?;
+                Some(xml[start..end].to_owned())
+            });
+            let clean = |v: Option<String>| {
+                v.map(|v| xml_text(&v).trim().to_owned())
+                    .filter(|v| !v.is_empty())
+            };
+            return [
+                clean(title),
+                clean(meta(xml, "creator")),
+                clean(meta(xml, "subject")),
+                clean(meta(xml, "keyword")),
+            ];
+        }
+        let Some(data) = summary(doc) else {
+            return Default::default();
+        };
+        [PID_TITLE, PID_AUTHOR, PID_SUBJECT, PID_KEYWORDS].map(|pid| summary_text(data, pid))
     }
 
     fn path_is_new(&self) -> bool {

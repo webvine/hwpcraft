@@ -12,12 +12,16 @@ use hwpcraft_doc::model::{
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
 
+#[path = "table_equalize.rs"]
+mod equalize;
+
 /// (command id, Korean label, shortcut) shown in help and command search.
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("table.create", "표 만들기", "Ctrl+N,T"),
     ("table.info", "표 정보", ""),
     ("table.properties.get", "표 속성 조회", ""),
     ("table.properties", "표/셀 속성", "P"),
+    ("table.properties.apply", "표·셀 속성 함께 적용", ""),
     ("table.cell_properties.get", "셀 속성 조회", ""),
     ("table.cell_properties", "셀 속성 / 셀 테두리·배경", "L"),
     ("table.merge", "셀 합치기", "M"),
@@ -79,6 +83,11 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
         "table.properties",
         "table, props{cellSpacing, padding*, pageBreak 0–2, repeatHeader, treatAsChar, textWrap, vertRelTo, horzAlign, *Offset, outerMargin*, hasCaption, caption*…} (HWPUNIT)",
         r##"{"props":{"repeatHeader":true,"hasCaption":true,"captionDirection":3}}"##,
+    ),
+    (
+        "table.properties.apply",
+        "table?, range?, table_props{}, cell_props{}, borders{} → 표·셀 속성을 실행 취소 한 번으로 적용. 하나라도 실패하면 모두 복원",
+        r##"{"table_props":{"outerLeft":567},"cell_props":{"fillColor":"#dbe5f1"}}"##,
     ),
     (
         "table.cell_properties.get",
@@ -382,7 +391,8 @@ const TABLE_KEYS: &[(&str, Kind)] = &[
     ("captionWidth", Kind::Int(0, 170_079)),
     ("captionSpacing", LENGTH),
     ("tableWidth", SIZE),
-    ("tableHeight", SIZE),
+    // Matches table.create and the desktop's total-height field (up to 2 m).
+    ("tableHeight", Kind::Int(283, 566_929)),
 ];
 const CELL_KEYS: &[(&str, Kind)] = &[
     ("width", SIZE),
@@ -665,6 +675,39 @@ impl Session {
                 }
                 let a = self.table_target(p.table)?;
                 self.set_table_properties(a, &p.props)?;
+                Ok(self.info())
+            }
+            "table.properties.apply" => {
+                #[derive(Default, Deserialize)]
+                #[serde(default, deny_unknown_fields)]
+                struct Apply {
+                    table: Option<ObjectAddress>,
+                    range: Option<CellRange>,
+                    table_props: Map<String, Value>,
+                    cell_props: Map<String, Value>,
+                    borders: Option<Map<String, Value>>,
+                }
+                let p: Apply = serde_json::from_value(params)?;
+                let a = self.table_target(p.table)?;
+                if !p.table_props.is_empty()
+                    || !p.cell_props.is_empty()
+                    || p.borders.as_ref().is_some_and(|b| !b.is_empty())
+                {
+                    self.transaction(|s| {
+                        s.set_table_properties(a, &Value::Object(p.table_props))?;
+                        if !p.cell_props.is_empty()
+                            || p.borders.as_ref().is_some_and(|b| !b.is_empty())
+                        {
+                            s.set_cell_properties(
+                                a,
+                                p.range,
+                                &Value::Object(p.cell_props),
+                                p.borders.as_ref(),
+                            )?;
+                        }
+                        Ok(())
+                    })?;
+                }
                 Ok(self.info())
             }
             "table.cell_properties" => {
@@ -1231,6 +1274,11 @@ impl Session {
         }) - setup.left_mm
             - setup.right_mm
             - setup.gutter_mm;
+        // In a section with several columns a table fills the caret's column, as in
+        // Hangul; RHWP would size it from the whole body. Less RHWP's outer margins.
+        let column = self
+            .caret_column_mm()
+            .map(|w| w - 2.0 * 283.0 * 25.4 / 7200.0);
         let widths: Option<Vec<u32>> = match (&p.column_widths_mm, p.width_mm) {
             (Some(list), _) => {
                 if list.len() != cols {
@@ -1239,12 +1287,12 @@ impl Session {
                 Some(list.iter().map(|w| hu(*w)).collect())
             }
             (None, Some(w)) => Some(vec![hu(w / cols as f64); cols]),
-            (None, None) => None,
+            (None, None) => column.map(|w| vec![hu(w / cols as f64); cols]),
         };
         let total_mm: f64 = match (&p.column_widths_mm, p.width_mm) {
             (Some(list), _) => list.iter().sum(),
             (None, Some(w)) => w,
-            (None, None) => body,
+            (None, None) => column.unwrap_or(body),
         };
         if p.column_widths_mm
             .iter()
@@ -1252,6 +1300,7 @@ impl Session {
             .chain(p.width_mm.iter())
             .chain(p.height_mm.iter())
             .any(|v| !v.is_finite() || *v <= 0.0)
+            || p.column_widths_mm.iter().flatten().any(|w| *w < 1.0)
             || total_mm / (cols as f64) < 1.0
             || total_mm > 600.0
         {
@@ -1297,6 +1346,7 @@ impl Session {
                 let at = s.split_offset(c)?;
                 // Cells start in 바탕글's paragraph shape (`plain_table_cells`).
                 let options = hwpcraft_doc::TableCreationOptions {
+                    column_widths: widths.clone().map(hwpcraft_doc::TableColumnWidths::Absolute),
                     cell_para_shape_id: Some(s.plain_para_shape_id()),
                     ..Default::default()
                 };
@@ -1323,13 +1373,9 @@ impl Session {
                 control: index("controlIdx")?,
             };
             s.plain_table_cells(a)?;
-            if !p.treat_as_char
-                && let Some(w) = &widths
-            {
-                s.core
-                    .set_table_column_widths_native(a.section, a.paragraph, a.control, w.clone())
-                    .map_err(err)?;
-            }
+            // Widths are supplied at creation. Resizing a just-created table
+            // replaces its measured total height with minimum cell heights;
+            // a long table in columns can then be mistaken for a single piece.
             if let Some(h) = p.height_mm {
                 let row = hu(h / rows as f64);
                 let t = s.table_at(a)?;
@@ -1350,10 +1396,47 @@ impl Session {
                         &Value::Array(updates).to_string(),
                     )
                     .map_err(err)?;
+                s.sync_absolute_table_size(a)?;
             }
             s.reseat(a, 0, 0)
         })?;
         self.table_target(None)
+    }
+
+    /// Absolute heights must not retain the native resize operation's extra
+    /// natural-line allowance. Keep common dimensions and stored dimensions equal.
+    fn sync_absolute_table_size(&mut self, a: ObjectAddress) -> Result<()> {
+        if let Some(Control::Table(t)) = self
+            .core
+            .document_mut()
+            .sections
+            .get_mut(a.section)
+            .and_then(|section| section.paragraphs.get_mut(a.paragraph))
+            .and_then(|p| p.controls.get_mut(a.control))
+        {
+            t.update_ctrl_dimensions();
+        }
+        self.refresh_layout()
+    }
+
+    /// The width (mm) of the column the caret is in, when its page has several.
+    fn caret_column_mm(&self) -> Option<f64> {
+        let caret = self.caret().ok()?;
+        let x = caret["x"].as_f64()?;
+        let info = self
+            .page_info(u32::try_from(caret["pageIndex"].as_u64()?).ok()?)
+            .ok()?;
+        let columns: Vec<(f64, f64)> = info["columns"]
+            .as_array()?
+            .iter()
+            .filter_map(|c| Some((c["x"].as_f64()?, c["width"].as_f64()?)))
+            .collect();
+        if columns.len() < 2 {
+            return None;
+        }
+        let gap = |(cx, w): &(f64, f64)| (x - (cx + w / 2.0)).abs() - w / 2.0;
+        let (_, w) = columns.iter().min_by(|a, b| gap(a).total_cmp(&gap(b)))?;
+        Some(w * 25.4 / 96.0)
     }
 
     /// Grid, spans, sizes and short cell text for dialogs and block painting.
@@ -1503,6 +1586,17 @@ impl Session {
                         *slot = *v;
                         relayout = true;
                     }
+                    // HWPX writes these fields, while HWP and layout use common.
+                    let saved = match key.as_str() {
+                        "outerLeft" => &mut t.outer_margin_left,
+                        "outerRight" => &mut t.outer_margin_right,
+                        "outerTop" => &mut t.outer_margin_top,
+                        _ => &mut t.outer_margin_bottom,
+                    };
+                    if *saved != *v {
+                        *saved = *v;
+                        relayout = true;
+                    }
                 }
             }
             if relayout {
@@ -1551,6 +1645,7 @@ impl Session {
                         &Value::Array(updates).to_string(),
                     )
                     .map_err(err)?;
+                s.sync_absolute_table_size(a)?;
             }
             Ok(())
         })
@@ -1865,18 +1960,33 @@ impl Session {
             usize::from(r.end_col - r.start_col) + 1,
         );
         let units = if merge_first { 1 } else { cells.len() };
-        let new_rows = usize::from(t.row_count) + block_rows.max(1) * usize::from(rows);
-        let new_cols = usize::from(t.col_count) + block_cols.max(1) * usize::from(columns);
-        if units * usize::from(rows) * usize::from(columns) + t.cells.len() > MAX_CELLS
-            || new_rows > MAX_ROWS + block_rows
-            || new_cols > MAX_COLUMNS + block_cols
+        let single = cells.len() == 1;
+        // A merged cell reuses its existing grid spans. Counting every covered
+        // column as a fresh split rejected valid requests at the grid limit.
+        let (new_rows, new_cols) = if single || merge_first {
+            (
+                usize::from(t.row_count) + usize::from(rows).saturating_sub(block_rows),
+                usize::from(t.col_count) + usize::from(columns).saturating_sub(block_cols),
+            )
+        } else {
+            (
+                usize::from(t.row_count) + block_rows * usize::from(rows - 1),
+                usize::from(t.col_count) + block_cols * usize::from(columns - 1),
+            )
+        };
+        if units * usize::from(rows) * usize::from(columns) + t.cells.len() - cells.len()
+            > MAX_CELLS
+            || new_rows > MAX_ROWS
+            || new_cols > MAX_COLUMNS
             || usize::from(rows) > MAX_ROWS
             || usize::from(columns) > MAX_COLUMNS
         {
             bail!("나눈 뒤 표는 {MAX_ROWS}줄, {MAX_COLUMNS}칸, {MAX_CELLS}셀 이하여야 합니다.");
         }
-        let single = cells.len() == 1;
         self.transaction(|s| {
+            if merge_first && !single {
+                s.merge_cells(a, Some(r))?;
+            }
             if single || merge_first {
                 s.core
                     .split_table_cell_into_native(
@@ -1888,7 +1998,9 @@ impl Session {
                         rows,
                         columns,
                         equal_height,
-                        merge_first,
+                        // RHWP's similarly named flag *unmerges* an existing
+                        // span. Hangul's dialog option merges the chosen block.
+                        false,
                     )
                     .map_err(err)?;
             } else {
@@ -1924,6 +2036,14 @@ impl Session {
     ) -> Result<()> {
         let r = self.block(a, range)?;
         let t = self.table_at(a)?;
+        let partial = if rows {
+            r.start_col != 0 || r.end_col + 1 != t.col_count
+        } else {
+            r.start_row != 0 || r.end_row + 1 != t.row_count
+        };
+        if partial || (!rows && t.cells.iter().any(|c| c.col_span > 1)) {
+            return self.equalize_block_cells(a, r, rows);
+        }
         let (start, end) = if rows {
             (usize::from(r.start_row), usize::from(r.end_row))
         } else {

@@ -2,7 +2,7 @@
 
 HWP/HWPX 문서를 작성·편집·저장하고 PNG/PDF로 검증하는 로컬 헤드리스 서버입니다. 데스크톱과 같은 HwpCraft `Session` 명령·문서 모델을 사용합니다. 한컴 COM이나 실행 중인 GUI 창을 제어하지 않습니다.
 
-현재 소스는 공식 Rust SDK `rmcp 3.7.0`을 사용하며 **MCP `2026-07-28`과 2025년 판(`2025-03-26`, `2025-06-18`, `2025-11-25`)을 함께 지원**합니다(0.20). 2026-07-28 클라이언트(Claude Code 등)는 요청마다 메타데이터를 보내는 무상태 방식으로, 2025년 판 클라이언트(Codex CLI, Cursor, VS Code, Claude Desktop, Python SDK 1.x 등)는 `initialize` 핸드셰이크로 연결합니다. 설치된 이전 실행 파일은 소스와 기능이 다를 수 있으므로, 사용할 실행 파일의 `mcp --help`와 실제 discovery를 확인하세요. 명령 등록은 아래한글 기능 전체의 완성도나 모든 옵션의 호환성 검증을 뜻하지 않습니다.
+현재 소스는 공식 Rust SDK `rmcp 3.8.0`을 사용하며 **MCP `2026-07-28`과 2025년 판(`2025-03-26`, `2025-06-18`, `2025-11-25`)을 함께 지원**합니다(0.20). 2026-07-28 클라이언트(Claude Code 등)는 요청마다 메타데이터를 보내는 무상태 방식으로, 2025년 판 클라이언트(Codex CLI, Cursor, VS Code, Claude Desktop, Python SDK 1.x 등)는 `initialize` 핸드셰이크로 연결합니다. 설치된 이전 실행 파일은 소스와 기능이 다를 수 있으므로, 사용할 실행 파일의 `mcp --help`와 실제 discovery를 확인하세요. 명령 등록은 아래한글 기능 전체의 완성도나 모든 옵션의 호환성 검증을 뜻하지 않습니다.
 
 ## 실행과 연결
 
@@ -152,9 +152,9 @@ PowerShell에서는 `$env:HWPCRAFT_MCP_TOKEN = Get-Content "$env:APPDATA\HwpCraf
 | `execute` | `command`, `params?`: 공통 엔진 명령 |
 | `batch` | `commands:[{command,params?}]`, `keepGoing?`, `atomic?`: 1–1,000개 순차 실행 |
 | `new_document` | `force?`: 새 독립 문서 또는 지정 문서 초기화 |
-| `open_document` | `path`, `force?`: 파일 열기 |
+| `open_document` | `path`, `force?`: 파일 열기(HWP·HWPX·HWP3·HML, Word `.docx`는 한글 문서로 바꿔 엶) |
 | `open_protected_document` | `path`, `password`, `force?`: 암호 파일 열기 |
-| `save_document` | `path?`: HWP/HWPX 저장, PDF/TXT/DOCX 내보내기(DOCX 결과의 `omitted`에 담지 못한 것 목록: 그리기 개체·수식·문단 번호 글자 등). 생략하면 현재 저장 경로. `acceptTrackChanges?`(기본 false): 한글 변경 추적 기록이 있는 문서는 HWP·HWPX로 저장하면 고쳤든 아니든 기록을 그대로 두고(결과의 `trackChangesKept`), DOCX·암호를 건 HWP는 기록을 담지 못해 거절하며, true면 모든 변경을 적용한 결과본(삭제한 글은 지우고 삽입한 글은 남김)으로 저장하고 변경 기록을 지움. 변경 목록은 `execute document.track_changes`, 적용·취소는 `document.track_changes.accept`·`.reject`, 기록하며 편집하기는 `document.track_changes.record`(`execute document.track_changes`로 상태 확인) 그림 효과(그림자·네온·부드러운 가장자리·반사)는 .hwp와 HWPX 모두에 저장됩니다(`picture.effects`로 넣은 효과, HWPX에서 읽은 효과 포함). `dropPictureEffects?`는 예전 호출과의 호환을 위해 받기만 하고 아무것도 빼지 않으며, 결과의 `droppedPictureEffects`는 0입니다. |
+| `save_document` | `path?`: HWP/HWPX 저장, PDF/TXT/DOCX 내보내기(DOCX 결과의 `omitted`에 담지 못한 것 목록: 그림으로 바꾼 수식·차트·그리기 개체 등). 생략하면 현재 저장 경로. `acceptTrackChanges?`(기본 false): 한글 변경 추적 기록이 있는 문서는 HWP·HWPX로 저장하면 고쳤든 아니든 기록을 그대로 두고(결과의 `trackChangesKept`), DOCX·암호를 건 HWP는 기록을 담지 못해 거절하며, true면 모든 변경을 적용한 결과본(삭제한 글은 지우고 삽입한 글은 남김)으로 저장하고 변경 기록을 지움. 변경 목록은 `execute document.track_changes`, 적용·취소는 `document.track_changes.accept`·`.reject`, 기록하며 편집하기는 `document.track_changes.record`(`execute document.track_changes`로 상태 확인) 그림 효과(그림자·네온·부드러운 가장자리·반사)는 .hwp와 HWPX 모두에 저장됩니다(`picture.effects`로 넣은 효과, HWPX에서 읽은 효과 포함). `dropPictureEffects?`는 예전 호출과의 호환을 위해 받기만 하고 아무것도 빼지 않으며, 결과의 `droppedPictureEffects`는 0입니다. |
 | `close_document` | `force?`: 지정 문서 닫기 |
 | `list_documents` | 입력 없음: 데스크톱 HwpCraft 사용자가 MCP에 공유한 문서의 `document_id`·제목·경로·미저장 여부. MCP로 만든 문서는 나열하지 않음 |
 | `type_text` | `text`: 선택 대체 또는 커서 입력, 줄바꿈은 새 문단 |
@@ -199,6 +199,8 @@ PowerShell에서는 `$env:HWPCRAFT_MCP_TOKEN = Get-Content "$env:APPDATA\HwpCraf
 커서·문단·셀 인덱스는 0부터, `occurrence`와 `render_page`/`page.layout.get`의 쪽은 1부터입니다. 커서 offset은 **Unicode 스칼라** 개수입니다. `가😀한글`에서 `한글`은 offset 2에 시작합니다. UTF-8 바이트나 UTF-16 단위가 아닙니다. `inspect_document.charShapes`의 native 위치를 커서 offset으로 그대로 사용하지 마세요.
 
 `get_text`/`inspect_document`는 기본 100개, 최대 1,000개 문단을 반환합니다. `nextStart`가 null일 때까지 이어서 읽으세요. 머리말·글상자·주석·중첩 표를 모두 평탄화하지 않습니다. 해당 내용은 `context.v2.list/get`과 개체별 조회 명령으로 탐색합니다. 편집은 반환된 주소와 최신 `generation`을 사용합니다. 본문 상용구도 공통 `tools.autotext.body.*` 명령으로 등록·미리보기·삽입할 수 있으며 지원 문맥과 거절 조건은 [명령 안내](mcp-commands.md)에 있습니다.
+
+머리말·꼬리말 안의 그림·도형·글상자·표는 `page.header_footer.object.list`로 찾고, 돌려받은 `address`(`{section, paragraph, control, header_footer: {paragraph, control}}`, 앞 셋은 머리말 안의 자리, `header_footer`는 본문의 머리말·꼬리말 컨트롤)를 `object.properties(.get)`·`object.size`·`object.move_by`·`object.rotate`·`object.delete`·`textbox.*` 같은 본문 개체 명령에 그대로 씁니다. 한 번 실행 취소되며, `page.layout.get`(include_controls)의 `controlLayout`에서 `headerFooter`가 붙은 항목도 같은 주소입니다. 머리말·꼬리말 글은 `context.v2.*`로 고칩니다. `page.header_footer.text`는 글 한 줄과 쪽 번호 같은 필드만 있는 머리말·꼬리말을 다시 쓰며, 그림·표·여러 문단·여러 글자 모양이 있으면 거절합니다(`page.header_footer.text.get`의 `lossless`·`lossy`).
 
 새 차트는 본문의 `chart.create`로 15종을 작성합니다. 기본 5종(`column`, `bar`, `line`, `pie`, `doughnut`)에 분산형(`scatter`), 주가형(`stock_hlc`, `stock_ohlc`), 3D형(`column_3d`, `bar_3d`, `pie_3d`), 0.19에서 더한 `combo`(계열마다 막대·꺾은선, 보조 축), `area`, `radar`(표준·표식·채움), `bubble`(거품 크기)이 있습니다. 먼저 `chart.types`로 종류별 제약을 조회하세요. `chart.definition.get {index}`로 자체 차트의 현재 XML 기반 전체 구성을 읽고 `chart.configure`로 변경합니다. 분산형은 계열별 공통 `x_values`와 같은 점 개수가 필요하며, 주가형은 고정된 계열 순서와 가격 범위를 검사합니다. 다른 기존 차트의 지원되는 값 편집은 `chart.data` 경로입니다. 생성 결과의 `nativeInterop:"unverified"`는 한컴에서 새 출력물을 열고 고치는 호환성을 아직 확인하지 않았다는 뜻입니다. HwpCraft의 HWP/HWPX 자체 왕복·PNG·PDF 검사와 별개입니다. 이 15종 밖의 종류(표면형 등)나 중첩·그룹 도넛 표시는 지원하지 않습니다. [차트 인자 예제](mcp-commands.md#차트-만들기구성-변경)를 참고하세요.
 

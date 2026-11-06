@@ -1,0 +1,211 @@
+diff --git a/src/document_core/commands/object_ops/table.rs b/src/document_core/commands/object_ops/table.rs
+index 3d9b972d8..de446decd 100644
+--- a/src/document_core/commands/object_ops/table.rs
++++ b/src/document_core/commands/object_ops/table.rs
+@@ -2115,4 +2115,160 @@ mod topbottom_table_next_paragraph_tests {
+         assert!(dh > 0, "host moved {dh}");
+         assert_eq!(dn, dh, "next paragraph moved {dn}, host {dh}");
+     }
++
++    fn first(core: &DocumentCore, pi: usize) -> i32 {
++        core.document().sections[0].paragraphs[pi].line_segs[0].vertical_pos
++    }
++
++    /// 줄을 한글이 저장한 줄로 바꾼다: RHWP 표시를 지우고 줄을 차례로 쌓되, 다음 문단은
++    /// 한글처럼 host 첫 줄 + 표 상자 아래끝에 둔다(빈 host 911건 실측). 그 거리를 준다.
++    fn hangul_rows(core: &mut DocumentCore) -> i32 {
++        hangul_rows_with(core, false)
++    }
++
++    /// `below` 면 한글이 글 있는 host 를 저장하듯 host 첫 줄을 표 상자 아래에 두고 다음
++    /// 문단은 host 줄 바로 뒤에 둔다.
++    fn hangul_rows_with(core: &mut DocumentCore, below: bool) -> i32 {
++        let paragraphs = &mut core.document_mut().sections[0].paragraphs;
++        let box_end = paragraphs[1]
++            .controls
++            .iter()
++            .find_map(|ctrl| match ctrl {
++                Control::Table(table) => Some(
++                    (table.common.vertical_offset as i32).max(0)
++                        + i32::from(table.outer_margin_top)
++                        + table.common.height as i32
++                        + i32::from(table.outer_margin_bottom),
++                ),
++                _ => None,
++            })
++            .unwrap();
++        let (mut vpos, mut host) = (0, 0);
++        for (pi, para) in paragraphs.iter_mut().enumerate() {
++            if pi == 1 {
++                host = vpos;
++                if below {
++                    vpos += box_end;
++                }
++            }
++            if pi == 2 {
++                vpos = vpos.max(host + box_end);
++            }
++            for line in &mut para.line_segs {
++                line.tag &= !LineSeg::TAG_IMPLEMENTATION_PROPERTY;
++                line.vertical_pos = vpos;
++                vpos += line.line_height + line.line_spacing;
++            }
++        }
++        box_end
++    }
++
++    /// 한글이 저장한 줄에서 빈 host 에 글자를 치면 다음 문단은 저장된 자리(표 상자
++    /// 아래)에 그대로 있어야 한다 — host 줄 끝으로 다시 이으면 표 안으로 올라간다.
++    #[test]
++    fn typing_into_a_host_with_hangul_rows_keeps_the_next_paragraph_below_the_table() {
++        let mut core = document(None);
++        hangul_rows(&mut core);
++        let next = first(&core, 2);
++        let (_, bottom, before) = geometry(&core);
++        assert!(
++            before >= bottom,
++            "stored: box bottom {bottom} next {before}"
++        );
++        core.insert_text_native(0, 1, 0, "가나").unwrap();
++        assert_eq!(
++            first(&core, 2),
++            next,
++            "the next paragraph keeps its stored place"
++        );
++        let (_, bottom, after) = geometry(&core);
++        assert!(
++            after >= bottom - 0.5,
++            "box and host text bottom {bottom}, next {after}"
++        );
++    }
++
++    /// host 의 줄이 저장된 거리를 넘게 자라면 다음 문단은 host 마지막 줄 아래로 밀린다.
++    #[test]
++    fn a_host_with_hangul_rows_that_grows_past_the_stored_gap_pushes_the_next_paragraph() {
++        let mut core = document(None);
++        let box_end = hangul_rows(&mut core);
++        let next = first(&core, 2);
++        core.insert_text_native(0, 1, 0, &"가나다라마바사아자차".repeat(60))
++            .unwrap();
++        let paragraphs = &core.document().sections[0].paragraphs;
++        let host = &paragraphs[1].line_segs;
++        let last = host.last().unwrap();
++        let host_end = last.vertical_pos + last.line_height;
++        assert!(
++            host_end - host[0].vertical_pos > box_end,
++            "the host grew past the box: {} lines, end {host_end}, box {box_end}",
++            host.len()
++        );
++        assert!(
++            first(&core, 2) >= host_end && first(&core, 2) > next,
++            "next {} (stored {next}), host end {host_end}",
++            first(&core, 2)
++        );
++    }
++
++    /// host 에 친 글을 다 지우면 다음 문단은 저장된 자리(표 상자 아래)로 돌아온다 —
++    /// 앞 편집에서 밀린 자리가 바닥이 되면 안 된다. `spacing` 은 다음 문단의 문단 위
++    /// 간격(HWPUNIT): 문단 사이 간격이 있어도 같아야 한다.
++    fn delete_what_was_typed(spacing: Option<i32>) {
++        let mut core = document(None);
++        if let Some(spacing) = spacing {
++            core.apply_para_format_native(0, 2, &format!(r#"{{"spacingBefore":{spacing}}}"#))
++                .unwrap();
++        }
++        hangul_rows(&mut core);
++        let next = first(&core, 2);
++        let text = "가나다라마바사아자차".repeat(60);
++        core.insert_text_native(0, 1, 0, &text).unwrap();
++        assert!(first(&core, 2) > next, "typing pushed the next paragraph");
++        core.delete_text_native(0, 1, 0, text.chars().count())
++            .unwrap();
++        assert_eq!(
++            first(&core, 2),
++            next,
++            "the next paragraph is back at its stored place"
++        );
++        let (_, bottom, after) = geometry(&core);
++        assert!(
++            after >= bottom - 0.5 && after < bottom + 40.0,
++            "box bottom {bottom}, next {after}"
++        );
++    }
++
++    #[test]
++    fn deleting_what_was_typed_into_a_host_with_hangul_rows_brings_the_next_paragraph_back() {
++        delete_what_was_typed(None);
++    }
++
++    #[test]
++    fn deleting_what_was_typed_brings_the_next_paragraph_back_across_paragraph_spacing() {
++        delete_what_was_typed(Some(1000));
++    }
++
++    /// 한글이 host 줄을 이미 표 상자 아래에 저장했으면 그 줄 끝이 다음 문단을 이끈다 —
++    /// host 글을 지우면 다음 문단도 따라 올라온다.
++    #[test]
++    fn a_host_whose_line_hangul_stored_below_the_table_lets_the_next_paragraph_follow_it_up() {
++        let mut core = document(None);
++        let text = "가나다라마바사아자차".repeat(60);
++        core.insert_text_native(0, 1, 0, &text).unwrap();
++        hangul_rows_with(&mut core, true);
++        let next = first(&core, 2);
++        core.delete_text_native(0, 1, 0, text.chars().count() - 10)
++            .unwrap();
++        assert!(
++            first(&core, 2) < next,
++            "the next paragraph followed the host up"
++        );
++        let (_, bottom, after) = geometry(&core);
++        assert!(
++            after >= bottom - 0.5 && after < bottom + 40.0,
++            "box and host text bottom {bottom}, next {after}"
++        );
++    }
+ }
+diff --git a/src/renderer/composer/line_breaking.rs b/src/renderer/composer/line_breaking.rs
+index 90e161b73..18a86ca21 100755
+--- a/src/renderer/composer/line_breaking.rs
++++ b/src/renderer/composer/line_breaking.rs
+@@ -5288,7 +5288,40 @@ pub(crate) fn recalculate_section_vpos(
+             let gap = prev_idx
+                 .map(|pp| boundary_gap(&paragraphs[pp], &paragraphs[pi]))
+                 .unwrap_or(0);
+-            next_vpos.saturating_add(gap) - current_start
++            let flow = next_vpos.saturating_add(gap);
++            // [HwpCraft 0112] 한글이 저장한 줄의 구역에서 편집한 문단이 문단 기준
++            // 자리차지 표의 host 면 다음 문단을 줄 끝으로 다시 잇지 않는다 — 이 구역의
++            // seg_end 에는 표 상자가 없어 다음 문단이 표 안으로 끌려 올라간다. 다음
++            // 문단은 저장된 자리를 지키되 host 높이가 줄어든 만큼은 따라 올라오고
++            // (자라면 줄 끝이 민다), 저장된 host 첫 줄 + 표 상자 아래에 있었으면 host
++            // 첫 줄 + 표 상자 아래끝보다 위로는 올리지 않는다. 둘 다 이번 편집 전후의
++            // host 로만 정해 앞 편집이 쌓이지 않는다.
++            let kept = prev_idx
++                .filter(|&pp| {
++                    !own_rows
++                        && pp == start_para
++                        && !is_ignored(pp)
++                        && !is_ignored(pi)
++                        && is_original_lineseg
++                        && para_topbottom_table_box_end_hu(&paragraphs[pp]).is_some()
++                })
++                .and_then(|pp| {
++                    let box_end = para_topbottom_table_box_end_hu(&paragraphs[pp])?;
++                    let stored_first = orig_prev_first?;
++                    let first = paragraphs[pp].line_segs.first()?.vertical_pos;
++                    let floor = (current_start >= stored_first.saturating_add(box_end))
++                        .then(|| first.saturating_add(box_end));
++                    let carry = start_stored_end
++                        .filter(|&end| end <= current_start)
++                        .map(|end| {
++                            let grew = next_vpos
++                                .saturating_sub(first)
++                                .saturating_sub(end.saturating_sub(stored_first));
++                            current_start.saturating_add(grew.min(0))
++                        });
++                    floor.max(carry)
++                });
++            kept.map_or(flow, |kept| flow.max(kept)) - current_start
+         } else {
+             // 미변조 연속 경계 — 직전 delta 캐리로 기존 간격을 정확히 보존.
+             prev_delta

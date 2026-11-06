@@ -75,6 +75,10 @@ impl PdfSlot {
     pub(crate) fn busy(&self) -> bool {
         self.worker.is_some()
     }
+    /// A close request held back for the work that just ended (now cleared).
+    pub(crate) fn take_close_after(&mut self) -> bool {
+        std::mem::take(&mut self.close_after)
+    }
     pub(crate) fn start(
         &mut self,
         pages: usize,
@@ -179,7 +183,12 @@ impl HwpApp {
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         self.pdf.close_after = true;
-        self.message = "PDF 저장이 끝나면 창을 닫습니다. 지금 닫으려면 닫기를 한 번 더 누르세요 (PDF는 저장되지 않습니다).".into();
+        self.message = if self.printing() {
+            "인쇄를 마치는 중입니다. 끝나면 창을 닫습니다. 지금 닫으려면 닫기를 한 번 더 누르세요 (보내지 못한 쪽은 인쇄되지 않습니다)."
+        } else {
+            "PDF 저장이 끝나면 창을 닫습니다. 지금 닫으려면 닫기를 한 번 더 누르세요 (PDF는 저장되지 않습니다)."
+        }
+        .into();
         self.pdf.progress.clear();
         true
     }

@@ -19,7 +19,6 @@ fn caret_y(s: &Session) -> anyhow::Result<f64> {
 }
 
 #[test]
-#[ignore = "0.21: RHWP hit_test_native returns offsets one short on lines after an inline object, so the probe lands a line too far (being fixed)"]
 fn down_and_up_leave_a_line_made_tall_by_an_inline_shape() -> anyhow::Result<()> {
     let mut s = Session::new()?;
     let text = "글자처럼 취급한 도형이 첫 줄을 높게 만든다. ".repeat(12);

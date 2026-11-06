@@ -11,6 +11,8 @@ mod comments_editor;
 mod context_editor;
 mod context_editor_v2;
 mod document_scroll;
+#[cfg(test)]
+mod drag_select_tests;
 mod ext_core;
 mod ext_format;
 mod ext_object;
@@ -18,9 +20,13 @@ mod ext_shell;
 mod ext_table;
 mod extensions;
 mod feature_dialogs;
+mod file_drop;
 mod find_dialog;
 mod format_dialogs;
 mod hanja_dialog;
+mod hf_edit;
+mod hf_objects;
+mod hf_shell;
 mod icons;
 #[cfg(test)]
 mod input_format_tests;
@@ -29,6 +35,8 @@ mod mcp_bridge;
 mod nested_edit;
 mod object_dialogs;
 mod page_setup;
+#[cfg(test)]
+mod paste_picture_tests;
 mod pdf_export;
 mod platform;
 pub use platform::{app_icon, write_icon_png};
@@ -110,10 +118,15 @@ pub struct HwpApp {
     editor_cursor: Cursor,
     editor_generation: u64,
     preedit: String,
+    /// Paste commands egui sent nothing for (a clipboard without text).
+    paste_keys: clipboard::PasteKeys,
     frames: u64,
     screenshot: Option<PathBuf>,
     exit_after_screenshot: bool,
     ext: extensions::ExtState,
+    file_drop: file_drop::FileDrop,
+    hf: hf_shell::HfShell,
+    hf_object: hf_objects::HfObject,
     /// Kept for start-up views and module hooks that run outside a frame.
     ctx: egui::Context,
     find_state: find_dialog::FindState,
@@ -345,10 +358,14 @@ impl HwpApp {
             editor_cursor: Cursor::default(),
             editor_generation: u64::MAX,
             preedit: String::new(),
+            paste_keys: Default::default(),
             frames: 0,
             screenshot,
             exit_after_screenshot,
             ext: extensions::ExtState::default(),
+            file_drop: file_drop::FileDrop::default(),
+            hf: Default::default(),
+            hf_object: Default::default(),
             ctx,
             find_state: find_dialog::FindState::default(),
             page_sizes: (u64::MAX, Vec::new()),
@@ -370,7 +387,7 @@ impl HwpApp {
         }
     }
     fn command(&mut self, command: Command) {
-        if self.nested_command(&command).is_some() {
+        if self.hf_command(&command).is_some() || self.nested_command(&command).is_some() {
             return;
         }
         let r = self.session.execute(command);
@@ -379,7 +396,10 @@ impl HwpApp {
         self.follow_cursor();
     }
     fn run(&mut self, id: &str, params: serde_json::Value) -> bool {
-        if let Some(success) = self.nested_run(id, &params) {
+        if let Some(success) = self
+            .hf_run(id, &params)
+            .or_else(|| self.nested_run(id, &params))
+        {
             return success;
         }
         let result = self.session.run(id, params);
@@ -387,6 +407,41 @@ impl HwpApp {
         self.sync_formatting();
         self.follow_cursor();
         success
+    }
+    /// Paste the clipboard's picture when the text that came with it is no more
+    /// than the picture's address (`None`: no text): picture files copied in a file
+    /// manager, else a copied bitmap. `false` when there is no picture, so a text
+    /// paste can go ahead.
+    fn paste_picture(&mut self, text: Option<&str>) -> bool {
+        // Nested text and a header or footer being edited keep their own paste; a
+        // 배포용 문서 takes none.
+        if text.is_some_and(|text| !clipboard::only_names_a_picture(text))
+            || self.session.nested_caret().is_some()
+            || self.session.hf_target().is_some()
+            || self.session.is_distribution()
+        {
+            return false;
+        }
+        let Some(picture) = clipboard::picture() else {
+            return false;
+        };
+        match picture {
+            Ok(clipboard::Picture::Files(paths)) => {
+                for path in paths {
+                    if !self.run("picture.insert", json!({"path": path})) {
+                        break;
+                    }
+                }
+            }
+            Ok(clipboard::Picture::Png(bytes)) => {
+                let r = self.session.paste_picture(&bytes);
+                self.result(r);
+                self.sync_formatting();
+                self.follow_cursor();
+            }
+            Err(error) => self.error = Some(error),
+        }
+        true
     }
     fn sync_formatting(&mut self) {
         if self.show_character || self.show_paragraph {
@@ -444,7 +499,14 @@ impl HwpApp {
             Pending::Open(path) => match self.session.open(&path) {
                 Ok(()) => {
                     self.page = 0;
-                    self.message = format!("열기 완료 · {}", path.display());
+                    self.message = match self.session.import_notes() {
+                        [] => format!("열기 완료 · {}", path.display()),
+                        notes => format!(
+                            "Word 문서를 한글 문서로 열었습니다 · {} · 바꾸어 담은 것: {}",
+                            path.display(),
+                            notes.join(", ")
+                        ),
+                    };
                 }
                 Err(e) if hwpcraft_formats::needs_password(&e) => {
                     self.password_prompt = Some(PasswordPrompt {
@@ -466,7 +528,9 @@ impl HwpApp {
     }
     fn open(&mut self, ctx: &egui::Context) {
         if let Some(p) = rfd::FileDialog::new()
+            .add_filter("한글·Word 문서", &["hwp", "hwpx", "docx", "docm", "dotx"])
             .add_filter("한글 문서", &["hwp", "hwpx"])
+            .add_filter("Word 문서 (DOCX)", &["docx", "docm", "dotx"])
             .pick_file()
         {
             self.request(Pending::Open(p), ctx);
@@ -913,6 +977,7 @@ impl HwpApp {
                 egui::Sense::click_and_drag()
             },
         );
+        self.file_drop.pages.push((page, rect));
         // One shared focus target keeps keyboard and IME routing independent of the page.
         let canvas = egui::Id::new("document-canvas");
         if response.clicked() || response.drag_started() || response.secondary_clicked() {
@@ -954,21 +1019,36 @@ impl HwpApp {
                 );
             }
         }
-        // Module canvas modes (e.g. table cell blocks) may take over pointer input.
-        if !locked && !self.ext_canvas(page, &response, rect) {
+        self.hf_paint(ui.painter(), page, rect);
+        // Header/footer editing, then module canvas modes (e.g. table cell blocks) may
+        // take over pointer input.
+        if !locked
+            && !self.hf_canvas(page, &response, rect)
+            && !self.ext_canvas(page, &response, rect)
+        {
             let hit = |s: &Self, p: Pos2| {
                 let pos = (p - rect.min) / s.zoom;
                 s.session.hit_test(page, pos.x as f64, pos.y as f64)
             };
-            // A drag that starts in a nested cell or text box puts the nested caret at
-            // the press point first, so the drag selects from there (over paragraphs).
+            // A new drag selects from the press point, whatever was selected before:
+            // the caret goes there first (the body caret, or the nested caret in a
+            // nested cell or text box), and the drag extends from it. Shift+drag keeps
+            // extending the current selection.
             if response.drag_started()
                 && !ctx.input(|i| i.modifiers.shift)
                 && let Some(o) = ctx.input(|i| i.pointer.press_origin())
-                && hit(self, o).is_err()
             {
-                let pos = (o - rect.min) / self.zoom;
-                self.nested_click(page, pos.x as f64, pos.y as f64, false);
+                match hit(self, o) {
+                    Ok(c) => {
+                        self.session.clear_nested();
+                        let r = self.session.select(c, false);
+                        self.result(r);
+                    }
+                    Err(_) => {
+                        let pos = (o - rect.min) / self.zoom;
+                        self.nested_click(page, pos.x as f64, pos.y as f64, false);
+                    }
+                }
             }
             if (response.clicked() || response.dragged())
                 && let Some(p) = response.interact_pointer_pos()
@@ -1021,7 +1101,10 @@ impl HwpApp {
         if !locked {
             response.context_menu(|ui| self.canvas_context_menu(ui));
         }
-        let Some(caret) = caret.filter(|c| c["pageIndex"].as_u64() == Some(page as u64)) else {
+        // The body caret hides while a header or footer is edited (hf_shell draws its own).
+        let Some(caret) = caret.filter(|c| {
+            c["pageIndex"].as_u64() == Some(page as u64) && self.session.hf_target().is_none()
+        }) else {
             return;
         };
         let x = caret["x"].as_f64().unwrap_or(0.0) as f32 * self.zoom + rect.min.x;
@@ -1125,7 +1208,33 @@ impl HwpApp {
         }
         let events = ctx.input(|i| i.events.clone());
         let canvas = ctx.memory(|m| m.focused() == Some(egui::Id::new("document-canvas")));
+        let now = ctx.input(|i| i.time);
         for event in events {
+            // A copied picture: egui sends no paste without text on the clipboard.
+            if self.paste_keys.swallowed(&event, now) && self.preedit.is_empty() {
+                if canvas {
+                    self.paste_picture(None);
+                } else if ctx.memory(|m| m.has_focus(egui::Id::new("ai-panel-input-box"))) {
+                    // A picture pasted into the AI question box is attached.
+                    self.ai_attach_clipboard();
+                }
+            }
+            // A header or footer being edited takes the keyboard (Esc leaves it, even
+            // after egui dropped the canvas focus on it).
+            let escape = matches!(
+                event,
+                Event::Key {
+                    key: Key::Escape,
+                    pressed: true,
+                    ..
+                }
+            );
+            if (canvas || escape) && self.hf_key_event(&event) {
+                if escape {
+                    ctx.memory_mut(|m| m.request_focus(egui::Id::new("document-canvas")));
+                }
+                continue;
+            }
             // egui drops the canvas focus on Esc before this runs; Esc still leaves the
             // nested caret, and the body caret takes the keyboard again.
             if self.session.nested_caret().is_some()
@@ -1244,6 +1353,9 @@ impl HwpApp {
                     self.follow_cursor();
                 }
                 Event::Paste(t) if canvas => {
+                    if self.paste_picture(Some(&t)) {
+                        continue;
+                    }
                     let html = clipboard::html();
                     let r = self.session.paste_with_html(&t, html.as_deref());
                     self.result(r);
@@ -1341,6 +1453,19 @@ impl HwpApp {
             || self.ext_modal_open()
             || self.ai_locked()
         {
+            return;
+        }
+        // A header or footer edited on the page keeps its keys from the body's shortcuts;
+        // saving still works.
+        if self.session.hf_target().is_some() {
+            let save = egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            };
+            if ctx.input_mut(|i| i.consume_key(save, Key::S)) {
+                self.save(false, None);
+            }
             return;
         }
         if self.ext_keys(ctx) || self.ext_shortcuts(ctx) {
@@ -1591,9 +1716,15 @@ impl eframe::App for HwpApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending = Some(Pending::Quit);
         }
-        let dropped = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_owned()));
-        if let Some(path) = dropped {
-            self.request(Pending::Open(path), ctx);
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_owned())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.drop_files(&dropped, ctx);
         }
         let events = ctx.input(|i| i.events.clone());
         for event in events {
@@ -1621,6 +1752,7 @@ impl eframe::App for HwpApp {
         // Timed only while a bench runs (`--view bench-edit`), with eframe's time for the
         // last frame (ui and painting, not the wait for the screen).
         let mut laps = ext_shell::Laps::new(self.ext.shell.bench_running());
+        self.file_drop.pages.clear();
         self.ext.shell.frame_cpu_ms = frame.info().cpu_usage.map(|s| f64::from(s) * 1000.0);
         self.sync_formatting();
         laps.mark();
@@ -1648,6 +1780,7 @@ impl eframe::App for HwpApp {
         self.dialogs(&ctx);
         laps.mark();
         self.ext.shell.laps = laps.done();
+        self.file_drop_ui(&ctx);
         self.frames += 1;
         if self.screenshot.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));

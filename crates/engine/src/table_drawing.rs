@@ -15,7 +15,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const PARAMS: &[(&str, &str, &str)] = &[
     (
         "table.move",
-        "지금 쪽 안에서 최상위 표를 옮깁니다. page는 0부터, dx_mm/dy_mm은 옮길 밀리미터. 글자처럼 취급한 표는 떠 있는 표가 되고, 나뉜 표는 거절합니다.",
+        "최상위 표를 옮깁니다. page는 표가 보이는 쪽(0부터), dx_mm/dy_mm은 옮길 밀리미터. 여러 쪽에 나뉜 표도 표 전체가 함께 옮겨집니다. 표의 기준(문단·쪽·종이)은 그대로 두고 오프셋만 바꾸며, 글자처럼 취급한 표는 떠 있는 표가 됩니다. 표가 용지 밖으로 나가거나 그 자리에서 쪽 안에 들어가지 않으면 거절하고 문서는 그대로 둡니다.",
         r##"{"table":{"section":0,"paragraph":0,"control":0},"page":0,"dx_mm":10,"dy_mm":5}"##,
     ),
     (
@@ -125,35 +125,23 @@ impl Session {
         }
         let a = p.table;
         let find = |s: &Self| -> Result<Value> {
-            let layout: Value = serde_json::from_str(&s.page_control_layout(p.page)?)?;
-            layout["controls"]
-                .as_array()
+            s.table_pieces(a, p.page)?
                 .into_iter()
-                .flatten()
-                .find(|t| {
-                    t["type"] == "table"
-                        && t["secIdx"] == a.section
-                        && t["paraIdx"] == a.paragraph
-                        && t["controlIdx"] == a.control
-                })
-                .cloned()
+                .next()
                 .ok_or_else(|| anyhow!("현재 쪽에서 표를 찾지 못했습니다."))
         };
         let before = find(self)?;
-        // A split table cannot be moved as if its fragment were the entire object.
-        for page in 0..self.page_count()? {
-            if page == p.page {
-                continue;
-            }
-            let l: Value = serde_json::from_str(&self.page_control_layout(page)?)?;
-            if l["controls"].as_array().into_iter().flatten().any(|t| {
-                t["type"] == "table"
-                    && t["secIdx"] == a.section
-                    && t["paraIdx"] == a.paragraph
-                    && t["controlIdx"] == a.control
-            }) {
-                bail!("여러 쪽에 걸친 표는 표/셀 속성에서 위치를 조절하세요.");
-            }
+        // A table split across pages or columns moves as a whole, not as its piece
+        // here. Its pieces are on consecutive pages around this one.
+        let mut first_page = p.page;
+        while first_page > 0 && !self.table_pieces(a, first_page - 1)?.is_empty() {
+            first_page -= 1;
+        }
+        let split = first_page < p.page
+            || self.table_pieces(a, p.page)?.len() > 1
+            || (p.page + 1 < self.page_count()? && !self.table_pieces(a, p.page + 1)?.is_empty());
+        if split {
+            return self.move_split_table(&p, &before, first_page);
         }
         let x = before["x"]
             .as_f64()
@@ -177,17 +165,137 @@ impl Session {
         if p.dx_mm.abs() < 0.001 && p.dy_mm.abs() < 0.001 {
             return Ok(());
         }
+        // It keeps its horizontal and vertical references (paragraph, page, paper):
+        // a paragraph-anchored table moved once still follows its text and can
+        // still run onto the next page, as in Hangul.
+        self.place_table(a, p.page, x, y, None)
+    }
+    /// The boxes (page px) of top-level table `a`'s pieces on `page`: none, one,
+    /// or one per column it runs through.
+    fn table_pieces(&self, a: ObjectAddress, page: u32) -> Result<Vec<Value>> {
+        let layout: Value = serde_json::from_str(&self.page_control_layout(page)?)?;
+        Ok(layout["controls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| ObjectAddress::top_level_table(t) == Some(a))
+            .cloned()
+            .collect())
+    }
+    /// Move a table split across pages or columns, as Hangul does when one of its
+    /// pieces is dragged: the whole table moves by the drag, every piece sideways by
+    /// the same amount (each stays in its own column), and down or up it starts that
+    /// much lower or higher and still flows on. It keeps its horizontal reference
+    /// (paper, page, column or paragraph); vertically it is anchored to its
+    /// paragraph, which Hangul's split tables always are: a paper-placed table no
+    /// longer flows across pages. Offsets are found by measuring the first piece
+    /// with no offset, then corrected once.
+    fn move_split_table(&mut self, p: &MoveTable, here: &Value, first_page: u32) -> Result<()> {
+        let a = p.table;
+        let first_piece = |s: &Self| -> Result<Option<(f64, f64)>> {
+            Ok(s.table_pieces(a, first_page)?
+                .first()
+                .and_then(|t| Some((t["x"].as_f64()?, t["y"].as_f64()?))))
+        };
+        let (fx, fy) =
+            first_piece(self)?.ok_or_else(|| anyhow!("표의 첫 쪽을 찾지 못했습니다."))?;
+        let (dx, dy) = (p.dx_mm * 96.0 / 25.4, p.dy_mm * 96.0 / 25.4);
+        let num = |v: &Value, k: &str| v[k].as_f64().ok_or_else(|| anyhow!("표 위치 오류"));
+        let (x, y) = (fx + dx, fy + dy);
+        let paper = self.page_info(first_page)?;
+        let (paper_w, paper_h) = (
+            paper["width"].as_f64().unwrap_or(0.0),
+            paper["height"].as_f64().unwrap_or(0.0),
+        );
+        let (hx, hw) = (num(here, "x")? + dx, num(here, "w")?);
+        if x < -0.1
+            || hx < -0.1
+            || y < -0.1
+            || x + hw > paper_w + 0.1
+            || hx + hw > paper_w + 0.1
+            || y >= paper_h
+        {
+            bail!("용지 안으로 표를 이동하세요.");
+        }
+        if p.dx_mm.abs() < 0.001 && p.dy_mm.abs() < 0.001 {
+            return Ok(());
+        }
+        self.place_table(a, first_page, x, y, Some("Para"))
+    }
+    /// Put table `a` so that its first piece on `page` lands at (`x`, `y`) (page
+    /// px). Its horizontal and vertical references are kept, or vertically
+    /// `vert_rel` when given; only the offsets change. They are found by measuring
+    /// that piece aligned left/top with no offset, then corrected once (outer
+    /// margins, the anchor's layout). A table treated as a character becomes a
+    /// top-and-bottom object. One undo step; nothing changes on failure.
+    fn place_table(
+        &mut self,
+        a: ObjectAddress,
+        page: u32,
+        x: f64,
+        y: f64,
+        vert_rel: Option<&str>,
+    ) -> Result<()> {
+        let piece = |s: &Self| -> Result<Option<(f64, f64)>> {
+            Ok(s.table_pieces(a, page)?
+                .first()
+                .and_then(|t| Some((t["x"].as_f64()?, t["y"].as_f64()?))))
+        };
         self.transaction(|s| {
             let inline = s.table_at(a)?.common.treat_as_char;
-            let mut props = json!({"treatAsChar":false,"horzRelTo":"Paper","vertRelTo":"Paper","horzAlign":"Left","vertAlign":"Top","horzOffset":(x*75.0).round() as i32,"vertOffset":(y*75.0).round() as i32});
-            if inline { props["textWrap"] = json!("TopAndBottom"); }
-            s.core.set_table_properties_native(a.section,a.paragraph,a.control,&props.to_string()).map_err(err)?;
-            // Account for outer margins/anchor layout instead of jumping at the first drag.
-            *s.page_field_cache.borrow_mut() = None;
-            let placed = find(s)?;
-            props["horzOffset"] = json!((x*75.0).round() as i64 + ((x-placed["x"].as_f64().unwrap_or(x))*75.0).round() as i64);
-            props["vertOffset"] = json!((y*75.0).round() as i64 + ((y-placed["y"].as_f64().unwrap_or(y))*75.0).round() as i64);
-            s.core.set_table_properties_native(a.section,a.paragraph,a.control,&props.to_string()).map_err(err)?;
+            let mut props = json!({"treatAsChar":false,"horzAlign":"Left","horzOffset":0,
+                "vertAlign":"Top","vertOffset":0});
+            if let Some(rel) = vert_rel {
+                props["vertRelTo"] = json!(rel);
+            }
+            if inline {
+                props["textWrap"] = json!("TopAndBottom");
+            }
+            let apply = |s: &mut Self, props: &Value| -> Result<()> {
+                s.core
+                    .set_table_properties_native(
+                        a.section,
+                        a.paragraph,
+                        a.control,
+                        &props.to_string(),
+                    )
+                    .map_err(err)?;
+                *s.page_field_cache.borrow_mut() = None;
+                Ok(())
+            };
+            apply(s, &props)?;
+            let (bx, by) = piece(s)?.ok_or_else(|| anyhow!("표를 놓을 자리를 찾지 못했습니다."))?;
+            let (mut ox, mut oy) = (((x - bx) * 75.0).round(), ((y - by) * 75.0).round());
+            props["horzOffset"] = json!(ox as i64);
+            props["vertOffset"] = json!(oy as i64);
+            apply(s, &props)?;
+            // A table that no longer fits there is pushed to another page by the
+            // layout: refuse the move (it rolls back) rather than land it elsewhere.
+            let placed = |s: &Self| -> Result<(f64, f64)> {
+                piece(s)?.ok_or_else(|| {
+                    anyhow!("표가 그 자리에서는 쪽 안에 들어가지 않습니다. 조금 위로 옮기세요.")
+                })
+            };
+            let (px, py) = placed(s)?;
+            if (px - x).abs() > 0.05 || (py - y).abs() > 0.05 {
+                ox += ((x - px) * 75.0).round();
+                oy += ((y - py) * 75.0).round();
+                props["horzOffset"] = json!(ox as i64);
+                props["vertOffset"] = json!(oy as i64);
+                apply(s, &props)?;
+                // Still off: the layout keeps the table inside the body (a drop into
+                // the bottom margin stops at the body's edge). Store the offset of
+                // where it is shown, so the file says what the page shows.
+                let (qx, qy) = placed(s)?;
+                if (qx - x).abs() > 0.5 || (qy - y).abs() > 0.5 {
+                    ox -= ((x - qx) * 75.0).round();
+                    oy -= ((y - qy) * 75.0).round();
+                    props["horzOffset"] = json!(ox as i64);
+                    props["vertOffset"] = json!(oy as i64);
+                    apply(s, &props)?;
+                    placed(s)?;
+                }
+            }
             Ok(())
         })
     }

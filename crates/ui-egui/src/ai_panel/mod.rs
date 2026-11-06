@@ -11,6 +11,7 @@ use context::Context;
 use runner::{Output, Request, Running};
 use stream::{Engine, Turn};
 
+mod attach;
 mod changes;
 mod context;
 mod history;
@@ -75,6 +76,8 @@ pub(crate) struct Message {
     pub error: Option<String>,
     /// The question's place in the history and what it changed.
     pub link: Option<history::Link>,
+    /// Names of the files the question carried.
+    pub attachments: Vec<String>,
 }
 
 impl Message {
@@ -89,6 +92,7 @@ impl Message {
             stopped: false,
             error: None,
             link: None,
+            attachments: Vec::new(),
         }
     }
     fn ai() -> Self {
@@ -132,6 +136,10 @@ pub(crate) struct State {
     close_requested: bool,
     engine: Engine,
     input: String,
+    /// Files (and pasted pictures) the next question carries.
+    attachments: Vec<attach::Attachment>,
+    /// Files dropped on the panel, among them a document: 열기 or 첨부 is asked.
+    dropped: Option<Vec<PathBuf>>,
     messages: Vec<Message>,
     /// Conversation to continue, per engine (its session/thread id).
     conversation: Option<(Engine, String)>,
@@ -226,6 +234,15 @@ enum Region {
     Dropped,
     /// Nothing to send (the caret is in a nested table or a text box).
     Unknown,
+}
+
+/// The document a question edits, in front of every question: a continued conversation
+/// remembers the document_id of its first question, which ends when the window opens the
+/// document again (Codex gets the standing instructions only with the first question).
+fn document_line(document_id: &str) -> String {
+    format!(
+        "[문서]\n이번 질문의 document_id는 \"{document_id}\"다. 대화 앞부분이나 이전 도구 호출에 나온 다른 document_id는 더 이상 쓸 수 없다.\n\n"
+    )
 }
 
 /// The question as sent: the region block, then the request.
@@ -391,14 +408,22 @@ impl HwpApp {
             Region::Context(c) => Some(c.chip()),
             _ => None,
         };
-        self.ext
-            .ai
-            .messages
-            .push(Message::user(question.clone(), chip));
+        let files = std::mem::take(&mut self.ext.ai.attachments);
+        let mut asked = Message::user(question.clone(), chip);
+        asked.attachments = files.iter().map(attach::Attachment::name).collect();
+        self.ext.ai.messages.push(asked);
         let refuse = |s: &mut Self, why: String| s.ext.ai.messages.push(Message::failed(why));
         if self.session.is_distribution() {
             return refuse(self, "배포용 문서는 AI가 편집할 수 없습니다.".into());
         }
+        let material = match attach::read(&files) {
+            Ok(m) => m,
+            Err(why) => {
+                // Kept, so the file can be taken off and the question sent again.
+                self.ext.ai.attachments = files;
+                return refuse(self, why);
+            }
+        };
         let program = match cli {
             Some(Cli {
                 program: Some(p),
@@ -418,6 +443,8 @@ impl HwpApp {
             Ok(e) => e,
             Err(e) => return refuse(self, format!("MCP 연결을 준비하지 못했습니다: {e}")),
         };
+        // The question's pictures, for picture.insert_attachment / picture.replace.
+        self.session.set_run_pictures(material.pictures);
         let (model, effort) = self.ai_choice(engine);
         let model = model.as_ref();
         let root = work_root();
@@ -425,10 +452,15 @@ impl HwpApp {
         let request = Request {
             engine,
             program,
-            prompt: match &seed {
-                Some(s) => format!("{s}\n{}", prompt(&region, &question)),
-                None => prompt(&region, &question),
-            },
+            prompt: format!(
+                "{}{}{}{}",
+                document_line(&endpoint.document_id),
+                seed.as_deref()
+                    .map(|s| format!("{s}\n"))
+                    .unwrap_or_default(),
+                material.text,
+                prompt(&region, &question)
+            ),
             system: SYSTEM.replace("{document_id}", &endpoint.document_id),
             resume: self
                 .ext
@@ -443,6 +475,7 @@ impl HwpApp {
             codex_home: root.join("codex-home"),
             model: model.and_then(|m| m.id.clone()),
             effort,
+            images: material.images,
         };
         match runner::start(&request) {
             Ok(running) => {
@@ -465,6 +498,119 @@ impl HwpApp {
                 self.ai_turn_end();
                 refuse(self, e.to_string());
             }
+        }
+    }
+
+    /// Attach files to the next question. Files that cannot be attached, and
+    /// any past [`attach::MAX_FILES`], are said on the status bar.
+    pub(crate) fn ai_attach(&mut self, files: Vec<PathBuf>) {
+        let mut refused = Vec::new();
+        for path in files {
+            let name = attach::Attachment::File(path.clone()).name();
+            if attach::kind_of(&path).is_none() {
+                refused.push(format!("{name}: 첨부할 수 없는 형식"));
+            } else if self.ext.ai.attachments.len() >= attach::MAX_FILES {
+                refused.push(format!("{name}: {}개까지 첨부", attach::MAX_FILES));
+            } else if !self
+                .ext
+                .ai
+                .attachments
+                .contains(&attach::Attachment::File(path.clone()))
+            {
+                self.ext.ai.attachments.push(attach::Attachment::File(path));
+            }
+        }
+        self.message = if refused.is_empty() {
+            format!(
+                "AI 편집에 파일 {}개를 첨부했습니다.",
+                self.ext.ai.attachments.len()
+            )
+        } else {
+            format!(
+                "첨부하지 못했습니다 · {} · {}",
+                refused.join(", "),
+                attach::SUPPORTED
+            )
+        };
+    }
+
+    /// A picture (or picture files) pasted into the question box. `false` when
+    /// the clipboard holds no picture.
+    pub(crate) fn ai_attach_clipboard(&mut self) -> bool {
+        match crate::clipboard::picture() {
+            Some(Ok(crate::clipboard::Picture::Files(files))) => self.ai_attach(files),
+            Some(Ok(crate::clipboard::Picture::Png(png))) => {
+                if self.ext.ai.attachments.len() >= attach::MAX_FILES {
+                    self.message = format!("{}개까지 첨부합니다.", attach::MAX_FILES);
+                    return true;
+                }
+                let n = self
+                    .ext
+                    .ai
+                    .attachments
+                    .iter()
+                    .filter(|a| matches!(a, attach::Attachment::Pasted { .. }))
+                    .count();
+                self.ext.ai.attachments.push(attach::Attachment::Pasted {
+                    name: format!("붙인 그림 {}.png", n + 1),
+                    png,
+                });
+                self.message = "AI 편집에 클립보드 그림을 첨부했습니다.".into();
+            }
+            Some(Err(why)) => self.message = why,
+            None => return false,
+        }
+        true
+    }
+
+    /// Files dropped on the AI panel (`file_drop` decides where a drop lands): pictures
+    /// and text files are attached; with a document among them the panel asks whether to
+    /// open it or attach the files. `false` while a question runs, so the drop goes on to
+    /// the document's handling.
+    pub(crate) fn ai_take_dropped(&mut self, files: &[PathBuf]) -> bool {
+        if files.is_empty() || self.ai_busy() {
+            return false;
+        }
+        if files
+            .iter()
+            .any(|f| attach::kind_of(f) == Some(attach::Kind::Document))
+        {
+            self.ext.ai.dropped = Some(files.to_vec());
+        } else {
+            // Other files are refused by name on the status bar.
+            self.ai_attach(files.to_vec());
+        }
+        true
+    }
+
+    /// Tests elsewhere: the names of the files the next question carries.
+    #[cfg(test)]
+    pub(crate) fn ai_attachment_names(&self) -> Vec<String> {
+        self.ext
+            .ai
+            .attachments
+            .iter()
+            .map(attach::Attachment::name)
+            .collect()
+    }
+
+    /// The answer to the dropped-document question: `Some(true)` attaches the
+    /// files, `Some(false)` opens the first document, `None` drops them.
+    pub(crate) fn ai_resolve_drop(&mut self, ctx: &egui::Context, attach: Option<bool>) {
+        let Some(files) = self.ext.ai.dropped.take() else {
+            return;
+        };
+        match attach {
+            Some(true) => self.ai_attach(files),
+            Some(false) => {
+                if let Some(document) = files
+                    .into_iter()
+                    .find(|f| attach::kind_of(f) == Some(attach::Kind::Document))
+                {
+                    self.request(Pending::Open(document), ctx);
+                }
+            }
+            None => {}
         }
     }
 
@@ -586,6 +732,7 @@ impl HwpApp {
     /// End the question: the token stops working and its edits become one undo
     /// step. Whether the document changed.
     fn ai_turn_end(&mut self) -> bool {
+        self.session.clear_run_pictures();
         match self.ai_run_end() {
             Ok(changed) => changed,
             Err(e) => {
@@ -618,6 +765,11 @@ mod tests {
         assert!(p.ends_with("\n[요청]\n굵게 해 줘"), "{p}");
         assert_eq!(prompt(&Region::Unknown, "굵게 해 줘"), "굵게 해 줘");
         // After the chip's ✕ the AI is told not to guess "this part" from the caret.
+        let line = document_line("doc-7");
+        assert!(
+            line.starts_with("[문서]\n") && line.contains("\"doc-7\""),
+            "{line}"
+        );
         let dropped = prompt(&Region::Dropped, "이 부분을 지워 줘");
         assert!(dropped.contains("짐작하지 말고"), "{dropped}");
         assert!(
@@ -672,6 +824,152 @@ mod tests {
             },
         );
         out.textures_delta.clear();
+    }
+
+    /// Ctrl+V in the question box: a picture is attached (a browser's address text
+    /// with it is not typed), text is typed, and the V coming up attaches nothing more.
+    #[test]
+    fn a_picture_pasted_in_the_question_box_is_attached_once() {
+        use crate::paste_picture_tests::fake_clipboard;
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        // As the window runs: the panel first, then the keyboard.
+        let step = |app: &mut HwpApp, events: Vec<egui::Event>| {
+            let ctx = app.ctx.clone();
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::Panel::right("ai-panel-test")
+                        .default_size(320.0)
+                        .show(ui, |ui| app.ai_panel_ui(ui));
+                    app.keyboard(ui.ctx());
+                },
+            );
+            out.textures_delta.clear();
+        };
+        let ctrl = egui::Modifiers::COMMAND;
+        let v_up = egui::Event::Key {
+            key: Key::V,
+            physical_key: Some(Key::V),
+            pressed: false,
+            repeat: false,
+            modifiers: ctrl,
+        };
+        let paste = |app: &mut HwpApp, text: Option<&str>| {
+            step(app, vec![egui::Event::ModifiersChanged(ctrl)]);
+            if let Some(text) = text {
+                step(app, vec![egui::Event::Paste(text.into())]);
+            }
+            step(app, vec![v_up.clone()]);
+            step(
+                app,
+                vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+            );
+        };
+        step(&mut app, vec![]);
+        app.ctx
+            .memory_mut(|m| m.request_focus(egui::Id::new("ai-panel-input-box")));
+        step(&mut app, vec![]);
+        // A picture alone on the clipboard (egui sends no paste).
+        fake_clipboard(None, true).unwrap();
+        paste(&mut app, None);
+        assert_eq!(app.ext.ai.attachments.len(), 1);
+        // A browser's copy: the address and the picture.
+        fake_clipboard(Some("https://example.com/a.png"), true).unwrap();
+        paste(&mut app, Some("https://example.com/a.png"));
+        assert_eq!(app.ext.ai.attachments.len(), 2);
+        assert!(app.ext.ai.input.is_empty(), "{:?}", app.ext.ai.input);
+        // Text is typed, even with a picture beside it.
+        fake_clipboard(Some("표로 정리해 줘"), true).unwrap();
+        paste(&mut app, Some("표로 정리해 줘"));
+        assert_eq!(app.ext.ai.input, "표로 정리해 줘");
+        assert_eq!(app.ext.ai.attachments.len(), 2);
+        let names: Vec<String> = app
+            .ext
+            .ai
+            .attachments
+            .iter()
+            .map(attach::Attachment::name)
+            .collect();
+        assert_eq!(names, ["붙인 그림 1.png", "붙인 그림 2.png"]);
+    }
+
+    /// 첨부: files dropped on the window or picked join the next question, the
+    /// question names them, and a file that cannot be read stays attached.
+    #[test]
+    fn attached_files_go_with_the_next_question() {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        let dir = std::env::temp_dir().join(format!("ai-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("메모.txt");
+        std::fs::write(&note, "자료").unwrap();
+        let picture = dir.join("그림.png");
+        image::RgbImage::new(4, 4).save(&picture).unwrap();
+        let report = dir.join("보고서.hwpx");
+        let ctx = app.ctx.clone();
+        // Pictures and text dropped on the panel are attached.
+        assert!(app.ai_take_dropped(&[note.clone(), picture.clone()]));
+        assert_eq!(app.ext.ai.attachments.len(), 2);
+        // Another kind is refused by name, and the drop stays with the panel.
+        assert!(app.ai_take_dropped(&[dir.join("도면.dwg")]));
+        assert!(app.message.contains("도면.dwg"), "{}", app.message);
+        assert_eq!(app.ext.ai.attachments.len(), 2);
+        // A document: the panel asks. 취소 drops it; 첨부 attaches every dropped file.
+        assert!(app.ai_take_dropped(std::slice::from_ref(&report)));
+        frame(&mut app, vec![]);
+        assert!(app.ext.ai.dropped.is_some(), "the question is shown");
+        app.ai_resolve_drop(&ctx, None);
+        assert!(app.ext.ai.dropped.is_none() && app.ext.ai.attachments.len() == 2);
+        assert!(app.ai_take_dropped(&[picture.clone(), report.clone()]));
+        app.ai_resolve_drop(&ctx, Some(true));
+        assert_eq!(app.ext.ai.attachments.len(), 3, "the picture is there once");
+        // 열기 opens the document, not the picture dropped before it.
+        // (An edited document asks to save first, so the open waits as pending.)
+        app.session.execute(Command::Insert("편집".into())).unwrap();
+        assert!(app.ai_take_dropped(&[picture.clone(), report.clone()]));
+        app.ai_resolve_drop(&ctx, Some(false));
+        assert!(
+            matches!(&app.pending, Some(crate::Pending::Open(p)) if p == &report),
+            "{:?}",
+            app.pending.is_some()
+        );
+        app.pending = None;
+        // The same file twice, an unknown kind, and past the limit.
+        app.ai_attach(vec![note.clone(), dir.join("도구.exe")]);
+        assert_eq!(app.ext.ai.attachments.len(), 3);
+        assert!(app.message.contains("도구.exe"), "{}", app.message);
+        app.ai_attach((0..5).map(|i| dir.join(format!("{i}.txt"))).collect());
+        assert_eq!(app.ext.ai.attachments.len(), attach::MAX_FILES);
+        assert!(app.message.contains("5개까지"), "{}", app.message);
+        // Sending: the question bubble names the files. The missing report and
+        // the four files that do not exist cannot be read: the question is
+        // refused and the files stay attached.
+        app.ext.ai.clis = Some(vec![(
+            Engine::Claude,
+            Cli {
+                program: Some(PathBuf::from("claude")),
+                unusable: None,
+            },
+        )]);
+        app.ext.ai.input = "자료로 표를 만들어 줘".into();
+        app.ai_send(&ctx);
+        let asked = &app.ext.ai.messages[0];
+        assert_eq!(
+            asked.attachments[..3],
+            ["메모.txt", "그림.png", "보고서.hwpx"]
+        );
+        let refused = app.ext.ai.messages[1].error.clone().unwrap_or_default();
+        assert!(refused.contains("보고서.hwpx"), "{refused}");
+        assert_eq!(app.ext.ai.attachments.len(), attach::MAX_FILES);
+        // A 배포용 document is refused before the files are read, and they go.
+        app.session.core.document_mut().header.distribution = true;
+        app.ext.ai.input = "다시".into();
+        app.ai_send(&ctx);
+        assert!(app.ext.ai.attachments.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod memo_formats;
 mod page_counter_formats;
 mod page_number_formats;
 pub mod pdf_compact;
+pub mod pdf_meta;
 mod table_repair;
 mod textbox_formats;
 mod tracked_formats;
@@ -20,10 +21,33 @@ pub use tracked_formats::save_tracked_hwp;
 
 pub const MAX_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Open an HWP/HWPX/HWP3 document. A password-protected file fails with an error
-/// [`needs_password`] recognises; open it again with [`open_with_password`].
+/// Open an HWP/HWPX/HWP3 document, or a Word document (`.docx`) converted to one.
+/// A password-protected file fails with an error [`needs_password`] recognises; open
+/// it again with [`open_with_password`].
 pub fn open(path: &Path) -> Result<DocumentCore> {
-    open_inner(path, None)
+    open_inner(path, None).map(|(core, _)| core)
+}
+
+/// [`open`], with what a Word document's conversion could not carry ("what · count"
+/// lines; empty for HWP files).
+pub fn open_with_notes(path: &Path, password: Option<&str>) -> Result<(DocumentCore, Vec<String>)> {
+    if password.is_some_and(str::is_empty) {
+        bail!("문서 암호를 입력하세요.");
+    }
+    open_inner(path, password.map(str::as_bytes))
+}
+
+/// Is `path` (by its extension) or `bytes` (a ZIP package with `word/document.xml`) a
+/// Word document?
+pub fn is_word_document(path: &Path, bytes: &[u8]) -> bool {
+    let by_name = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "docx" | "docm" | "dotx" | "dotm"));
+    by_name
+        || bytes.starts_with(b"PK\x03\x04")
+            && zip::ZipArchive::new(std::io::Cursor::new(bytes))
+                .is_ok_and(|zip| zip.index_for_name("word/document.xml").is_some())
 }
 
 /// Open a password-protected document (HWP5 EncryptVersion 4, HWP3, ODF-encrypted HWPX).
@@ -32,10 +56,10 @@ pub fn open_with_password(path: &Path, password: &str) -> Result<DocumentCore> {
     if password.is_empty() {
         bail!("문서 암호를 입력하세요.");
     }
-    open_inner(path, Some(password.as_bytes()))
+    open_inner(path, Some(password.as_bytes())).map(|(core, _)| core)
 }
 
-fn open_inner(path: &Path, password: Option<&[u8]>) -> Result<DocumentCore> {
+fn open_inner(path: &Path, password: Option<&[u8]>) -> Result<(DocumentCore, Vec<String>)> {
     file_access::check_read(&path.to_string_lossy()).map_err(anyhow::Error::msg)?;
     // Windows answers "access denied" for a folder; say what is wrong.
     if path.is_dir() {
@@ -57,16 +81,24 @@ fn open_inner(path: &Path, password: Option<&[u8]>) -> Result<DocumentCore> {
     if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
         bail!("문서가 128 MB 제한을 초과했습니다.");
     }
-    let mut core = match page_counter_formats::open(&bytes, password)? {
-        Some(core) => core,
-        None => page_number_formats::open(&bytes, password)?,
+    let mut notes = Vec::new();
+    let mut core = if is_word_document(path, &bytes) {
+        let password = password.map(|p| String::from_utf8_lossy(p).into_owned());
+        let imported = hwpcraft_docx::import(&bytes, password.as_deref())?;
+        notes = imported.omitted;
+        imported.core
+    } else {
+        match page_counter_formats::open(&bytes, password)? {
+            Some(core) => core,
+            None => page_number_formats::open(&bytes, password)?,
+        }
     };
     // Damaged row/column counts would otherwise panic inside RHWP rendering.
     table_repair::repair(&mut core);
     // HWPX may intentionally omit generated line caches. Ask RHWP to repair
     // only layouts identified by its validation report before the first render.
     core.reflow_linesegs_on_demand();
-    Ok(core)
+    Ok((core, notes))
 }
 
 /// A throwaway core holding `doc` only for serialization. RHWP's HWP/HWPX writers
@@ -201,9 +233,9 @@ fn save_inner(core: &DocumentCore, path: &Path, password: Option<&[u8]>) -> Resu
             core.release_page_render_caches();
             pdf_compact::compact(pdf.map_err(|e| anyhow::anyhow!("{e}"))?)
         }
-        // What DOCX cannot carry is reported by `docx_export::export`; callers that
+        // What DOCX cannot carry is reported by `hwpcraft_docx::export`; callers that
         // need the list call it directly.
-        ("docx", _) => docx_export::export(core)?.bytes,
+        ("docx", _) => hwpcraft_docx::export(core)?.bytes,
         ("txt", _) => {
             let mut lines = Vec::new();
             for section in &core.document().sections {

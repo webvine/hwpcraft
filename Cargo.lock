@@ -108,6 +108,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "arbitrary"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
+dependencies = [
+ "derive_arbitrary",
+]
+
+[[package]]
 name = "arboard"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -826,6 +835,17 @@ checksum = "a878c850e9e421b20262e9b41f9c860e4785fa07541c266b62ff9d1ef998a80a"
 dependencies = [
  "const-oid",
  "zeroize",
+]
+
+[[package]]
+name = "derive_arbitrary"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b034bd7d5f032402a2479444dcc6f74e36a03f31854d41680fb240ef682a1ac"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -1680,7 +1700,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hwpcraft"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1689,7 +1709,7 @@ dependencies = [
 
 [[package]]
 name = "hwpcraft-cli"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "hwpcraft-engine",
@@ -1704,21 +1724,40 @@ dependencies = [
 
 [[package]]
 name = "hwpcraft-doc"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "rhwp",
  "serde",
 ]
 
 [[package]]
+name = "hwpcraft-docx"
+version = "0.22.0"
+dependencies = [
+ "anyhow",
+ "fontdb",
+ "hwpcraft-doc",
+ "hwpcraft-formats",
+ "hwpcraft-render",
+ "image",
+ "serde_json",
+ "tempfile",
+ "ttf-parser",
+ "wordcraft-doc",
+ "wordcraft-docx",
+ "zip 8.6.0",
+]
+
+[[package]]
 name = "hwpcraft-engine"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
  "encoding_rs",
  "hwpcraft-doc",
+ "hwpcraft-docx",
  "hwpcraft-formats",
  "image",
  "quick-xml 0.42.0",
@@ -1726,28 +1765,29 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "zip",
+ "zip 8.6.0",
 ]
 
 [[package]]
 name = "hwpcraft-formats"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "cfb",
  "flate2",
  "hwpcraft-doc",
+ "hwpcraft-docx",
  "hwpcraft-render",
  "image",
  "quick-xml 0.42.0",
  "serde_json",
  "tempfile",
- "zip",
+ "zip 8.6.0",
 ]
 
 [[package]]
 name = "hwpcraft-mcp"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1769,22 +1809,26 @@ dependencies = [
 
 [[package]]
 name = "hwpcraft-render"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "hwpcraft-doc",
  "hwpcraft-formats",
  "resvg",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "hwpcraft-ui-egui"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64 0.22.1",
  "eframe",
  "egui",
+ "encoding_rs",
  "hwpcraft-doc",
  "hwpcraft-engine",
  "hwpcraft-formats",
@@ -3361,7 +3405,7 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "zeroize",
- "zip",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -3395,14 +3439,14 @@ dependencies = [
  "roxmltree 0.21.1",
  "sha1",
  "sha2",
- "zip",
+ "zip 8.6.0",
 ]
 
 [[package]]
 name = "rmcp"
-version = "3.7.0"
+version = "3.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ece64e19631fc38758181e637c15509a2c2709ee53bfde1e1d58f9dc991f919e"
+checksum = "f8be15815186873ea063bf005011d16c356804973489e40c39116ae3a2878d1f"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3433,9 +3477,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "3.7.0"
+version = "3.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "967fa7f7935d7d6217d593df0e8e5c9307bcaf256974a5a9ee64476c97735389"
+checksum = "8b0748e054a5f5598b3213cf72099ae6b2745ba4d996c59ccf455150a7dbb839"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -5069,6 +5113,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "wordcraft-doc"
+version = "0.15.1"
+dependencies = [
+ "base64 0.23.1",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "unicode-segmentation",
+ "wordcraft-geom",
+]
+
+[[package]]
+name = "wordcraft-docx"
+version = "0.15.1"
+dependencies = [
+ "aes",
+ "base64 0.23.1",
+ "cfb",
+ "chrono",
+ "getrandom 0.3.4",
+ "hmac",
+ "log",
+ "quick-xml 0.41.0",
+ "sha1",
+ "sha2",
+ "thiserror 2.0.21",
+ "unicode-bidi",
+ "wordcraft-doc",
+ "wordcraft-geom",
+ "zeroize",
+ "zip 3.0.0",
+]
+
+[[package]]
+name = "wordcraft-geom"
+version = "0.15.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "write-fonts"
 version = "0.48.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5175,6 +5261,20 @@ name = "zeroize"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+
+[[package]]
+name = "zip"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12598812502ed0105f607f941c386f43d441e00148fce9dec3ca5ffb0bde9308"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "zopfli",
+]
 
 [[package]]
 name = "zip"

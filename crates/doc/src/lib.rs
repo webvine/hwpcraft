@@ -3,11 +3,11 @@
 pub const VERSION: &str = include_str!("../../../VERSION");
 pub use rhwp::DocumentCore;
 pub use rhwp::docdiff;
-/// Table creation options (column widths, alignments, cell paragraph shape).
-pub use rhwp::document_core::TableCreationOptions;
 pub use rhwp::document_core::hyperlink::{HyperlinkInfo, HyperlinkTarget};
 /// Privacy scan option/result types for `DocumentCore::scan_pii` / `detect_hidden_text`.
 pub use rhwp::document_core::queries::{hidden_text, pii_scan};
+/// Table creation options (column widths, alignments, cell paragraph shape).
+pub use rhwp::document_core::{TableColumnWidths, TableCreationOptions};
 pub use rhwp::model;
 pub use rhwp::paint::RenderProfile;
 pub use rhwp::paint::{LayerNode, LayerNodeKind, PaintOp};
@@ -17,6 +17,8 @@ pub use rhwp::parser::body_text::parse_paragraph_list as parse_hwp_paragraph_lis
 pub use rhwp::parser::cfb_reader::decompress_stream_limited as decompress_hwp_stream;
 pub use rhwp::parser::record::Record as HwpRecord;
 pub use rhwp::password_crypto;
+/// Table heights as the layout measures them (nested-table edits).
+pub use rhwp::renderer::height_measurer::HeightMeasurer;
 pub use rhwp::renderer::hyperlinks::{PdfDest, PdfLink};
 /// Convert one picture ahead into RHWP's process-wide memo (patch 0059).
 pub use rhwp::renderer::image_resolver::prewarm_image_conversion;
@@ -24,9 +26,11 @@ pub use rhwp::renderer::layout::set_layout_diagnostics;
 pub use rhwp::renderer::pdf::PdfExportOptions;
 pub use rhwp::renderer::pdf::svgs_to_pdf_with_links;
 pub use rhwp::renderer::render_tree::{PageRenderTree, RenderNode, RenderNodeType};
+pub use rhwp::renderer::style_resolver::{ResolvedStyleSet, resolve_styles};
 pub use rhwp::renderer::svg::SvgRenderer;
 pub use rhwp::renderer::{
-    layer_renderer::LayerRenderer, svg::FontEmbedMode, svg_layer::SvgLayerRenderer,
+    layer_renderer::LayerRenderer, render_font_family_chain, svg::FontEmbedMode,
+    svg_layer::SvgLayerRenderer,
 };
 pub use rhwp::serializer::record_writer::write_records as write_hwp_records;
 /// RHWP view-flag setters (paragraph marks, control codes, transparent borders)

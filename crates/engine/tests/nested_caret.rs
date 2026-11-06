@@ -220,6 +220,10 @@ fn format_queries_follow_the_nested_caret() -> anyhow::Result<()> {
     let nested = s.paragraph_format()?;
     s.clear_nested();
     assert_eq!(s.character_properties()?["bold"], false);
-    assert_ne!(s.paragraph_format()?["alignment"], nested["alignment"], "{nested}");
+    assert_ne!(
+        s.paragraph_format()?["alignment"],
+        nested["alignment"],
+        "{nested}"
+    );
     Ok(())
 }

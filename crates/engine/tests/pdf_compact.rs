@@ -94,7 +94,9 @@ fn a_picture_on_every_page_is_stored_once() -> anyhow::Result<()> {
     assert!(check_structure(&small)? < check_structure(&raw)?);
     // Nothing is left to merge, and the export paths compact too.
     assert_eq!(compact(small.clone()), small);
-    assert_eq!(s.render_pdf(&pages)?, small);
+    // The export paths compact too; the document information follows as an update.
+    let exported = s.render_pdf(&pages)?;
+    assert!(exported.starts_with(&small) && exported.len() > small.len());
     let path = dir.path().join("out.pdf");
     s.save(&path)?;
     let saved = std::fs::read(&path)?;

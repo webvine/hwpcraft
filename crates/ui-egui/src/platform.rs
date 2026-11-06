@@ -152,9 +152,15 @@ fn parse_lpstat(default: &str, all: &str) -> Vec<Printer> {
 
 /// Print `pdf` `copies` times on `printer` (the default one when `None`), the way each OS
 /// offers it: the Windows shell `Print` / `PrintTo` verbs (Windows 11's default PDF app,
-/// Edge, has neither, so the PDF is opened instead), and CUPS `lp` (`-d` for a printer)
+/// Edge, has neither, so the PDF is opened instead; the desktop prints through GDI
+/// before it gets here), and CUPS `lp` (`-d` for a printer, `-o collate` with copies)
 /// on macOS and Linux, falling back to `open` / `xdg-open`.
-pub(crate) fn print_pdf(pdf: &Path, copies: u32, printer: Option<&str>) -> PrintOutcome {
+pub(crate) fn print_pdf(
+    pdf: &Path,
+    copies: u32,
+    collate: bool,
+    printer: Option<&str>,
+) -> PrintOutcome {
     let copies = copies.clamp(1, 99);
     let printed = if cfg!(target_os = "windows") {
         (0..copies).all(|_| succeeds(&mut windows_print_command(pdf, printer)))
@@ -162,6 +168,9 @@ pub(crate) fn print_pdf(pdf: &Path, copies: u32, printer: Option<&str>) -> Print
         let mut lp = Command::new("lp");
         if let Some(printer) = printer {
             lp.arg("-d").arg(printer);
+        }
+        if copies > 1 {
+            lp.arg("-o").arg(format!("collate={collate}"));
         }
         succeeds(lp.arg("-n").arg(copies.to_string()).arg(pdf))
     };

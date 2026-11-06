@@ -24,7 +24,7 @@ impl Session {
         self.refuse_tracked_save(path)?;
         hwpcraft_formats::file_access::check_write(&path.to_string_lossy())
             .map_err(anyhow::Error::msg)?;
-        let export = hwpcraft_formats::docx_export::export(&self.core)?;
+        let export = hwpcraft_docx::export(&self.core)?;
         hwpcraft_formats::atomic_write(path, &export.bytes)?;
         Ok(export.omitted)
     }
@@ -132,8 +132,7 @@ mod tests {
             "page.number",
             json!({"position": "bottom_center", "format": 0, "dash": true, "start": 1}),
         )?;
-        // A text box behind the text: cut out of the page it would picture the body
-        // text twice, so it is reported instead.
+        // A text box behind the text: a Word shape behind the text, its text kept.
         let made = s.run(
             "shape.insert",
             json!({"kind": "textbox", "width_mm": 20.0, "height_mm": 10.0, "paragraphs": ["뒤"]}),
@@ -146,13 +145,15 @@ mod tests {
         let path = dir.path().join("rich.docx");
         let omitted = s.export_docx(&path, false)?;
         assert!(
-            omitted.iter().any(|o| o.starts_with("글 뒤·글 앞 도형")),
+            omitted.iter().any(|o| o.starts_with("수식(그림으로 씀)")),
             "{omitted:?}"
         );
         let document = part(&path, "word/document.xml")?;
         assert!(document.contains("<w:footnoteReference "));
         assert!(document.contains("<w:endnoteReference "));
-        assert!(document.contains("name=\"수식\""));
+        assert!(document.contains("descr=\"a^2+b^2=c^2\""), "the equation picture");
+        assert!(document.contains("behindDoc=\"1\"") && document.contains("<w:txbxContent>"));
+        assert!(document.contains(">뒤<"), "the text box keeps its text");
         assert!(part(&path, "word/footnotes.xml")?.contains("각주 내용"));
         assert!(part(&path, "word/endnotes.xml")?.contains("미주 내용"));
         let footer = (1..10)
@@ -160,7 +161,7 @@ mod tests {
             .ok_or_else(|| anyhow!("no footer part"))?;
         assert!(footer.contains("PAGE"), "{footer}");
         // The equation picture is a relationship of the document part.
-        assert!(part(&path, "word/_rels/document.xml.rels")?.contains("media/equation1.png"));
+        assert!(part(&path, "word/_rels/document.xml.rels")?.contains("media/"));
         Ok(())
     }
 

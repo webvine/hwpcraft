@@ -18,7 +18,10 @@ pub(crate) const GROUP_UNDO_LIMIT: usize = 12;
 /// Commands refused while restricted (see [`Session::set_commands_restricted`]):
 /// those that write files, read local files into the document, replace the
 /// document, change the user's settings folder, set a password, or step the
-/// history outside the group.
+/// history outside the group. Refused here by id; `picture.replace` is not listed
+/// because it refuses only its `path` (a file) inside the command and takes the
+/// question's pictures (`attachment`). Projections keep the restriction
+/// (`Session::scratch_session`).
 pub const RESTRICTED_COMMANDS: &[&str] = &[
     // Files written to disk.
     "file.save",

@@ -98,7 +98,8 @@ struct Properties {
     /// 0: 표/셀 속성, 1: 셀 테두리/배경.
     cell_only: bool,
     tab: usize,
-    table: ObjectAddress,
+    /// The table: a body address, or a header/footer one (`header_footer`).
+    table: Value,
     range: Option<Value>,
     table_original: Value,
     table_draft: Value,
@@ -193,11 +194,19 @@ fn css_color(v: &Value) -> [u8; 3] {
 }
 fn mm_field(ui: &mut egui::Ui, label: &str, v: &mut Value, key: &str, max_mm: f64) {
     let mut mm = v[key].as_f64().unwrap_or(0.0) / HU_PER_MM;
+    let min_mm = if matches!(key, "horzOffset" | "vertOffset") {
+        -max_mm
+    } else {
+        0.0
+    };
     ui.label(label);
     if ui
         .add(
             egui::DragValue::new(&mut mm)
-                .range(0.0..=max_mm)
+                .range(min_mm..=max_mm)
+                // Opening properties must not rewrite imported dimensions that
+                // exceed the range offered for new edits.
+                .clamp_existing_to_range(false)
                 .speed(0.1)
                 .fixed_decimals(2)
                 .suffix(" mm"),
@@ -465,7 +474,17 @@ impl HwpApp {
 
     /// `Some(enabled)` when this module owns the ribbon/menu command id.
     pub(crate) fn table_ext_enabled(&self, id: &str) -> Option<bool> {
-        let in_table = self.session.cursor.cell.is_some();
+        let own = self.table_ext_enabled_body(id);
+        // A picked header or footer table takes only what reaches it (hf_objects).
+        let picked = self.hf_in_table().then(|| self.hf_object_enabled(id));
+        match (own, picked.flatten()) {
+            (Some(_), Some(enabled)) => Some(enabled),
+            _ => own,
+        }
+    }
+    fn table_ext_enabled_body(&self, id: &str) -> Option<bool> {
+        // A header or footer table picked by its frame counts (hf_objects).
+        let in_table = self.session.cursor.cell.is_some() || self.hf_in_table();
         match id {
             "table.create" | "table.from_text" => Some(!in_table),
             "table.to_text" | "table.sort" | "table.auto_fill" | "table.caption_text"
@@ -526,6 +545,12 @@ impl HwpApp {
     }
     /// Return true when the command id was handled.
     pub(crate) fn table_ext_dispatch(&mut self, id: &str, _ctx: &egui::Context) -> bool {
+        // A picked header or footer table takes its own commands (hf_objects).
+        if self.hf_in_table()
+            && let Some(done) = self.hf_object_ribbon(id)
+        {
+            return done;
+        }
         // A caret in a table inside a table cell: merge / split go to that table.
         if let Some(done) = self.nested_table_dispatch(id) {
             return done;
@@ -689,8 +714,40 @@ impl HwpApp {
             return;
         };
         let range = self.block_range();
-        let t = self.session.run("table.properties.get", json!({}));
-        let mut c = json!({});
+        self.open_table_properties_with(json!(table), range, cell_only, tab);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn table_properties_dialog_open(&self) -> bool {
+        self.ext.table.properties.is_some()
+    }
+
+    /// 표 속성 for a whole table picked by its frame (a header or footer table, see
+    /// hf_objects): the cell tabs cover all its cells.
+    pub(crate) fn open_table_properties_at(&mut self, table: Value) {
+        let r = self
+            .session
+            .run("table.properties.get", json!({"table": table}));
+        let Some(t) = self.result(r) else {
+            return;
+        };
+        let last = |k: &str| t[k].as_u64().unwrap_or(1).saturating_sub(1);
+        let range = json!({"start_row": 0, "start_col": 0,
+            "end_row": last("rows"), "end_col": last("columns")});
+        self.open_table_properties_with(table, Some(range), false, 0);
+    }
+
+    fn open_table_properties_with(
+        &mut self,
+        table: Value,
+        range: Option<Value>,
+        cell_only: bool,
+        tab: usize,
+    ) {
+        let t = self
+            .session
+            .run("table.properties.get", json!({"table": table}));
+        let mut c = json!({"table": table});
         if let Some(r) = &range {
             c["range"] = r.clone();
         }
@@ -916,7 +973,8 @@ impl HwpApp {
             })
             .collect();
         for t in layout["controls"].as_array()?.iter().rev() {
-            if t["type"] != "table" {
+            // A header/footer table's numbers are not a body address.
+            if t["type"] != "table" || t.get("headerFooter").is_some() {
                 continue;
             }
             let (Some(si), Some(pi), Some(ci)) =
@@ -1021,7 +1079,11 @@ impl HwpApp {
         else {
             return true;
         };
-        let painter = response.ctx.layer_painter(response.layer_id);
+        let painter = response
+            .ctx
+            .layer_painter(response.layer_id)
+            // Only the page's visible part: never over the ribbon or rulers.
+            .with_clip_rect(response.interact_rect);
         let to_screen = |q: Pos2| rect.min + q.to_vec2() * self.zoom;
         let guide = Stroke::new(1.0, chrome::Tokens::ACCENT);
         let (a, b) = if l.vertical {
@@ -1084,10 +1146,15 @@ impl HwpApp {
         let layout = self.page_layout(page);
         let range = b.range();
         let n = |v: &Value, k: &str| v[k].as_u64().unwrap_or(0);
-        let painter = response.ctx.layer_painter(response.layer_id);
+        let painter = response
+            .ctx
+            .layer_painter(response.layer_id)
+            // Only the page's visible part: never over the ribbon or rulers.
+            .with_clip_rect(response.interact_rect);
         let fill = Color32::from_rgba_unmultiplied(46, 105, 220, 70);
         for t in layout["controls"].as_array().into_iter().flatten() {
             if t["type"] != "table"
+                || t.get("headerFooter").is_some()
                 || n(t, "secIdx") as usize != b.table.section
                 || n(t, "paraIdx") as usize != b.table.paragraph
                 || n(t, "controlIdx") as usize != b.table.control
@@ -1678,29 +1745,15 @@ impl HwpApp {
                         .map(|(_, k, _)| ((*k).to_owned(), line.clone()))
                 })
                 .collect();
-            let mut ok = true;
-            if !table.is_empty() {
-                let r = self
-                    .session
-                    .run("table.properties", json!({"table":d.table,"props":table}));
-                if let Err(e) = r {
-                    d.error = Some(format!("{e:#}"));
-                    ok = false;
-                }
-            }
-            if ok && (!cell.is_empty() || !borders.is_empty()) {
-                let mut p = json!({"table":d.table,"props":cell});
-                if !borders.is_empty() {
-                    p["borders"] = Value::Object(borders);
-                }
-                if let Some(r) = &d.range {
-                    p["range"] = r.clone();
-                }
-                if let Err(e) = self.session.run("table.cell_properties", p) {
-                    d.error = Some(format!("{e:#}"));
-                    ok = false;
-                }
-            }
+            let result = self.session.run(
+                "table.properties.apply",
+                json!({
+                    "table":d.table, "range":d.range,
+                    "table_props":table, "cell_props":cell, "borders":borders
+                }),
+            );
+            let ok = result.is_ok();
+            d.error = result.err().map(|e| format!("{e:#}"));
             self.ext.table.layout = None;
             self.sync_formatting();
             close = ok;
@@ -2348,6 +2401,22 @@ fn paint_style_preview(ui: &egui::Ui, r: Rect, style: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_dimension_fields_does_not_change_imported_values() {
+        let ctx = egui::Context::default();
+        let mut values = json!({"horzOffset":-1417,"vertOffset":-567,"tableHeight":700000});
+        let before = values.clone();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                mm_field(ui, "가로", &mut values, "horzOffset", 600.0);
+                mm_field(ui, "세로", &mut values, "vertOffset", 600.0);
+                mm_field(ui, "높이", &mut values, "tableHeight", 2000.0);
+            });
+            output.textures_delta.clear();
+        }
+        assert_eq!(values, before);
+    }
 
     #[test]
     fn a_nested_table_grid_line_carries_its_cell_path() -> anyhow::Result<()> {

@@ -1726,6 +1726,35 @@ const NOTE_SHAPE: &[(&str, Action)] = &[
     ("각주 모양", A::Ext("note.shape.footnote")),
     ("미주 모양", A::Ext("note.shape.endnote")),
 ];
+/// Why a body command is grey while a header or footer is edited on the page.
+const HF_EDITING: &str =
+    "머리말/꼬리말 편집 중에는 본문 명령을 쓸 수 없습니다. [닫기]로 마친 뒤 쓰세요.";
+/// 머리말/꼬리말 context tab, shown while one is edited on the page (hf_shell).
+const HEADER_FOOTER: &[Item] = &[
+    Big(Icon::Reject, "닫기", A::Ext("page.hf.close"), false),
+    Sep,
+    Big(Icon::Prev, "이전", A::Ext("page.hf.prev"), false),
+    Big(Icon::Next, "다음", A::Ext("page.hf.next"), false),
+    Big(
+        Icon::Footer,
+        "머리말/꼬리말\n바꾸기",
+        A::Ext("page.hf.switch"),
+        false,
+    ),
+    Sep,
+    Checks(&[
+        ("양쪽", A::Ext("page.hf.both")),
+        ("홀수 쪽", A::Ext("page.hf.odd")),
+        ("짝수 쪽", A::Ext("page.hf.even")),
+    ]),
+    Sep,
+    Big(
+        Icon::HidePage,
+        "현재 쪽만\n감추기",
+        A::Ext("page.hide"),
+        false,
+    ),
+];
 const PICTURE: &[Item] = &[
     Big(
         Icon::Image,
@@ -1955,11 +1984,12 @@ const TABS: &[(&str, char, &[Item])] = &[
     ("표 레이아웃", 'L', TABLE_LAYOUT),
     ("그림", 'P', PICTURE),
     ("도형", 'X', SHAPE),
+    ("머리말/꼬리말", 'G', HEADER_FOOTER),
 ];
 /// Space after a column of check boxes (보기 tab), so neighbouring columns do not touch.
 const CHECK_GAP: f32 = 10.0;
-/// Context tabs shown only while a table cell or an object is current.
-const CONTEXT_TABS: std::ops::RangeInclusive<usize> = 9..=12;
+/// Context tabs shown only while a table cell, an object or a header/footer is current.
+const CONTEXT_TABS: std::ops::RangeInclusive<usize> = 9..=13;
 const ACCENT: Color32 = Color32::from_rgb(0, 150, 250);
 const CONTEXT: Color32 = Color32::from_rgb(32, 139, 121);
 const LINE: Color32 = Color32::from_rgb(229, 229, 229);
@@ -2120,8 +2150,45 @@ impl HwpApp {
         ) || Self::action_id(action)
             .is_some_and(|id| id.starts_with("view.") || id.starts_with("help."))
     }
+    /// While a header or footer is edited on the page: viewing, files, undo, the
+    /// 머리말/꼬리말 tab and, for a picked header object or table, its context tab (they
+    /// act on it); body commands wait until it is closed.
+    fn allowed_while_hf(&self, action: Action) -> bool {
+        let shared = Self::allowed_while_ai(action)
+            || matches!(
+                action,
+                A::Undo | A::Redo | A::New | A::Open | A::Save | A::SaveAs | A::Pdf
+            )
+            || Self::action_id(action).is_some_and(|id| {
+                // 끼워 넣기 puts a document at the body caret.
+                id.starts_with("page.hf.")
+                    || (id.starts_with("file.") && id != "file.insert")
+                    || id == "page.hide"
+            });
+        if shared {
+            return true;
+        }
+        let tabs: &[usize] = if self.hf_in_table() {
+            &[9, 10]
+        } else if self.object_ext_selected_kind().is_some() {
+            &[11, 12]
+        } else {
+            &[]
+        };
+        let Some(id) = Self::action_id(action) else {
+            return false;
+        };
+        tabs.iter().any(|&tab| {
+            Self::tools(TABS[tab].2)
+                .iter()
+                .any(|(_, _, a)| Self::action_id(*a) == Some(id))
+        })
+    }
     fn enabled(&self, action: Action) -> bool {
         if self.ai_locked() && !Self::allowed_while_ai(action) {
+            return false;
+        }
+        if self.session.hf_target().is_some() && !self.allowed_while_hf(action) {
             return false;
         }
         let free_text = self.session.cursor.cell.is_none();
@@ -2133,7 +2200,8 @@ impl HwpApp {
             A::Redo => self.session.can_redo(),
             A::Cut | A::Copy => self.session.has_selection(),
             A::Table | A::Break | A::Columns | A::ColumnBreak | A::Picture => free_text,
-            A::TableEdit(_) => !free_text,
+            // Rows and columns of a header table come with its cell caret.
+            A::TableEdit(_) => !free_text && self.session.hf_target().is_none(),
             A::PasteFormat => self.format_clipboard.is_some(),
             _ => true,
         }
@@ -2170,6 +2238,10 @@ impl HwpApp {
         use super::object_dialogs::ObjectDialog;
         if self.ai_locked() && !Self::allowed_while_ai(action) {
             self.message = super::ext_shell::AI_LOCKED.into();
+            return;
+        }
+        if self.session.hf_target().is_some() && !self.allowed_while_hf(action) {
+            self.message = HF_EDITING.into();
             return;
         }
         match action {
@@ -2238,7 +2310,10 @@ impl HwpApp {
             }
             A::Paste => {
                 ctx.memory_mut(|m| m.request_focus(egui::Id::new("document-canvas")));
-                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                // egui's paste request carries text only.
+                if !self.paste_picture(crate::clipboard::text().as_deref()) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                }
             }
             A::Character => {
                 self.format_draft = None;
@@ -2363,6 +2438,18 @@ impl HwpApp {
         if self.ai_locked() && !Self::allowed_while_ai(action) {
             return super::ext_shell::AI_LOCKED;
         }
+        if self.session.hf_target().is_some() {
+            // A picked header object or table: what it does not take yet.
+            if (self.hf_in_table() && matches!(action, A::TableEdit(_)))
+                || Self::action_id(action)
+                    .is_some_and(|id| self.hf_object_enabled(id) == Some(false))
+            {
+                return crate::hf_objects::HF_OBJECT_UNSUPPORTED;
+            }
+            if !self.allowed_while_hf(action) {
+                return HF_EDITING;
+            }
+        }
         let in_table = self.session.cursor.cell.is_some();
         match action {
             A::Cut | A::Copy => return SELECT_TEXT,
@@ -2382,6 +2469,9 @@ impl HwpApp {
             "page.delete" => "쪽이 하나뿐이라 지울 쪽이 없습니다.",
             "view.guides.clear" => "지울 안내선이 없습니다. [안내선 넣기]로 먼저 넣으세요.",
             "page.label.add_page" => "라벨 문서가 아닙니다. [라벨 문서 만들기]로 먼저 만드세요.",
+            id if id.starts_with("page.hf.") => {
+                "쪽의 머리말이나 꼬리말 영역을 두 번 눌러 편집을 시작하세요."
+            }
             "review.accept" | "review.accept_all" | "review.reject" | "review.reject_all"
             | "review.prev" | "review.next" => "이 문서에는 한글의 변경 추적 기록이 없습니다.",
             "page.text_direction.horizontal"
@@ -2873,21 +2963,31 @@ impl HwpApp {
     /// Contextual tab (표 디자인 Y, 표 레이아웃 L, 그림 P, 도형 X) the Alt tab tip `letter`
     /// selects, when that tab is showing.
     pub(crate) fn keytip_context_tab(&self, letter: char) -> Option<usize> {
-        let in_table = self.session.cursor.cell.is_some();
+        let in_table = self.table_tabs_shown();
         CONTEXT_TABS
             .into_iter()
             .find(|&i| TABS[i].1 == letter && self.tab_visible(i, in_table))
+    }
+    /// The body caret is in a table cell (the 표 tabs); not while a header or footer is
+    /// edited on the page, whose commands would reach that body table.
+    pub(crate) fn body_in_table(&self) -> bool {
+        self.session.cursor.cell.is_some() && self.session.hf_target().is_none()
+    }
+    /// The 표 tabs show: the body caret is in a table, or a header table is picked.
+    fn table_tabs_shown(&self) -> bool {
+        self.body_in_table() || self.hf_in_table()
     }
     fn tab_visible(&self, index: usize, in_table: bool) -> bool {
         match index {
             9 | 10 => in_table,
             11 => self.ext.shell.object_kind == Some("picture"),
             12 => self.ext.shell.object_kind.is_some_and(|k| k != "picture"),
+            13 => self.session.hf_target().is_some(),
             _ => true,
         }
     }
     fn menu_tabs(&mut self, ui: &mut egui::Ui) {
-        let in_table = self.session.cursor.cell.is_some();
+        let in_table = self.table_tabs_shown();
         let visible: Vec<usize> = (0..TABS.len())
             .filter(|&i| self.tab_visible(i, in_table))
             .collect();
@@ -4041,9 +4141,10 @@ impl HwpApp {
             }
         }
     }
-    pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let white = egui::Frame::NONE.fill(Color32::WHITE);
-        let in_table = self.session.cursor.cell.is_some();
+    /// Open the context tab of what was just picked (as Hangul does) and leave a tab
+    /// that no longer shows.
+    fn follow_context_tabs(&mut self) {
+        let in_table = self.table_tabs_shown();
         let kind = self.object_ext_selected_kind();
         if kind != self.ext.shell.object_kind {
             self.ext.shell.object_kind = kind;
@@ -4054,9 +4155,26 @@ impl HwpApp {
                 None => {}
             }
         }
-        if !self.tab_visible(self.tab, in_table) {
-            self.tab = 1;
+        // A header table picked on the page opens 표 디자인.
+        let hf_table = self.hf_in_table();
+        if hf_table != self.ext.shell.hf_table_tab {
+            self.ext.shell.hf_table_tab = hf_table;
+            if hf_table {
+                self.tab = 9;
+            }
         }
+        if !self.tab_visible(self.tab, in_table) {
+            // Back to the 머리말/꼬리말 tab while one is edited.
+            self.tab = if self.session.hf_target().is_some() {
+                crate::hf_shell::HF_TAB
+            } else {
+                1
+            };
+        }
+    }
+    pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let white = egui::Frame::NONE.fill(Color32::WHITE);
+        self.follow_context_tabs();
         egui::Panel::top("hwp-menus")
             .exact_size(33.0)
             .frame(white.inner_margin(egui::Margin {
@@ -4089,7 +4207,9 @@ impl HwpApp {
     /// The 서식 도구 줄, disabled and faded as a whole while the AI edits: the colour and
     /// line pieces draw their own colours, which a disabled Ui leaves as they are.
     fn format_bar_unless_locked(&mut self, ui: &mut egui::Ui) {
-        let locked = self.ai_locked();
+        // Its formats apply to the body, so it also waits while a header or footer is
+        // edited on the page.
+        let locked = self.ai_locked() || self.session.hf_target().is_some();
         ui.add_enabled_ui(!locked, |ui| {
             if locked {
                 ui.multiply_opacity(0.45);
@@ -4703,6 +4823,21 @@ fn recent_row(ui: &mut egui::Ui, i: usize, path: &std::path::Path) -> egui::Resp
 mod tests {
     use super::*;
 
+    /// 붙이기 puts a copied picture in; text still goes through egui's paste request.
+    #[test]
+    fn the_paste_button_puts_a_copied_picture_in() -> anyhow::Result<()> {
+        use crate::paste_picture_tests::{fake_clipboard, pictures};
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        fake_clipboard(None, true)?;
+        a.dispatch(A::Paste, &a.ctx.clone());
+        assert!(a.error.is_none(), "{:?}", a.error);
+        assert_eq!(pictures(&a), 1);
+        fake_clipboard(Some("글"), true)?;
+        a.dispatch(A::Paste, &a.ctx.clone());
+        assert_eq!(pictures(&a), 1);
+        Ok(())
+    }
+
     /// AI 편집 패널: while a question runs only viewing commands work, typing and opening
     /// wait, and editing comes back when it ends.
     #[test]
@@ -4749,6 +4884,110 @@ mod tests {
         assert!(a.enabled(A::Undo));
         type_text(&mut a, "나");
         assert_eq!(a.session.text(), "가나");
+        Ok(())
+    }
+
+    /// 머리말 그림을 고르면 그림 탭이 열리고 그 명령이 머리말 그림에 갑니다(리본 경로).
+    /// 고르기를 풀면 머리말/꼬리말 탭으로 돌아갑니다. 머리말 표를 고르면 표 탭이 열리고
+    /// 표 명령이 켜집니다.
+    #[test]
+    fn picked_header_objects_and_tables_take_their_ribbon_tabs() -> anyhow::Result<()> {
+        use crate::hf_objects::tests::{
+            click, frame, header_box, header_picture, header_table, screen,
+        };
+        use crate::hf_shell::HF_TAB;
+        // The toolbar's own tab bookkeeping, without drawing it over the test page.
+        let ui = |a: &mut HwpApp| {
+            a.follow_context_tabs();
+        };
+        let mut a = header_picture();
+        let z = a.zoom;
+        frame(&mut a, vec![], 0.0);
+        ui(&mut a);
+        assert_eq!(a.tab, HF_TAB);
+        assert!(!a.allowed_while_hf(A::Ext("object.rotate.right")));
+        let b = header_box(&a).ok_or_else(|| anyhow::anyhow!("no header picture"))?;
+        click(&mut a, screen(z, b.center()));
+        ui(&mut a);
+        assert_eq!(a.tab, 11, "the picture tab opens");
+        // Let through to the object module, which acts on the picked header picture.
+        assert!(a.allowed_while_hf(A::Ext("object.rotate.right")));
+        assert!(a.enabled(A::Ext("object.rotate.right")));
+        // Not for a header object yet: grey, saying so.
+        assert!(!a.enabled(A::Ext("object.group")));
+        assert_eq!(
+            a.disabled_reason(A::Ext("object.group")),
+            crate::hf_objects::HF_OBJECT_UNSUPPORTED
+        );
+        let ctx = a.ctx.clone();
+        a.dispatch(A::Ext("object.rotate.right"), &ctx);
+        assert_ne!(a.message, HF_EDITING);
+        let address = a
+            .hf_object_address()
+            .ok_or_else(|| anyhow::anyhow!("not picked"))?;
+        let p = a
+            .session
+            .run("object.properties.get", json!({"address": address}))?;
+        assert_eq!(p["props"]["rotationAngle"], 90, "{p}");
+        assert!(!a.enabled(A::Table), "body commands still wait");
+        // Let go (Esc): back to the 머리말/꼬리말 tab, still editing.
+        assert!(a.hf_object_deselect());
+        ui(&mut a);
+        assert_eq!(a.tab, HF_TAB);
+        assert!(!a.allowed_while_hf(A::Ext("object.rotate.right")));
+
+        let mut t = header_table();
+        let z = t.zoom;
+        frame(&mut t, vec![], 0.0);
+        ui(&mut t);
+        let (_, b, _) = t
+            .hf_objects_on(0)
+            .into_iter()
+            .find(|(_, _, table)| *table)
+            .ok_or_else(|| anyhow::anyhow!("no header table"))?;
+        click(&mut t, screen(z, Pos2::new(b.min.x, b.center().y)));
+        assert!(t.hf_in_table());
+        ui(&mut t);
+        assert_eq!(t.tab, 9, "the table tab opens");
+        assert!(t.tab_visible(9, t.table_tabs_shown()) && t.tab_visible(10, t.table_tabs_shown()));
+        assert!(t.enabled(A::Ext("table.properties")));
+        // Rows and columns wait for the header table's cell caret, even when the body
+        // caret sits in a body table.
+        let rows = A::TableEdit(hwpcraft_engine::TableEdit::DeleteRow);
+        assert!(!t.enabled(rows));
+        assert_eq!(
+            t.disabled_reason(rows),
+            crate::hf_objects::HF_OBJECT_UNSUPPORTED
+        );
+        Ok(())
+    }
+
+    /// 머리말/꼬리말 편집 중에는 본문 명령이 회색이고 눌러도 안내만 합니다. 상황 탭,
+    /// 보기와 실행 취소는 되고, 닫으면 상황 탭이 사라집니다.
+    #[test]
+    fn body_commands_wait_while_a_header_is_edited() -> anyhow::Result<()> {
+        use crate::hf_shell::HF_TAB;
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        a.session.run("text.insert", json!({"text": "본문"}))?;
+        let hit = a.session.hf_page_target(0, false)?;
+        assert!(a.hf_open(hit, 0, None));
+        assert!(a.tab_visible(HF_TAB, false) && a.tab == HF_TAB);
+        assert!(!a.enabled(A::Table));
+        assert_eq!(a.disabled_reason(A::Table), HF_EDITING);
+        assert!(a.enabled(A::Ext("page.hf.close")) && a.enabled(A::ZoomIn) && a.enabled(A::Undo));
+        assert!(
+            !a.allowed_while_hf(A::Ext("file.insert")),
+            "it edits the body"
+        );
+        assert!(a.allowed_while_hf(A::Ext("file.save_pages")));
+        let ctx = a.ctx.clone();
+        a.dispatch(A::Table, &ctx);
+        assert_eq!(a.message, HF_EDITING);
+        assert!(!a.show_table);
+        a.dispatch(A::Ext("page.hf.close"), &ctx);
+        assert!(a.session.hf_target().is_none());
+        assert!(!a.tab_visible(HF_TAB, false));
+        assert!(a.enabled(A::Table));
         Ok(())
     }
 

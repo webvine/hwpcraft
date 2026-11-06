@@ -5,8 +5,10 @@ use serde_json::{Value, json};
 fn texts(svg: &str) -> String {
     let mut out = String::new();
     for part in svg.split("<text").skip(1) {
+        // Unpainted text (the word spaces print output keeps for PDF search) is not drawn.
         if let (Some(gt), Some(end)) = (part.find('>'), part.find("</text>"))
             && gt < end
+            && !part[..gt].contains("fill=\"none\"")
         {
             out.push_str(&part[gt + 1..end]);
         }

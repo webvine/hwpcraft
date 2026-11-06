@@ -2,6 +2,8 @@
 # HwpCraft work always reads the latest upstream code. Fast-forward only: a
 # sibling with local changes or a diverged branch is reported, never reset.
 # HwpCraft's own RHWP patches are reverted before and re-applied after the pull.
+# WordCraft is a build dependency (DOCX): it is moved to the commit in
+# WORDCRAFT_REV instead of the newest one, so every build uses the same source.
 # Usage: pwsh -NoProfile -File scripts/sync-siblings.ps1 [-Only rhwp,wordcraft]
 param([string[]]$Only = @())
 $ErrorActionPreference = 'Continue'
@@ -20,6 +22,20 @@ foreach ($dir in Get-ChildItem -Path $Parent -Directory) {
     if ($Only.Count -gt 0 -and $Only -notcontains $dir.Name) { continue }
     $repo = $dir.FullName
     $before = (git -C $repo rev-parse --short HEAD 2>$null)
+    $pinFile = Join-Path (Split-Path $PSScriptRoot -Parent) 'WORDCRAFT_REV'
+    if ($dir.Name -eq 'wordcraft' -and (Test-Path $pinFile)) {
+        $pin = (Get-Content $pinFile -Raw).Trim()
+        $dirty = (git -C $repo status --porcelain --untracked-files=no 2>$null)
+        $head = (git -C $repo rev-parse HEAD 2>$null)
+        if ($head -eq $pin) { $rows += [pscustomobject]@{ repo = $dir.Name; before = $before; after = $before; result = 'at WORDCRAFT_REV' }; continue }
+        if ($dirty) { $rows += [pscustomobject]@{ repo = $dir.Name; before = $before; after = $before; result = 'local changes: not moved to WORDCRAFT_REV' }; continue }
+        git -C $repo fetch --quiet 2>$null
+        git -C $repo checkout --quiet --detach $pin 2>$null
+        $after = (git -C $repo rev-parse --short HEAD 2>$null)
+        $result = if ((git -C $repo rev-parse HEAD 2>$null) -eq $pin) { 'moved to WORDCRAFT_REV' } else { 'WORDCRAFT_REV not found: not moved' }
+        $rows += [pscustomobject]@{ repo = $dir.Name; before = $before; after = $after; result = $result }
+        continue
+    }
     if (-not $before) { $rows += [pscustomobject]@{ repo = $dir.Name; before = ''; after = ''; result = 'no commits' }; continue }
     $dirty = (git -C $repo status --porcelain --untracked-files=no 2>$null)
     git -C $repo fetch --quiet --prune 2>$null

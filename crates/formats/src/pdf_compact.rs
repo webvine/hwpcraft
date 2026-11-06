@@ -42,10 +42,10 @@ pub fn compact(pdf: Vec<u8>) -> Vec<u8> {
     }
 }
 
-struct Trailer {
-    size: u32,
+pub(crate) struct Trailer {
+    pub(crate) size: u32,
     /// Trailer dictionary text (between `trailer` and `startxref`).
-    dict: Vec<u8>,
+    pub(crate) dict: Vec<u8>,
 }
 
 fn plan(pdf: &[u8]) -> Option<(Vec<Object>, usize, Trailer)> {
@@ -63,7 +63,7 @@ fn plan(pdf: &[u8]) -> Option<(Vec<Object>, usize, Trailer)> {
 }
 
 /// The byte offset after `startxref` at the end of the file.
-fn start_xref(pdf: &[u8]) -> Option<usize> {
+pub(crate) fn start_xref(pdf: &[u8]) -> Option<usize> {
     let tail_start = pdf.len().saturating_sub(64);
     let tail = &pdf[tail_start..];
     let at = find(tail, b"startxref")? + b"startxref".len();
@@ -78,7 +78,7 @@ fn start_xref(pdf: &[u8]) -> Option<usize> {
 }
 
 /// In-use object offsets and the trailer of a one-section xref table.
-fn xref_table(pdf: &[u8], at: usize) -> Option<(HashMap<u32, usize>, Trailer)> {
+pub(crate) fn xref_table(pdf: &[u8], at: usize) -> Option<(HashMap<u32, usize>, Trailer)> {
     let text = &pdf[at..];
     let mut lines = text.split(|&b| b == b'\n');
     if lines.next()?.trim_ascii() != b"xref" {
@@ -324,7 +324,7 @@ fn is_regular(b: u8) -> bool {
     !b.is_ascii_whitespace() && !b"()<>[]{}/%".contains(&b)
 }
 
-fn number_after(text: &[u8], key: &[u8]) -> Option<u32> {
+pub(crate) fn number_after(text: &[u8], key: &[u8]) -> Option<u32> {
     let mut at = 0;
     // `/Length` must not match `/Length1`: the name has to end at the key.
     while let Some(found) = find(&text[at..], key) {
@@ -343,7 +343,7 @@ fn number_after(text: &[u8], key: &[u8]) -> Option<u32> {
     None
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 

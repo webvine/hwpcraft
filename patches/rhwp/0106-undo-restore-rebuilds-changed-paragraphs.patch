@@ -1,0 +1,1182 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 0cb554ba2..96d442132 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -2908,14 +2908,16 @@ impl DocumentCore {
+         let (_, doc, text_reflowed_table_paths, stamps) = self.snapshot_store[idx].clone();
+         let changed = self.snapshot_changed_sections(&doc, &stamps);
+         let previous = std::mem::replace(&mut self.document, doc);
++        let reflowed_before = std::mem::take(&mut self.render_normalization.text_reflowed_tables);
+         self.restore_text_reflowed_tables_from_snapshot(&text_reflowed_table_paths);
+         self.bump_bin_data_epoch();
+-        let reused =
+-            changed.is_some_and(|changed| self.rebuild_changed_sections(&changed, &previous));
++        let reused = changed.is_some_and(|changed| {
++            self.rebuild_changed_sections(&changed, &previous, &reflowed_before, stamps.doc_info)
++        });
+         drop(previous);
+         if !reused {
+             // 문서를 통째로 갈아끼웠으므로 파생 상태는 전부 새 원본에서 다시 만든다.
+-            self.rebuild_derived_state();
++            self.rebuild_derived_state_with_doc_info_stamp(Some(stamps.doc_info));
+         }
+         // 파생 상태가 이제 스냅샷 내용과 맞으므로 그 표식을 잇는다.
+         self.model_stamps = stamps;
+diff --git a/src/document_core/queries/rendering.rs b/src/document_core/queries/rendering.rs
+index 5f23f05a5..0c9a4c3bc 100644
+--- a/src/document_core/queries/rendering.rs
++++ b/src/document_core/queries/rendering.rs
+@@ -4875,20 +4875,177 @@ impl DocumentCore {
+             .zip(&self.model_stamps.sections)
+             .map(|(snapshot_stamp, current)| snapshot_stamp != current)
+             .collect();
+-        // 모든 구역이 바뀌었으면 전체 재구성이 더 싸다.
+-        (!changed.iter().all(|changed| *changed)).then_some(changed)
++        // [HwpCraft 0106] 모든 구역이 바뀌었어도 구역 안에서 문단을 나누어 재사용할 수 있다.
++        // 그럴 수 없으면 `rebuild_changed_sections` 가 전체 재구성으로 돌린다.
++        Some(changed)
++    }
++
++    /// [HwpCraft 0106] 스냅샷 복원에서 바뀐 구역 `idx` 의 앞뒤로 그대로인 문단 수 `(앞, 뒤)`.
++    ///
++    /// 문단 구성은 문단과 스타일만, 측정은 거기에 그 문단의 세션 편집 규칙만 읽는다
++    /// (`compose_paragraph_with_horizontal_shaping`, `HeightMeasurer::enter_paragraph`). 그래서
++    /// 안쪽 문단까지 모든 필드가 같고(`PartialEq`) 편집 규칙도 같은 문단은 바꾸기 전의 구성·측정을
++    /// 그대로 쓴다. 구역 정의가 다르거나, 바꾸기 전 파생 상태가 문단마다 맞춰져 있지 않거나
++    /// (배치·지연 조판·dirty 문단), 렌더 정규화본이 있는 구역이면 `None` — 구역을 통째로 다시 만든다.
++    /// 표의 글자 흐름 표시(`text_reflowed_tables`, 바꾸기 전은 `reflowed_before`)는 표 측정에
++    /// 들어가므로 그 표시가 다른 표를 가진 문단도 다시 만든다. `self.document` 는 이미 복원한 문서다.
++    fn restored_paragraph_ends(
++        &self,
++        idx: usize,
++        previous: &Document,
++        reflowed_before: &std::collections::HashSet<super::super::TableTextReflowKey>,
++    ) -> Option<(usize, usize)> {
++        let section = self.document.sections.get(idx)?;
++        let before = previous.sections.get(idx)?;
++        let old_len = before.paragraphs.len();
++        let settled = !self.batch_mode
++            && self.batch_recompose_sections.is_empty()
++            && self.deferred_pagination_descriptor.is_none()
++            && !self.dirty_sections.get(idx).copied().unwrap_or(true)
++            && self
++                .dirty_paragraphs
++                .get(idx)
++                .and_then(|bits| bits.as_deref())
++                .is_some_and(|bits| bits.len() == old_len && !bits.iter().any(|dirty| *dirty))
++            && self.composed.get(idx).is_some_and(|c| c.len() == old_len)
++            && self
++                .measured_sections
++                .get(idx)
++                .is_some_and(|m| m.fallback_paragraphs.len() == old_len)
++            && self
++                .render_normalization
++                .sections
++                .get(idx)
++                .is_none_or(|normalized| normalized.is_none());
++        if !settled || before.section_def != section.section_def {
++            return None;
++        }
++        let rules = |document: &Document| {
++            let profile = document.section_layout_profile(idx);
++            [
++                profile.at_paragraph(false).session_edited(),
++                profile.at_paragraph(true).session_edited(),
++            ]
++        };
++        let (was, now) = (rules(previous), rules(&self.document));
++        /// 문단의 표마다 글자 흐름 표시가 `set` 에 있는가.
++        fn reflowed<'a>(
++            set: &'a std::collections::HashSet<super::super::TableTextReflowKey>,
++            para: &'a Paragraph,
++        ) -> impl Iterator<Item = bool> + 'a {
++            para.controls.iter().filter_map(move |ctrl| match ctrl {
++                Control::Table(table) => {
++                    Some(set.contains(&super::super::TableTextReflowKey::from_table(table)))
++                }
++                _ => None,
++            })
++        }
++        let reflowed_now = &self.render_normalization.text_reflowed_tables;
++        let same = |a: &Paragraph, b: &Paragraph| {
++            let edited = a.edited_in_session as usize;
++            was[edited] == now[edited]
++                && a == b
++                && reflowed(reflowed_before, a).eq(reflowed(reflowed_now, b))
++        };
++        let head = before
++            .paragraphs
++            .iter()
++            .zip(&section.paragraphs)
++            .take_while(|(a, b)| same(a, b))
++            .count();
++        let tail = before.paragraphs[head..]
++            .iter()
++            .rev()
++            .zip(section.paragraphs[head..].iter().rev())
++            .take_while(|(a, b)| same(a, b))
++            .count();
++        Some((head, tail))
++    }
++
++    /// [HwpCraft 0106] 복원한 구역 `idx` 에서 앞 `head`·뒤 `tail` 문단의 구성·측정을 바꾸기 전
++    /// 것(`old_len` 문단)에서 옮기고, 그 사이 문단만 새로 구성해 dirty 로 둔다. 사이 문단의 표
++    /// 측정은 버린다 — 편집 세션의 행 높이 하한(`floor_rows_to_prev`)이 옛 표에 걸리지 않게,
++    /// 전체 재구성처럼 처음부터 잰다.
++    fn splice_restored_paragraphs(&mut self, idx: usize, old_len: usize, head: usize, tail: usize) {
++        let new_len = self.document.sections[idx].paragraphs.len();
++        let old_middle = head..old_len - tail;
++        let new_middle = head..new_len - tail;
++        let middle: Vec<ComposedParagraph> = self.document.sections[idx].paragraphs
++            [new_middle.clone()]
++        .iter()
++        .map(|para| compose_paragraph_with_horizontal_shaping(para, &self.styles))
++        .collect();
++        self.composed[idx].splice(old_middle.clone(), middle);
++        let measured = &mut self.measured_sections[idx];
++        measured
++            .tables
++            .retain(|table| !old_middle.contains(&table.para_index));
++        for table in &mut measured.tables {
++            if table.para_index >= old_middle.end {
++                table.para_index = table.para_index + new_middle.end - old_middle.end;
++            }
++        }
++        let placeholder = crate::renderer::height_measurer::MeasuredParagraph {
++            para_index: 0,
++            total_height: 0.0,
++            line_heights: vec![0.0],
++            line_spacings: vec![0.0],
++            spacing_before: 0.0,
++            spacing_after: 0.0,
++            has_table: false,
++        };
++        measured.fallback_paragraphs.splice(
++            old_middle,
++            std::iter::repeat_n(placeholder, new_middle.len()),
++        );
++        for (i, para) in measured.fallback_paragraphs.iter_mut().enumerate() {
++            para.para_index = i;
++        }
++        let same_count = old_len == new_len && !new_middle.is_empty();
++        let mut dirty = vec![false; new_len];
++        dirty[new_middle].fill(true);
++        self.dirty_paragraphs[idx] = Some(dirty);
++        if same_count {
++            // 문단을 다시 구성한 편집과 같다: 사이 문단의 줄 배치가 직전 조판 때와 같으면
++            // 그 조판 원본을 다시 쓴다(0031).
++            if let Some(marks) = self.typeset_marks.get_mut(idx) {
++                marks.stamps = marks.stamps.saturating_add(1);
++                marks.recomposed = marks.recomposed.saturating_add(1);
++            }
++        } else if let Some(reuse) = self.typeset_reuse.get_mut(idx) {
++            // 문단이 끼거나 빠졌다 — 처음부터 조판한다.
++            *reuse = None;
++        }
+     }
+ 
+     /// 스냅샷으로 갈아끼운 문서에서 `changed` 구역의 파생 상태만 다시 만든다.
+     ///
+     /// 바뀐 구역은 전체 재구성과 같은 경로(문단 구성 → 전체 측정 → 조판)를 밟는다. 그 구역의
+     /// 쪽 수·쪽 번호·머리말/꼬리말·바탕쪽이 달라지면 뒤 구역도 다시 조판한다(측정은 재사용).
++    /// [HwpCraft 0106] 단 구역 안에서 앞뒤로 그대로인 문단은 구성·측정을 옮겨 쓰고 그 사이만
++    /// 다시 만든다(`restored_paragraph_ends`). `reflowed_before` 는 바꾸기 전 문서의 글자 흐름 표
++    /// 목록이다. `doc_info_stamp` 는 복원한 DocInfo 의 표식으로,
++    /// 조판 재사용 열쇠를 복원 뒤 표식과 맞춰 다음 편집이 이 조판을 재사용하게 한다.
+     /// 결과를 믿을 수 없는 경우에는 `false` 를 돌려주고, 호출자가 전부 다시 만든다.
+     pub(crate) fn rebuild_changed_sections(
+         &mut self,
+         changed: &[bool],
+         previous: &Document,
++        reflowed_before: &std::collections::HashSet<super::super::TableTextReflowKey>,
++        doc_info_stamp: u64,
+     ) -> bool {
++        let count = changed.len();
++        let ends: Vec<Option<(usize, usize)>> = (0..count)
++            .map(|idx| {
++                changed[idx]
++                    .then(|| self.restored_paragraph_ends(idx, previous, reflowed_before))
++                    .flatten()
++            })
++            .collect();
++        // 모든 구역을 통째로 다시 만들어야 하면 전체 재구성이 더 싸다.
++        if changed.iter().all(|changed| *changed) && ends.iter().all(Option::is_none) {
++            return false;
++        }
+         let style_flags = |styles: &crate::renderer::style_resolver::ResolvedStyleSet| {
+             (
+                 styles.page_number_char_style_id,
+@@ -4899,6 +5056,7 @@ impl DocumentCore {
+         let before = style_flags(&self.styles);
+         self.pending_cell_format_vpos = false;
+         self.rebuild_resolved_styles();
++        self.model_stamps.doc_info = doc_info_stamp;
+         if style_flags(&self.styles) != before {
+             return false;
+         }
+@@ -4919,16 +5077,27 @@ impl DocumentCore {
+                     .sections
+                     .get(idx)
+                     .is_some_and(|section| section_has_endnote(section));
+-            self.composed[idx] =
+-                compose_section_with_horizontal_shaping(&self.document.sections[idx], &self.styles);
++            if let Some((head, tail)) = ends[idx] {
++                self.splice_restored_paragraphs(
++                    idx,
++                    previous.sections[idx].paragraphs.len(),
++                    head,
++                    tail,
++                );
++            } else {
++                self.composed[idx] = compose_section_with_horizontal_shaping(
++                    &self.document.sections[idx],
++                    &self.styles,
++                );
++                self.measured_tables[idx].clear();
++                self.measured_sections[idx] = MeasuredSection {
++                    fallback_paragraphs: Vec::new(),
++                    tables: Vec::new(),
++                };
++                self.dirty_paragraphs[idx] = None;
++            }
+             self.dirty_sections[idx] = true;
+             self.invalidate_render_normalization_section(idx);
+-            self.measured_tables[idx].clear();
+-            self.measured_sections[idx] = MeasuredSection {
+-                fallback_paragraphs: Vec::new(),
+-                tables: Vec::new(),
+-            };
+-            self.dirty_paragraphs[idx] = None;
+             self.para_column_map[idx].clear();
+         }
+         // 문서 끝 미주는 마지막 구역이 모아 조판한다.
+@@ -4968,6 +5137,18 @@ impl DocumentCore {
+         if self.pagination.len() != count {
+             return false;
+         }
++        // 렌더 정규화본은 구역 전체에서 다시 만든다. 문단을 나누어 옮겨 쓴 구역에 새로 생겼으면
++        // 옮겨 쓴 측정을 믿지 않는다.
++        if (0..count).any(|idx| {
++            ends[idx].is_some()
++                && self
++                    .render_normalization
++                    .sections
++                    .get(idx)
++                    .is_some_and(|normalized| normalized.is_some())
++        }) {
++            return false;
++        }
+         let first_shifted = (0..count).find(|&idx| {
+             carry_before[idx]
+                 .as_ref()
+@@ -4999,9 +5180,22 @@ impl DocumentCore {
+     /// (정규화·측정) → 페이지네이션 → 페이지 트리. 앞 단계를 뒤 단계보다 늦게
+     /// 만들면 같은 패스 안에서 옛 값이 섞인다.
+     pub(crate) fn rebuild_derived_state(&mut self) {
++        self.rebuild_derived_state_with_doc_info_stamp(None);
++    }
++
++    /// [HwpCraft 0106] `rebuild_derived_state` 에서 다시 만든 스타일에 DocInfo 표식
++    /// `doc_info_stamp` 를 붙인다(스냅샷 복원: 복원한 DocInfo 의 표식). 조판 재사용 열쇠가
++    /// 복원 뒤 표식과 같아야 다음 편집이 이 조판을 재사용한다.
++    pub(crate) fn rebuild_derived_state_with_doc_info_stamp(
++        &mut self,
++        doc_info_stamp: Option<u64>,
++    ) {
+         self.pending_cell_format_vpos = false;
+         self.untracked_model_edit = false;
+         self.rebuild_resolved_styles();
++        if let Some(stamp) = doc_info_stamp {
++            self.model_stamps.doc_info = stamp;
++        }
+         self.rebuild_embedded_exact_font_sources();
+         self.recompose_all_with_horizontal_shaping();
+         self.mark_all_sections_dirty();
+@@ -11627,3 +11821,200 @@ mod hwpcraft_header_footer_entries_tests {
+         assert!(at(&mut cache, other).iter().all(|&i| i == other));
+     }
+ }
++
++#[cfg(test)]
++mod hwpcraft_paragraph_restore_tests {
++    use crate::document_core::DocumentCore;
++
++    /// A height the measurer never gives; a kept measurement shows it after a restore.
++    const MARK: f64 = -12345.0;
++
++    /// One section of `count` paragraphs, 1 to 25 short words long.
++    fn report(count: usize) -> DocumentCore {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        for i in 0..count {
++            let text = "가나다라 마바사 ".repeat(i % 5 * 6 + 1);
++            core.insert_text_native(0, i, 0, &text).unwrap();
++            if i + 1 < count {
++                core.split_paragraph_native(0, i, text.chars().count(), None)
++                    .unwrap();
++            }
++        }
++        core
++    }
++
++    fn mark_measured(core: &mut DocumentCore) {
++        for para in &mut core.measured_sections[0].fallback_paragraphs {
++            para.total_height = MARK;
++        }
++    }
++
++    /// The paragraphs whose measurement the restore kept.
++    fn kept(core: &DocumentCore) -> Vec<usize> {
++        core.measured_sections[0]
++            .fallback_paragraphs
++            .iter()
++            .enumerate()
++            .filter_map(|(i, p)| (p.total_height == MARK).then_some(i))
++            .collect()
++    }
++
++    fn pages(core: &DocumentCore) -> Vec<String> {
++        (0..core.page_count())
++            .map(|page| core.render_page_svg_native(page).expect("svg"))
++            .collect()
++    }
++
++    fn rebuilt(core: &DocumentCore) -> Vec<String> {
++        let mut fresh = DocumentCore::new_empty();
++        fresh.create_blank_document_native().unwrap();
++        fresh.set_document(core.document().clone());
++        pages(&fresh)
++    }
++
++    /// Undo and redo of typing lay out only the typed paragraph again; every page
++    /// equals a full rebuild of the same document.
++    #[test]
++    fn undo_of_typing_rebuilds_only_the_typed_paragraph() {
++        let mut core = report(40);
++        let before = core.save_snapshot_native();
++        core.insert_text_native(0, 20, 1, "가").unwrap();
++        let after = core.save_snapshot_native();
++        mark_measured(&mut core);
++        core.restore_snapshot_native(before).unwrap();
++        let others: Vec<usize> = (0..40).filter(|&i| i != 20).collect();
++        assert_eq!(kept(&core), others);
++        assert_eq!(pages(&core), rebuilt(&core));
++        mark_measured(&mut core);
++        core.restore_snapshot_native(after).unwrap();
++        assert_eq!(kept(&core), others);
++        assert_eq!(pages(&core), rebuilt(&core));
++    }
++
++    /// Undo of a split and of a merge keep the paragraphs before the change. The ones
++    /// after it here carry shifted stored vertical positions, so they are laid out
++    /// again too.
++    #[test]
++    fn undo_of_split_and_merge_keeps_the_paragraphs_before_them() {
++        let mut core = report(40);
++        let before = core.save_snapshot_native();
++        core.split_paragraph_native(0, 10, 2, None).unwrap();
++        mark_measured(&mut core);
++        core.restore_snapshot_native(before).unwrap();
++        assert_eq!(kept(&core), (0..10).collect::<Vec<_>>());
++        assert_eq!(pages(&core), rebuilt(&core));
++
++        let before = core.save_snapshot_native();
++        core.merge_paragraph_native(0, 30).unwrap();
++        mark_measured(&mut core);
++        core.restore_snapshot_native(before).unwrap();
++        assert_eq!(kept(&core), (0..29).collect::<Vec<_>>());
++        assert_eq!(pages(&core), rebuilt(&core));
++    }
++
++    /// In a stored document the paragraphs on later pages keep their stored vertical
++    /// positions: undo and redo of a split keep them at their shifted places.
++    #[test]
++    fn undo_of_a_split_keeps_the_paragraphs_on_later_pages() {
++        let mut core =
++            DocumentCore::from_bytes(include_bytes!("../../../samples/20250130-hongbo.hwp"))
++                .expect("open");
++        let count = core.document().sections[0].paragraphs.len();
++        let para = (0..count)
++            .find(|&i| {
++                core.document().sections[0].paragraphs[i]
++                    .text
++                    .chars()
++                    .count()
++                    >= 2
++            })
++            .expect("text");
++        let before = core.save_snapshot_native();
++        core.split_paragraph_native(0, para, 1, None).unwrap();
++        let after = core.save_snapshot_native();
++        mark_measured(&mut core);
++        core.restore_snapshot_native(before).unwrap();
++        assert!(kept(&core).iter().any(|&i| i > para), "{:?}", kept(&core));
++        assert_eq!(pages(&core), rebuilt(&core));
++        mark_measured(&mut core);
++        core.restore_snapshot_native(after).unwrap();
++        assert!(
++            kept(&core).iter().any(|&i| i > para + 1),
++            "{:?}",
++            kept(&core)
++        );
++        assert_eq!(pages(&core), rebuilt(&core));
++    }
++
++    /// A paragraph that differs only in its session-edit mark is laid out again: the
++    /// mark is not serialized but changes the paragraph's layout rules.
++    #[test]
++    fn a_paragraph_differing_only_in_its_edit_mark_is_laid_out_again() {
++        let mut core = report(10);
++        let before = core.save_snapshot_native();
++        let para = &mut core.document.sections[0].paragraphs[4];
++        para.edited_in_session = !para.edited_in_session;
++        core.stamp_section_changed(0);
++        core.paginate();
++        mark_measured(&mut core);
++        core.restore_snapshot_native(before).unwrap();
++        assert!(!kept(&core).contains(&4));
++        assert_eq!(pages(&core), rebuilt(&core));
++    }
++
++    /// The typesetting an undo lays out is the one the next edit reuses: the restore
++    /// keys it with the restored DocInfo mark (it used a newer mark, and the first
++    /// edit after an undo typeset the whole section again).
++    #[test]
++    fn the_first_edit_after_an_undo_reuses_its_typesetting() {
++        let mut core = report(40);
++        let before = core.save_snapshot_native();
++        core.insert_text_native(0, 20, 1, "가").unwrap();
++        core.restore_snapshot_native(before).unwrap();
++        let kept = core.typeset_reuse[0].as_mut().expect("kept typesetting");
++        kept.raw.pre_emitted_host_heights.insert(usize::MAX, 1.0);
++        core.insert_text_native(0, 5, 1, "나").unwrap();
++        assert!(core.pagination[0]
++            .pre_emitted_host_heights
++            .contains_key(&usize::MAX));
++    }
++
++    /// Undo and redo of typing in a table cell of a stored document lay out only the
++    /// table's paragraph again and equal a full rebuild. The edit marks the table as
++    /// reflowed (`text_reflowed_tables`, keyed by address): only paragraphs whose
++    /// tables differ in that mark are laid out again.
++    #[test]
++    fn undo_of_a_cell_edit_equals_a_full_rebuild() {
++        let mut core =
++            DocumentCore::from_bytes(include_bytes!("../../../samples/20250130-hongbo.hwp"))
++                .expect("open");
++        let (para, ctrl) = core.document().sections[0]
++            .paragraphs
++            .iter()
++            .enumerate()
++            .find_map(|(i, p)| {
++                p.controls
++                    .iter()
++                    .position(|c| matches!(c, crate::model::control::Control::Table(_)))
++                    .map(|c| (i, c))
++            })
++            .expect("table");
++        let opened = pages(&core);
++        let before = core.save_snapshot_native();
++        core.insert_text_in_cell_native(0, para, ctrl, 0, 0, 0, "가")
++            .unwrap();
++        let after = core.save_snapshot_native();
++        let count = core.document().sections[0].paragraphs.len();
++        let others: Vec<usize> = (0..count).filter(|&i| i != para).collect();
++        mark_measured(&mut core);
++        core.restore_snapshot_native(before).unwrap();
++        assert_eq!(kept(&core), others);
++        assert_eq!(pages(&core), opened);
++        assert_eq!(pages(&core), rebuilt(&core));
++        mark_measured(&mut core);
++        core.restore_snapshot_native(after).unwrap();
++        assert_eq!(kept(&core), others);
++        assert_eq!(pages(&core), rebuilt(&core));
++    }
++}
+diff --git a/src/model/control.rs b/src/model/control.rs
+index 67000c054..ce9a8002f 100644
+--- a/src/model/control.rs
++++ b/src/model/control.rs
+@@ -25,7 +25,7 @@ where
+ }
+ 
+ /// 문단 내 컨트롤 (확장 컨트롤)
+-#[derive(Debug, Clone, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+ pub enum Control {
+     /// 구역 정의 ('secd')
+     SectionDef(Box<SectionDef>),
+@@ -125,7 +125,7 @@ pub const CTRL_CHAR_CODE_UNITS: u32 = 8;
+ pub const EQUATION_LINE_MODE_BIT: u32 = 0x0000_0001;
+ 
+ /// 수식 ('eqed' 컨트롤, HWP 스펙 표 105)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct Equation {
+     /// 개체 공통 속성 (위치, 크기, 배치)
+     pub common: CommonObjAttr,
+@@ -165,7 +165,7 @@ pub struct Equation {
+ }
+ 
+ /// 자동 번호 ('atno' 컨트롤, HWP 스펙 표 144)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct AutoNumber {
+     /// 번호 종류 (각주, 미주, 그림, 표, 수식)
+     pub number_type: AutoNumberType,
+@@ -200,7 +200,7 @@ pub enum AutoNumberType {
+ }
+ 
+ /// 새 번호 지정 ('nwno' 컨트롤)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct NewNumber {
+     /// 번호 종류
+     pub number_type: AutoNumberType,
+@@ -209,7 +209,7 @@ pub struct NewNumber {
+ }
+ 
+ /// 쪽 번호 위치 ('pgnp' 컨트롤, HWP 스펙 표 149)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct PageNumberPos {
+     /// 번호 형식 (표 150 bit 0~7, 표 134 참조)
+     pub format: u8,
+@@ -226,7 +226,7 @@ pub struct PageNumberPos {
+ }
+ 
+ /// 책갈피 ('bokm' 컨트롤)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct Bookmark {
+     /// 책갈피 이름
+     pub name: String,
+@@ -316,7 +316,7 @@ pub struct IndexMark {
+ }
+ 
+ /// 하이퍼링크 ('%hlk' 필드)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct Hyperlink {
+     /// URL
+     pub url: String,
+@@ -325,7 +325,7 @@ pub struct Hyperlink {
+ }
+ 
+ /// 덧말 ('tdut' 컨트롤)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct Ruby {
+     /// 기준 텍스트 (`<hp:mainText>`) — 덧말이 달리는 본문 글자. (#1587)
+     /// 파서가 para.text 에 넣지 않고 여기 보존한다(시각 충실도 핵심).
+@@ -345,7 +345,7 @@ pub struct Ruby {
+ }
+ 
+ /// 글자 겹침 ('tcps' 컨트롤, HWP 스펙 표 152)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct CharOverlap {
+     /// 겹칠 글자 목록 (최대 9글자)
+     pub chars: Vec<char>,
+@@ -360,7 +360,7 @@ pub struct CharOverlap {
+ }
+ 
+ /// 감추기 ('pghd' 컨트롤)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct PageHide {
+     /// 머리말 감추기
+     pub hide_header: bool,
+@@ -377,7 +377,7 @@ pub struct PageHide {
+ }
+ 
+ /// 숨은 설명 ('tcmt' 컨트롤)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct HiddenComment {
+     /// 문단 리스트
+     pub paragraphs: Vec<Paragraph>,
+@@ -829,7 +829,7 @@ mod parameter_list_codec_tests {
+ }
+ 
+ /// 필드 컨트롤
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct Field {
+     /// 필드 타입
+     pub field_type: FieldType,
+@@ -1076,7 +1076,7 @@ pub enum FormType {
+ }
+ 
+ /// 양식 개체 ('form' 컨트롤, ctrl_id=0x666f726d)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct FormObject {
+     /// 개체 공통 배치 속성 (위치·크기·기준·정렬·어울림)
+     ///
+@@ -1113,7 +1113,7 @@ pub struct FormObject {
+ }
+ 
+ /// 알 수 없는 컨트롤
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct UnknownControl {
+     /// 컨트롤 ID
+     pub ctrl_id: u32,
+diff --git a/src/model/document.rs b/src/model/document.rs
+index 0697400bb..80dc3f010 100644
+--- a/src/model/document.rs
++++ b/src/model/document.rs
+@@ -51,7 +51,7 @@ pub const HWPX_ORIGIN_STREAM_PATH: &str = "/RhwpHwpxOrigin";
+ pub const HWP3_ORIGIN_STREAM_PATH: &str = "/RhwpHwp3Origin";
+ 
+ /// 파서가 모델링하지 않는 원시 레코드 (라운드트립 보존용)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct RawRecord {
+     /// 태그 ID
+     pub tag_id: u16,
+@@ -300,7 +300,7 @@ pub struct Section {
+ pub const SECTION_WONGGOJI_FORMAT: u32 = 0x0040_0000;
+ 
+ /// 구역 정의 (HWPTAG_CTRL_HEADER - 'secd')
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct SectionDef {
+     /// 속성 비트 플래그
+     pub flags: u32,
+diff --git a/src/model/footnote.rs b/src/model/footnote.rs
+index 358d5afb3..f7f60b6cb 100644
+--- a/src/model/footnote.rs
++++ b/src/model/footnote.rs
+@@ -12,7 +12,7 @@ use super::*;
+ /// LIST_HEADER for Footnote (size=16): paraCount(SInt4) + property(UInt4) + 8 byte zero padding.
+ ///
+ /// 참조: `hwplib::ControlFootnote` + `CtrlHeaderFootnote`.
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct Footnote {
+     /// 각주 번호
+     pub number: u16,
+@@ -38,7 +38,7 @@ pub struct Footnote {
+ }
+ 
+ /// 미주 ('en  ' 컨트롤) — [Task #1050] Footnote 와 동일 구조
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct Endnote {
+     /// 미주 번호
+     pub number: u16,
+@@ -64,7 +64,7 @@ pub struct Endnote {
+ }
+ 
+ /// 각주/미주 모양 (HWPTAG_FOOTNOTE_SHAPE)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct FootnoteShape {
+     /// 속성 비트 플래그
+     pub attr: u32,
+diff --git a/src/model/header_footer.rs b/src/model/header_footer.rs
+index 0461354aa..79305c965 100644
+--- a/src/model/header_footer.rs
++++ b/src/model/header_footer.rs
+@@ -3,7 +3,7 @@
+ use super::paragraph::Paragraph;
+ 
+ /// 머리말 ('head' 컨트롤)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct Header {
+     /// 적용 범위
+     pub apply_to: HeaderFooterApply,
+@@ -26,7 +26,7 @@ pub struct Header {
+ }
+ 
+ /// 꼬리말 ('foot' 컨트롤)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct Footer {
+     /// 적용 범위
+     pub apply_to: HeaderFooterApply,
+@@ -64,7 +64,7 @@ pub enum HeaderFooterApply {
+ ///
+ /// 구역 단위 페이지 템플릿. 양쪽/홀수/짝수 3종류 설정 가능.
+ /// SectionDef의 자식 LIST_HEADER 레코드에서 파싱.
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct MasterPage {
+     /// 적용 범위 (양쪽/홀수/짝수)
+     pub apply_to: HeaderFooterApply,
+diff --git a/src/model/hyperlink_format.rs b/src/model/hyperlink_format.rs
+index c4786e41b..f0c7569dc 100644
+--- a/src/model/hyperlink_format.rs
++++ b/src/model/hyperlink_format.rs
+@@ -46,12 +46,12 @@ impl Format {
+         }
+     }
+ }
+-#[derive(Debug, Clone, Serialize, Deserialize)]
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ struct Run {
+     len: usize,
+     format: Format,
+ }
+-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
++#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+ pub struct OriginalFormat {
+     runs: Vec<Run>,
+ }
+diff --git a/src/model/image.rs b/src/model/image.rs
+index facdfbe90..a3347aaae 100644
+--- a/src/model/image.rs
++++ b/src/model/image.rs
+@@ -11,7 +11,7 @@ pub(crate) fn external_picture_basename(path: &str) -> &str {
+ }
+ 
+ /// 그림 개체 (HWPTAG_SHAPE_COMPONENT_PICTURE)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct Picture {
+     /// 개체 공통 속성
+     pub common: CommonObjAttr,
+@@ -80,7 +80,7 @@ impl Picture {
+ }
+ 
+ /// 자르기 정보
+-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Copy, Default, serde::Serialize)]
+ pub struct CropInfo {
+     pub left: i32,
+     pub top: i32,
+@@ -89,7 +89,7 @@ pub struct CropInfo {
+ }
+ 
+ /// 이미지 속성
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct ImageAttr {
+     /// 밝기
+     pub brightness: i8,
+@@ -110,7 +110,7 @@ pub struct ImageAttr {
+ 
+ /// HWPX 그림 효과 (`hp:effects`). OWPML `EffectsType` 순서: 그림자, 네온, 부드러운
+ /// 가장자리, 반사. 값은 원문 문자열 그대로 보존한다(왕복 시 표기를 바꾸지 않는다).
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct PictureEffects {
+     pub shadow: Option<PictureShadow>,
+     pub glow: Option<PictureGlow>,
+@@ -129,7 +129,7 @@ impl PictureEffects {
+ }
+ 
+ /// HWPX 네온 효과 (`hp:glow`): 투명도(0~1), 크기(HWPUNIT), 색.
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct PictureGlow {
+     pub alpha: Option<String>,
+     pub radius: Option<String>,
+@@ -137,13 +137,13 @@ pub struct PictureGlow {
+ }
+ 
+ /// HWPX 부드러운 가장자리 효과 (`hp:softEdge`): 크기(HWPUNIT).
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct PictureSoftEdge {
+     pub radius: Option<String>,
+ }
+ 
+ /// HWPX 반사 효과 (`hp:reflection`).
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct PictureReflection {
+     pub align_style: Option<String>,
+     /// 흐릿한 정도(HWPUNIT)
+@@ -164,21 +164,21 @@ pub struct PictureReflection {
+ }
+ 
+ /// 반사 효과의 시작·끝 값 (`hp:alpha`, `hp:pos`).
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct EffectRange {
+     pub start: Option<String>,
+     pub end: Option<String>,
+ }
+ 
+ /// 효과 색 변환 (`hp:effectsColor/hp:effect`): ALPHA, GRAY, COMP, GAMMA, INV_GAMMA, INV.
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct EffectColorTransform {
+     pub kind: String,
+     pub value: String,
+ }
+ 
+ /// HWPX 그림 그림자 효과 (`hp:shadow`).
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct PictureShadow {
+     pub style: Option<String>,
+     pub alpha: Option<String>,
+@@ -193,14 +193,14 @@ pub struct PictureShadow {
+ }
+ 
+ /// HWPX 효과의 x/y 좌표성 값 (`hp:skew`, `hp:scale`).
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct EffectPoint {
+     pub x: Option<String>,
+     pub y: Option<String>,
+ }
+ 
+ /// HWPX 효과 색상 (`hp:effectsColor`).
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct EffectColor {
+     pub color_type: Option<String>,
+     pub scheme_idx: Option<String>,
+@@ -212,7 +212,7 @@ pub struct EffectColor {
+ }
+ 
+ /// HWPX 효과 RGB 색상 (`hp:rgb`).
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct EffectRgb {
+     pub r: Option<String>,
+     pub g: Option<String>,
+diff --git a/src/model/mod.rs b/src/model/mod.rs
+index 56af06c8c..cc5968f8c 100644
+--- a/src/model/mod.rs
++++ b/src/model/mod.rs
+@@ -37,7 +37,7 @@ pub type HwpUnit16 = i16;
+ pub type ColorRef = u32;
+ 
+ /// 2차원 좌표
+-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Copy, Default, serde::Serialize)]
+ pub struct Point {
+     pub x: i32,
+     pub y: i32,
+@@ -63,7 +63,7 @@ impl Rect {
+ }
+ 
+ /// 4방향 여백
+-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Copy, Default, serde::Serialize)]
+ pub struct Padding {
+     pub left: HwpUnit16,
+     pub right: HwpUnit16,
+diff --git a/src/model/page.rs b/src/model/page.rs
+index bfa7d9485..b3ff577af 100644
+--- a/src/model/page.rs
++++ b/src/model/page.rs
+@@ -3,7 +3,7 @@
+ use super::*;
+ 
+ /// 용지 설정 (HWPTAG_PAGE_DEF)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct PageDef {
+     /// 용지 가로 크기
+     pub width: HwpUnit,
+@@ -66,7 +66,7 @@ pub enum BindingMethod {
+ }
+ 
+ /// 쪽 테두리/배경 (HWPTAG_PAGE_BORDER_FILL)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct PageBorderFill {
+     /// 속성 비트 플래그
+     pub attr: u32,
+@@ -117,7 +117,7 @@ pub enum PageBorderUiBasis {
+ }
+ 
+ /// 단 정의 ('cold' 컨트롤)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct ColumnDef {
+     /// 단 종류
+     pub column_type: ColumnType,
+diff --git a/src/model/paragraph.rs b/src/model/paragraph.rs
+index 327284dec..655f6e742 100644
+--- a/src/model/paragraph.rs
++++ b/src/model/paragraph.rs
+@@ -13,7 +13,7 @@ pub struct CharShapeRun {
+ }
+ 
+ /// 문단 (HWPTAG_PARA_HEADER + 하위 레코드)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct Paragraph {
+     /// 문자 수 (제어 문자 포함)
+     pub char_count: u32,
+@@ -319,7 +319,7 @@ pub enum ColumnBreakType {
+ }
+ 
+ /// 글자 모양 참조 (문단 내 위치별 글자 모양)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct CharShapeRef {
+     /// 글자 모양이 바뀌는 시작 위치
+     pub start_pos: u32,
+@@ -451,7 +451,7 @@ impl LineSeg {
+ }
+ 
+ /// 영역 태그 (HWPTAG_PARA_RANGE_TAG)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct RangeTag {
+     /// 영역 시작
+     pub start: u32,
+@@ -590,7 +590,7 @@ pub struct TitleMark {
+ }
+ 
+ /// 필드 텍스트 범위 (0x03 FIELD_BEGIN ~ 0x04 FIELD_END 사이 텍스트)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct FieldRange {
+     /// text 문자열 내 시작 인덱스 (포함)
+     pub start_char_idx: usize,
+@@ -620,7 +620,7 @@ pub struct FieldRange {
+ /// 다단락 필드의 종료 마커. begin 문단에서 `Control::Field` 로 보존되는 것과 달리,
+ /// end 문단에는 컨트롤·FieldRange 가 없어 8유닛 슬롯을 표현할 산출물이 없다.
+ /// 이를 기록해 직렬화기가 `<hp:fieldEnd>` 를 같은 위치에 복원한다 (Task #1556).
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct OrphanFieldEnd {
+     /// text 문자열 내 위치 (이 인덱스 직전에 8유닛 fieldEnd 슬롯이 놓인다).
+     /// 텍스트 끝이면 `text.chars().count()`.
+diff --git a/src/model/shape.rs b/src/model/shape.rs
+index b429befcf..119218b7e 100644
+--- a/src/model/shape.rs
++++ b/src/model/shape.rs
+@@ -27,7 +27,7 @@ pub(crate) mod common_obj_offsets {
+ }
+ 
+ /// 개체 공통 속성 (모든 개체에 공통)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct CommonObjAttr {
+     /// 컨트롤 ID
+     pub ctrl_id: u32,
+@@ -213,7 +213,7 @@ pub enum TextFlow {
+ }
+ 
+ /// 개체 요소 속성 (그리기 개체 공통)
+-#[derive(Debug, Clone, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+ pub struct ShapeComponentAttr {
+     /// SHAPE_COMPONENT 내 ctrl_id (라운드트립 보존용, 0이면 기본값 사용)
+     pub ctrl_id: u32,
+@@ -311,7 +311,7 @@ impl Default for ShapeComponentAttr {
+ }
+ 
+ /// 그리기 개체 공통 속성
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct DrawingObjAttr {
+     /// 개체 요소 속성
+     pub shape_attr: ShapeComponentAttr,
+@@ -339,7 +339,7 @@ pub struct DrawingObjAttr {
+ }
+ 
+ /// 글상자 (그리기 개체 내 텍스트)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct TextBox {
+     /// LIST_HEADER list_attr (라운드트립 보존용)
+     pub list_attr: u32,
+@@ -367,7 +367,7 @@ pub struct TextBox {
+ }
+ 
+ /// 그리기 개체 종류
+-#[derive(Debug, Clone, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+ pub enum ShapeObject {
+     /// 직선
+     Line(LineShape),
+@@ -519,7 +519,7 @@ impl ShapeObject {
+ }
+ 
+ /// 직선 개체 (HWPTAG_SHAPE_COMPONENT_LINE)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct LineShape {
+     /// 공통 속성
+     pub common: CommonObjAttr,
+@@ -582,7 +582,7 @@ impl LinkLineType {
+ }
+ 
+ /// 연결선 제어점
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct ConnectorControlPoint {
+     pub x: i32,
+     pub y: i32,
+@@ -590,7 +590,7 @@ pub struct ConnectorControlPoint {
+ }
+ 
+ /// 연결선 추가 데이터 (SC_LINE 확장)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct ConnectorData {
+     /// 연결선 타입
+     pub link_type: LinkLineType,
+@@ -609,7 +609,7 @@ pub struct ConnectorData {
+ }
+ 
+ /// 사각형 개체 (HWPTAG_SHAPE_COMPONENT_RECTANGLE)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct RectangleShape {
+     /// 공통 속성
+     pub common: CommonObjAttr,
+@@ -643,7 +643,7 @@ impl RectangleShape {
+ }
+ 
+ /// 타원 개체 (HWPTAG_SHAPE_COMPONENT_ELLIPSE)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct EllipseShape {
+     /// 공통 속성
+     pub common: CommonObjAttr,
+@@ -668,7 +668,7 @@ pub struct EllipseShape {
+ }
+ 
+ /// 호 개체 (HWPTAG_SHAPE_COMPONENT_ARC)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct ArcShape {
+     /// 공통 속성
+     pub common: CommonObjAttr,
+@@ -685,7 +685,7 @@ pub struct ArcShape {
+ }
+ 
+ /// 다각형 개체 (HWPTAG_SHAPE_COMPONENT_POLYGON)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct PolygonShape {
+     /// 공통 속성
+     pub common: CommonObjAttr,
+@@ -698,7 +698,7 @@ pub struct PolygonShape {
+ }
+ 
+ /// 곡선 개체 (HWPTAG_SHAPE_COMPONENT_CURVE)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct CurveShape {
+     /// 공통 속성
+     pub common: CommonObjAttr,
+@@ -711,7 +711,7 @@ pub struct CurveShape {
+ }
+ 
+ /// 묶음 개체 (HWPTAG_SHAPE_COMPONENT_CONTAINER)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct GroupShape {
+     /// 공통 속성
+     pub common: CommonObjAttr,
+@@ -724,7 +724,7 @@ pub struct GroupShape {
+ }
+ 
+ /// 캡션 정보
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct Caption {
+     /// 방향 (0: left, 1: right, 2: top, 3: bottom)
+     pub direction: CaptionDirection,
+@@ -794,14 +794,14 @@ pub enum LegendPosition {
+ }
+ 
+ /// 범례
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct Legend {
+     pub position: LegendPosition,
+     pub visible: bool,
+ }
+ 
+ /// 축
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct Axis {
+     pub label: Option<String>,
+     pub labels: Vec<String>,
+@@ -810,7 +810,7 @@ pub struct Axis {
+ }
+ 
+ /// 데이터 시리즈 (한 줄기 막대/선 등)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct DataSeries {
+     /// 시리즈 이름 (범례 표시용)
+     pub name: String,
+@@ -823,7 +823,7 @@ pub struct DataSeries {
+ }
+ 
+ /// 차트 개체 (GSO + HWPTAG_CHART_DATA)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct ChartShape {
+     /// 공통 속성
+     pub common: CommonObjAttr,
+@@ -861,7 +861,7 @@ pub enum OlePreviewFormat {
+ }
+ 
+ /// OLE 프리뷰 이미지
+-#[derive(Debug, Clone, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+ pub struct OlePreview {
+     pub format: OlePreviewFormat,
+     pub bytes: Vec<u8>,
+@@ -878,7 +878,7 @@ pub enum OleDrawingAspect {
+ }
+ 
+ /// OLE 개체 (HWPTAG_SHAPE_COMPONENT_OLE)
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct OleShape {
+     /// 공통 속성
+     pub common: CommonObjAttr,
+diff --git a/src/model/style.rs b/src/model/style.rs
+index 9c7bf4d33..f9fa848e5 100644
+--- a/src/model/style.rs
++++ b/src/model/style.rs
+@@ -853,7 +853,7 @@ pub enum ImageFillMode {
+ }
+ 
+ /// 테두리 선 정보 (그리기 개체용)
+-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Copy, Default, serde::Serialize)]
+ pub struct ShapeBorderLine {
+     /// 선 색상
+     pub color: ColorRef,
+diff --git a/src/model/table.rs b/src/model/table.rs
+index 077e05df3..53a440a17 100644
+--- a/src/model/table.rs
++++ b/src/model/table.rs
+@@ -29,7 +29,7 @@ std::thread_local! {
+ }
+ 
+ /// 표 개체 (HWPTAG_TABLE)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct Table {
+     /// 속성 비트 플래그
+     pub attr: u32,
+@@ -93,7 +93,7 @@ pub enum TablePageBreak {
+ }
+ 
+ /// 표 영역 속성
+-#[derive(Debug, Clone, Default, serde::Serialize)]
++#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+ pub struct TableZone {
+     /// 시작 열 주소
+     pub start_col: u16,
+@@ -108,7 +108,7 @@ pub struct TableZone {
+ }
+ 
+ /// 표 셀 (HWPTAG_LIST_HEADER + 셀 속성)
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+ pub struct Cell {
+     /// 셀 열 주소 (0부터 시작)
+     pub col: u16,

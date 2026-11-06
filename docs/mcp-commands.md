@@ -131,6 +131,9 @@ MCP 없이도 같은 목록을 CLI로 봅니다: `hwpcraft-cli commands [검색�
 ## 그림 넣기·개체 캡션
 
 - `picture.insert` {path, width_mm?, treat_as_char?}: treat_as_char를 생략하면 글자처럼 취급(0.19부터, 이전에는 떠 있는 그림). false면 캐럿 문단 기준·단 왼쪽·어울림으로 넣고 글이 옆으로 흐른다.
+- `picture.replace` {address, path | attachment, keep_aspect?}: 그림의 이미지만 바꾼다(자리·배치·캡션 유지, keep_aspect 기본 true면 너비를 두고 높이를 새 비율로). 머리말·꼬리말 그림은 `page.header_footer.object.list`의 address로 바꾼다. AI 편집 중에는 path(파일 읽기)가 막히고 attachment(질문에 첨부한 그림 번호)만 된다.
+- `picture.insert_attachment` {attachment, width_mm?, treat_as_char?}: AI 편집 패널 질문에 첨부한 그림을 캐럿 자리에 넣는다. 파일을 읽지 않으므로 AI 편집 중에도 쓸 수 있다.
+- `page.header_footer.field.insert` {kind, header?, apply_to?, section?, paragraph?, offset?}: 머리말·꼬리말의 지정한 자리(기본 첫 문단 끝)에 쪽 번호·전체 쪽수·파일 이름·만든 날짜·저장한 날짜 필드를 넣는다. 화면에서 머리말을 고치는 중이 아니어도 되고, 그 머리말의 다른 내용(그림·표 등)은 그대로 둔다(`page.header_footer.text`는 첫 문단 글을 통째로 바꾼다).
 - `object.caption_text` {address, text} — address(그림·도형·묶음·차트·OLE), text(캡션 번호 뒤 문자열, 1,000자 이하). 캡션은 object.properties hasCaption으로 먼저 넣는다
 - `object.caption_text.get` {address}
 - 표 캡션은 `table.caption_text` {table, text}

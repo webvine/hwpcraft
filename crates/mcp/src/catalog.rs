@@ -7,8 +7,31 @@ use std::{
     sync::OnceLock,
 };
 
-fn all_commands() -> &'static [Value] {
-    static COMMANDS: OnceLock<Vec<Value>> = OnceLock::new();
+/// A catalog entry with what a search compares, lower-cased once.
+struct Entry {
+    value: Value,
+    /// The id, lower case.
+    id: String,
+    /// The label (commands) or command id (actions), lower case.
+    other: String,
+}
+
+impl Entry {
+    fn new(value: Value, other_field: &str) -> Self {
+        let lower = |name: &str| value[name].as_str().unwrap_or("").to_lowercase();
+        Self {
+            id: lower("id"),
+            other: lower(other_field),
+            value,
+        }
+    }
+    fn matches(&self, query: &str) -> bool {
+        query.is_empty() || self.id.contains(query) || self.other.contains(query)
+    }
+}
+
+fn all_commands() -> &'static [Entry] {
+    static COMMANDS: OnceLock<Vec<Entry>> = OnceLock::new();
     COMMANDS.get_or_init(|| {
         // One pass over the help tables; looking each id up re-parses them all.
         let mut help: HashMap<_, _> = HashMap::new();
@@ -21,27 +44,37 @@ fn all_commands() -> &'static [Value] {
             .map(|(id, label, shortcut)| {
                 let (help, example) = help.remove(id).unwrap_or_else(|| parameters(id));
                 let actions: Vec<&str> = hwpcraft_engine::HWP_ACTIONS.iter().filter(|(_,cmd,_,_)| *cmd == *id).map(|(a,_,_,_)| *a).collect();
-                json!({"id":id,"label":label,"shortcut":shortcut,"paramsHelp":help,"paramsExample":example,"hwpActions":actions})
+                Entry::new(json!({"id":id,"label":label,"shortcut":shortcut,"paramsHelp":help,"paramsExample":example,"hwpActions":actions}), "label")
             }).collect()
     })
 }
 
 pub(crate) fn commands(query: &str) -> Value {
     let query = query.to_lowercase();
-    let matches = |entry: &&Value| {
-        let field = |name| entry[name].as_str().unwrap_or("").to_lowercase();
-        query.is_empty() || field("id").contains(&query) || field("label").contains(&query)
-    };
-    Value::Array(all_commands().iter().filter(matches).cloned().collect())
+    Value::Array(
+        all_commands()
+            .iter()
+            .filter(|entry| entry.matches(&query))
+            .map(|entry| entry.value.clone())
+            .collect(),
+    )
 }
 
-fn all_actions() -> &'static [Value] {
-    static ACTIONS: OnceLock<Vec<Value>> = OnceLock::new();
+/// Every command id, in catalog order.
+pub(crate) fn command_ids() -> Vec<&'static str> {
+    all_commands()
+        .iter()
+        .filter_map(|entry| entry.value["id"].as_str())
+        .collect()
+}
+
+fn all_actions() -> &'static [Entry] {
+    static ACTIONS: OnceLock<Vec<Entry>> = OnceLock::new();
     ACTIONS.get_or_init(|| {
         hwpcraft_engine::HWP_ACTIONS
             .iter()
             .map(|(id, cmd, params, status)| {
-                json!({"id":id,"command":cmd,"defaultParams":serde_json::from_str::<Value>(params).unwrap_or(json!({})),"mapping":status,"parameterSet":hwpcraft_engine::hwp_parameter_schema(id)})
+                Entry::new(json!({"id":id,"command":cmd,"defaultParams":serde_json::from_str::<Value>(params).unwrap_or(json!({})),"mapping":status,"parameterSet":hwpcraft_engine::hwp_parameter_schema(id)}), "command")
             })
             .collect()
     })
@@ -50,12 +83,13 @@ fn all_actions() -> &'static [Value] {
 /// Hangul action ids with their HwpCraft command and default parameters.
 pub(crate) fn actions(query: &str) -> Value {
     let query = query.to_lowercase();
-    let matches = |entry: &&Value| {
-        let id = entry["id"].as_str().unwrap_or("");
-        let command = entry["command"].as_str().unwrap_or("");
-        query.is_empty() || id.to_lowercase().contains(&query) || command.contains(&query)
-    };
-    Value::Array(all_actions().iter().filter(matches).cloned().collect())
+    Value::Array(
+        all_actions()
+            .iter()
+            .filter(|entry| entry.matches(&query))
+            .map(|entry| entry.value.clone())
+            .collect(),
+    )
 }
 
 /// Fallback for a command whose owning module has not documented it yet.

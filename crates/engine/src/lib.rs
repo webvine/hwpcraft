@@ -49,8 +49,12 @@ mod contexts_v2;
 pub use contexts_v2::{ContextAddress, ContextStep};
 mod comments;
 mod features;
+mod run_pictures;
 mod find;
 pub use find::{FindDirection, FindOptions};
+mod hf_edit;
+mod hf_objects;
+pub use hf_edit::{HfApply, HfCharState, HfHit, HfPoint, HfTarget};
 mod links;
 mod macros;
 mod nested_caret;
@@ -84,6 +88,7 @@ pub use equation_macros::{
     EquationMacro, delete_equation_macro, equation_macro, equation_macros, save_equation_macro,
 };
 mod automation;
+mod bare_objects;
 mod control_slots;
 mod cross_ref;
 mod date_fields;
@@ -282,6 +287,8 @@ pub struct Session {
     nested_block: Option<NestedBlock>,
     /// Cell boxes of the nested block, keyed by (generation, page, block).
     nested_block_rects: std::cell::RefCell<Option<NestedBlockRects>>,
+    /// The header or footer being edited on the page (see `hf_edit`).
+    hf: hf_edit::HfState,
     pub cursor: Cursor,
     /// Selection is confined to the current paragraph, including table cells.
     pub anchor: Option<usize>,
@@ -328,6 +335,10 @@ pub struct Session {
     geometry_cache: GeometryCache,
     visual_hint: std::cell::Cell<Option<VisualHint>>,
     hit_hint: std::cell::Cell<Option<VisualHint>>,
+    /// The caret stands after the bare inline object at this cursor (`bare_objects`).
+    after_object: std::cell::Cell<Option<Cursor>>,
+    /// A click landed after a bare inline object; `select` takes it up.
+    hit_after: std::cell::Cell<Option<Cursor>>,
     revision: u64,
     next_revision: u64,
     saved_revision: u64,
@@ -351,6 +362,10 @@ pub struct Session {
     undo_group: Option<undo_group::ActiveGroup>,
     /// Refuse `RESTRICTED_COMMANDS` (`set_commands_restricted`).
     commands_restricted: bool,
+    /// Pictures attached to the question being answered (`run_pictures`).
+    run_pictures: Vec<(usize, String, Vec<u8>)>,
+    /// What converting the opened Word document could not carry.
+    import_notes: Vec<String>,
 }
 impl Session {
     pub fn new() -> Result<Self> {
@@ -377,6 +392,7 @@ impl Session {
             nested: None,
             nested_block: None,
             nested_block_rects: Default::default(),
+            hf: Default::default(),
             authored: path.is_none(),
             path,
             password: None,
@@ -403,6 +419,8 @@ impl Session {
             geometry_cache: GeometryCache::default(),
             visual_hint: std::cell::Cell::new(None),
             hit_hint: std::cell::Cell::new(None),
+            after_object: std::cell::Cell::new(None),
+            hit_after: std::cell::Cell::new(None),
             revision: 0,
             next_revision: 1,
             saved_revision: 0,
@@ -417,11 +435,13 @@ impl Session {
             shade_base: None,
             undo_group: None,
             commands_restricted: false,
+            run_pictures: Vec::new(),
+            import_notes: Vec::new(),
         }
     }
     pub fn open(&mut self, path: &Path) -> Result<()> {
         self.ensure_history_replacement_allowed()?;
-        let mut core = hwpcraft_formats::open(path)?;
+        let (mut core, notes) = hwpcraft_formats::open_with_notes(path, None)?;
         comments::restore_memo_content(&mut core)?;
         track_changes::seal_tracked_sections(&mut core);
         let generation = self.generation + 1;
@@ -435,19 +455,26 @@ impl Session {
         opened.macros = self.take_macro_recorder();
         opened.track_marks =
             track_changes::unread_track_marks(hwpx_track_marks_of(path), opened.core.document());
+        opened.import_notes = notes;
         *self = opened;
         Ok(())
+    }
+    /// What converting the opened Word document could not carry ("what · count" lines);
+    /// empty for HWP documents.
+    pub fn import_notes(&self) -> &[String] {
+        &self.import_notes
     }
     /// Open a password-protected document. The password is kept for later saves.
     pub fn open_with_password(&mut self, path: &Path, password: &str) -> Result<()> {
         self.ensure_history_replacement_allowed()?;
-        let mut core = hwpcraft_formats::open_with_password(path, password)?;
+        let (mut core, notes) = hwpcraft_formats::open_with_notes(path, Some(password))?;
         comments::restore_memo_content(&mut core)?;
         track_changes::seal_tracked_sections(&mut core);
         let generation = self.generation + 1;
         let mut opened = Self::with_core(core, Some(path.to_owned()));
         opened.generation = generation;
         opened.password = Some(password.to_owned());
+        opened.import_notes = notes;
         opened.page_count()?;
         opened.macros = self.take_macro_recorder();
         opened.track_marks =
@@ -500,13 +527,18 @@ impl Session {
             self.refuse_tracked_save(path)?;
         }
         self.with_save_times(path, |s| s.save_with_tab_widths(path))?;
-        if matches!(
-            path.extension()
-                .and_then(|x| x.to_str())
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("hwp" | "hwpx")
-        ) {
+        // A Word document saved back to its own file stays that document.
+        let own_docx = self.path.as_deref() == Some(path)
+            && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("docx"));
+        if own_docx
+            || matches!(
+                path.extension()
+                    .and_then(|x| x.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("hwp" | "hwpx")
+            )
+        {
             self.path = Some(path.to_owned());
             self.saved_revision = self.revision;
         }
@@ -667,6 +699,7 @@ impl Session {
             offset: n("charOffset"),
             cell,
         };
+        let cursor = self.place_hit(page, x, cursor);
         // A hit probe is pending until selection actually accepts its cursor.
         // Hover/read-only queries therefore never move the displayed caret.
         self.hit_hint.set(None);
@@ -721,6 +754,9 @@ impl Session {
         self.caret_at(self.cursor)
     }
     pub fn caret_at(&self, c: Cursor) -> Result<Value> {
+        if let Some(after) = self.after_object_caret(c)? {
+            return Ok(after);
+        }
         let hint = self.current_visual_hint(c);
         let key = (self.generation, c, hint.map(|h| (h.page, h.affinity)));
         if let Some((at, value)) = self.caret_memo.borrow().as_ref()
@@ -1177,7 +1213,7 @@ impl Session {
     }
     fn split(&mut self) -> Result<()> {
         let c = self.cursor;
-        let offset = self.split_offset(c)?;
+        let offset = self.split_offset(c)? + self.split_after_object();
         if let Some(t) = c.cell {
             self.core
                 .split_paragraph_in_cell_native(
@@ -1210,6 +1246,8 @@ impl Session {
             bail!("한 번에 입력할 수 있는 텍스트는 1 MB 이하입니다.");
         }
         check_typed_text(text)?;
+        // Typed after a bare inline object, the text stays behind it.
+        let behind = self.after_object_control();
         let replace = self.overwrite && !self.has_selection();
         if replace && self.track_recording() {
             bail!("변경 추적 기록 중에는 수정(겹쳐 쓰기) 모드로 입력할 수 없습니다.");
@@ -1255,6 +1293,12 @@ impl Session {
                         .insert_text_native(c.section, c.paragraph, c.offset, line)
                 };
                 r.map_err(err)?;
+                if i == 0
+                    && c.cell.is_none()
+                    && let Some(ci) = behind
+                {
+                    s.keep_object_in_front(c, ci)?;
+                }
                 s.repair_trailing_number_stride(c, old_len);
                 ticket.apply_range(&mut s.core, c, c.offset..c.offset + line.chars().count())?;
                 s.track_inserted(c, c.offset..c.offset + line.chars().count())?;
@@ -1278,10 +1322,17 @@ impl Session {
         if self.track_recording() {
             return self.track_delete(back);
         }
+        if let Some(r) = self.delete_bare_object(back) {
+            return r;
+        }
         let c = self.cursor;
         let length = self.len();
         if back && c.offset > 0 {
-            return self.delete_range(c.offset - 1..c.offset);
+            let object_before = self.object_before_deleted(c);
+            self.delete_range(c.offset - 1..c.offset)?;
+            // The character behind an object went: the caret stays behind the object.
+            self.behind_after_backspace(object_before);
+            return Ok(());
         }
         if !back && c.offset < length {
             return self.delete_range(c.offset..c.offset + 1);

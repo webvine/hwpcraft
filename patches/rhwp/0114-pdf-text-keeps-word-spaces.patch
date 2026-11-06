@@ -1,0 +1,84 @@
+diff --git a/src/renderer/svg.rs b/src/renderer/svg.rs
+index 9e1d653..6d08194 100644
+--- a/src/renderer/svg.rs
++++ b/src/renderer/svg.rs
+@@ -3505,6 +3505,25 @@ impl Renderer for SvgRenderer {
+             for (char_idx, cluster_str) in clusters.iter() {
+                 // 공백의 저장 전진폭·장식은 유지하되 글꼴의 잘못된 NBSP 윤곽선은 그리지 않는다.
+                 if cluster_str.chars().all(char::is_whitespace) {
++                    // [HwpCraft 0114] 인쇄 등가 profile(PDF·인쇄)에서는 같은 자리에 보이지
++                    // 않는 U+0020 을 겹쳐 쓴다 — 빈칸 글자가 출력 텍스트 스트림에 없으면 PDF
++                    // 에서 복사·검색한 글의 띄어쓰기가 모두 사라진다(13개 표본 전부). 그리는
++                    // 것은 없고(`fill="none"`), 편집 화면 SVG 는 그대로다. usvg 는 윤곽선이
++                    // 하나도 없는 <text> 를 버리므로(빈칸만 있으면 PDF 에 오지 않음) 칠하지 않는
++                    // 밑줄을 달아 남긴다. 투명도(`fill-opacity="0"`)로 숨기면 빈칸마다 그래픽
++                    // 상태와 밑줄 경로가 쓰여 PDF 가 최대 2.7배 커진다.
++                    if !self.profile.shows_editor_visuals() {
++                        self.output.push_str(&format!(
++                            "<text x=\"{:.4}\" y=\"{:.4}\" font-family=\"{}\" font-size=\"{}\" \
++                             fill=\"none\" text-decoration=\"underline\" \
++                             xml:space=\"preserve\">{}</text>\n",
++                            x + char_positions[*char_idx],
++                            y,
++                            escape_xml(&font_family),
++                            font_size,
++                            " ".repeat(cluster_str.chars().count()),
++                        ));
++                    }
+                     continue;
+                 }
+                 if cluster_str == "-" {
+diff --git a/src/renderer/svg/tests.rs b/src/renderer/svg/tests.rs
+index 74c2907..676219a 100644
+--- a/src/renderer/svg/tests.rs
++++ b/src/renderer/svg/tests.rs
+@@ -30,6 +30,49 @@ fn test_svg_draw_text() {
+     assert!(output.contains("font-weight=\"bold\""));
+ }
+ 
++/// [HwpCraft 0114] 인쇄 등가 profile 은 빈칸 자리에 칠하지 않는 U+0020 을 남겨 PDF 에서
++/// 복사·검색한 글의 띄어쓰기를 지킨다(usvg 가 버리지 않도록 칠하지 않는 밑줄을 단다).
++/// 편집 화면 profile 은 종전대로 빈칸을 쓰지 않는다.
++#[test]
++fn print_profile_keeps_word_spaces_as_unpainted_text() {
++    let draw = |profile| {
++        let mut renderer = SvgRenderer::new();
++        renderer.profile = profile;
++        renderer.begin_page(800.0, 600.0);
++        renderer.draw_text(
++            "가 나",
++            10.0,
++            20.0,
++            &TextStyle {
++                font_size: 16.0,
++                ..Default::default()
++            },
++        );
++        renderer.output().to_string()
++    };
++    let print = draw(crate::paint::RenderProfile::Print);
++    let spaces: Vec<&str> = print
++        .lines()
++        .filter(|l| l.contains("xml:space=\"preserve\"> </text>"))
++        .collect();
++    assert_eq!(spaces.len(), 1, "{print}");
++    assert!(
++        spaces[0].contains("fill=\"none\"") && spaces[0].contains("text-decoration=\"underline\""),
++        "{}",
++        spaces[0]
++    );
++    let screen = draw(crate::paint::RenderProfile::Screen);
++    assert!(!screen.contains("xml:space"), "{screen}");
++    // 보이는 글자는 두 profile 이 같다.
++    let glyphs = |svg: &str| {
++        svg.lines()
++            .filter(|l| l.starts_with("<text") && !l.contains("xml:space"))
++            .map(str::to_owned)
++            .collect::<Vec<_>>()
++    };
++    assert_eq!(glyphs(&print), glyphs(&screen));
++}
++
+ #[test]
+ fn test_svg_draw_text_medium_weight() {
+     let mut renderer = SvgRenderer::new();

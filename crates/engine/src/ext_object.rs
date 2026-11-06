@@ -117,6 +117,12 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "",
     ),
     ("picture.effects.get", "그림 효과 조회", ""),
+    ("picture.replace", "그림 바꾸기 (자리·너비 유지)", ""),
+    (
+        "picture.insert_attachment",
+        "질문에 첨부한 그림 넣기 (AI 편집)",
+        "",
+    ),
     (
         "insert.auto_number",
         "번호 넣기 (쪽·전체 쪽·그림·표·수식 번호)",
@@ -140,6 +146,16 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
         "picture.insert",
         "path(PNG·JPG·BMP·GIF, 20 MB·8192 px 이하), width_mm(없으면 원본 비율), treat_as_char(생략하면 true=글자처럼 취급, 0.19부터; false면 캐럿 문단 기준·단 왼쪽·어울림으로 띄움). 표 셀 안에서는 treat_as_char와 관계없이 그 셀 왼쪽 위에 어울림으로 띄움(셀 안 글자처럼 그림은 아직 지원 안 함)",
         r##"{"path":"C:/img/logo.png","width_mm":60.0}"##,
+    ),
+    (
+        "picture.replace",
+        "address(그림; 머리말·꼬리말 그림은 page.header_footer.object.list의 address), path(PNG·JPG·BMP·GIF, 20 MB·8192 px 이하) 또는 attachment(AI 편집 패널 질문에 첨부한 그림 번호, [첨부 자료]의 파일 번호) 중 하나, keep_aspect(기본 true: 너비를 두고 높이를 새 그림 비율로; false면 틀 크기 그대로). 자리·배치·캡션은 그대로이고 실행 취소 한 번. AI 편집 중에는 path를 쓸 수 없고 attachment만 됩니다",
+        r##"{"address":{"section":0,"paragraph":0,"control":0},"attachment":1}"##,
+    ),
+    (
+        "picture.insert_attachment",
+        "attachment(AI 편집 패널 질문에 첨부한 그림 번호, [첨부 자료]의 파일 번호), width_mm(없으면 원본 비율), treat_as_char(기본 true). 파일을 읽지 않으므로 AI 편집 중에도 쓸 수 있고, 첨부가 없으면 거절. 결과 address",
+        r##"{"attachment":1,"width_mm":60.0}"##,
     ),
     (
         "object.properties.get",
@@ -1469,6 +1485,43 @@ impl Session {
                 self.set_picture_effects(address, &p)?;
                 Ok(json!({"effects": self.picture_effects(address)?}))
             }
+            "picture.replace" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Replace {
+                    address: ObjectAddress,
+                    #[serde(default)]
+                    path: Option<std::path::PathBuf>,
+                    #[serde(default)]
+                    attachment: Option<usize>,
+                    #[serde(default = "keep_aspect_by_default")]
+                    keep_aspect: bool,
+                }
+                fn keep_aspect_by_default() -> bool {
+                    true
+                }
+                let p: Replace = serde_json::from_value(params)?;
+                let (name, bytes) = self.picture_source(p.path, p.attachment)?;
+                self.replace_picture(p.address, &name, &bytes, p.keep_aspect)?;
+                Ok(json!({"address": p.address}))
+            }
+            "picture.insert_attachment" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Attached {
+                    attachment: usize,
+                    #[serde(default)]
+                    width_mm: Option<f64>,
+                    #[serde(default = "inline_attachment")]
+                    treat_as_char: bool,
+                }
+                fn inline_attachment() -> bool {
+                    true
+                }
+                let p: Attached = serde_json::from_value(params)?;
+                let a = self.insert_run_picture(p.attachment, p.width_mm, p.treat_as_char)?;
+                Ok(json!({"address": a}))
+            }
             "picture.effects.get" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -1743,6 +1796,22 @@ impl Session {
         Ok(Some((kind, Value::Object(map).to_string())))
     }
     fn apply_object_props(&mut self, a: ObjectAddress, kind: u8, json: &str) -> Result<()> {
+        // The paragraph's stored line still holds an object in the line (글자처럼 취급) at
+        // its old size: when the size changes, drop the line so RHWP lays the paragraph
+        // out again and the text after it moves (a floating object's band RHWP redoes).
+        let inline = self
+            .object(a)
+            .ok()
+            .and_then(common_of)
+            .is_some_and(|c| c.treat_as_char);
+        if inline {
+            let v: Value = serde_json::from_str(json)?;
+            if (v.get("width").is_some() || v.get("height").is_some())
+                && v.get("treatAsChar") != Some(&Value::Bool(false))
+            {
+                self.drop_stored_lines(a);
+            }
+        }
         match kind {
             0 => self
                 .core
@@ -3077,6 +3146,7 @@ impl Session {
                     && n(c, "paraIdx") == Some(a.paragraph)
                     && n(c, "controlIdx") == Some(a.control)
                     && c.get("cellIdx").is_none()
+                    && c.get("headerFooter").is_none()
             })
             .ok_or_else(|| anyhow!("쪽 배치에서 개체를 찾지 못했습니다."))?;
         let f = |k: &str| c[k].as_f64().unwrap_or(0.0);

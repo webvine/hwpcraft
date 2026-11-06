@@ -244,6 +244,9 @@ pub(crate) fn move_whole_border(t: &mut Table, vertical: bool, b: u16, d: i64) -
     Ok(())
 }
 
+const SPLIT_BORDER: &str =
+    "여러 쪽에 걸친 표는 가로 경계선을 블록만큼 옮길 수 없습니다. 줄 전체의 경계선을 옮기세요.";
+
 impl Session {
     /// `table.move_border` with a cell block: the border moves only for the block's rows
     /// (a vertical border) or columns (a horizontal one). A block covering the whole
@@ -280,7 +283,7 @@ impl Session {
         let drawn = if vertical {
             None
         } else {
-            Some(self.drawn_table(a)?)
+            Some(self.drawn_table(a, SPLIT_BORDER)?)
         };
         self.transaction(|s| {
             let doc = s.core.document_mut();
@@ -304,7 +307,7 @@ impl Session {
             // A cell whose text needs more room than the edge left grows its row again
             // and the table with it: refuse instead, as Hangul stops the drag there.
             if let Some((_, height)) = drawn
-                && (s.drawn_table(a)?.1 - height).abs() > 1.0
+                && (s.drawn_table(a, SPLIT_BORDER)?.1 - height).abs() > 1.0
             {
                 bail!("셀 내용보다 작게 줄일 수 없습니다. 경계선을 덜 옮기세요.");
             }
@@ -313,8 +316,13 @@ impl Session {
     }
 
     /// Drawn row heights (HWPUNIT, `None` where no cell starts and ends a grid row) and
-    /// the drawn height (px) of a table that lies on one page.
-    fn drawn_table(&self, a: ObjectAddress) -> Result<(Vec<Option<u32>>, f64)> {
+    /// the drawn height (px) of a table that lies on one page; `split` refuses one that
+    /// does not.
+    pub(crate) fn drawn_table(
+        &self,
+        a: ObjectAddress,
+        split: &str,
+    ) -> Result<(Vec<Option<u32>>, f64)> {
         let page: Value = serde_json::from_str(
             &self
                 .core
@@ -333,19 +341,12 @@ impl Session {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .find(|t| {
-                    t["type"] == "table"
-                        && t["secIdx"] == a.section
-                        && t["paraIdx"] == a.paragraph
-                        && t["controlIdx"] == a.control
-                })
+                .find(|t| ObjectAddress::top_level_table(t) == Some(a))
                 .cloned())
         };
         let table = find(page)?.ok_or_else(|| anyhow!("쪽 배치에서 표를 찾지 못했습니다."))?;
         if page + 1 < self.core.page_count() && find(page + 1)?.is_some() {
-            bail!(
-                "여러 쪽에 걸친 표는 가로 경계선을 블록만큼 옮길 수 없습니다. 줄 전체의 경계선을 옮기세요."
-            );
+            bail!("{split}");
         }
         let rows = usize::from(self.table_at(a)?.row_count);
         let mut lines: Vec<Option<f64>> = vec![None; rows + 1];
@@ -375,7 +376,7 @@ impl Session {
 /// Store the drawn row heights in the cells, so the grid rows `move_border_in_block` splits
 /// are the ones on screen. A row drawn within a few HWPUNIT of its stored height (the
 /// layout rounds to 0.1 px) keeps the stored one.
-fn pin_row_heights(t: &mut Table, drawn: &[Option<u32>]) {
+pub(crate) fn pin_row_heights(t: &mut Table, drawn: &[Option<u32>]) {
     if t.cell_spacing != 0 {
         return;
     }

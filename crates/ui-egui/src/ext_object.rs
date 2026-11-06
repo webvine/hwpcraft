@@ -14,6 +14,10 @@ const HU_PER_MM: f64 = 7200.0 / 25.4;
 /// RHWP page coordinates are 96 dpi pixels.
 const MM_PER_PX: f32 = 25.4 / 96.0;
 
+/// Shown when a press lands only on a header/footer object, which has no body address:
+/// it is edited from the header or footer itself (hf_objects).
+const HEADER_OBJECT_MESSAGE: &str =
+    "머리말·꼬리말 안의 개체는 머리말·꼬리말 영역을 두 번 눌러 들어가서 고칩니다.";
 #[derive(Clone, Copy)]
 struct Selected {
     address: ObjectAddress,
@@ -484,7 +488,8 @@ struct PictureInsert {
 }
 #[derive(Clone)]
 struct Properties {
-    address: ObjectAddress,
+    /// The object's address: a body `ObjectAddress`, or one with `header_footer`.
+    address: Value,
     kind: String,
     tab: usize,
     original: Value,
@@ -768,6 +773,14 @@ const SHAPES: &[(&str, &str)] = &[
 impl HwpApp {
     /// `Some(enabled)` when this module owns the ribbon/menu command id.
     pub(crate) fn object_ext_enabled(&self, id: &str) -> Option<bool> {
+        let own = self.object_ext_enabled_body(id);
+        // A picked header or footer object takes the object tabs' commands (hf_objects).
+        match (own, self.hf_object_enabled(id)) {
+            (Some(_), Some(enabled)) => Some(enabled),
+            _ => own,
+        }
+    }
+    fn object_ext_enabled_body(&self, id: &str) -> Option<bool> {
         let body = self.session.cursor.cell.is_none();
         let selected = self.ext.object.selected.is_some();
         let unlocked = self.ext.object.selected.is_some_and(|s| !s.locked);
@@ -914,6 +927,9 @@ impl HwpApp {
     }
     /// Return true when the command id was handled.
     pub(crate) fn object_ext_dispatch(&mut self, id: &str, _ctx: &egui::Context) -> bool {
+        if let Some(done) = self.hf_object_ribbon(id) {
+            return done;
+        }
         let connector = if id == "insert.shape.connector" {
             Some(&CONNECTORS[0])
         } else {
@@ -1171,7 +1187,7 @@ impl HwpApp {
             self.ext.object.layout = None;
         }
     }
-    fn clear_object_selection(&mut self) {
+    pub(crate) fn clear_object_selection(&mut self) {
         self.ext.object.selected = None;
         self.ext.object.multi.clear();
         self.ext.object.endpoint = None;
@@ -1207,6 +1223,7 @@ impl HwpApp {
                 && n(c, "paraIdx") == Some(a.paragraph)
                 && n(c, "controlIdx") == Some(a.control)
                 && c.get("cellIdx").is_none()
+                && c.get("headerFooter").is_none()
         })?;
         Some(self.selected_from_layout(page, c.clone()))
     }
@@ -1281,6 +1298,10 @@ impl HwpApp {
             })
     }
     pub(super) fn open_object_properties(&mut self, a: ObjectAddress) {
+        self.open_object_properties_at(json!(a));
+    }
+    /// 개체 속성 for the object at `a` (a body address, or a header/footer one).
+    pub(crate) fn open_object_properties_at(&mut self, a: Value) {
         let r = self
             .session
             .run("object.properties.get", json!({"address":a}));
@@ -1331,7 +1352,11 @@ impl HwpApp {
         rect: Rect,
     ) -> bool {
         let to_page = |s: &Self, p: Pos2| ((p - rect.min) / s.zoom).to_pos2();
-        let painter = response.ctx.layer_painter(response.layer_id);
+        let painter = response
+            .ctx
+            .layer_painter(response.layer_id)
+            // Only the page's visible part: never over the ribbon or rulers.
+            .with_clip_rect(response.interact_rect);
         if let Some(kind) = self.ext.object.draw {
             if kind == "polygon" || kind == "curve" {
                 return self.draw_polygon(page, response, rect, kind == "curve");
@@ -1796,7 +1821,11 @@ impl HwpApp {
                 self.ext.object.points_page = page;
             }
         }
-        let painter = response.ctx.layer_painter(response.layer_id);
+        let painter = response
+            .ctx
+            .layer_painter(response.layer_id)
+            // Only the page's visible part: never over the ribbon or rulers.
+            .with_clip_rect(response.interact_rect);
         let to_screen = |q: Pos2| rect.min + q.to_vec2() * self.zoom;
         let stroke = Stroke::new(1.2, chrome::Tokens::ACCENT);
         let pts: Vec<Pos2> = self
@@ -1864,7 +1893,11 @@ impl HwpApp {
         {
             self.ext.object.points.push(p);
         }
-        let painter = response.ctx.layer_painter(response.layer_id);
+        let painter = response
+            .ctx
+            .layer_painter(response.layer_id)
+            // Only the page's visible part: never over the ribbon or rulers.
+            .with_clip_rect(response.interact_rect);
         let pts: Vec<Pos2> = self
             .ext
             .object
@@ -1999,21 +2032,26 @@ impl HwpApp {
     }
     fn object_at(&mut self, page: u32, p: Pos2) -> Option<Selected> {
         let layout = self.object_page_layout(page)?;
-        let c = layout["controls"]
-            .as_array()?
-            .iter()
-            .rev()
-            .filter(|c| {
-                matches!(
-                    c["type"].as_str(),
-                    Some("image" | "shape" | "line" | "group" | "equation")
-                ) && c.get("cellIdx").is_none()
-                    && c.get("noteRef").is_none()
-                    && c["controlIdx"].is_u64()
-            })
-            .find(|c| Self::layout_bbox(c).expand(3.0).contains(p))?
-            .clone();
-        Some(self.selected_from_layout(page, c))
+        let hits = layout["controls"].as_array()?.iter().rev().filter(|c| {
+            matches!(
+                c["type"].as_str(),
+                Some("image" | "shape" | "line" | "group" | "equation")
+            ) && c.get("cellIdx").is_none()
+                && c.get("noteRef").is_none()
+                && c["controlIdx"].is_u64()
+                && Self::layout_bbox(c).expand(3.0).contains(p)
+        });
+        // A header/footer object's numbers are its place in the header, not a body
+        // address: read as one they name whatever body object has the same numbers.
+        let (header, body): (Vec<&Value>, Vec<&Value>) =
+            hits.partition(|c| c.get("headerFooter").is_some());
+        let Some(c) = body.first() else {
+            if !header.is_empty() {
+                self.message = HEADER_OBJECT_MESSAGE.into();
+            }
+            return None;
+        };
+        Some(self.selected_from_layout(page, (*c).clone()))
     }
     /// A shape or picture that a connector can attach to, with its nearest connection point.
     fn subject_at(&mut self, page: u32, p: Pos2) -> Option<(ObjectAddress, u32)> {
@@ -2027,6 +2065,7 @@ impl HwpApp {
                 matches!(c["type"].as_str(), Some("image" | "shape" | "group"))
                     && c.get("cellIdx").is_none()
                     && c.get("noteRef").is_none()
+                    && c.get("headerFooter").is_none()
             })
             .find_map(|c| {
                 let bbox = Self::layout_bbox(c);
@@ -2148,6 +2187,10 @@ impl HwpApp {
     /// Kind of the selected object for contextual ribbon tabs.
     pub(crate) fn object_ext_selected_kind(&self) -> Option<&'static str> {
         use hwpcraft_doc::model::control::Control;
+        // A picked header or footer object (hf_objects); its tables go to the table tabs.
+        if let Some(kind) = self.hf_object_kind() {
+            return (kind != "table").then_some(kind);
+        }
         let a = self.ext.object.selected?.address;
         match self
             .session
@@ -4235,10 +4278,10 @@ impl HwpApp {
 }
 
 /// Handle index 8 is the rotation knob above the top edge.
-const ROTATE: usize = 8;
-const ROTATE_GAP: f32 = 22.0;
+pub(crate) const ROTATE: usize = 8;
+pub(crate) const ROTATE_GAP: f32 = 22.0;
 /// Handle order: left-top, top, right-top, left, right, left-bottom, bottom, right-bottom.
-fn handle_points(r: Rect) -> [Pos2; 8] {
+pub(crate) fn handle_points(r: Rect) -> [Pos2; 8] {
     [
         r.left_top(),
         r.center_top(),
@@ -4251,7 +4294,7 @@ fn handle_points(r: Rect) -> [Pos2; 8] {
     ]
 }
 /// Handle under page point `p` (page pixels); tolerances follow the screen size.
-fn handle_at(bbox: Rect, p: Pos2, zoom: f32) -> Option<usize> {
+pub(crate) fn handle_at(bbox: Rect, p: Pos2, zoom: f32) -> Option<usize> {
     let tol = 6.0 / zoom;
     let knob = bbox.center_top() - Vec2::new(0.0, ROTATE_GAP / zoom);
     if knob.distance(p) <= tol {
@@ -4261,7 +4304,7 @@ fn handle_at(bbox: Rect, p: Pos2, zoom: f32) -> Option<usize> {
         .iter()
         .position(|h| (h.x - p.x).abs() <= tol && (h.y - p.y).abs() <= tol)
 }
-fn handle_cursor(h: usize) -> egui::CursorIcon {
+pub(crate) fn handle_cursor(h: usize) -> egui::CursorIcon {
     use egui::CursorIcon::*;
     match h {
         0 | 7 => ResizeNwSe,
@@ -4272,7 +4315,7 @@ fn handle_cursor(h: usize) -> egui::CursorIcon {
     }
 }
 /// New box for dragging handle `h` to `p`; Shift on a corner keeps the aspect ratio.
-fn resized(b: Rect, h: usize, p: Pos2, keep_ratio: bool) -> Rect {
+pub(crate) fn resized(b: Rect, h: usize, p: Pos2, keep_ratio: bool) -> Rect {
     let min = 1.0 / MM_PER_PX; // 1 mm
     let (mut l, mut t, mut r, mut bt) = (b.left(), b.top(), b.right(), b.bottom());
     match h {
@@ -4400,6 +4443,12 @@ impl HwpApp {
             Err(_) => self.message = "문서에 개체가 없습니다.".into(),
         }
     }
+    /// The address the ribbon's object commands act on: a picked header or footer
+    /// object (with `header_footer`), else the selected body object.
+    fn object_target(&self) -> Option<Value> {
+        self.hf_object_address()
+            .or_else(|| self.ext.object.selected.map(|s| json!(s.address)))
+    }
     fn selected_targets(&self) -> Vec<ObjectAddress> {
         let mut v: Vec<ObjectAddress> = self.ext.object.multi.iter().map(|m| m.address).collect();
         if let Some(s) = self.ext.object.selected {
@@ -4421,7 +4470,7 @@ impl HwpApp {
     /// 0.14 table-object commands: alignment, quick styles, navigation, text boxes,
     /// pictures, numbers and notes. True when handled.
     fn object_ext_dispatch_14(&mut self, id: &str) -> bool {
-        let selected = self.ext.object.selected.map(|s| s.address);
+        let selected = self.object_target();
         if let Some(mode) = id.strip_prefix("object.align.") {
             let Some((_, label, _)) = ALIGNS.iter().find(|(m, _, _)| *m == mode) else {
                 return false;
@@ -4597,7 +4646,11 @@ impl HwpApp {
                     return true;
                 };
                 let mut n = 0;
-                for a in self.selected_targets() {
+                let targets: Vec<Value> = match self.hf_object_address() {
+                    Some(a) => vec![a],
+                    None => self.selected_targets().iter().map(|a| json!(a)).collect(),
+                };
+                for a in targets {
                     if self.run("object.format", json!({"address":a,"format":f})) {
                         n += 1;
                     } else {
@@ -5345,5 +5398,143 @@ mod tests {
         d.name = " ".into();
         assert!(d.grey().is_some());
         Ok(())
+    }
+
+    /// A document whose header (or footer) has a floating picture at control 0 of its
+    /// second paragraph and whose body paragraph 1 has another one at control 0, so the
+    /// header picture's layout numbers equal the body picture's address.
+    fn header_over_body_picture(footer: bool) -> HwpApp {
+        let dir = std::env::temp_dir().join(format!(
+            "hwpcraft-header-object-{}-{footer}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let logo = dir.join("logo.png");
+        image::RgbImage::from_pixel(60, 30, image::Rgb([68, 114, 196]))
+            .save(&logo)
+            .unwrap();
+        let mut a = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        let s = &mut a.session;
+        s.execute(hwpcraft_engine::Command::Insert("본문 첫 문단".into()))
+            .unwrap();
+        s.execute(hwpcraft_engine::Command::Split).unwrap();
+        s.run(
+            "picture.insert",
+            json!({"path": logo, "width_mm": 30.0, "treat_as_char": false}),
+        )
+        .unwrap();
+        let command = if footer { "page.footer" } else { "page.header" };
+        s.run(command, json!({"apply_to": "both", "template": 0}))
+            .unwrap();
+        let doc = s.core.document_mut();
+        let picture = doc.sections[0].paragraphs[1].clone();
+        let paragraphs = doc.sections[0]
+            .paragraphs
+            .iter_mut()
+            .flat_map(|p| p.controls.iter_mut())
+            .find_map(|c| match c {
+                hwpcraft_doc::model::control::Control::Header(h) if !footer => {
+                    Some(&mut h.paragraphs)
+                }
+                hwpcraft_doc::model::control::Control::Footer(f) if footer => {
+                    Some(&mut f.paragraphs)
+                }
+                _ => None,
+            })
+            .unwrap();
+        paragraphs.truncate(1);
+        paragraphs.push(picture);
+        let path = dir.join("header.hwpx");
+        s.save(&path).unwrap();
+        s.open(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        a
+    }
+
+    /// Canvas point at the centre of the first laid-out picture on page 0 that is (or
+    /// is not) in a header or footer.
+    fn picture_centre(a: &HwpApp, in_header: bool) -> Pos2 {
+        let layout: Value =
+            serde_json::from_str(&a.session.page_control_layout(0).unwrap()).unwrap();
+        let c = layout["controls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "image" && c.get("headerFooter").is_some() == in_header)
+            .unwrap()
+            .clone();
+        let f = |k: &str| c[k].as_f64().unwrap() as f32;
+        Pos2::new(50.0, 50.0) + Vec2::new(f("x") + f("w") / 2.0, f("y") + f("h") / 2.0) * a.zoom
+    }
+
+    fn body_pictures(a: &HwpApp) -> usize {
+        a.session.core.document().sections[0]
+            .paragraphs
+            .iter()
+            .flat_map(|p| &p.controls)
+            .filter(|c| matches!(c, hwpcraft_doc::model::control::Control::Picture(_)))
+            .count()
+    }
+
+    /// A header or footer picture's layout numbers are its place in the header, not a
+    /// body address: clicking it selected the body picture with the same numbers, so
+    /// Delete removed that body picture. Now it says header objects cannot be edited
+    /// yet and selects nothing; the body picture itself is still selected with its
+    /// own box.
+    #[test]
+    fn clicking_a_header_or_footer_picture_never_selects_a_body_picture() {
+        for footer in [false, true] {
+            let mut a = header_over_body_picture(footer);
+            assert_eq!(body_pictures(&a), 1);
+            canvas_frame(&mut a, vec![]);
+            let p = picture_centre(&a, true);
+            canvas_frame_after(
+                &mut a,
+                vec![egui::Event::PointerMoved(p), press(p, true)],
+                1.0,
+            );
+            canvas_frame(&mut a, vec![press(p, false)]);
+            assert!(a.ext.object.selected.is_none(), "footer {footer}");
+            assert_eq!(a.message, HEADER_OBJECT_MESSAGE, "footer {footer}");
+            let keys_ctx = a.ctx.clone();
+            let _ = keys_ctx.run_ui(
+                egui::RawInput {
+                    events: vec![key(Key::Delete)],
+                    ..Default::default()
+                },
+                |ui| {
+                    a.object_ext_keys(ui.ctx());
+                },
+            );
+            assert_eq!(
+                body_pictures(&a),
+                1,
+                "footer {footer}: the body picture stays"
+            );
+
+            let p = picture_centre(&a, false);
+            canvas_frame(&mut a, vec![]);
+            canvas_frame_after(
+                &mut a,
+                vec![egui::Event::PointerMoved(p), press(p, true)],
+                1.0,
+            );
+            canvas_frame(&mut a, vec![press(p, false)]);
+            let s = a.ext.object.selected.expect("the body picture is selected");
+            assert_eq!(
+                s.address,
+                ObjectAddress {
+                    section: 0,
+                    paragraph: 1,
+                    control: 0
+                }
+            );
+            assert!(
+                s.bbox
+                    .contains(Pos2::ZERO + (p - Pos2::new(50.0, 50.0)) / a.zoom),
+                "footer {footer}: {:?}",
+                s.bbox
+            );
+        }
     }
 }

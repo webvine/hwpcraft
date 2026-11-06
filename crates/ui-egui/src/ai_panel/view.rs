@@ -41,6 +41,7 @@ impl HwpApp {
         self.ai_detect(&ctx);
         self.ai_history_follow();
         let busy = self.ai_busy();
+        self.ai_drop_question(&ctx);
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
         self.ai_header(ui, busy);
         ui.separator();
@@ -477,6 +478,8 @@ impl HwpApp {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 self.ai_context_chip(ui);
+                self.ai_attachment_chips(ui, busy);
+                self.ai_paste_picture_address(ui, busy);
                 let edit = egui::TextEdit::multiline(&mut self.ext.ai.input)
                     .id(egui::Id::new("ai-panel-input-box"))
                     .hint_text("AI에게 요청하기…")
@@ -493,6 +496,29 @@ impl HwpApp {
                 // An engine that cannot run is said here, not after sending.
                 let blocked = self.ai_unusable();
                 ui.horizontal(|ui| {
+                    let full = self.ext.ai.attachments.len() >= attach::MAX_FILES;
+                    if ui
+                        .add_enabled(!busy && !full, egui::Button::new("첨부").small())
+                        .on_hover_text(crate::ribbon::platform_keys(&format!(
+                            "편집 자료로 쓸 파일을 붙입니다: {}. 이 입력 칸에 끌어 놓거나, 이 칸에서 Ctrl+V로 그림을 붙여도 됩니다. 최대 {}개.",
+                            attach::SUPPORTED,
+                            attach::MAX_FILES
+                        )).into_owned())
+                        .on_disabled_hover_text(format!("{}개까지 첨부합니다.", attach::MAX_FILES))
+                        .clicked()
+                        && let Some(files) = rfd::FileDialog::new()
+                            .add_filter(
+                                "첨부할 수 있는 파일",
+                                &[
+                                    "png", "jpg", "jpeg", "gif", "bmp", "txt", "md", "csv", "tsv",
+                                    "json", "xml", "html", "htm", "log", "yaml", "yml", "ini",
+                                    "toml", "hwp", "hwpx", "docx", "docm", "dotx",
+                                ],
+                            )
+                            .pick_files()
+                    {
+                        self.ai_attach(files);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if busy {
                             if ui
@@ -554,6 +580,115 @@ impl HwpApp {
                 });
             });
         ui.add_space(6.0);
+    }
+
+    /// 문서를 끌어 놓았을 때: open it, or attach the dropped files for the AI.
+    fn ai_drop_question(&mut self, ctx: &egui::Context) {
+        let Some(files) = self.ext.ai.dropped.as_ref() else {
+            return;
+        };
+        let names = files
+            .iter()
+            .map(|f| attach::Attachment::File(f.clone()).name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut answer = None;
+        egui::Window::new("끌어 놓은 파일")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                wrapped(
+                    ui,
+                    format!("{names}\n문서를 열까요, AI 편집의 자료로 첨부할까요?"),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("AI 편집에 첨부").clicked() {
+                        answer = Some(Some(true));
+                    }
+                    if ui.button("문서 열기").clicked() {
+                        answer = Some(Some(false));
+                    }
+                    if ui.button("취소").clicked() {
+                        answer = Some(None);
+                    }
+                });
+            });
+        if let Some(answer) = answer {
+            self.ai_resolve_drop(ctx, answer);
+        }
+    }
+
+    /// A picture copied in a browser comes with its address as text: pasted into
+    /// the question box, the picture is attached instead of the address typed.
+    /// The paste stays (emptied, which the box ignores) so the V coming up is
+    /// not taken for a second, swallowed paste.
+    fn ai_paste_picture_address(&mut self, ui: &mut egui::Ui, busy: bool) {
+        let focused = ui.memory(|m| m.has_focus(egui::Id::new("ai-panel-input-box")));
+        let address = ui.input(|i| {
+            i.events.iter().any(
+                |e| matches!(e, egui::Event::Paste(t) if crate::clipboard::only_names_a_picture(t)),
+            )
+        });
+        if focused && !busy && address && self.ai_attach_clipboard() {
+            ui.input_mut(|i| {
+                for e in &mut i.events {
+                    if let egui::Event::Paste(t) = e {
+                        t.clear();
+                    }
+                }
+            });
+        }
+    }
+
+    /// The files the next question carries, each with a ✕.
+    fn ai_attachment_chips(&mut self, ui: &mut egui::Ui, busy: bool) {
+        let mut remove = None;
+        for (i, a) in self.ext.ai.attachments.iter().enumerate() {
+            egui::Frame::new()
+                .fill(STEP_FILL)
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(6, 2))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("✕").frame(false).small())
+                                .on_hover_text("첨부를 뺍니다")
+                                .clicked()
+                            {
+                                remove = Some(i);
+                            }
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let name = a.name();
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!("첨부 · {name}"))
+                                                .small()
+                                                .color(SUBTLE),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(match a {
+                                        attach::Attachment::File(path) => {
+                                            path.display().to_string()
+                                        }
+                                        attach::Attachment::Pasted { .. } => {
+                                            "클립보드에서 붙인 그림".to_owned()
+                                        }
+                                    });
+                                },
+                            );
+                        });
+                    });
+                });
+        }
+        if let Some(i) = remove {
+            self.ext.ai.attachments.remove(i);
+        }
     }
 
     /// What "this part" will mean, with a ✕ to send the question without it.
@@ -794,6 +929,17 @@ fn user_message(ui: &mut egui::Ui, m: &Message) {
             ui.scope(|ui| {
                 ui.set_max_width(max);
                 wrapped(ui, RichText::new(c).small().color(SUBTLE));
+            });
+        }
+        if !m.attachments.is_empty() {
+            ui.scope(|ui| {
+                ui.set_max_width(max);
+                wrapped(
+                    ui,
+                    RichText::new(format!("첨부 · {}", m.attachments.join(", ")))
+                        .small()
+                        .color(SUBTLE),
+                );
             });
         }
     });

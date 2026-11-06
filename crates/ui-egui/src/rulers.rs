@@ -74,6 +74,11 @@ impl HwpApp {
         let Ok(para) = self.session.paragraph(c) else {
             return (1, c.offset + 1);
         };
+        // Imported/control-only paragraphs may have no saved line segments.
+        // The status bar must remain usable before layout supplies them.
+        if para.line_segs.is_empty() {
+            return (1, c.offset + 1);
+        }
         // Line segments count UTF-16 units.
         let unit: usize = para.text.chars().take(c.offset).map(char::len_utf16).sum();
         let index = para
@@ -297,6 +302,7 @@ impl HwpApp {
                         )
                         .on_hover_text(hwpcraft_engine::DISTRIBUTION_READ_ONLY);
                     }
+                    self.hf_status_chip(ui);
                     if self.ai_locked()
                         && status_chip(
                             ui,
@@ -852,7 +858,12 @@ const START_HINT: &str = "문서를 열거나 흰 쪽을 클릭해 입력하세�
 
 /// The start-up hint no longer applies once a file is open or the document has content.
 /// A rounded status-bar chip for an ongoing state (macro recording, MCP connection).
-fn status_chip(ui: &mut egui::Ui, text: &str, ink: Color32, fill: Color32) -> egui::Response {
+pub(crate) fn status_chip(
+    ui: &mut egui::Ui,
+    text: &str,
+    ink: Color32,
+    fill: Color32,
+) -> egui::Response {
     let galley =
         ui.painter()
             .layout_no_wrap(text.to_owned(), egui::FontId::proportional(11.5), ink);
@@ -896,6 +907,19 @@ fn start_hint_is_stale(app: &HwpApp) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_position_accepts_a_paragraph_without_line_segments() -> anyhow::Result<()> {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        app.session.core.document_mut().sections[0].paragraphs[0]
+            .line_segs
+            .clear();
+        assert_eq!(app.line_and_column(), (1, 1));
+        let ctx = app.ctx.clone();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.status_bar(ui));
+        output.textures_delta.clear();
+        Ok(())
+    }
 
     #[test]
     fn the_scroll_rail_stays_beside_the_page_from_the_memo_panes_first_frame() -> anyhow::Result<()>

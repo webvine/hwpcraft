@@ -1,6 +1,8 @@
 # Build HwpCraft for Windows, macOS and Linux and attach the archives to a
-# GitHub release when a version tag (v0.14, v0.15, …) is pushed. RHWP is a
-# path dependency, so its tagged source is checked out next to the project.
+# GitHub release when a version tag (v0.14, v0.15, …) is pushed. RHWP and
+# WordCraft (its DOCX reader and writer) are path dependencies, so their source
+# is checked out next to the project: RHWP at its tag, WordCraft at the commit
+# in WORDCRAFT_REV.
 name: release
 
 on:
@@ -53,6 +55,14 @@ jobs:
           repository: edwardkim/rhwp
           ref: ${{ env.RHWP_TAG }}
           path: rhwp
+      - name: WordCraft commit (WORDCRAFT_REV)
+        shell: bash
+        run: echo "WORDCRAFT_REV=$(tr -d '[:space:]' < hwpcraft/WORDCRAFT_REV)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: storytold/wordcraft
+          ref: ${{ env.WORDCRAFT_REV }}
+          path: wordcraft
       - name: Apply local RHWP patches (patches/rhwp/README.md)
         shell: bash
         run: |
@@ -86,10 +96,12 @@ jobs:
           NAME=HwpCraft-$VERSION-${{ matrix.name }}
           mkdir -p dist/$NAME/licenses
           cp target/${{ matrix.target }}/release/hwpcraft${{ matrix.exe }} target/${{ matrix.target }}/release/hwpcraft-cli${{ matrix.exe }} dist/$NAME/
-          cp README.md README.en.md LICENSE THIRD-PARTY-NOTICES.txt THIRD-PARTY-DEPENDENCIES.md VERSION dist/$NAME/
+          cp README.md README.en.md LICENSE THIRD-PARTY-NOTICES.txt THIRD-PARTY-DEPENDENCIES.md THIRD-PARTY-LICENSES.txt VERSION dist/$NAME/
           cp assets/licenses/* dist/$NAME/licenses/
           cp assets/icons/lucide/LICENSE.txt dist/$NAME/licenses/LICENSE-Lucide-ISC.txt
           cp ../rhwp/LICENSE dist/$NAME/licenses/LICENSE-RHWP.txt
+          cp ../wordcraft/NOTICE dist/$NAME/licenses/NOTICE-WordCraft.txt
+          cp ../wordcraft/LICENSE-MIT dist/$NAME/licenses/LICENSE-WordCraft-MIT.txt
           BIN=target/${{ matrix.target }}/release
           if [ "${{ runner.os }}" = "macOS" ]; then
             # HwpCraft.app: double-click to start (the plain binaries stay alongside).

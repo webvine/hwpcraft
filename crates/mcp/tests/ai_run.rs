@@ -457,3 +457,207 @@ fn run_formatting() {
     session.execute(Command::Undo).unwrap();
     assert_eq!(session.text(), "");
 }
+
+const META: &str = r#"{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}"#;
+
+/// A 2026 request's body with `params` and the protocol `_meta`.
+fn request_body(method: &str, mut params: Value) -> Vec<u8> {
+    params["_meta"] = serde_json::from_str(META).unwrap();
+    serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})).unwrap()
+}
+
+/// Its HTTP head; `name` is the `Mcp-Name` header the method carries.
+fn request_head(
+    address: &str,
+    token: &str,
+    method: &str,
+    name: Option<&str>,
+    length: usize,
+) -> String {
+    let name = name
+        .map(|n| format!("Mcp-Name: {n}\r\n"))
+        .unwrap_or_default();
+    format!(
+        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {method}\r\n{name}Connection: close\r\nContent-Length: {length}\r\n\r\n"
+    )
+}
+
+/// The JSON-RPC message in an HTTP reply (JSON or a one-event stream).
+fn message(reply: &str) -> Value {
+    let start = reply.find("{\"").expect(reply);
+    let end = reply.rfind('}').expect(reply);
+    serde_json::from_str(&reply[start..=end]).expect(reply)
+}
+
+#[test]
+fn a_request_sent_with_an_ended_runs_token_does_not_run_in_the_next_run() {
+    let Some(_config) = in_own_settings_folder(
+        "a_request_sent_with_an_ended_runs_token_does_not_run_in_the_next_run",
+    ) else {
+        return run_old_token();
+    };
+}
+
+fn run_old_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::new().unwrap();
+    session
+        .execute(Command::Insert("사용자 글".into()))
+        .unwrap();
+    let (mut bridge, _user, address) = start(dir.path(), &session);
+    let first = bridge.begin_ai_run(&mut session).unwrap();
+    let body = request_body(
+        "tools/call",
+        json!({"name":"type_text","arguments":{"document_id":first.document_id,"text":" 옛 실행"}}),
+    );
+    // A helper of the first run sends its headers (the token is checked on them)
+    // and only part of the body.
+    let mut socket = std::net::TcpStream::connect(&address).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let head = request_head(
+        &address,
+        &first.token,
+        "tools/call",
+        Some("type_text"),
+        body.len(),
+    );
+    socket.write_all(head.as_bytes()).unwrap();
+    let (part, rest) = body.split_at(body.len() / 2);
+    socket.write_all(part).unwrap();
+    socket.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    // That run ends and the next one begins before the rest arrives.
+    bridge.end_ai_run(&mut session).unwrap();
+    let _second = bridge.begin_ai_run(&mut session).unwrap();
+    let rest = rest.to_vec();
+    let client = std::thread::spawn(move || {
+        socket.write_all(&rest).unwrap();
+        let mut reply = String::new();
+        socket.read_to_string(&mut reply).unwrap();
+        reply
+    });
+    let reply = serve_until(&mut bridge, &mut session, client);
+    let result = message(&reply)["result"].clone();
+    assert_eq!(result["isError"], true, "{reply}");
+    assert!(reply.contains("실행이 끝났습니다"), "{reply}");
+    bridge.end_ai_run(&mut session).unwrap();
+    assert_eq!(session.text(), "사용자 글");
+}
+
+#[test]
+fn an_ai_run_reads_no_document_but_the_windows() {
+    let Some(_config) = in_own_settings_folder("an_ai_run_reads_no_document_but_the_windows")
+    else {
+        return run_read_other();
+    };
+}
+
+fn run_read_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::new().unwrap();
+    session.execute(Command::Insert("창 문서".into())).unwrap();
+    let (mut bridge, user, address) = start(dir.path(), &session);
+    // Another client keeps a document of its own on the same server.
+    let other = body(&call(&address, &user, "new_document", json!({})));
+    let other = other["document_id"].as_str().unwrap().to_owned();
+    call(
+        &address,
+        &user,
+        "type_text",
+        json!({"document_id": other, "text": "다른 문서의 비밀"}),
+    );
+    let run = bridge.begin_ai_run(&mut session).unwrap();
+    let read = |address: String, token: String, id: String| {
+        std::thread::spawn(move || {
+            let uri = format!("hwpcraft://documents/{id}");
+            let body = request_body("resources/read", json!({"uri": uri}));
+            let mut socket = std::net::TcpStream::connect(&address).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let head = request_head(&address, &token, "resources/read", Some(&uri), body.len());
+            socket.write_all(head.as_bytes()).unwrap();
+            socket.write_all(&body).unwrap();
+            let mut reply = String::new();
+            socket.read_to_string(&mut reply).unwrap();
+            reply
+        })
+    };
+    let refused = read(address.clone(), run.token.clone(), other.clone());
+    let refused = serve_until(&mut bridge, &mut session, refused);
+    assert!(message(&refused).get("error").is_some(), "{refused}");
+    assert!(!refused.contains("다른 문서의 비밀"), "{refused}");
+    // The window's own document stays readable.
+    let window = read(address.clone(), run.token.clone(), run.document_id.clone());
+    let window = serve_until(&mut bridge, &mut session, window);
+    assert!(message(&window).get("result").is_some(), "{window}");
+    bridge.end_ai_run(&mut session).unwrap();
+    // The user's token still reads it.
+    let user_read = read(address, user, other);
+    let user_read = serve_until(&mut bridge, &mut session, user_read);
+    assert!(user_read.contains("다른 문서의 비밀"), "{user_read}");
+}
+
+#[test]
+fn an_ai_runs_subscriptions_end_with_the_run() {
+    let Some(_config) = in_own_settings_folder("an_ai_runs_subscriptions_end_with_the_run") else {
+        return run_listen();
+    };
+}
+
+fn run_listen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::new().unwrap();
+    session.execute(Command::Insert("창 문서".into())).unwrap();
+    let (mut bridge, _user, address) = start(dir.path(), &session);
+    let run = bridge.begin_ai_run(&mut session).unwrap();
+    let uri = format!("hwpcraft://documents/{}", run.document_id);
+    let body = request_body(
+        "subscriptions/listen",
+        json!({"notifications":{"resourceSubscriptions":[uri]}}),
+    );
+    let (acked_tx, acked) = std::sync::mpsc::channel();
+    let (address2, token) = (address.clone(), run.token.clone());
+    let client = std::thread::spawn(move || {
+        let mut socket = std::net::TcpStream::connect(&address2).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let head = request_head(&address2, &token, "subscriptions/listen", None, body.len());
+        socket.write_all(head.as_bytes()).unwrap();
+        socket.write_all(&body).unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0_u8; 4096];
+        let mut said = false;
+        loop {
+            match socket.read(&mut buf) {
+                Ok(0) => return Ok(String::from_utf8_lossy(&seen).into_owned()),
+                Ok(n) => {
+                    seen.extend_from_slice(&buf[..n]);
+                    if !said && String::from_utf8_lossy(&seen).contains("acknowledged") {
+                        said = true;
+                        let _ = acked_tx.send(());
+                    }
+                }
+                // Still open when the read times out: the stream outlived the run.
+                Err(error) => {
+                    return Err(format!("{error}: {}", String::from_utf8_lossy(&seen)));
+                }
+            }
+        }
+    });
+    let started = Instant::now();
+    while acked.try_recv().is_err() {
+        let _ = bridge.serve(&mut session, Duration::from_millis(20));
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "no acknowledgement"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    bridge.end_ai_run(&mut session).unwrap();
+    let ended = serve_until(&mut bridge, &mut session, client);
+    assert!(ended.is_ok(), "{ended:?}");
+}

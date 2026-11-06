@@ -31,6 +31,9 @@ pub(crate) struct TurnRecord {
     pub question: String,
     /// The context chip it was sent with.
     pub context: Option<String>,
+    /// Names of the files it carried (never their contents).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
     pub answer: Option<String>,
     pub tools: Vec<ToolRecord>,
     pub changed: bool,
@@ -735,11 +738,11 @@ impl HwpApp {
         };
         let turn = m.turn.clone().unwrap_or_default();
         let (changed, stopped, error) = (m.changed, m.stopped, m.error.clone());
-        let (question, context) = message
+        let (question, context, attachments) = message
             .checked_sub(1)
             .and_then(|i| self.ext.ai.messages.get(i))
             .filter(|q| q.user)
-            .map(|q| (q.text.clone(), q.context.clone()))
+            .map(|q| (q.text.clone(), q.context.clone(), q.attachments.clone()))
             .unwrap_or_default();
         let after = changes::snapshot(&self.session);
         let calls: Vec<(String, serde_json::Value)> = turn
@@ -779,6 +782,7 @@ impl HwpApp {
                 session: turn.session.clone(),
                 question: hide(&question, secrets),
                 context,
+                attachments,
                 answer: turn.answer.as_deref().map(|a| hide(a, secrets)),
                 tools: turn
                     .calls
@@ -839,7 +843,9 @@ impl HwpApp {
         let turns = store.turns(id);
         let mut messages = Vec::new();
         for (i, t) in turns.iter().enumerate() {
-            messages.push(Message::user(t.question.clone(), t.context.clone()));
+            let mut asked = Message::user(t.question.clone(), t.context.clone());
+            asked.attachments = t.attachments.clone();
+            messages.push(asked);
             let tools = t
                 .tools
                 .iter()
@@ -1078,6 +1084,7 @@ mod tests {
             session: Some("abc-123".into()),
             question: q.into(),
             context: None,
+            attachments: vec!["메모.txt".into()],
             answer: Some("고쳤습니다".into()),
             tools: vec![ToolRecord {
                 tool: "type_text".into(),
@@ -1111,6 +1118,12 @@ mod tests {
             .append(&id, Some(&doc), &turn("한 줄 더", "f2"))
             .unwrap();
         assert_eq!(store.turns(&id).len(), 2);
+        // Attachment names are kept; a record from before 0.22 has none.
+        assert_eq!(store.turns(&id)[0].attachments, ["메모.txt"]);
+        let mut old = serde_json::to_value(turn("예전", "f0")).unwrap();
+        old.as_object_mut().unwrap().remove("attachments");
+        let old: TurnRecord = serde_json::from_value(old).unwrap();
+        assert!(old.attachments.is_empty());
         assert_eq!(store.for_document(Some(&doc), "f2")[0].1, Relation::Same);
         assert_eq!(store.for_document(Some(&doc), "f9")[0].1, Relation::Changed);
         let moved = dir.join("옮긴 보고서.hwpx");

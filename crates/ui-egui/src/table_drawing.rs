@@ -23,7 +23,7 @@ pub(crate) struct State {
     color: [u8; 3],
     selected: Option<ObjectAddress>,
     size_draft: Option<(u64, f64, f64)>,
-    resize: Option<(u32, usize, Pos2, Rect, f64, f64, u64)>,
+    resize: Option<Resize>,
     moving: Option<(u32, Pos2, Rect, u64)>,
     /// Editable top-level tables per page (address, page-space box, cell count on
     /// that page) for the current document generation. The selection canvas runs
@@ -32,6 +32,22 @@ pub(crate) struct State {
     selection_tables: Option<(u64, std::collections::HashMap<u32, Vec<SelectionTable>>)>,
 }
 type SelectionTable = (ObjectAddress, Rect, usize);
+/// A table outline handle being dragged.
+#[derive(Clone, Copy)]
+struct Resize {
+    page: u32,
+    /// 0 width, 1 height, 2 both.
+    handle: usize,
+    start: Pos2,
+    /// The table's box on this page (one piece of a table split across pages).
+    original: Rect,
+    /// Table width and height (HWPUNIT).
+    width: f64,
+    height: f64,
+    /// The whole table's height on screen: a piece shows only part of a split table.
+    full: f32,
+    generation: u64,
+}
 impl HwpApp {
     pub(crate) fn pen_checked(&self, id: &str) -> bool {
         matches!(
@@ -157,7 +173,8 @@ impl HwpApp {
         let raw = self.session.page_control_layout(page).ok()?;
         let layout: Value = serde_json::from_str(&raw).ok()?;
         for t in layout["controls"].as_array()?.iter().rev() {
-            if t["type"] != "table" {
+            // A header/footer table's numbers are not a body address.
+            if t["type"] != "table" || t.get("headerFooter").is_some() {
                 continue;
             }
             let f = |k: &str| t[k].as_f64().unwrap_or(0.0) as f32;
@@ -235,7 +252,11 @@ impl HwpApp {
             };
             let local = to_page(p);
             let end = Pos2::new(local.x, local.y);
-            let painter = response.ctx.layer_painter(response.layer_id);
+            let painter = response
+                .ctx
+                .layer_painter(response.layer_id)
+                // Only the page's visible part: never over the ribbon or rulers.
+                .with_clip_rect(response.interact_rect);
             let from = rect.min + start.to_vec2() * self.zoom;
             let stroke = Stroke::new(
                 if mode == Mode::Erase { 4.0 } else { 1.5 },
@@ -446,14 +467,8 @@ impl HwpApp {
             .into_iter()
             .flatten()
             .filter_map(|t| {
-                if t["type"] != "table" || t.get("headerFooter").is_some() {
-                    return None;
-                }
-                let a = ObjectAddress {
-                    section: t["secIdx"].as_u64()? as usize,
-                    paragraph: t["paraIdx"].as_u64()? as usize,
-                    control: t["controlIdx"].as_u64()? as usize,
-                };
+                // Nested tables carry their host's indices: they are not pieces of it.
+                let a = ObjectAddress::top_level_table(t)?;
                 // Nested controls do not share the top-level editing address space.
                 self.session.table_layout(a, None).ok()?;
                 let f = |k: &str| t[k].as_f64().unwrap_or(0.0) as f32;
@@ -480,7 +495,11 @@ impl HwpApp {
         }
         let pointer = response.ctx.input(|i| i.pointer.interact_pos());
         let origin = page_press(response);
-        let painter = response.ctx.layer_painter(response.layer_id);
+        let painter = response
+            .ctx
+            .layer_painter(response.layer_id)
+            // Only the page's visible part: never over the ribbon or rulers.
+            .with_clip_rect(response.interact_rect);
         let zoom = self.zoom;
         let controls: Vec<SelectionTable> = self
             .selection_tables(page)
@@ -539,29 +558,45 @@ impl HwpApp {
         let Some(a) = self.ext.pen.selected else {
             return false;
         };
-        let Some((_, rect, page_cells)) = controls.iter().find(|(address, _, _)| *address == a)
-        else {
+        // The table's pieces on this page: one, or one per column it runs through.
+        let pieces: Vec<Rect> = controls
+            .iter()
+            .filter(|(address, _, _)| *address == a)
+            .map(|(_, r, _)| *r)
+            .collect();
+        if pieces.is_empty() {
             if response.clicked() {
                 self.ext.pen.selected = None;
             }
             return false;
-        };
-        let rect = *rect;
-        painter.rect_stroke(
-            rect,
-            0.0,
-            Stroke::new(1.5, chrome::Tokens::ACCENT),
-            egui::StrokeKind::Outside,
-        );
-        let handles = [
-            rect.right_center(),
-            rect.center_bottom(),
-            rect.right_bottom(),
-        ];
-        let hovered = pointer
-            .filter(|_| response.hovered())
-            .and_then(|p| handles.iter().position(|h| h.distance(p) < 8.0));
-        for h in handles {
+        }
+        // A table split across pages or columns: every piece resizes the width, only
+        // the piece holding the table's real bottom resizes the height (the others
+        // end at a page or column break), as in Hangul.
+        let mut on_page = |p: u32| self.selection_tables(p).iter().any(|(x, _, _)| *x == a);
+        let continues_after = on_page(page + 1);
+        let split = pieces.len() > 1 || continues_after || (page > 0 && on_page(page - 1));
+        let mut handles: Vec<(usize, Pos2, Rect)> = Vec::new();
+        for (n, r) in pieces.iter().copied().enumerate() {
+            painter.rect_stroke(
+                r,
+                0.0,
+                Stroke::new(1.5, chrome::Tokens::ACCENT),
+                egui::StrokeKind::Outside,
+            );
+            handles.push((0, r.right_center(), r));
+            if n + 1 == pieces.len() && !continues_after {
+                handles.push((1, r.center_bottom(), r));
+                handles.push((2, r.right_bottom(), r));
+            }
+        }
+        let hovered = pointer.filter(|_| response.hovered()).and_then(|p| {
+            handles
+                .iter()
+                .find(|(_, h, _)| h.distance(p) < 8.0)
+                .map(|(i, _, _)| *i)
+        });
+        for (_, h, _) in handles.iter().copied() {
             painter.rect_filled(
                 Rect::from_center_size(h, Vec2::splat(8.0)),
                 1.0,
@@ -580,27 +615,29 @@ impl HwpApp {
         if self.ext.pen.moving.is_none()
             && let Some(start) = origin
         {
-            if let Some(i) = handles.iter().position(|h| h.distance(start) < 8.0) {
-                let Ok(info) = self.session.table_layout(a, None) else {
-                    return true;
-                };
-                if Some(*page_cells) != info["cells"].as_array().map(Vec::len) {
-                    self.error = Some("쪽에 나뉜 표의 크기는 표/셀 속성에서 조절하세요.".into());
-                    return true;
-                }
+            if let Some(&(i, _, rect)) = handles.iter().find(|(_, h, _)| h.distance(start) < 8.0) {
                 if let Ok(props) = self.session.table_properties(a) {
-                    self.ext.pen.resize = Some((
+                    let height = props["tableHeight"].as_f64().unwrap_or(0.0);
+                    // A piece shows only part of a split table: the height change is
+                    // measured against the whole table (HWPUNIT, 7200 per 96 px).
+                    let full = if split {
+                        (height / 75.0) as f32 * self.zoom
+                    } else {
+                        rect.height()
+                    };
+                    self.ext.pen.resize = Some(Resize {
                         page,
-                        i,
+                        handle: i,
                         start,
-                        rect,
-                        props["tableWidth"].as_f64().unwrap_or(0.0),
-                        props["tableHeight"].as_f64().unwrap_or(0.0),
-                        self.session.generation,
-                    ));
+                        original: rect,
+                        width: props["tableWidth"].as_f64().unwrap_or(0.0),
+                        height,
+                        full: full.max(1.0),
+                        generation: self.session.generation,
+                    });
                 }
-            } else if on_table_outline(rect, start) {
-                self.ext.pen.moving = Some((page, start, rect, self.session.generation));
+            } else if let Some(rect) = pieces.iter().find(|r| on_table_outline(**r, start)) {
+                self.ext.pen.moving = Some((page, start, *rect, self.session.generation));
             } else {
                 self.ext.pen.selected = None;
                 return false;
@@ -672,7 +709,17 @@ impl HwpApp {
             }
             return true;
         }
-        if let Some((owner, i, start, original, w, h, generation)) = self.ext.pen.resize {
+        if let Some(Resize {
+            page: owner,
+            handle: i,
+            start,
+            original,
+            width: w,
+            height: h,
+            full,
+            generation,
+        }) = self.ext.pen.resize
+        {
             if owner != page {
                 return true;
             }
@@ -690,14 +737,20 @@ impl HwpApp {
             let mut sy = if i == 0 {
                 1.0
             } else {
-                ((original.height() + delta.y) / original.height()).max(0.02)
+                ((full + delta.y) / full).max(0.02)
             };
             if response.ctx.input(|i| i.modifiers.shift) {
                 let scale = if i == 1 { sy } else { sx };
                 sx = scale;
                 sy = scale;
             }
-            let preview = Rect::from_min_size(original.min, original.size() * Vec2::new(sx, sy));
+            let preview = Rect::from_min_size(
+                original.min,
+                Vec2::new(
+                    original.width() * sx,
+                    (original.height() + full * (sy - 1.0)).max(1.0),
+                ),
+            );
             painter.rect_stroke(
                 preview,
                 0.0,
@@ -889,6 +942,57 @@ mod tests {
                 > before["columnWidths"][0].as_u64().unwrap()
         );
     }
+    /// The table's outline and move grip stay inside the page's visible part:
+    /// a table scrolled half out of view must not paint over the ribbon.
+    #[test]
+    fn a_table_scrolled_out_of_view_does_not_paint_over_the_ribbon() {
+        let mut app = fixture();
+        let a: ObjectAddress = serde_json::from_value(
+            app.session.run("table.info", json!({})).unwrap()["table"].clone(),
+        )
+        .unwrap();
+        app.ext.pen.selected = Some(a);
+        // The document view starts at y = 300; above it is the ribbon.
+        let view_top = bounds(&app).top() + 40.0;
+        let ctx = app.ctx.clone();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1100.0, 1400.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    let page = Rect::from_min_size(
+                        Pos2::new(50.0, 50.0),
+                        Vec2::new(794.0, 1123.0) * app.zoom,
+                    );
+                    ui.set_clip_rect(Rect::from_min_max(
+                        Pos2::new(0.0, view_top),
+                        Pos2::new(1100.0, 1400.0),
+                    ));
+                    let response = ui.interact(
+                        page,
+                        egui::Id::new("page-clip-test"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    app.ext_canvas(0, &response, page);
+                },
+            );
+            out.textures_delta.clear();
+            shapes = out.shapes;
+        }
+        assert!(!shapes.is_empty(), "the selected table draws its outline");
+        for s in &shapes {
+            assert!(
+                s.clip_rect.top() >= view_top - 0.5,
+                "an overlay may paint above the view: {:?} {:?}",
+                s.clip_rect,
+                s.shape.visual_bounding_rect()
+            );
+        }
+    }
+
     #[test]
     fn short_drag_batched_in_one_frame() {
         let mut app = fixture();
@@ -1067,5 +1171,184 @@ mod tests {
         assert_eq!(axis_coordinate(&map, 180.0), 10.0);
         assert_eq!(axis_coordinate(&map, 190.0), 15.0);
         assert_eq!(axis_coordinate(&map, 140.0), 5.0);
+    }
+
+    /// A table split across pages is resized with the mouse as in Hangul: the width
+    /// handle works on every piece, the height handles only on the piece that holds
+    /// the table's real bottom (the first piece ends at the page break).
+    #[test]
+    fn a_table_split_across_pages_resizes_with_the_mouse() {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        app.session
+            .run("table.create", json!({"rows":60,"columns":3}))
+            .unwrap();
+        let a: ObjectAddress = serde_json::from_value(
+            app.session.run("table.info", json!({})).unwrap()["table"].clone(),
+        )
+        .unwrap();
+        let page_rect =
+            Rect::from_min_size(Pos2::new(50.0, 50.0), Vec2::new(794.0, 1123.0) * app.zoom);
+        let piece = |app: &HwpApp, page: u32| {
+            let v: Value =
+                serde_json::from_str(&app.session.page_control_layout(page).unwrap()).unwrap();
+            let t = v["controls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["type"] == "table")
+                .unwrap()
+                .clone();
+            let f = |k: &str| t[k].as_f64().unwrap() as f32;
+            Rect::from_min_size(
+                page_rect.min + Vec2::new(f("x"), f("y")) * app.zoom,
+                Vec2::new(f("w"), f("h")) * app.zoom,
+            )
+        };
+        let props = |app: &HwpApp| {
+            let p = app.session.table_properties(a).unwrap();
+            (
+                p["tableWidth"].as_f64().unwrap(),
+                p["tableHeight"].as_f64().unwrap(),
+            )
+        };
+        let on_page = |app: &mut HwpApp, page: u32, events: Vec<Event>| {
+            let ctx = app.ctx.clone();
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1100.0, 1400.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let response = ui.interact(
+                        page_rect,
+                        egui::Id::new("page-split-test"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    app.ext_canvas(page, &response, page_rect);
+                },
+            );
+            out.textures_delta.clear();
+        };
+        let drag_on = |app: &mut HwpApp, page: u32, start: Pos2, end: Pos2| {
+            app.ext.pen.selected = Some(a);
+            on_page(app, page, vec![]);
+            on_page(
+                app,
+                page,
+                vec![Event::PointerMoved(start), button(start, true)],
+            );
+            on_page(app, page, vec![Event::PointerMoved(end)]);
+            on_page(app, page, vec![button(end, false)]);
+            assert!(app.error.is_none(), "{:?}", app.error);
+        };
+        let last = piece(&app, 1);
+        // Hangul unit per page pixel (96 dpi): 7200 / 96.
+        let per_px = 75.0 / f64::from(app.zoom);
+
+        let (w0, h0) = props(&app);
+        drag_on(
+            &mut app,
+            1,
+            last.right_center(),
+            last.right_center() + Vec2::new(40.0, 0.0),
+        );
+        let (w1, h1) = props(&app);
+        assert!((w1 - w0 - 40.0 * per_px).abs() < 150.0, "{w0} -> {w1}");
+        assert_eq!(h1, h0);
+
+        let last = piece(&app, 1);
+        drag_on(
+            &mut app,
+            1,
+            last.center_bottom(),
+            last.center_bottom() + Vec2::new(0.0, 30.0),
+        );
+        let (_, h2) = props(&app);
+        assert!((h2 - h1 - 30.0 * per_px).abs() < 300.0, "{h1} -> {h2}");
+
+        // The first piece's bottom is the page break, not a height handle: a press
+        // there starts no resize (it is the outline, which moves the table).
+        let first = piece(&app, 0);
+        app.ext.pen.selected = Some(a);
+        on_page(&mut app, 0, vec![]);
+        let at = first.center_bottom();
+        on_page(&mut app, 0, vec![Event::PointerMoved(at), button(at, true)]);
+        assert!(app.ext.pen.resize.is_none());
+        on_page(&mut app, 0, vec![button(at, false)]);
+        app.ext.pen.moving = None;
+        assert_eq!(props(&app).1, h2);
+        // Its width handle works.
+        drag_on(
+            &mut app,
+            0,
+            first.right_center(),
+            first.right_center() - Vec2::new(40.0, 0.0),
+        );
+        assert!((props(&app).0 - w1 + 40.0 * per_px).abs() < 150.0);
+
+        // The move grip of the second piece moves the whole table, every piece.
+        let (first, last) = (piece(&app, 0), piece(&app, 1));
+        let grip = table_move_grip(last).center();
+        drag_on(&mut app, 1, grip, grip + Vec2::new(30.0, 0.0));
+        assert!((piece(&app, 0).left() - first.left() - 30.0).abs() < 1.0);
+        assert!((piece(&app, 1).left() - last.left() - 30.0).abs() < 1.0);
+    }
+
+    /// The page layout gives a table nested in a cell the indices of its cell
+    /// paragraph, which can equal a top-level table's address. It is not a piece
+    /// of that table: its grip and handles would act on the other table, and the
+    /// table would count as split across pages.
+    #[test]
+    fn a_nested_table_is_not_a_piece_of_another_table() {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false).unwrap();
+        let s = &mut app.session;
+        // T1 (paragraph 1) alone on page 1; T2 on page 2 holds a nested table whose
+        // layout entry reads section 0, paragraph 1, control 0, as T1.
+        s.run("text.insert", json!({"text": "앞"})).unwrap();
+        s.run("paragraph.split", json!({})).unwrap();
+        s.run("paragraph.split", json!({})).unwrap();
+        s.run(
+            "text.insert",
+            json!({"text": "쪽을 넘기는 긴 문단입니다. ".repeat(130)}),
+        )
+        .unwrap();
+        s.run("paragraph.split", json!({})).unwrap();
+        s.run("table.create", json!({"rows": 2, "columns": 2}))
+            .unwrap();
+        s.run(
+            "selection.set",
+            json!({"cursor":{"section":0,"paragraph":1,"offset":0}}),
+        )
+        .unwrap();
+        s.run("table.create", json!({"rows": 2, "columns": 2}))
+            .unwrap();
+        let a: ObjectAddress =
+            serde_json::from_value(s.run("table.info", json!({})).unwrap()["table"].clone())
+                .unwrap();
+        s.run(
+            "context.table.create",
+            json!({"address":{"section":0,"paragraph":4,
+                "path":[{"control":0,"cell":0,"paragraph":0}]},"rows":2,"columns":2}),
+        )
+        .unwrap();
+        let layout: Value = serde_json::from_str(&s.page_control_layout(1).unwrap()).unwrap();
+        assert!(
+            layout["controls"].as_array().unwrap().iter().any(|t| {
+                t["secIdx"] == a.section
+                    && t["paraIdx"] == a.paragraph
+                    && t["controlIdx"] == a.control
+            }),
+            "the nested table's entry reads as T1"
+        );
+        assert_eq!(
+            app.selection_tables(0)
+                .iter()
+                .filter(|(x, _, _)| *x == a)
+                .count(),
+            1
+        );
+        let tables = app.selection_tables(1);
+        assert!(tables.iter().all(|(x, _, _)| *x != a), "{tables:?}");
     }
 }

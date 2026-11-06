@@ -5,7 +5,10 @@ tree and binary distributions include or link the following third-party work.
 Full license texts for bundled assets are kept in assets/licenses/ and
 assets/icons/lucide/LICENSE.txt and are shipped with every binary package.
 A complete list of Rust crate dependencies with their licenses is generated
-into THIRD-PARTY-DEPENDENCIES.md from Cargo.lock.
+into THIRD-PARTY-DEPENDENCIES.md from Cargo.lock, and the copyright notices
+and license texts those crates ship are collected into
+THIRD-PARTY-LICENSES.txt (scripts/third-party-licenses.py); both files are
+shipped with every binary package.
 
 1. RHWP — https://github.com/edwardkim/rhwp
    Copyright (c) 2025-2026 Edward Kim. MIT License.
@@ -30,6 +33,10 @@ into THIRD-PARTY-DEPENDENCIES.md from Cargo.lock.
    crates/ui-egui/src/ribbon_layout.rs adapts WordCraft's ribbon_fit.rs;
    crates/formats/src/file_access.rs adapts WordCraft's file_access.rs; the
    MCP lifecycle / tools / session structure follows WordCraft's crates/mcp.
+   DOCX import and export (crates/docx) link WordCraft's wordcraft-doc,
+   wordcraft-docx and wordcraft-geom crates (MIT OR Apache-2.0, used under
+   MIT; the commit in WORDCRAFT_REV). No WordCraft fonts, brand assets or
+   language data are linked.
    License text: assets/licenses/LICENSE-WordCraft-MIT.txt.
 
 4. DeckCraft and DesignCraft (MIT License)
@@ -51,6 +58,9 @@ into THIRD-PARTY-DEPENDENCIES.md from Cargo.lock.
    in THIRD-PARTY-DEPENDENCIES.md. Crates offered under a choice of licenses
    are used under the MIT license where available, otherwise under
    Apache-2.0; no GPL-only or AGPL code is included.
+   Their copyright notices and license texts, including the BSD-3-Clause
+   notice for the WHATWG Encoding Standard data in encoding_rs, are in
+   THIRD-PARTY-LICENSES.txt.
    Crates that ship additional notice files have them reproduced in
    assets/licenses/: subsetter (code adapted from ttf-parser, MIT —
    NOTICE-subsetter.txt), svg2pdf (bundled ICC profiles, CC0 1.0 —

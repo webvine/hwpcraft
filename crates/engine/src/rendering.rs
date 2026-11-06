@@ -72,9 +72,11 @@ impl Session {
             && !has_chart_overrides
             && !self.has_internal_links()
         {
+            let meta = self.pdf_meta(core, pages, true);
             return core
                 .render_pages_pdf_native_with_options(pages, &options)
                 .map(hwpcraft_formats::pdf_compact::compact)
+                .map(|pdf| hwpcraft_formats::pdf_meta::apply(pdf, &meta))
                 .map_err(err);
         }
         self.pdf_job(pages)?.convert()
@@ -172,8 +174,85 @@ impl Session {
         if prep.svgs.len() != prep.pages.len() {
             bail!("PDF 쪽 준비가 끝나지 않았습니다.");
         }
+        let meta = self.pdf_meta_for(&prep.pages, true)?;
         let (svgs, links) = prep.into_parts();
-        Ok(PdfJob::from_svgs(svgs, links))
+        Ok(PdfJob::from_svgs(svgs, links, meta))
+    }
+
+    /// [`Session::pdf_meta`] in the layout PDF pages are prepared in (page fields applied).
+    pub(crate) fn pdf_meta_for(
+        &self,
+        pages: &[u32],
+        outline: bool,
+    ) -> Result<hwpcraft_formats::pdf_meta::PdfMeta> {
+        let fields = self.page_field_layout()?;
+        let core = fields.as_ref().map_or(&self.core, |layout| &layout.core);
+        Ok(self.pdf_meta(core, pages, outline))
+    }
+
+    /// What a PDF of `pages` says about itself: the document's 문서 정보 (the file name
+    /// when it has no title), HwpCraft as creator, the export time (the save clock, so
+    /// fixed in tests), and with `outline` a bookmark for each outline heading (개요) on
+    /// those pages, going to its line.
+    fn pdf_meta(
+        &self,
+        core: &hwpcraft_doc::DocumentCore,
+        pages: &[u32],
+        outline: bool,
+    ) -> hwpcraft_formats::pdf_meta::PdfMeta {
+        let [title, author, subject, keywords] = self.document_summary();
+        let title = title.or_else(|| {
+            self.path
+                .as_deref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+        });
+        let version = hwpcraft_doc::VERSION.trim();
+        let mut items = Vec::new();
+        if outline {
+            for heading in self.outline_headings(10).unwrap_or_default() {
+                let Ok(raw) = core.get_cursor_rect_native(heading.section, heading.paragraph, 0)
+                else {
+                    continue;
+                };
+                let Ok(rect) = serde_json::from_str::<Value>(&raw) else {
+                    continue;
+                };
+                let (Some(page), Some(x), Some(y)) = (
+                    rect["pageIndex"].as_u64(),
+                    rect["x"].as_f64(),
+                    rect["y"].as_f64(),
+                ) else {
+                    continue;
+                };
+                let Some(index) = pages.iter().position(|&p| u64::from(p) == page) else {
+                    continue;
+                };
+                let title = format!("{} {}", heading.number.trim(), heading.title.trim());
+                // CSS px at 96 dpi → points.
+                items.push(hwpcraft_formats::pdf_meta::OutlineItem {
+                    level: heading.level,
+                    title: title.trim().to_owned(),
+                    page: index,
+                    x: (x * 0.75) as f32,
+                    y: (y * 0.75) as f32,
+                });
+            }
+        }
+        hwpcraft_formats::pdf_meta::PdfMeta {
+            title,
+            author,
+            subject,
+            keywords,
+            creator: format!("HwpCraft {version}"),
+            producer: format!("HwpCraft {version} (RHWP)"),
+            date: Some(
+                crate::date_fields::now()
+                    .format("D:%Y%m%d%H%M%SZ")
+                    .to_string(),
+            ),
+            outline: items,
+        }
     }
 }
 
@@ -215,29 +294,38 @@ impl Drop for ReleaseRenderCaches<'_> {
     }
 }
 
-/// Prepared PDF pages; `convert` may run on any thread (see `Session::pdf_job`).
+/// Prepared PDF pages; `convert` may run on any thread (see `Session::pdf_job`). The
+/// pages are print SVGs (`sheets`), which the desktop also sends to a printer directly.
 pub struct PdfJob {
-    pages: usize,
-    convert: Box<dyn FnOnce() -> Result<Vec<u8>> + Send>,
+    svgs: Vec<String>,
+    links: Vec<Vec<hwpcraft_doc::PdfLink>>,
+    meta: hwpcraft_formats::pdf_meta::PdfMeta,
 }
 impl PdfJob {
     /// The job converting `svgs` (one PDF page each, with `links` in the same order).
-    pub(crate) fn from_svgs(svgs: Vec<String>, links: Vec<Vec<hwpcraft_doc::PdfLink>>) -> Self {
-        let options = hwpcraft_formats::pdf_options();
-        Self {
-            pages: svgs.len(),
-            convert: Box::new(move || {
-                hwpcraft_doc::svgs_to_pdf_with_links(&svgs, &links, &options)
-                    .map(hwpcraft_formats::pdf_compact::compact)
-                    .map_err(anyhow::Error::msg)
-            }),
-        }
+    pub(crate) fn from_svgs(
+        svgs: Vec<String>,
+        links: Vec<Vec<hwpcraft_doc::PdfLink>>,
+        meta: hwpcraft_formats::pdf_meta::PdfMeta,
+    ) -> Self {
+        Self { svgs, links, meta }
     }
     pub fn page_count(&self) -> usize {
-        self.pages
+        self.svgs.len()
+    }
+    /// The PDF pages as print SVGs (CSS px at 96 dpi), in order.
+    pub fn sheets(&self) -> &[String] {
+        &self.svgs
     }
     /// Lay out, embed fonts and assemble the PDF bytes.
     pub fn convert(self) -> Result<Vec<u8>> {
-        (self.convert)()
+        hwpcraft_doc::svgs_to_pdf_with_links(
+            &self.svgs,
+            &self.links,
+            &hwpcraft_formats::pdf_options(),
+        )
+        .map(hwpcraft_formats::pdf_compact::compact)
+        .map(|pdf| hwpcraft_formats::pdf_meta::apply(pdf, &self.meta))
+        .map_err(anyhow::Error::msg)
     }
 }

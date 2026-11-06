@@ -4,8 +4,8 @@
 use rmcp::{
     ErrorData, RoleServer,
     model::{
-        ClientJsonRpcMessage, ClientRequest, GetExtensions, GetMeta, ProtocolVersion, RequestId,
-        ServerJsonRpcMessage,
+        ClientJsonRpcMessage, ClientNotification, ClientRequest, GetExtensions, GetMeta,
+        ProtocolVersion, RequestId, ServerJsonRpcMessage,
     },
     transport::Transport,
 };
@@ -237,6 +237,23 @@ impl Write for BoundedOutput {
     }
 }
 
+/// What answers a request whose response is over [`MAX_RESPONSE_BYTES`]; none
+/// for a message that answers no request.
+fn too_large_answer(message: &ServerJsonRpcMessage) -> Option<ServerJsonRpcMessage> {
+    let id = match message {
+        ServerJsonRpcMessage::Response(response) => response.id.clone(),
+        ServerJsonRpcMessage::Error(error) => error.id.clone()?,
+        _ => return None,
+    };
+    Some(ServerJsonRpcMessage::error(
+        ErrorData::internal_error(
+            "the response is over 32 MiB; ask for less (a smaller range, fewer pages, or a shorter batch)",
+            None,
+        ),
+        Some(id),
+    ))
+}
+
 fn encode(message: &ServerJsonRpcMessage) -> io::Result<Vec<u8>> {
     let mut bytes = BoundedOutput(Vec::new());
     serde_json::to_writer(&mut bytes, message)
@@ -335,9 +352,10 @@ impl<R: AsyncRead + Send + Unpin + 'static> StrictStdio<R> {
             }
             // A call cancelled before the SDK starts it never reaches the gate.
             ClientJsonRpcMessage::Notification(notification) => {
-                if let Ok(value) = serde_json::to_value(&notification.notification)
-                    && value["method"] == "notifications/cancelled"
-                    && let Ok(key) = serde_json::to_string(&value["params"]["requestId"])
+                if let ClientNotification::CancelledNotification(cancelled) =
+                    &notification.notification
+                    && let Some(id) = &cancelled.params.request_id
+                    && let Ok(key) = serde_json::to_string(id)
                 {
                     release(&self.admission, &self.unanswered, &key);
                 }
@@ -363,13 +381,22 @@ impl<R: AsyncRead + Send + Unpin + 'static> Transport<RoleServer> for StrictStdi
         message: ServerJsonRpcMessage,
     ) -> impl Future<Output = io::Result<()>> + Send + 'static {
         // An answered call no longer holds the ones read after it.
-        if let ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_) = &message
-            && let Ok(value) = serde_json::to_value(&message)
-            && let Ok(key) = serde_json::to_string(&value["id"])
+        let id = match &message {
+            ServerJsonRpcMessage::Response(response) => Some(&response.id),
+            ServerJsonRpcMessage::Error(error) => error.id.as_ref(),
+            _ => None,
+        };
+        if let Some(id) = id
+            && let Ok(key) = serde_json::to_string(id)
         {
             release(&self.admission, &self.unanswered, &key);
         }
-        let bytes = encode(&message);
+        // A response too large to send still answers its request: the client
+        // would otherwise wait for it forever.
+        let bytes = encode(&message).or_else(|error| match too_large_answer(&message) {
+            Some(answer) => encode(&answer),
+            None => Err(error),
+        });
         let writer = self.writer.clone();
         async move {
             let (ack, received) = oneshot::channel();
@@ -861,6 +888,102 @@ mod tests {
         transport.send(error(-32600)).await?;
         transport.close().await?;
         assert_eq!(output.messages()?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_answer_or_a_cancel_lets_the_calls_after_it_go() -> anyhow::Result<()> {
+        let call = |id: Value| -> anyhow::Result<Vec<u8>> {
+            let mut bytes = serde_json::to_vec(
+                &json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                    "name":"list_commands","arguments":{},
+                    "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}
+                }}),
+            )?;
+            bytes.push(b'\n');
+            Ok(bytes)
+        };
+        let mut bytes = call(json!("한글😀"))?;
+        bytes.extend(call(json!(7))?);
+        bytes.extend(call(json!(8))?);
+        bytes.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":8}}\n");
+        let mut transport = new(io::Cursor::new(bytes), Capture::default());
+        let unanswered = |transport: &StrictStdio<_>| {
+            transport
+                .unanswered
+                .lock()
+                .map(|map| map.len())
+                .unwrap_or(usize::MAX)
+        };
+        for _ in 0..3 {
+            transport.receive().await.context("call lost")?;
+        }
+        assert_eq!(unanswered(&transport), 3);
+        transport.receive().await.context("cancel lost")?;
+        assert_eq!(unanswered(&transport), 2);
+        assert!(
+            !transport.admission.admitted(1),
+            "the first two calls still run"
+        );
+        transport
+            .send(ServerJsonRpcMessage::error(
+                ErrorData::new(rmcp::model::ErrorCode(-32602), "own fixture", None),
+                Some(RequestId::String("한글😀".into())),
+            ))
+            .await?;
+        transport
+            .send(ServerJsonRpcMessage::Response(
+                rmcp::model::JsonRpcResponse {
+                    jsonrpc: Default::default(),
+                    id: RequestId::Number(7),
+                    result: rmcp::model::ServerResult::CallToolResult(
+                        rmcp::model::CallToolResult::success(Vec::new()),
+                    ),
+                },
+            ))
+            .await?;
+        assert_eq!(unanswered(&transport), 0);
+        assert!(
+            transport.admission.admitted(3),
+            "every call was answered or cancelled"
+        );
+        transport.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_response_too_large_to_send_still_answers_its_request() -> anyhow::Result<()> {
+        let output = Capture::default();
+        let mut transport = new(io::Cursor::new(Vec::<u8>::new()), output.clone());
+        let huge = "x".repeat(MAX_RESPONSE_BYTES);
+        let result =
+            rmcp::model::ServerResult::CallToolResult(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::ContentBlock::text(huge.clone()),
+            ]));
+        let response = ServerJsonRpcMessage::Response(rmcp::model::JsonRpcResponse {
+            jsonrpc: Default::default(),
+            id: RequestId::Number(7),
+            result,
+        });
+        transport.send(response).await?;
+        let error = ServerJsonRpcMessage::error(
+            ErrorData::new(rmcp::model::ErrorCode(-32603), huge, None),
+            Some(RequestId::Number(8)),
+        );
+        transport.send(error).await?;
+        transport.close().await?;
+        let messages = output.messages()?;
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        for (message, id) in messages.iter().zip([7, 8]) {
+            assert_eq!(message["id"], id, "{message}");
+            assert_eq!(message["error"]["code"], -32603, "{message}");
+            assert!(
+                message["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("32 MiB")),
+                "{message}"
+            );
+        }
         Ok(())
     }
 

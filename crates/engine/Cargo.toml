@@ -6,6 +6,7 @@ license.workspace = true
 [dependencies]
 hwpcraft-doc.workspace = true
 hwpcraft-formats.workspace = true
+hwpcraft-docx.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 serde.workspace = true

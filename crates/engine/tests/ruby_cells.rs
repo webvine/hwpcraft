@@ -48,7 +48,11 @@ fn ruby_in_a_table_cell() -> anyhow::Result<()> {
     s.anchor = Some(0);
     let made = s.run("format.ruby", json!({"text": "한자"}))?;
     assert_eq!(made["position"], 0, "{made}");
-    assert_eq!(cell_text(&s), " 공부", "the base text moved into the control");
+    assert_eq!(
+        cell_text(&s),
+        " 공부",
+        "the base text moved into the control"
+    );
     s.cursor = cell_caret(&s, 0);
     let list = s.run("format.ruby.list", json!({}))?;
     assert_eq!(list[0]["base"], "漢字", "{list}");

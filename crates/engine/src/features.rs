@@ -192,28 +192,30 @@ impl Session {
         std::fs::File::open(path)?
             .take(20_000_001)
             .read_to_end(&mut bytes)?;
-        if bytes.len() > 20_000_000 {
-            bail!("그림 파일은 20 MB 이하입니다.");
-        }
-        let format = image::guess_format(&bytes)
-            .map_err(|_| anyhow!("그림 형식을 알 수 없습니다. PNG, JPG, BMP, GIF를 지원합니다."))?;
-        let extension = match format {
-            image::ImageFormat::Png => "png",
-            image::ImageFormat::Jpeg => "jpg",
-            image::ImageFormat::Bmp => "bmp",
-            image::ImageFormat::Gif => "gif",
-            other => bail!("{other:?} 그림은 지원하지 않습니다. PNG, JPG, BMP, GIF를 넣으세요."),
-        };
-        let reader = image::ImageReader::with_format(std::io::Cursor::new(&bytes), format);
-        let (w, h) = reader.into_dimensions()?;
-        if w == 0 || h == 0 || w > 8192 || h > 8192 || u64::from(w) * u64::from(h) > 16_000_000 {
-            bail!("그림은 8192픽셀 및 1,600만 화소 이하입니다.");
-        }
-        let mut reader = image::ImageReader::with_format(std::io::Cursor::new(&bytes), format);
-        let mut limits = image::Limits::default();
-        limits.max_alloc = Some(128_000_000);
-        reader.limits(limits);
-        reader.decode()?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().chars().take(200).collect::<String>())
+            .unwrap_or_default();
+        self.insert_picture_data(&bytes, &name, width_mm, treat_as_char)
+    }
+    /// Paste a picture from the system clipboard (PNG, JPG, BMP or GIF bytes) at the
+    /// caret, as Hangul pastes one: like a character, natural size capped by the
+    /// text width.
+    pub fn paste_picture(&mut self, bytes: &[u8]) -> Result<Option<ObjectAddress>> {
+        self.guard_distribution()?;
+        self.guard_protected()?;
+        self.insert_picture_data(bytes, "", None, true)
+    }
+    /// [`Self::insert_picture`] for picture bytes already in memory; `name` is the
+    /// picture's description.
+    pub(crate) fn insert_picture_data(
+        &mut self,
+        bytes: &[u8],
+        name: &str,
+        width_mm: Option<f64>,
+        treat_as_char: bool,
+    ) -> Result<Option<ObjectAddress>> {
+        let (extension, w, h) = checked_picture(bytes)?;
         let p = self.page_setup()?;
         let body = (if p.landscape { p.height_mm } else { p.width_mm })
             - p.left_mm
@@ -232,10 +234,6 @@ impl Session {
             (width_mm * 7200.0 / 25.4).round().max(1.0) as u32,
             (height_mm * 7200.0 / 25.4).round().max(1.0) as u32,
         );
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().chars().take(200).collect::<String>())
-            .unwrap_or_default();
         let mut inserted = None;
         self.transaction(|s| {
             s.delete_selection()?;
@@ -256,13 +254,13 @@ impl Session {
                     c.paragraph,
                     c.offset,
                     &cell_path,
-                    &bytes,
+                    bytes,
                     width,
                     height,
                     w,
                     h,
                     extension,
-                    &name,
+                    name,
                     None,
                     None,
                 )
@@ -583,4 +581,32 @@ impl Session {
             Ok(())
         })
     }
+}
+
+/// A picture HwpCraft can put in a document: PNG, JPG, BMP or GIF, at most 20 MB and
+/// 8192 px (16 million pixels), that decodes. Its file extension and size in pixels.
+pub(crate) fn checked_picture(bytes: &[u8]) -> Result<(&'static str, u32, u32)> {
+    if bytes.len() > 20_000_000 {
+        bail!("그림 파일은 20 MB 이하입니다.");
+    }
+    let format = image::guess_format(bytes)
+        .map_err(|_| anyhow!("그림 형식을 알 수 없습니다. PNG, JPG, BMP, GIF를 지원합니다."))?;
+    let extension = match format {
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::Jpeg => "jpg",
+        image::ImageFormat::Bmp => "bmp",
+        image::ImageFormat::Gif => "gif",
+        other => bail!("{other:?} 그림은 지원하지 않습니다. PNG, JPG, BMP, GIF를 넣으세요."),
+    };
+    let reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    let (w, h) = reader.into_dimensions()?;
+    if w == 0 || h == 0 || w > 8192 || h > 8192 || u64::from(w) * u64::from(h) > 16_000_000 {
+        bail!("그림은 8192픽셀 및 1,600만 화소 이하입니다.");
+    }
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128_000_000);
+    reader.limits(limits);
+    reader.decode()?;
+    Ok((extension, w, h))
 }

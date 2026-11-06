@@ -1,0 +1,924 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 3aa2b86..f1cb066 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -1607,7 +1607,13 @@ impl DocumentCore {
+     ///
+     /// 반환값: 실제로 reflow 된 문단 개수 (본문 + 셀 내부 합계).
+     pub fn reflow_linesegs_on_demand(&mut self) -> usize {
+-        if self.validation_report.is_empty() {
++        // 저장 줄이 하나도 없는 구역(줄 캐시 없이 쓴 HWPX)은 검증 경고가 없어도 줄을
++        // 만든다 — 빈 문단과 개체만 있는 문서도 다시 연 조판이 편집 중 조판과 같아야 한다.
++        let has_rowless_section = self.document.sections.iter().any(|section| {
++            !section.paragraphs.is_empty()
++                && section.paragraphs.iter().all(|p| p.line_segs.is_empty())
++        });
++        if self.validation_report.is_empty() && !has_rowless_section {
+             return 0;
+         }
+ 
+@@ -1774,6 +1780,28 @@ impl DocumentCore {
+                                 }
+                             }
+                         }
++                        // 표 캡션 문단도 줄을 만든다 — 줄 없는 캡션은 높이를 기본 400 HU 로
++                        // 잡아 표 상자가 그만큼 짧아지고 뒤 문단이 캡션 위에 그려졌다.
++                        // 상자는 표 속성의 캡션 줄 나눔(`set_table_properties_native`)과 같다.
++                        if let Some(caption) = table.caption.as_mut() {
++                            let width_hu = match caption.direction {
++                                crate::model::shape::CaptionDirection::Left
++                                | crate::model::shape::CaptionDirection::Right => caption.width,
++                                _ => caption.max_width,
++                            };
++                            let width_px = crate::renderer::hwpunit_to_px(width_hu as i32, dpi);
++                            for caption_para in &mut caption.paragraphs {
++                                if Self::needs_reflow_broadly(caption_para) {
++                                    reflow_line_segs(
++                                        caption_para,
++                                        ParagraphBox::content_width_px(width_px, dpi),
++                                        &styles,
++                                        dpi,
++                                    );
++                                    reflowed += 1;
++                                }
++                            }
++                        }
+                     }
+                 }
+                 pi += 1;
+diff --git a/src/document_core/commands/object_ops/table.rs b/src/document_core/commands/object_ops/table.rs
+index 026777d..3d9b972 100644
+--- a/src/document_core/commands/object_ops/table.rs
++++ b/src/document_core/commands/object_ops/table.rs
+@@ -706,6 +706,13 @@ impl DocumentCore {
+         self.document.sections[section_idx].raw_stream = None;
+ 
+         let para = &self.document.sections[section_idx].paragraphs[para_idx];
++        // 줄이 모두 RHWP 몫(구현 태그)인 문단에 넣는 표의 host·이웃 줄도 RHWP 몫이다 —
++        // 저장 줄로 읽히면 같은 문서를 다시 연 조판(새로 조판)과 편집 중 조판이 갈린다.
++        let own_rows = !para.line_segs.is_empty()
++            && para
++                .line_segs
++                .iter()
++                .all(|line| line.tag & LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0);
+         let is_empty_para = para.text.is_empty() && para.controls.is_empty();
+         let is_structure_only_empty_para = Self::is_structure_only_empty_paragraph(para);
+ 
+@@ -792,6 +799,15 @@ impl DocumentCore {
+         for i in para_idx..fresh_end.min(self.document.sections[section_idx].paragraphs.len()) {
+             self.reflow_paragraph(section_idx, i);
+         }
++        if own_rows {
++            for para in &mut self.document.sections[section_idx].paragraphs
++                [insert_para_idx..(insert_para_idx + 2).min(fresh_end)]
++            {
++                for line in &mut para.line_segs {
++                    line.tag |= LineSeg::TAG_IMPLEMENTATION_PROPERTY;
++                }
++            }
++        }
+         let doc_hwp3_layout = self.document.layout_profile().hwp3_layout();
+         crate::renderer::composer::recalculate_section_vpos(
+             &mut self.document.sections[section_idx].paragraphs,
+@@ -1922,3 +1938,181 @@ mod tests {
+         assert_cells_inherit_cursor_shape(table_of(&core));
+     }
+ }
++
++#[cfg(test)]
++mod topbottom_table_next_paragraph_tests {
++    //! 문단 기준 자리차지 표(바깥 여백 283)와 그 캡션 뒤 문단은 표 상자(위·아래 바깥
++    //! 여백과 캡션 포함) 아래에서 시작한다 — 편집 중 화면, HWP 저장 후, 줄 캐시 없이
++    //! 쓴 HWPX(HwpCraft 의 새 문서) 저장 후 다시 연 화면이 모두 같아야 한다. 새 문서의
++    //! 줄은 HwpCraft 처럼 RHWP 의 것으로 표시한다(한글이 저장한 줄이 없는 구역).
++    use crate::document_core::DocumentCore;
++    use crate::model::control::Control;
++    use crate::model::paragraph::{LineSeg, Paragraph};
++    use crate::renderer::render_tree::{RenderNode, RenderNodeType};
++
++    /// (표 위끝, 표·캡션 상자 아래끝, 다음 문단 첫 줄 위끝)
++    fn geometry(core: &DocumentCore) -> (f64, f64, f64) {
++        fn walk(node: &RenderNode, out: &mut Vec<(String, f64, f64)>) {
++            match &node.node_type {
++                RenderNodeType::Table(_) => out.push((
++                    "<table>".into(),
++                    node.bbox.y,
++                    node.bbox.y + node.bbox.height,
++                )),
++                RenderNodeType::TextRun(run) if !run.text.trim().is_empty() => out.push((
++                    run.text.clone(),
++                    node.bbox.y,
++                    node.bbox.y + node.bbox.height,
++                )),
++                _ => {}
++            }
++            for child in &node.children {
++                walk(child, out);
++            }
++        }
++        let tree = core.build_page_render_tree(0).unwrap();
++        let mut items = Vec::new();
++        walk(&tree.root, &mut items);
++        let table = items
++            .iter()
++            .find(|i| i.0 == "<table>")
++            .expect("table")
++            .clone();
++        let next = items
++            .iter()
++            .find(|i| i.0.starts_with("다음"))
++            .expect("next")
++            .1;
++        // 표 안 글자와 캡션 글자: 제목과 다음 문단을 뺀 나머지.
++        let bottom = items
++            .iter()
++            .filter(|i| !i.0.starts_with("다음") && !i.0.starts_with("제목"))
++            .map(|i| i.2)
++            .fold(table.2, f64::max);
++        (table.1, bottom, next)
++    }
++
++    fn document(caption: Option<u8>) -> DocumentCore {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        mark_own(&mut core.document_mut().sections[0].paragraphs);
++        core.insert_text_native(0, 0, 0, "제목").unwrap();
++        core.split_paragraph_native(0, 0, 2, None).unwrap();
++        core.create_table_native(0, 1, 0, 3, 3).unwrap();
++        for cell in 0..9 {
++            core.insert_text_in_cell_native(0, 1, 0, cell, 0, 0, "가")
++                .unwrap();
++        }
++        if let Some(direction) = caption {
++            core.set_table_properties_native(
++                0,
++                1,
++                0,
++                &format!(r#"{{"hasCaption":true,"captionDirection":{direction}}}"#),
++            )
++            .unwrap();
++        }
++        core.insert_text_native(0, 2, 0, "다음 문단").unwrap();
++        core
++    }
++
++    fn mark_own(paragraphs: &mut [Paragraph]) {
++        for para in paragraphs {
++            for line in &mut para.line_segs {
++                line.tag |= LineSeg::TAG_IMPLEMENTATION_PROPERTY;
++            }
++            for ctrl in &mut para.controls {
++                if let Control::Table(table) = ctrl {
++                    for cell in &mut table.cells {
++                        mark_own(&mut cell.paragraphs);
++                    }
++                    if let Some(caption) = table.caption.as_mut() {
++                        mark_own(&mut caption.paragraphs);
++                    }
++                }
++            }
++        }
++    }
++
++    fn check(caption: Option<u8>) {
++        let core = document(caption);
++        let live = geometry(&core);
++        // HWP 는 줄 캐시를 쓴다.
++        let hwp = DocumentCore::from_bytes(&core.export_hwp_native().unwrap()).unwrap();
++        // 줄 캐시 없이 쓴 HWPX 는 다시 읽을 때 새로 조판한다.
++        let mut export = DocumentCore::new_empty();
++        *export.document_mut() = core.document().clone();
++        mark_own(&mut export.document_mut().sections[0].paragraphs);
++        let mut hwpx = DocumentCore::from_bytes(&export.export_hwpx_native().unwrap()).unwrap();
++        hwpx.reflow_linesegs_on_demand();
++        let margin = crate::renderer::hwpunit_to_px(283, 96.0);
++        for (name, (top, bottom, next)) in [
++            ("live", live),
++            ("hwp", geometry(&hwp)),
++            ("hwpx", geometry(&hwpx)),
++        ] {
++            eprintln!("{caption:?} {name}: top {top:.2} box bottom {bottom:.2} next {next:.2}");
++            assert!(
++                next >= bottom + margin - 0.5,
++                "{caption:?} {name}: top {top} box bottom {bottom} next {next}"
++            );
++            assert!(
++                (top - live.0).abs() < 0.5 && (next - live.2).abs() < 0.5,
++                "{caption:?} {name}: {:?} vs live {live:?}",
++                (top, bottom, next)
++            );
++        }
++    }
++
++    #[test]
++    fn the_paragraph_after_a_topbottom_table_starts_below_its_outer_margin() {
++        check(None);
++    }
++
++    #[test]
++    fn the_paragraph_after_a_captioned_topbottom_table_starts_below_the_caption() {
++        // 아래(3)·위(2)·왼쪽(0)·오른쪽(1) 캡션.
++        for direction in [3, 2, 0, 1] {
++            check(Some(direction));
++        }
++    }
++
++    /// 한글이 저장한 줄에서는 다음 문단이 표 상자 안쪽(host 줄 바로 아래)에 있을 수
++    /// 있다. host 앞에서 Enter 를 치면 host 와 다음 문단이 같이 내려가야 한다 — 상자
++    /// 끝을 리셋 기준으로 쓰면 다음 문단을 단 리셋으로 보고 제자리에 둔다.
++    #[test]
++    fn enter_before_a_host_with_hangul_rows_moves_the_next_paragraph_too() {
++        let mut core = document(None);
++        {
++            let paragraphs = &mut core.document_mut().sections[0].paragraphs;
++            let mut vpos = 0;
++            for para in paragraphs.iter_mut() {
++                for line in &mut para.line_segs {
++                    line.tag &= !LineSeg::TAG_IMPLEMENTATION_PROPERTY;
++                    line.vertical_pos = vpos;
++                    vpos += line.line_height + line.line_spacing;
++                }
++            }
++            let table_height = paragraphs[1]
++                .controls
++                .iter()
++                .find_map(|ctrl| match ctrl {
++                    Control::Table(table) => Some(table.common.height as i32),
++                    _ => None,
++                })
++                .unwrap();
++            assert!(
++                paragraphs[2].line_segs[0].vertical_pos
++                    < paragraphs[1].line_segs[0].vertical_pos + table_height
++            );
++        }
++        let first = |core: &DocumentCore, pi: usize| {
++            core.document().sections[0].paragraphs[pi].line_segs[0].vertical_pos
++        };
++        let (host, next) = (first(&core, 1), first(&core, 2));
++        core.split_paragraph_native(0, 0, 2, None).unwrap();
++        let (dh, dn) = (first(&core, 2) - host, first(&core, 3) - next);
++        assert!(dh > 0, "host moved {dh}");
++        assert_eq!(dn, dh, "next paragraph moved {dn}, host {dh}");
++    }
++}
+diff --git a/src/document_core/commands/table_ops.rs b/src/document_core/commands/table_ops.rs
+index 65dfb9d..ae5b6f8 100644
+--- a/src/document_core/commands/table_ops.rs
++++ b/src/document_core/commands/table_ops.rs
+@@ -2989,21 +2989,29 @@ impl DocumentCore {
+                 table.raw_ctrl_data[common_obj_offsets::MARGIN_LEFT]
+                     .copy_from_slice(&v.to_le_bytes());
+                 table.common.margin.left = v;
++                // 조판은 `outer_margin_*` 를 읽는다 — 파서처럼 같은 값을 둔다.
++                table.outer_margin_left = v;
+             }
+             if let Some(v) = json_i16(json, "outerRight") {
+                 table.raw_ctrl_data[common_obj_offsets::MARGIN_RIGHT]
+                     .copy_from_slice(&v.to_le_bytes());
+                 table.common.margin.right = v;
++                // 조판은 `outer_margin_*` 를 읽는다 — 파서처럼 같은 값을 둔다.
++                table.outer_margin_right = v;
+             }
+             if let Some(v) = json_i16(json, "outerTop") {
+                 table.raw_ctrl_data[common_obj_offsets::MARGIN_TOP]
+                     .copy_from_slice(&v.to_le_bytes());
+                 table.common.margin.top = v;
++                // 조판은 `outer_margin_*` 를 읽는다 — 파서처럼 같은 값을 둔다.
++                table.outer_margin_top = v;
+             }
+             if let Some(v) = json_i16(json, "outerBottom") {
+                 table.raw_ctrl_data[common_obj_offsets::MARGIN_BOTTOM]
+                     .copy_from_slice(&v.to_le_bytes());
+                 table.common.margin.bottom = v;
++                // 조판은 `outer_margin_*` 를 읽는다 — 파서처럼 같은 값을 둔다.
++                table.outer_margin_bottom = v;
+             }
+         }
+ 
+@@ -3112,9 +3120,23 @@ impl DocumentCore {
+             }
+         }
+ 
++        // 줄 없는 캡션 문단(호출자가 캡션 문단을 갈아 끼운 뒤 등)도 줄을 만든다 —
++        // 줄이 없으면 캡션 높이를 기본 400 HU 로 잡아 뒤 문단이 캡션 위에 그려졌다.
++        let caption_rows_missing = self
++            .document
++            .sections
++            .get(section_idx)
++            .and_then(|section| section.paragraphs.get(parent_para_idx))
++            .and_then(|para| para.controls.get(control_idx))
++            .is_some_and(|control| {
++                matches!(control, crate::model::control::Control::Table(table)
++                if table.caption.as_ref().is_some_and(|caption| {
++                    caption.paragraphs.iter().any(|p| p.line_segs.is_empty())
++                }))
++            });
+         // 캡션 생성/수정/삭제 후에는 문서 전체 AutoNumber를 다시 배정한다.
+         // 중간 표 캡션 삭제 시 남은 표 번호가 한컴처럼 1부터 이어지도록 보장한다.
+-        if caption_created || caption_changed {
++        if caption_created || caption_changed || caption_rows_missing {
+             crate::parser::assign_auto_numbers(&mut self.document);
+             if let Some(crate::model::control::Control::Table(ref mut tbl)) =
+                 self.document.sections[section_idx].paragraphs[parent_para_idx]
+@@ -3134,15 +3156,20 @@ impl DocumentCore {
+                     let available_width_px =
+                         crate::renderer::hwpunit_to_px(available_width_hu as i32, self.dpi);
+                     // 표 캡션 상자 — 캡션은 자기 열이 없으므로 미스냅.
+-                    crate::renderer::composer::reflow_line_segs(
+-                        &mut cap.paragraphs[0],
+-                        crate::renderer::composer::ParagraphBox::content_width_px(
+-                            available_width_px,
++                    for (index, para) in cap.paragraphs.iter_mut().enumerate() {
++                        if index > 0 && !para.line_segs.is_empty() {
++                            continue;
++                        }
++                        crate::renderer::composer::reflow_line_segs(
++                            para,
++                            crate::renderer::composer::ParagraphBox::content_width_px(
++                                available_width_px,
++                                self.dpi,
++                            ),
++                            &self.styles,
+                             self.dpi,
+-                        ),
+-                        &self.styles,
+-                        self.dpi,
+-                    );
++                        );
++                    }
+                 }
+             }
+         }
+diff --git a/src/renderer/composer/line_breaking.rs b/src/renderer/composer/line_breaking.rs
+index c663619..90e161b 100644
+--- a/src/renderer/composer/line_breaking.rs
++++ b/src/renderer/composer/line_breaking.rs
+@@ -5203,10 +5203,25 @@ pub(crate) fn recalculate_section_vpos(
+         };
+         height.saturating_add(ls.line_spacing)
+     };
++    // 문단 기준 자리차지 표의 바깥 여백 상자가 줄보다 길면 그 아래에서 다음 문단이
++    // 시작한다 — 한글 저장 줄 실측(빈 host 문단 911건): 다음 문단 vpos = host vpos +
++    // 세로 오프셋 + outMargin.top + 표 높이 + outMargin.bottom. 구역의 줄이 모두
++    // RHWP 의 것일 때만 쓴다: 한글이 저장한 줄은 이미 그 자리에 다음 문단을 두며,
++    // 상자 끝을 리셋 기준으로 쓰면 host 앞 편집에서 다음 문단을 리셋으로 오판해
++    // host 만 밀린다.
++    let own_rows = crate::renderer::float_placement::section_rows_are_own(paragraphs);
+     let seg_end = |p: &Paragraph| -> Option<i32> {
+-        p.line_segs
++        let line_end = p
++            .line_segs
+             .last()
+-            .map(|ls| ls.vertical_pos.saturating_add(seg_advance(ls)))
++            .map(|ls| ls.vertical_pos.saturating_add(seg_advance(ls)))?;
++        let first = p.line_segs.first().map_or(0, |ls| ls.vertical_pos);
++        Some(
++            own_rows
++                .then(|| para_topbottom_table_box_end_hu(p))
++                .flatten()
++                .map_or(line_end, |box_end| line_end.max(first.saturating_add(box_end))),
++        )
+     };
+     let is_ignored = |pi: usize| {
+         ignore_reset_range
+@@ -5302,12 +5317,69 @@ pub(crate) fn recalculate_section_vpos(
+     }
+ }
+ 
++/// 문단에 앵커된 문단 기준 위 정렬 자리차지 표들의 바깥 여백 상자 아래끝 — 문단
++/// 첫 줄 vpos 에서 잰 HWPUNIT. 음수 세로 오프셋은 0 으로 본다(한글 저장 줄 실측).
++/// 위·아래 캡션은 캡션 간격 + 캡션 줄 높이(마지막 줄간격 제외)를 더한다 — 한글 저장
++/// 줄 실측(캡션 있는 빈 host 86건 정확 일치).
++pub(crate) fn para_topbottom_table_box_end_hu(para: &Paragraph) -> Option<i32> {
++    use crate::model::shape::{TextWrap, VertAlign, VertRelTo};
++    para.controls
++        .iter()
++        .filter_map(|ctrl| match ctrl {
++            Control::Table(table)
++                if !table.common.treat_as_char
++                    && table.common.text_wrap == TextWrap::TopAndBottom
++                    && table.common.vert_rel_to == VertRelTo::Para
++                    && matches!(table.common.vert_align, VertAlign::Top | VertAlign::Inside) =>
++            {
++                let offset = (table.common.vertical_offset as i32).max(0);
++                let caption = table
++                    .caption
++                    .as_ref()
++                    .filter(|caption| {
++                        matches!(
++                            caption.direction,
++                            crate::model::shape::CaptionDirection::Top
++                                | crate::model::shape::CaptionDirection::Bottom
++                        )
++                    })
++                    .map_or(0, |caption| {
++                        let lines: Vec<&LineSeg> = caption
++                            .paragraphs
++                            .iter()
++                            .flat_map(|para| para.line_segs.iter())
++                            .collect();
++                        if lines.is_empty() {
++                            return 0;
++                        }
++                        let height: i32 = lines
++                            .iter()
++                            .map(|line| line.line_height.saturating_add(line.line_spacing))
++                            .sum();
++                        i32::from(caption.spacing)
++                            .saturating_add(height)
++                            .saturating_sub(lines.last().map_or(0, |line| line.line_spacing))
++                    });
++                Some(
++                    offset
++                        .saturating_add(i32::from(table.outer_margin_top))
++                        .saturating_add(table.common.height.min(i32::MAX as u32) as i32)
++                        .saturating_add(caption)
++                        .saturating_add(i32::from(table.outer_margin_bottom)),
++                )
++            }
++            _ => None,
++        })
++        .max()
++}
++
+ /// [Task #2299] 문단의 흐름 end (마지막 LineSeg 의 vpos + 전진량, TAC th-관례).
+ /// 편집 호출자가 reflow 이전에 캡처해 `recalculate_section_vpos` 의
+ /// `start_stored_end` 로 전달하기 위한 헬퍼 — reflow 가 end 를 덮은 뒤에는 저장
+-/// 좌표를 복원할 수 없다.
++/// 좌표를 복원할 수 없다. 표 상자는 문단 줄이 모두 RHWP 의 것일 때만 더한다
++/// (`recalculate_section_vpos` 의 `seg_end` 와 같은 조건).
+ pub(crate) fn paragraph_flow_end(para: &Paragraph) -> Option<i32> {
+-    para.line_segs.last().map(|ls| {
++    let line_end = para.line_segs.last().map(|ls| {
+         let height = if ls.line_height > ls.text_height && ls.text_height > 0 {
+             ls.text_height
+         } else {
+@@ -5315,7 +5387,18 @@ pub(crate) fn paragraph_flow_end(para: &Paragraph) -> Option<i32> {
+         };
+         ls.vertical_pos
+             .saturating_add(height.saturating_add(ls.line_spacing))
+-    })
++    })?;
++    let first = para.line_segs.first().map_or(0, |ls| ls.vertical_pos);
++    let own_rows = para
++        .line_segs
++        .iter()
++        .all(|ls| ls.tag & LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0);
++    Some(
++        own_rows
++            .then(|| para_topbottom_table_box_end_hu(para))
++            .flatten()
++            .map_or(line_end, |box_end| line_end.max(first.saturating_add(box_end))),
++    )
+ }
+ 
+ /// font_size(px)를 LineSeg의 line_height(HWPUNIT)로 변환한다.
+diff --git a/src/renderer/float_placement.rs b/src/renderer/float_placement.rs
+index 12f208c..0411eec 100644
+--- a/src/renderer/float_placement.rs
++++ b/src/renderer/float_placement.rs
+@@ -3886,6 +3886,47 @@ pub(crate) fn original_hwpx_column_rowbreak_equal_outer_margin_hu(
+     Some(i32::from(table.outer_margin_left))
+ }
+ 
++/// 구역 본문의 줄이 모두 RHWP 몫(구현 태그)인가 — 줄 캐시 없이 쓴 HWPX 를 새로 조판한
++/// 구역이나 HwpCraft 의 새 문서. 한글이 저장한 줄이 하나라도 있으면 거짓이다.
++pub(crate) fn section_rows_are_own(paragraphs: &[Paragraph]) -> bool {
++    paragraphs.iter().all(|para| {
++        para.line_segs.iter().all(|line| {
++            line.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
++        })
++    })
++}
++
++/// 저장 줄 없이(RHWP 가 새로 조판한 줄만으로) 놓인 빈 host 의 문단 기준 위 정렬
++/// 자리차지 표가 흐름에 더 계상할 여분 — `outer_top + outer_bottom`
++/// (HU). 한글 저장 줄 실측(빈 host 911건): 다음 문단 vpos = host vpos + 그 여분 +
++/// 표 높이. 호출자는 구역에 한글이 저장한 줄이 없을 때만([`section_rows_are_own`])
++/// 쓴다 — 저장 줄이 있는 문서는 [`empty_host_physical_ladder_extras_hu`] 의 증거
++/// 게이트를 그대로 따른다(#2097 반증은 저장 줄 문서의 형상이다). 줄 캐시 없이 쓴
++/// HWPX(HwpCraft 의 새 문서)를 다시 열면 증거가 될 저장 줄이 없어 일반 빈 앵커
++/// 계약(표 높이만 전진)이 다음 문단을 표 아래 테두리 위로 올렸다.
++pub(crate) fn synthetic_empty_host_float_extras_hu(para: &Paragraph, table: &Table) -> Option<i32> {
++    // 실측이 탄탄한 형상만: 세로 오프셋 0, 글자 없는 host(단 맨 위 표 포함).
++    if !is_para_topbottom_float(&table.common)
++        || !matches!(table.common.vert_align, VertAlign::Top | VertAlign::Inside)
++        || signed_hwpunit(table.common.vertical_offset) != 0
++        || !para.text.is_empty()
++        || para
++            .controls
++            .iter()
++            .filter(|control| matches!(control, Control::Table(_)))
++            .count()
++            != 1
++        || !para.line_segs.iter().all(|line| {
++            line.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
++        })
++    {
++        return None;
++    }
++    let extras =
++        i32::from(table.outer_margin_top).saturating_add(i32::from(table.outer_margin_bottom));
++    (extras > 0).then_some(extras)
++}
++
+ /// [#5870] 빈 host 자리차지 float 의 저장 사다리가 **물리 공식과 정확히 일치**하는지 —
+ /// `next.vpos - host.vpos == v_off + outer_top + 선언높이 + outer_bottom` (±2HU) — 를
+ /// 검증하고, 일치하면 흐름에 더 계상해야 할 여분(`v_off + outer_top + outer_bottom`, HU)을
+diff --git a/src/renderer/layout.rs b/src/renderer/layout.rs
+index 7891432..b6b00f8 100644
+--- a/src/renderer/layout.rs
++++ b/src/renderer/layout.rs
+@@ -11,9 +11,10 @@ use super::float_placement::{
+     horizontal_range, is_para_topbottom_float, native_empty_host_physical_outer_box_paint_inset,
+     native_empty_host_rowbreak_line_advance_hu,
+     original_hwpx_column_rowbreak_equal_outer_margin_hu,
+-    para_relative_left_aligned_outer_margin_left_hu, signed_hwpunit,
++    para_relative_left_aligned_outer_margin_left_hu, section_rows_are_own, signed_hwpunit,
+     square_float_outer_margin_top_hu, stored_empty_anchor_band_host_line_advance_hu,
+-    stored_visible_anchor_band_host_line_advance_hu, FloatLaneSet, FloatPlacementContext,
++    stored_visible_anchor_band_host_line_advance_hu, synthetic_empty_host_float_extras_hu,
++    FloatLaneSet, FloatPlacementContext,
+ };
+ use super::font_metrics_data;
+ use super::height_cursor::HeightCursor;
+@@ -3669,6 +3670,14 @@ pub struct LayoutEngine {
+     /// 하단 고정 틀(#1658/#1858)은 빈 host 라 클램프가 흐름을 넘어도 겹칠 텍스트가
+     /// 없지만, 글이 있는 host 는 클램프가 곧 겹침이다.
+     para_float_host_has_text: std::cell::Cell<bool>,
++    /// 지금 배치하는 표 중 저장 줄 없는 구역(RHWP 몫 줄만 가진)의 빈 host 의 문단 기준
++    /// 위 정렬 자리차지 표 — 한글처럼 바깥 위 여백 아래에 그린다
++    /// ([`synthetic_empty_host_float_extras_hu`]). 표의 주소로 기억해 다른 경로로 배치하는
++    /// 표(머리말 등)가 낡은 값을 읽지 않게 한다.
++    para_float_host_synthetic_box: std::cell::Cell<usize>,
++    /// 그 표를 실제로 그린 아래끝(아래 캡션 포함) — 단 맨 위 바깥 상자 보정처럼 흐름
++    /// 차선에 들어가지 않는 이동까지 담는다.
++    para_float_synthetic_painted_bottom: std::cell::Cell<f64>,
+     /// [#7063] 이 아이템의 (**저장-vpos 스냅 이전 흐름 커서**, **직전 아이템 내용
+     /// 바닥**). 글자 없는 자리차지 표 host 는 스냅이 `spacing_before` 를 사전 차감한
+     /// 자리에 그대로 앉는데(#7203 — 조판할 글줄이 없어 재가산 경로를 안 탄다), 저장
+@@ -3829,6 +3838,8 @@ impl LayoutEngine {
+             reapply_snap_anchored_spacing_before: std::cell::Cell::new(false),
+             page_top_float_caption_spacing_para: std::cell::Cell::new(None),
+             para_float_host_has_text: std::cell::Cell::new(false),
++            para_float_host_synthetic_box: std::cell::Cell::new(0),
++            para_float_synthetic_painted_bottom: std::cell::Cell::new(f64::NEG_INFINITY),
+             item_flow_snap_context: std::cell::Cell::new(None),
+             hwpx_page_preview: std::cell::RefCell::new(None),
+             declared_trust_allowed: std::cell::Cell::new(true),
+@@ -4576,6 +4587,12 @@ impl LayoutEngine {
+         // 계산하는 것과 **같은 함수·같은 입력**이라 두 경로가 갈리지 않는다.
+         *self.body_float_carve_evidence.borrow_mut() =
+             super::float_placement::paper_or_page_float_carve_evidence(paragraphs);
++        // 상자 규칙 표 표시는 표 주소로 찾는다 — 앞 쪽의 표시가 남아 다른 문서·구역의
++        // 같은 주소 표(머리말·쪽 기준 표 등 앵커 경로를 거치지 않는 표)에 걸리지 않게
++        // 쪽마다 지운다.
++        self.para_float_host_synthetic_box.set(0);
++        self.para_float_synthetic_painted_bottom
++            .set(f64::NEG_INFINITY);
+         let mut tree = PageRenderTree::new(
+             page_content.page_index,
+             layout.page_width,
+@@ -13483,6 +13500,18 @@ impl LayoutEngine {
+                 .unwrap_or(false);
+             self.para_float_host_has_text
+                 .set(is_current_visible_para_float);
++            self.para_float_synthetic_painted_bottom
++                .set(f64::NEG_INFINITY);
++            self.para_float_host_synthetic_box
++                .set(match para.controls.get(control_index) {
++                    Some(Control::Table(t))
++                        if synthetic_empty_host_float_extras_hu(para, t).is_some()
++                            && section_rows_are_own(paragraphs) =>
++                    {
++                        t.as_ref() as *const crate::model::table::Table as usize
++                    }
++                    _ => 0,
++                });
+             let is_first_empty_para_float_control = is_current_empty_para_float
+                 && para.controls.iter().position(|c| {
+                     matches!(
+@@ -13836,6 +13865,12 @@ impl LayoutEngine {
+                         // [#4533 ⑥] 위-예약 Square: 앵커·후속 문단 vpos 가 동일
+                         // (붕괴 사다리) — 후행 간격도 사다리가 0 으로 증언한다.
+                         0
++                    } else if matches!(para.controls.get(control_index),
++                        Some(Control::Table(t)) if self.is_synthetic_box_table(t))
++                    {
++                        // 저장 줄 없는 빈 host 표: 다음 상자는 이 상자의 아래 바깥 여백 바로
++                        // 뒤에서 시작한다(한글 새 조판: 표-표 간격 = 아래 + 위 바깥 여백).
++                        0
+                     } else if let Some(ladder_gap) = stored_anchor_stack_gap {
+                         ladder_gap
+                     } else if suppress_empty_anchor_spacing {
+@@ -14051,12 +14086,25 @@ impl LayoutEngine {
+                                 }
+                             })
+                             .flatten();
++                    // 저장 줄 없는 빈 host 는 한글처럼 그린 표(와 캡션) 아래 바깥 여백까지
++                    // 흐름을 진행한다 — 위 여백·세로 오프셋은 그린 위치가 이미 담는다.
++                    let synthetic_box_bottom = match para.controls.get(control_index) {
++                        Some(Control::Table(table)) if self.is_synthetic_box_table(table) => Some(
++                            lanes
++                                .max_bottom()
++                                .max(self.para_float_synthetic_painted_bottom.get())
++                                + hwpunit_to_px(table.outer_margin_bottom as i32, self.dpi),
++                        ),
++                        _ => None,
++                    };
+                     // 저장 사다리가 전체 흐름 상자를 증명한 경우에는 그 높이가
+                     // 예약량이다. 앞 표 때문에 저장 원점과 paint 원점이 달라져도
+                     // 두 원점의 차이를 높이에 더하지 않는다. 테두리 원점만 알려진
+                     // 앵커는 기존 offset/예약 계약으로 처리한다.
+                     if let Some(advance) = stored_flow_advance {
+                         global_y_before + advance
++                    } else if let Some(bottom) = synthetic_box_bottom {
++                        bottom
+                     } else if is_native_picture_caption_float {
+                         lanes.max_bottom()
+                     } else {
+@@ -17092,3 +17140,18 @@ pub(crate) fn draw_line_numbers(
+         tree.root.children.push(line_node);
+     }
+ }
++
++impl LayoutEngine {
++    /// `table` 이 저장 줄 없는 구역의 빈 host 상자 규칙을 따르는 표인가
++    /// (`para_float_host_synthetic_box`).
++    pub(crate) fn is_synthetic_box_table(&self, table: &crate::model::table::Table) -> bool {
++        self.para_float_host_synthetic_box.get() == table as *const _ as usize
++    }
++
++    /// 상자 규칙 표를 그린 아래끝을 기록한다(`para_float_synthetic_painted_bottom`).
++    pub(crate) fn record_synthetic_painted_bottom(&self, bottom: f64) {
++        let current = self.para_float_synthetic_painted_bottom.get();
++        self.para_float_synthetic_painted_bottom
++            .set(current.max(bottom));
++    }
++}
+diff --git a/src/renderer/layout/table_layout.rs b/src/renderer/layout/table_layout.rs
+index 2dd3957..f1de555 100644
+--- a/src/renderer/layout/table_layout.rs
++++ b/src/renderer/layout/table_layout.rs
+@@ -3326,7 +3326,13 @@ impl LayoutEngine {
+                 computed_y
+             }
+         };
+-        let table_y = flow_table_y + physical_outer_box_paint_inset_px;
++        // 저장 줄 없는 빈 host 의 표는 `compute_table_y_position` 이 위 여백을 이미 실었다 —
++        // 단 맨 위 바깥 상자 보정을 다시 더하면 위 여백이 두 번 든다.
++        let table_y = if depth == 0 && self.is_synthetic_box_table(table) {
++            flow_table_y.max(y_start + physical_outer_box_paint_inset_px)
++        } else {
++            flow_table_y + physical_outer_box_paint_inset_px
++        };
+         let inline_table_flow_y_shift = if inline_x_override.is_some() {
+             para_y
+                 .map(|anchor_y| (flow_table_y - anchor_y).max(0.0))
+@@ -3629,13 +3635,35 @@ impl LayoutEngine {
+         }
+ 
+         col_node.children.push(table_node);
++        if depth == 0 && self.is_synthetic_box_table(table) {
++            let caption_below = render_caption
++                && table.caption.as_ref().is_some_and(|caption| {
++                    caption.direction == crate::model::shape::CaptionDirection::Bottom
++                });
++            self.record_synthetic_painted_bottom(
++                table_y
++                    + table_height
++                    + if caption_below {
++                        caption_spacing + caption_height
++                    } else {
++                        0.0
++                    },
++            );
++        }
+ 
+         // ── 7. 캡션 렌더링 ──
+         if render_caption {
+             if let Some(ref caption) = table.caption {
+                 use crate::model::shape::{CaptionDirection, CaptionVertAlign};
++                // 저장 줄 없는 구역의 빈 host 표는 위 캡션을 표 본체 바로 위에 붙인다 —
++                // 흐름 시작(`y_start`)은 위 바깥 여백을 담지 않을 수 있다.
++                let top_caption_y = if depth == 0 && self.is_synthetic_box_table(table) {
++                    table_y - caption_height - caption_spacing
++                } else {
++                    y_start
++                };
+                 let (cap_x, cap_w, cap_y) = match caption.direction {
+-                    CaptionDirection::Top => (table_x, table_width, y_start),
++                    CaptionDirection::Top => (table_x, table_width, top_caption_y),
+                     CaptionDirection::Bottom => (
+                         table_x,
+                         table_width,
+@@ -5571,9 +5599,13 @@ impl LayoutEngine {
+             // 한/글 실측 171.5 = 저장 상단 138.4 + v_offset 31.41 + om_top 1.88.
+             // 기준점을 안 옮긴 문단 기준 표는 종전대로 0 이다(근거 없이 넓히지 않는다).
+             // 글 앞으로/글 뒤로 문단 기준 표도 위 여백 아래에 그린다.
++            // 저장 줄 없는 빈 host 의 표도 상자 위끝(host 줄)에서 위 여백만큼 내려 그린다.
+             let om_top_px = if matches!(vert_rel_to, crate::model::shape::VertRelTo::Paper)
+                 || para_stored_anchor_y.is_some()
+                 || overlay_float_outer_margin_top_hu(table).is_some()
++                || (depth == 0
++                    && matches!(vert_rel_to, crate::model::shape::VertRelTo::Para)
++                    && self.is_synthetic_box_table(table))
+             {
+                 hwpunit_to_px(table.outer_margin_top as i32, self.dpi)
+             } else {
+@@ -5662,9 +5694,17 @@ impl LayoutEngine {
+                         .filter(|floor| *floor < y_start)
+                         .unwrap_or(y_start)
+                 };
++                // 저장 줄 없는 구역의 위 캡션은 표 상자 안에서 표 본체 앞에 놓이므로, 바닥은
++                // 캡션을 뺀 상자 위끝에 걸고 캡션 높이를 다시 얹는다 — 캡션 위끝이 흐름
++                // 바닥(바깥 위 여백 포함)보다 위로 올라가면 표 본체만 바닥까지 내려 위 여백이
++                // 사라졌다.
+                 let pushed =
+                     if matches!(table_text_wrap, crate::model::shape::TextWrap::TopAndBottom) {
+-                        raw_y.max(push_floor)
++                        if self.is_synthetic_box_table(table) {
++                            (raw_y - caption_top_offset).max(push_floor) + caption_top_offset
++                        } else {
++                            raw_y.max(push_floor)
++                        }
+                     } else {
+                         raw_y
+                     };
+diff --git a/src/renderer/typeset.rs b/src/renderer/typeset.rs
+index 3007fdf..1c54582 100644
+--- a/src/renderer/typeset.rs
++++ b/src/renderer/typeset.rs
+@@ -304,6 +304,8 @@ struct HostSpacing {
+     /// 흐름 전진에만 계상하고 fit 에서 제외한다 (#2195 stage58: 86712 구분선 간격
+     /// 한글 괘선 실측 vs hwpspec 178쪽 핀(#1086) 동시 충족).
+     after_for_fit: f64,
++    /// `after` 에 든 host 문단 끝 줄간격 (px). 없으면 0.
++    host_line_spacing: f64,
+ }
+ 
+ /// 단일 패스 조판 엔진
+@@ -4585,6 +4587,7 @@ impl TypesetEngine {
+             ft.strict_following_plain_text_fit
+                 || hwpx_rowbreak_tac_missing_owned_line
+                 || unstored_cell_band,
++            ft.host_spacing.host_line_spacing,
+             styles,
+         );
+         // [#5699 H1] 교정 계상으로 확보한 표 밴드 하단을 흐름 바닥으로 고정 —
+@@ -4642,6 +4645,7 @@ impl TypesetEngine {
+         is_first_placed: bool,
+         is_last_placed: bool,
+         strict_following_plain_text_fit: bool,
++        host_line_spacing: f64,
+         styles: &ResolvedStyleSet,
+     ) {
+         // [#2279 footer-오염] PAGE-앵커 Top 절대배치 표 기록 — 같은 쪽 후속
+@@ -5177,6 +5181,26 @@ impl TypesetEngine {
+                 st.advance_flow_by(
+                     pre_height + table_total_height + hwpunit_to_px(extras_hu as i32, self.dpi),
+                 );
++            } else if let Some(extras_hu) = st
++                .all_synthetic_lines
++                .then(|| {
++                    crate::renderer::float_placement::synthetic_empty_host_float_extras_hu(
++                        para, table,
++                    )
++                })
++                .flatten()
++            {
++                // 저장 줄 없는 빈 host: 위 바깥여백은 표 높이(host_spacing.before)에
++                // 이미 들어 있어 아래 바깥여백만 더한다 — layout 의
++                // lane flow-bottom 가산과 같은 상자 아래끝이다.
++                let top_hu = i32::from(table.outer_margin_top);
++                // host 간격은 다음도 빈 표 앵커일 때 host 줄간격을 표-표 간격으로 넣는다
++                // (1×1 자리표시 표는 빼고 — #874 #7). 새 조판의 한글은 바깥 여백만 두고,
++                // layout 도 이 표 뒤 간격을 늘 0 으로 두므로 넣은 만큼 그대로 뺀다.
++                st.advance_flow_by(
++                    pre_height + table_total_height - host_line_spacing
++                        + hwpunit_to_px(extras_hu.saturating_sub(top_hu), self.dpi),
++                );
+             } else {
+                 st.advance_flow_by(pre_height + table_total_height);
+             }
+diff --git a/src/renderer/typeset/section.rs b/src/renderer/typeset/section.rs
+index ecb7a14..7a0332b 100644
+--- a/src/renderer/typeset/section.rs
++++ b/src/renderer/typeset/section.rs
+@@ -141,7 +141,10 @@ impl TypesetEngine {
+                         (stored + 1, synthetic)
+                     }
+                 });
+-            st.record_synthetic_lines(synthetic > stored);
++            st.record_synthetic_lines(
++                synthetic > stored,
++                crate::renderer::float_placement::section_rows_are_own(paragraphs),
++            );
+         }
+         // [#2668 진단] 밴드 회수 판정 관측 — 동작 불변.
+         // "꼬리말 위치 쪽 번호(PageNumberPos)가 밴드를 점유하므로 회수 대상에서 빼야 한다"는
+diff --git a/src/renderer/typeset/state/commands.rs b/src/renderer/typeset/state/commands.rs
+index 1ed953e..20222ea 100644
+--- a/src/renderer/typeset/state/commands.rs
++++ b/src/renderer/typeset/state/commands.rs
+@@ -313,8 +313,9 @@ impl TypesetState {
+     pub(in crate::renderer::typeset) fn record_footer_presence(&mut self, no_footer: bool) {
+         self.data.section_has_no_footer = no_footer;
+     }
+-    pub(in crate::renderer::typeset) fn record_synthetic_lines(&mut self, mostly: bool) {
++    pub(in crate::renderer::typeset) fn record_synthetic_lines(&mut self, mostly: bool, all: bool) {
+         self.data.mostly_synthetic_lines = mostly;
++        self.data.all_synthetic_lines = all;
+     }
+     pub(in crate::renderer::typeset) fn observe_following_paragraph(
+         &mut self,
+diff --git a/src/renderer/typeset/state/data.rs b/src/renderer/typeset/state/data.rs
+index 7917a7e..6539d02 100644
+--- a/src/renderer/typeset/state/data.rs
++++ b/src/renderer/typeset/state/data.rs
+@@ -205,6 +205,8 @@ pub(in crate::renderer::typeset) struct StateView {
+     /// 편집기가 새로 만든 문서는 저장 흐름이 아니라 rhwp 계산 줄이다. 한컴 저장본에도
+     /// 합성 줄이 일부 섞이므로(#2559 표본) "하나라도"가 아니라 다수결로 가른다.
+     pub(in crate::renderer::typeset) mostly_synthetic_lines: bool,
++    /// 구역 본문의 줄이 모두 RHWP 몫인가([`crate::renderer::float_placement::section_rows_are_own`]).
++    pub(in crate::renderer::typeset) all_synthetic_lines: bool,
+     /// [Task #362] 한컴 빈 줄 감추기 옵션 (SectionDef bit 19). true 이면 페이지 시작에서
+     /// overflow 유발하는 빈 paragraph 최대 2개까지 height=0 처리.
+     pub(in crate::renderer::typeset) hide_empty_line: bool,
+diff --git a/src/renderer/typeset/state/transition.rs b/src/renderer/typeset/state/transition.rs
+index 7e3368a..17d7800 100644
+--- a/src/renderer/typeset/state/transition.rs
++++ b/src/renderer/typeset/state/transition.rs
+@@ -79,6 +79,7 @@ impl TypesetState {
+                 profile: Default::default(),
+                 has_stored_line_segs: false,
+                 mostly_synthetic_lines: false,
++                all_synthetic_lines: false,
+                 hide_empty_line: false,
+                 hidden_empty_lines: 0,
+                 hidden_empty_page_idx: usize::MAX,
+diff --git a/src/renderer/typeset/table/block/entry.rs b/src/renderer/typeset/table/block/entry.rs
+index 133757d..644d513 100644
+--- a/src/renderer/typeset/table/block/entry.rs
++++ b/src/renderer/typeset/table/block/entry.rs
+@@ -440,6 +440,7 @@ impl TypesetEngine {
+                         is_first_placed,
+                         is_last_placed,
+                         ft.strict_following_plain_text_fit,
++                        ft.host_spacing.host_line_spacing,
+                         styles,
+                     );
+                     if let Some(end) = saved_host_line_end {
+@@ -668,6 +669,7 @@ impl TypesetEngine {
+                     is_first_placed,
+                     is_last_placed,
+                     ft.strict_following_plain_text_fit,
++                    ft.host_spacing.host_line_spacing,
+                     styles,
+                 );
+                 // 저장 사다리에서 뺄 몫도 절대배치 본체만이다. 호스트 글줄의
+@@ -1822,6 +1824,7 @@ impl TypesetEngine {
+                 is_first_placed,
+                 is_last_placed,
+                 ft.strict_following_plain_text_fit,
++                ft.host_spacing.host_line_spacing,
+                 styles,
+             );
+             return None;
+@@ -1852,6 +1855,7 @@ impl TypesetEngine {
+                 is_first_placed,
+                 is_last_placed,
+                 ft.strict_following_plain_text_fit,
++                ft.host_spacing.host_line_spacing,
+                 styles,
+             );
+             return None;
+@@ -1938,6 +1942,7 @@ impl TypesetEngine {
+                 is_first_placed,
+                 is_last_placed,
+                 ft.strict_following_plain_text_fit,
++                ft.host_spacing.host_line_spacing,
+                 styles,
+             );
+             return None;
+@@ -1974,6 +1979,7 @@ impl TypesetEngine {
+                 is_first_placed,
+                 is_last_placed,
+                 ft.strict_following_plain_text_fit,
++                ft.host_spacing.host_line_spacing,
+                 styles,
+             );
+             return None;
+diff --git a/src/renderer/typeset/table/host_spacing.rs b/src/renderer/typeset/table/host_spacing.rs
+index 1f7b105..a513f7e 100644
+--- a/src/renderer/typeset/table/host_spacing.rs
++++ b/src/renderer/typeset/table/host_spacing.rs
+@@ -277,6 +277,7 @@ pub(super) fn resolve(
+         after,
+         spacing_after_only: sa,
+         after_for_fit: after - outer_bottom_flow_only,
++        host_line_spacing,
+     };
+ 
+     HostSpacingResult {

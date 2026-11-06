@@ -27,6 +27,8 @@ fn pages_render_the_same_after_pdf_export_releases_caches() -> anyhow::Result<()
 /// and an edit in between invalidates the preparation.
 #[test]
 fn incremental_pdf_preparation_matches_and_refuses_a_changed_document() -> anyhow::Result<()> {
+    // Both PDFs carry the export time; a fixed clock keeps them byte for byte equal.
+    hwpcraft_engine::fixed_clock(Some(1_793_000_000));
     let mut s = Session::new()?;
     s.execute(Command::Insert("첫 쪽".into()))?;
     for page in 2..=4 {

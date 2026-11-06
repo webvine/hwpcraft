@@ -51,6 +51,8 @@ pub struct DesktopBridge {
     failure: Arc<Mutex<Option<String>>>,
     /// The AI edit panel's run, if one is open.
     ai_gate: Arc<AiGate>,
+    /// The run `end_ai_run` is draining: its queued jobs still run.
+    draining: Option<u64>,
 }
 
 /// An open AI run: the panel gives its CLI this address and token.
@@ -95,7 +97,7 @@ impl DesktopBridge {
         let address = listener.local_addr()?;
         let workers = Arc::new(DocumentWorkers::new(None));
         let wake: Wake = Arc::new(wake);
-        let document = workers.attach_external(Arc::clone(&wake), info(session))?;
+        let document = workers.attach_external(Arc::clone(&wake), info(session), None)?;
         let shutdown = CancellationToken::new();
         let failure: Arc<Mutex<Option<String>>> = Arc::default();
         let server = {
@@ -139,6 +141,7 @@ impl DesktopBridge {
             token_file,
             failure,
             ai_gate,
+            draining: None,
         })
     }
 
@@ -165,7 +168,7 @@ impl DesktopBridge {
     /// still run under the run's rules and inside its group; then its edits
     /// become one undo step. Returns whether the document changed.
     pub fn end_ai_run(&mut self, session: &mut Session) -> Result<bool> {
-        self.ai_gate.end();
+        self.draining = self.ai_gate.end();
         // A request that passed the token check may still be queued (the CLI was
         // stopped mid-call). Run what is queued while the restriction and the
         // group still hold, until the queue stays empty for a moment.
@@ -189,6 +192,8 @@ impl DesktopBridge {
                 }
             }
         }
+        // From here a job the run still has queued is refused (`serve`).
+        self.draining = None;
         session.set_commands_restricted(false);
         let changed = if session.undo_group_active() {
             session.end_undo_group()?
@@ -240,7 +245,8 @@ impl DesktopBridge {
         // This runs on the window's thread: an engine panic must not take the
         // window, and the user's unsaved document, down with it.
         let served = catch_unwind(AssertUnwindSafe(|| {
-            self.document.serve(&mut self.backend, budget)
+            let run = self.ai_gate.current().or(self.draining);
+            self.document.serve(&mut self.backend, budget, run)
         }));
         std::mem::swap(&mut self.backend.session, session);
         let Ok(served) = served else {
@@ -287,9 +293,11 @@ impl DesktopBridge {
     /// End the current `document_id` (its queued requests fail, subscribers hear it
     /// close) and attach `session` under a new one.
     fn reattach(&mut self, session: &Session) -> Result<()> {
-        let fresh = self
-            .workers
-            .attach_external(Arc::clone(&self.wake), info(session))?;
+        let fresh = self.workers.attach_external(
+            Arc::clone(&self.wake),
+            info(session),
+            Some(&self.document),
+        )?;
         drop(std::mem::replace(&mut self.document, fresh));
         self.serial = session.document_serial;
         Ok(())
@@ -605,6 +613,108 @@ mod tests {
     }
 
     #[test]
+    fn the_window_gets_a_new_id_when_every_place_is_taken() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let token_file = dir.path().join("token");
+        let mut session = Session::new()?;
+        session.execute(Command::Insert("첫 문서".into()))?;
+        let mut bridge = DesktopBridge::start(
+            "127.0.0.1:0".parse()?,
+            Some(token_file.clone()),
+            &session,
+            || {},
+        )?;
+        let token = std::fs::read_to_string(&token_file)?.trim().to_owned();
+        let address = bridge
+            .url()
+            .trim_start_matches("http://")
+            .trim_end_matches("/mcp")
+            .to_owned();
+        // Clients fill every other place.
+        for _ in 1..16 {
+            let created = call(&address, &token, "new_document", json!({}));
+            assert_eq!(created["isError"], false, "{created}");
+        }
+        let old = bridge.document_id().to_owned();
+        // The user opens another document in the window.
+        let mut other = Session::new()?;
+        other.execute(Command::Insert("둘째 문서".into()))?;
+        bridge.serve(&mut other, Duration::from_millis(10))?;
+        assert_ne!(bridge.document_id(), old);
+        let listed = call(&address, &token, "list_documents", json!({}));
+        let ids: Vec<String> = text(&listed)["documents"]
+            .as_array()
+            .map(|d| {
+                d.iter()
+                    .filter_map(|x| x["document_id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(ids.iter().any(|id| id == bridge.document_id()), "{listed}");
+        assert!(!ids.contains(&old), "{listed}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_panic_writing_the_window_pdf_answers_and_keeps_the_document() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let token_file = dir.path().join("token");
+        let mut session = Session::new()?;
+        session.execute(Command::Insert("창 문서".into()))?;
+        let mut bridge = DesktopBridge::start(
+            "127.0.0.1:0".parse()?,
+            Some(token_file.clone()),
+            &session,
+            || {},
+        )?;
+        let token = std::fs::read_to_string(&token_file)?.trim().to_owned();
+        let address = bridge
+            .url()
+            .trim_start_matches("http://")
+            .trim_end_matches("/mcp")
+            .to_owned();
+        let id = bridge.document_id().to_owned();
+        let pdf = dir.path().join("panics.pdf");
+        *crate::document_workers::PANIC_PDF_WRITER_AT
+            .lock()
+            .map_err(|_| anyhow!("hook"))? = Some(pdf.clone());
+        let saved = {
+            let (a, t, i, p) = (address.clone(), token.clone(), id.clone(), pdf.clone());
+            std::thread::spawn(move || {
+                call(
+                    &a,
+                    &t,
+                    "save_document",
+                    json!({"document_id": i, "path": p}),
+                )
+            })
+        };
+        let saved = serve_until(&mut bridge, &mut session, saved);
+        *crate::document_workers::PANIC_PDF_WRITER_AT
+            .lock()
+            .map_err(|_| anyhow!("hook"))? = None;
+        // The request is answered as a failure, without the panic's text.
+        assert_eq!(saved["isError"], true, "{saved}");
+        assert!(
+            saved.to_string().contains("PDF를 만들다 내부 오류"),
+            "{saved}"
+        );
+        assert!(!saved.to_string().contains("private-test"), "{saved}");
+        assert!(!pdf.exists());
+        // The window's document keeps its id and still answers.
+        assert_eq!(bridge.document_id(), id);
+        let listed = call(&address, &token, "list_documents", json!({}));
+        assert!(listed.to_string().contains(&id), "{listed}");
+        let read = {
+            let (a, t, i) = (address.clone(), token.clone(), id.clone());
+            std::thread::spawn(move || call(&a, &t, "get_text", json!({"document_id": i})))
+        };
+        let read = serve_until(&mut bridge, &mut session, read);
+        assert_eq!(read["isError"], false, "{read}");
+        Ok(())
+    }
+
+    #[test]
     fn an_engine_panic_does_not_take_the_window_down() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut session = Session::new()?;
@@ -691,6 +801,53 @@ mod tests {
         assert_eq!(session.text(), "사용자 글 늦은 편집");
         // The late edit is inside the run's single undo step.
         session.execute(Command::Undo)?;
+        assert_eq!(session.text(), "사용자 글");
+        Ok(())
+    }
+
+    #[test]
+    fn a_job_the_ai_queued_is_refused_once_its_run_is_over() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut session = Session::new()?;
+        session.execute(Command::Insert("사용자 글".into()))?;
+        let mut bridge = DesktopBridge::start(
+            "127.0.0.1:0".parse()?,
+            Some(dir.path().join("token")),
+            &session,
+            || {},
+        )?;
+        let address = bridge
+            .url()
+            .trim_start_matches("http://")
+            .trim_end_matches("/mcp")
+            .to_owned();
+        let run = bridge.begin_ai_run(&mut session)?;
+        let insert = {
+            let (a, t, i) = (address.clone(), run.token.clone(), run.document_id.clone());
+            std::thread::spawn(move || {
+                call(
+                    &a,
+                    &t,
+                    "execute",
+                    json!({"document_id": i, "command": "text.insert", "params": {"text": " 늦은 편집"}}),
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(500));
+        // What `end_ai_run` does when its drain runs out of time before the
+        // window reached the job (a PDF export holding the queue): the run ends
+        // and its restriction is lifted with the job still queued.
+        bridge.ai_gate.end();
+        session.set_commands_restricted(false);
+        session.end_undo_group()?;
+        let insert = serve_until(&mut bridge, &mut session, insert);
+        assert_eq!(insert["isError"], true, "{insert}");
+        assert!(
+            text(&insert)
+                .to_string()
+                .contains(crate::ai_gate::RUN_ENDED),
+            "{insert}"
+        );
         assert_eq!(session.text(), "사용자 글");
         Ok(())
     }

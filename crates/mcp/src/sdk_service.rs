@@ -40,6 +40,8 @@ pub(crate) struct HwpService {
     subscription_shutdown: Option<CancellationToken>,
     workers: Arc<DocumentWorkers>,
     tools: Arc<Vec<Tool>>,
+    /// The tools/list answer, built once (the tools are fixed for the process).
+    tool_list: Arc<ListToolsResult>,
     validators: Arc<HashMap<String, jsonschema::Validator>>,
     capabilities: ServerCapabilities,
     completion_window: Arc<Mutex<VecDeque<Instant>>>,
@@ -120,6 +122,10 @@ impl HwpService {
             }
             typed.push(serde_json::from_value(definition)?);
         }
+        let tool_list = decode(
+            json!({"resultType":"complete","tools":&typed,"ttlMs":60000,"cacheScope":"public"}),
+        )
+        .map_err(|error| anyhow::anyhow!("tools/list: {}", error.message))?;
         Ok(Self {
             subscription_shutdown: None,
             completion_window: Arc::new(Mutex::new(VecDeque::new())),
@@ -127,6 +133,7 @@ impl HwpService {
             ai_gate: None,
             workers,
             tools: Arc::new(typed),
+            tool_list: Arc::new(tool_list),
             validators: Arc::new(validators),
             capabilities: serde_json::from_value(
                 json!({"tools":{},"resources":{"subscribe":true},"prompts":{},"completions":{},
@@ -140,9 +147,69 @@ impl HwpService {
         self
     }
 
+    /// The document resource's inspection result. Not found only when there is
+    /// no such document; a full queue, a cancellation or a failed inspection keeps
+    /// its own message.
+    async fn document_resource(
+        &self,
+        id: &str,
+        cancel: CancellationToken,
+    ) -> std::result::Result<Value, McpError> {
+        let missing = || McpError::resource_not_found("문서 ID가 없거나 문서가 닫혔습니다.", None);
+        if !self.workers.exists(id) {
+            return Err(missing());
+        }
+        let value = self
+            .workers
+            .execute(id, "document.inspect", json!({}), cancel)
+            .await
+            .map_err(|error| {
+                if self.workers.exists(id) {
+                    McpError::internal_error(format!("{error:#}"), None)
+                } else {
+                    missing()
+                }
+            })?;
+        if value["isError"] == true {
+            let data = tools::take_data(value);
+            let message = data["message"]
+                .as_str()
+                .or_else(|| data["error"].as_str())
+                .unwrap_or_default();
+            return Err(McpError::internal_error(
+                format!("document inspection failed: {message}"),
+                None,
+            ));
+        }
+        Ok(value)
+    }
+
+    /// Serve a subscription until its request ends or, on stdio, the transport.
+    async fn listen_until_shutdown(
+        &self,
+        context: rmcp::service::SubscriptionContext,
+    ) -> std::result::Result<(), McpError> {
+        match &self.subscription_shutdown {
+            Some(shutdown) => {
+                self.workers
+                    .subscriptions()
+                    .listen_until(context, shutdown.clone())
+                    .await
+            }
+            None => self.workers.subscriptions().listen(context).await,
+        }
+    }
+
     /// Run a long file tool as an MCP task. The task owns its cancellation:
-    /// it outlives this request, and only `tasks/cancel` stops it.
-    fn spawn_task(&self, name: String, args: Value) -> CreateTaskResult {
+    /// it outlives this request, and only `tasks/cancel` stops it. `queued` is
+    /// told once the call is on its document's queue, so the caller can let the
+    /// next call in read order go.
+    fn spawn_task(
+        &self,
+        name: String,
+        args: Value,
+        queued: tokio::sync::oneshot::Sender<()>,
+    ) -> CreateTaskResult {
         let service = self.clone();
         let task = self.tasks.spawn(tasks::options(), move |task| {
             Box::pin(async move {
@@ -155,16 +222,21 @@ impl HwpService {
                     }
                 });
                 let status = task.clone();
-                let outcome = progress::run(
-                    service.dispatch(&name, args, cancel),
-                    progress::HEARTBEAT,
-                    move |_, message| {
-                        if let Some(message) = message {
-                            status.set_status_message(message);
-                        }
-                        async {}
-                    },
-                )
+                let mut work: std::pin::Pin<Box<dyn Future<Output = _> + Send + '_>> =
+                    Box::pin(service.dispatch(&name, args, cancel));
+                // As for a direct call: the first poll puts it on its queue.
+                let first =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(work.as_mut().poll(cx))).await;
+                let _ = queued.send(());
+                if let std::task::Poll::Ready(done) = first {
+                    work = Box::pin(std::future::ready(done));
+                }
+                let outcome = progress::run(work, progress::HEARTBEAT, move |_, message| {
+                    if let Some(message) = message {
+                        status.set_status_message(message);
+                    }
+                    async {}
+                })
                 .await;
                 link.abort();
                 // Opening or creating folds its failure into an error result; a
@@ -305,6 +377,15 @@ fn cursor(request: &Option<PaginatedRequestParams>) -> std::result::Result<(), M
 /// Largest tool result sent, in bytes: below the stdio transport's 32 MiB message
 /// limit with room for the JSON-RPC envelope.
 const MAX_RESULT_BYTES: usize = 24 << 20;
+
+/// The AI run a request belongs to: the token check marks a request that
+/// presented a run's token (`sdk_http::require_token`).
+fn ai_run(extensions: &rmcp::model::Extensions) -> Option<u64> {
+    extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<crate::ai_gate::AiClient>())
+        .map(|client| client.0)
+}
 
 fn tool_result(
     mut value: Value,
@@ -490,15 +571,19 @@ impl ServerHandler for HwpService {
         &self,
         context: rmcp::service::SubscriptionContext,
     ) -> std::result::Result<(), McpError> {
-        match &self.subscription_shutdown {
-            Some(shutdown) => {
-                self.workers
-                    .subscriptions()
-                    .listen_until(context, shutdown.clone())
-                    .await
-            }
-            None => self.workers.subscriptions().listen(context).await,
+        // An AI run's subscriptions end with the run.
+        if let (Some(gate), Some(run)) =
+            (&self.ai_gate, ai_run(&context.request_context().extensions))
+        {
+            let Some(ended) = gate.ended(run) else {
+                return Err(McpError::invalid_request(crate::ai_gate::RUN_ENDED, None));
+            };
+            return tokio::select! {
+                listened = self.listen_until_shutdown(context) => listened,
+                () = ended.cancelled() => Ok(()),
+            };
         }
+        self.listen_until_shutdown(context).await
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
@@ -518,9 +603,7 @@ impl ServerHandler for HwpService {
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
         cursor(&request)?;
-        decode(
-            json!({"resultType":"complete","tools":self.tools.as_ref(),"ttlMs":60000,"cacheScope":"public"}),
-        )
+        Ok(ListToolsResult::clone(&self.tool_list))
     }
     async fn call_tool(
         &self,
@@ -552,12 +635,9 @@ impl ServerHandler for HwpService {
         // An AI run's request is counted until answered, so ending the run waits
         // for it (`DesktopBridge::end_ai_run`).
         let mut _ai_flight = None;
+        let ai = ai_run(&context.extensions);
         if let Some(gate) = &self.ai_gate {
-            let ai = context
-                .extensions
-                .get::<axum::http::request::Parts>()
-                .is_some_and(|parts| parts.extensions.get::<crate::ai_gate::AiClient>().is_some());
-            if ai {
+            if ai.is_some() {
                 _ai_flight = Some(gate.admit());
             }
             if let Some(message) = gate.refusal(name, &args, ai) {
@@ -578,15 +658,27 @@ impl ServerHandler for HwpService {
         let client_tasks = context
             .client_capabilities()
             .is_some_and(|capabilities| capabilities.supports_tasks());
+        // An AI request never becomes a task: its job must carry its run (below).
         if client_tasks
+            && ai.is_none()
             && tasks::eligible(name, &args)
             && self.tasks.running_task_count() < tasks::MAX_RUNNING
         {
-            return Ok(CallToolResponse::Task(
-                self.spawn_task(name.to_owned(), args),
-            ));
+            let (queued, on_queue) = tokio::sync::oneshot::channel();
+            let task = self.spawn_task(name.to_owned(), args, queued);
+            // Keep read order: the next call goes once this one is on its queue
+            // (or its task ended without getting there).
+            let _ = on_queue.await;
+            drop(ticket);
+            return Ok(CallToolResponse::Task(task));
         }
-        let mut work = Box::pin(self.dispatch(name, args, context.ct.clone()));
+        let dispatch = self.dispatch(name, args, context.ct.clone());
+        // The job an AI request queues carries its run, so the window refuses it
+        // once that run is over.
+        let mut work: std::pin::Pin<Box<dyn Future<Output = _> + Send + '_>> = match ai {
+            Some(run) => Box::pin(crate::ai_gate::AI_RUN.scope(run, dispatch)),
+            None => Box::pin(dispatch),
+        };
         // The first poll puts the call on its document's queue (nothing awaits
         // before that); then the next call in read order may go.
         let first = std::future::poll_fn(|cx| std::task::Poll::Ready(work.as_mut().poll(cx))).await;
@@ -677,25 +769,17 @@ impl ServerHandler for HwpService {
             return Ok(result.into());
         }
         let data = if let Some(id) = uri.strip_prefix("hwpcraft://documents/") {
-            let value = self
-                .workers
-                .execute(id, "document.inspect", json!({}), context.ct.clone())
-                .await
-                .map_err(|error| McpError::resource_not_found(error.to_string(), None))?;
-            if value["isError"] == true {
-                return Err(McpError::resource_not_found(
-                    "document inspection failed",
+            // An AI run reads the window's document only, as its tool calls do.
+            if let (Some(gate), Some(run)) = (&self.ai_gate, ai_run(&context.extensions))
+                && !gate.may_read(run, id)
+            {
+                return Err(McpError::invalid_request(
+                    "AI 편집은 이 창의 문서만 읽을 수 있습니다(실행이 끝났으면 읽을 수 없습니다).",
                     None,
                 ));
             }
-            let text = value["content"]
-                .as_array()
-                .and_then(|items| items.iter().find_map(|item| item["text"].as_str()));
-            let mut data: Value = text
-                .map(serde_json::from_str)
-                .transpose()
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?
-                .unwrap_or(Value::Null);
+            let value = self.document_resource(id, context.ct.clone()).await?;
+            let mut data = tools::take_data(value);
             if data.is_object() {
                 data[DOCUMENT] = json!(id);
             }
@@ -798,6 +882,7 @@ mod tests {
                 path: Some("C:/docs/보고서.hwpx".into()),
                 dirty: true,
             },
+            None,
         )?;
         let listed = list(service.clone()).await?;
         assert_eq!(
@@ -806,6 +891,44 @@ mod tests {
         );
         drop(shared);
         assert_eq!(list(service).await?, json!([]));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_document_resource_is_not_found_only_when_the_document_is_missing() -> Result<()> {
+        let workers = Arc::new(DocumentWorkers::new(None));
+        let service = HwpService::new(Arc::clone(&workers))?;
+        let not_found = McpError::resource_not_found("", None).code;
+        let missing = service
+            .document_resource("no-such-id", CancellationToken::new())
+            .await
+            .err()
+            .context("a missing document was read")?;
+        assert_eq!(missing.code, not_found);
+        // A window document nobody serves, its queue full.
+        let window = workers.attach_external(Arc::new(|| {}), Default::default(), None)?;
+        let id = window.id().to_owned();
+        let mut waiting = Vec::new();
+        for _ in 0..64 {
+            let (workers, id) = (Arc::clone(&workers), id.clone());
+            waiting.push(tokio::spawn(async move {
+                workers
+                    .execute(&id, "get_text", json!({}), CancellationToken::new())
+                    .await
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let full = service
+            .document_resource(&id, CancellationToken::new())
+            .await
+            .err()
+            .context("a full queue was read")?;
+        assert_ne!(full.code, not_found, "{full:?}");
+        assert!(full.message.contains("대기열"), "{full:?}");
+        drop(window);
+        for task in waiting {
+            let _ = task.await;
+        }
         Ok(())
     }
 

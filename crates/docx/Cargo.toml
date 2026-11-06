@@ -1,0 +1,21 @@
+[package]
+name = "hwpcraft-docx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+hwpcraft-doc.workspace = true
+hwpcraft-render.workspace = true
+wordcraft-doc.workspace = true
+wordcraft-docx.workspace = true
+anyhow.workspace = true
+image.workspace = true
+serde_json.workspace = true
+zip.workspace = true
+fontdb = "0.23"
+ttf-parser = "0.25"
+[dev-dependencies]
+tempfile.workspace = true
+hwpcraft-formats.workspace = true
+[lints]
+workspace = true

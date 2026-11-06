@@ -110,6 +110,12 @@ impl HwpApp {
         }
     }
     pub(crate) fn ruler_cell_geometry(&self, page_rect: Rect) -> Option<CellGeometry> {
+        // A caret in a nested table (or a text box): the ruler sets body-table cells only
+        // (`table.cell_properties` takes a body table address), so it shows nothing
+        // rather than the outer cell; nor while a header or footer is edited.
+        if self.session.nested_caret().is_some() || self.session.hf_target().is_some() {
+            return None;
+        }
         let c = self.session.cursor;
         let at = c.cell?;
         let page = self.session.caret().ok()?["pageIndex"].as_u64()? as u32;
@@ -129,14 +135,18 @@ impl HwpApp {
             return None;
         };
         let cell = table.cells.get(at.index)?;
+        let address = ObjectAddress {
+            section: c.section,
+            paragraph: c.paragraph,
+            control: at.control,
+        };
         let raw = self.session.page_control_layout(page).ok()?;
         let layout: Value = serde_json::from_str(&raw).ok()?;
-        let t = layout["controls"].as_array()?.iter().find(|t| {
-            t["type"] == "table"
-                && t["secIdx"] == c.section
-                && t["paraIdx"] == c.paragraph
-                && t["controlIdx"] == at.control
-        })?;
+        // Cell tables can list the same numbers as a body table (see `top_level_table`).
+        let t = layout["controls"]
+            .as_array()?
+            .iter()
+            .find(|t| ObjectAddress::top_level_table(t) == Some(address))?;
         let r = t["cells"]
             .as_array()?
             .iter()
@@ -148,7 +158,7 @@ impl HwpApp {
         );
         let effective=|a:i16,b:i16| if cell.use_cell_padding_axis(a,b){a.max(0)}else{b.max(0)} as f32*25.4/7200.0;
         Some(CellGeometry{
-            table:ObjectAddress{section:c.section,paragraph:c.paragraph,control:at.control},rect,
+            table:address,rect,
             padding:[effective(cell.padding.left,table.padding.left),effective(cell.padding.right,table.padding.right),effective(cell.padding.top,table.padding.top),effective(cell.padding.bottom,table.padding.bottom)],
             range:self.block_range().unwrap_or_else(||json!({"start_row":cell.row,"end_row":cell.row+cell.row_span-1,"start_col":cell.col,"end_col":cell.col+cell.col_span-1})),
             scale:self.zoom*96.0/25.4,
@@ -281,6 +291,98 @@ fn body_rect(info: &Value) -> Option<Rect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 셀 여백 눈금자는 커서가 있는 본문 표의 셀을 찾습니다. 앞 표의 셀 안에 든 표가 같은
+    /// 문단·컨트롤 번호(1, 0)로 나열되어도 그 표를 잡지 않고, 중첩 표 안에 커서가 있으면
+    /// 바깥 셀 대신 눈금자를 그리지 않습니다.
+    #[test]
+    fn the_cell_ruler_finds_the_body_table_not_a_nested_one_with_the_same_numbers()
+    -> anyhow::Result<()> {
+        let mut app = HwpApp::with_context(egui::Context::default(), None, None, false)?;
+        let s = &mut app.session;
+        s.run("insert.table", json!({"rows": 2, "columns": 2}))?;
+        // A table in the first table's cell: listed as paragraph 1, control 0.
+        let created = s.run(
+            "context.table.create",
+            json!({"address":{"section":0,"paragraph":0,"path":[{"control":2,"cell":0,"paragraph":0}]},
+                   "rows":2,"columns":2}),
+        )?;
+        // A body table at paragraph 1, control 0: the same numbers.
+        s.cursor = Cursor {
+            section: 0,
+            paragraph: 1,
+            offset: 0,
+            cell: None,
+        };
+        s.run("insert.table", json!({"rows": 2, "columns": 2}))?;
+        let raw = s.page_control_layout(0)?;
+        let layout: Value = serde_json::from_str(&raw)?;
+        let same: Vec<&Value> = layout["controls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| t["type"] == "table" && t["paraIdx"] == 1 && t["controlIdx"] == 0)
+            .collect();
+        anyhow::ensure!(same.len() == 2, "{raw}");
+        let body = same
+            .iter()
+            .find(|t| t["stableIndex"].as_array().is_some_and(|p| p.len() == 3))
+            .ok_or_else(|| anyhow::anyhow!("no body table entry"))?;
+        let width = body["cells"][0]["w"].as_f64().unwrap_or(0.0) as f32;
+
+        s.cursor = Cursor {
+            section: 0,
+            paragraph: 1,
+            offset: 0,
+            cell: Some(hwpcraft_doc::Cell {
+                control: 0,
+                index: 0,
+                paragraph: 0,
+            }),
+        };
+        app.page = 0;
+        let geometry = app
+            .ruler_cell_geometry(Rect::from_min_size(Pos2::ZERO, Vec2::splat(2000.0)))
+            .ok_or_else(|| anyhow::anyhow!("no ruler for the body table cell"))?;
+        assert!(
+            (geometry.rect.width() - width * app.zoom).abs() < 0.5,
+            "{} vs {}",
+            geometry.rect.width(),
+            width * app.zoom
+        );
+
+        // The caret in the nested table's cell: no ruler for the outer cell.
+        app.session.cursor = Cursor {
+            section: 0,
+            paragraph: 0,
+            offset: 0,
+            cell: Some(hwpcraft_doc::Cell {
+                control: 2,
+                index: 0,
+                paragraph: 1,
+            }),
+        };
+        // Clicked into the nested table's first cell.
+        let inner = same
+            .iter()
+            .find(|t| t["stableIndex"].as_array().is_some_and(|p| p.len() > 3))
+            .ok_or_else(|| anyhow::anyhow!("no nested table entry"))?;
+        let cell = &inner["cells"][0];
+        let at = |k: &str, size: &str| {
+            cell[k].as_f64().unwrap_or(0.0) + cell[size].as_f64().unwrap_or(0.0) / 2.0
+        };
+        let caret = app
+            .session
+            .hit_nested(0, at("x", "w"), at("y", "h"))?
+            .ok_or_else(|| anyhow::anyhow!("no nested caret at the cell: {created}"))?;
+        app.session.set_nested(caret, false)?;
+        assert!(app.session.nested_caret().is_some());
+        assert!(
+            app.ruler_cell_geometry(Rect::from_min_size(Pos2::ZERO, Vec2::splat(2000.0)))
+                .is_none()
+        );
+        Ok(())
+    }
     fn frame(app: &mut HwpApp, events: Vec<Event>) {
         let ctx = app.ctx.clone();
         let mut out = ctx.run_ui(

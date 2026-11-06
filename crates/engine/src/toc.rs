@@ -407,7 +407,7 @@ impl Session {
     }
 
     /// (section, paragraph) where each page starts, in page order.
-    fn page_starts(&self) -> Result<Vec<(usize, usize)>> {
+    pub(crate) fn page_starts(&self) -> Result<Vec<(usize, usize)>> {
         let pages = self.page_count()?;
         (0..pages)
             .map(|page| {

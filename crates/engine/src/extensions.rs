@@ -38,6 +38,7 @@ pub fn extension_commands()
         .chain(object_moves::COMMANDS)
         .chain(inline_moves::COMMANDS)
         .chain(master_objects::COMMANDS)
+        .chain(hf_objects::COMMANDS)
 }
 
 /// Every documented command: (id, parameter help, JSON example).
@@ -77,6 +78,7 @@ pub fn command_help_entries() -> impl Iterator<Item = (&'static str, &'static st
         .chain(object_moves::PARAMS)
         .chain(inline_moves::PARAMS)
         .chain(master_objects::PARAMS)
+        .chain(hf_objects::PARAMS)
         .map(|(id, help, example)| {
             (
                 *id,
@@ -98,7 +100,7 @@ type Handler = fn(&mut Session, &str, &Value) -> Option<Result<Value>>;
 
 impl Session {
     pub(crate) fn run_extension(&mut self, id: &str, params: Value) -> Result<Value> {
-        let handlers: [Handler; 33] = [
+        let handlers: [Handler; 34] = [
             Self::run_caret_ext,
             Self::run_format_ext,
             Self::run_table_ext,
@@ -132,6 +134,7 @@ impl Session {
             Self::run_object_moves_ext,
             Self::run_inline_moves_ext,
             Self::run_master_objects_ext,
+            Self::run_hf_objects_ext,
         ];
         for handler in handlers {
             if let Some(result) = handler(self, id, &params) {

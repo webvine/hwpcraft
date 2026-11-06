@@ -4,6 +4,8 @@ use serde_json::json;
 #[test]
 fn a_highlighted_continuation_scalar_uses_its_visible_page_independently_of_the_caret()
 -> anyhow::Result<()> {
+    // The two PDFs compared below carry their export time; fix the clock.
+    hwpcraft_engine::fixed_clock(Some(1_793_000_000));
     for with_field in [false, true] {
         let mut session = Session::new()?;
         session.run(

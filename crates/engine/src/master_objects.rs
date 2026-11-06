@@ -291,7 +291,7 @@ impl Session {
             .iter()
             .find(|m| m.apply_to == kind && !m.is_extension)
             .ok_or_else(|| anyhow!("이 구역에는 그 바탕쪽이 없습니다."))?;
-        let mut scratch = Session::with_core(master_projection(doc, section, master), None);
+        let mut scratch = self.scratch_session(master_projection(doc, section, master), false);
         let value = scratch.run(id, params)?;
         // Results that describe the scratch document describe this one instead.
         let value = (value != scratch.info()).then_some(value);

@@ -87,6 +87,24 @@ pub fn find_cli_in(engine: Engine, dirs: Vec<PathBuf>) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// A picture sent with a question (an attachment the panel read).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Image {
+    /// `image/png` or `image/jpeg`.
+    pub media_type: &'static str,
+    pub bytes: Vec<u8>,
+}
+
+impl Image {
+    fn extension(&self) -> &'static str {
+        if self.media_type == "image/png" {
+            "png"
+        } else {
+            "jpg"
+        }
+    }
+}
+
 /// One question to run.
 #[derive(Clone, Debug)]
 pub struct Request {
@@ -109,18 +127,33 @@ pub struct Request {
     pub model: Option<String>,
     /// Reasoning effort; `None` leaves the model's default.
     pub effort: Option<String>,
+    /// Pictures sent with the prompt: Claude gets them in its stream-json input,
+    /// Codex as `-i` files in the run folder (the CLI reads them; the model has
+    /// no file access).
+    pub images: Vec<Image>,
 }
 
 /// The program arguments, without the prompt (sent on stdin). Claude reads
 /// its MCP config and the standing instructions from private files, so neither
-/// the token nor the document id is on the command line.
-pub fn arguments(r: &Request, mcp_config: &Path, system_file: &Path) -> Vec<String> {
+/// the token nor the document id is on the command line. `pictures` are Codex's
+/// picture files.
+pub fn arguments(
+    r: &Request,
+    mcp_config: &Path,
+    system_file: &Path,
+    pictures: &[PathBuf],
+) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     let mut push = |s: &str| a.push(s.to_owned());
     match r.engine {
         Engine::Claude => {
             for s in ["-p", "--output-format", "stream-json", "--verbose"] {
                 push(s);
+            }
+            // Pictures go as content blocks of one stream-json user message.
+            if !r.images.is_empty() {
+                push("--input-format");
+                push("stream-json");
             }
             push("--mcp-config");
             push(&mcp_config.display().to_string());
@@ -169,6 +202,10 @@ pub fn arguments(r: &Request, mcp_config: &Path, system_file: &Path) -> Vec<Stri
             if let Some(e) = &r.effort {
                 push("-c");
                 push(&format!("model_reasoning_effort={e:?}"));
+            }
+            for p in pictures {
+                push("-i");
+                push(&p.display().to_string());
             }
             // Prompt from stdin.
             push("-");
@@ -281,6 +318,29 @@ fn shell_off_in(features: &str) -> anyhow::Result<()> {
             "이 Codex 판에서는 셸을 끌 수 없어 AI 편집에 쓰지 않습니다. Claude Code를 쓰세요."
         ),
     }
+}
+
+/// What Claude reads on stdin: the prompt, or with pictures one stream-json
+/// user message holding them and the prompt.
+fn claude_input(r: &Request) -> String {
+    use base64::Engine as _;
+    if r.images.is_empty() {
+        return r.prompt.clone();
+    }
+    let mut content: Vec<serde_json::Value> = r
+        .images
+        .iter()
+        .map(|i| {
+            serde_json::json!({"type": "image", "source": {"type": "base64",
+                "media_type": i.media_type,
+                "data": base64::engine::general_purpose::STANDARD.encode(&i.bytes)}})
+        })
+        .collect();
+    content.push(serde_json::json!({"type": "text", "text": r.prompt}));
+    format!(
+        "{}\n",
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": content}})
+    )
 }
 
 /// What Codex is told to do, since `exec` has no system-prompt flag.
@@ -482,7 +542,7 @@ pub fn start(r: &Request) -> anyhow::Result<Running> {
             files.0.push(system.clone());
             write_private(&config, claude_mcp_config(&r.url, &r.token).as_bytes())?;
             write_private(&system, r.system.as_bytes())?;
-            cmd.args(arguments(r, &config, &system));
+            cmd.args(arguments(r, &config, &system, &[]));
         }
         Engine::Codex => {
             std::fs::create_dir_all(&r.codex_home)?;
@@ -494,7 +554,17 @@ pub fn start(r: &Request) -> anyhow::Result<Running> {
             let user = CodexLogin::user_home()
                 .ok_or_else(|| anyhow::anyhow!("Codex 설정 폴더를 찾지 못했습니다."))?;
             login = Some(CodexLogin::copy(&user, &r.codex_home)?);
-            cmd.args(arguments(r, Path::new(""), Path::new("")))
+            let tag = run_tag();
+            let mut pictures = Vec::new();
+            for (i, image) in r.images.iter().enumerate() {
+                let path = r
+                    .work_dir
+                    .join(format!("picture-{tag}-{i}.{}", image.extension()));
+                files.0.push(path.clone());
+                write_private(&path, &image.bytes)?;
+                pictures.push(path);
+            }
+            cmd.args(arguments(r, Path::new(""), Path::new(""), &pictures))
                 .env("CODEX_HOME", &r.codex_home)
                 .env(TOKEN_ENV, &r.token);
         }
@@ -518,7 +588,7 @@ pub fn start(r: &Request) -> anyhow::Result<Running> {
         .spawn()
         .map_err(|e| anyhow::anyhow!("{}을(를) 실행하지 못했습니다: {e}", r.program.display()))?;
     let prompt = match r.engine {
-        Engine::Claude => r.prompt.clone(),
+        Engine::Claude => claude_input(r),
         Engine::Codex => codex_prompt(r),
     };
     let stdin = child.stdin.take();
@@ -679,6 +749,47 @@ mod tests {
             codex_home: PathBuf::from("h"),
             model: None,
             effort: None,
+            images: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pictures_go_to_claude_as_stream_json_and_to_codex_as_files() {
+        let mut r = request(Engine::Claude, None);
+        assert_eq!(claude_input(&r), "질문");
+        let a = arguments(&r, Path::new("m.json"), Path::new("i.txt"), &[]);
+        assert!(!a.contains(&"--input-format".to_owned()));
+        r.images = vec![Image {
+            media_type: "image/png",
+            bytes: vec![1, 2, 3],
+        }];
+        let a = arguments(&r, Path::new("m.json"), Path::new("i.txt"), &[]);
+        assert!(a.windows(2).any(|w| w == ["--input-format", "stream-json"]));
+        let input = claude_input(&r);
+        assert!(input.ends_with('\n') && input.lines().count() == 1);
+        let v: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
+        assert_eq!(v["type"], "user");
+        let content = &v["message"]["content"];
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        assert_eq!(content[0]["source"]["data"], "AQID");
+        assert_eq!(
+            content[1],
+            serde_json::json!({"type": "text", "text": "질문"})
+        );
+        // Codex: the CLI reads `-i` files before the prompt on stdin.
+        let picture = PathBuf::from("w/picture-1-0.png");
+        for resume in [None, Some("t1")] {
+            let a = arguments(
+                &request(Engine::Codex, resume),
+                Path::new(""),
+                Path::new(""),
+                std::slice::from_ref(&picture),
+            );
+            assert!(
+                a.windows(2).any(|w| w == ["-i", "w/picture-1-0.png"]),
+                "{a:?}"
+            );
+            assert_eq!(a.last().map(String::as_str), Some("-"));
         }
     }
 
@@ -688,6 +799,7 @@ mod tests {
             &request(Engine::Claude, Some("s1")),
             Path::new("m.json"),
             Path::new("i.txt"),
+            &[],
         );
         let at = |flag: &str| a.iter().position(|x| x == flag).map(|i| a[i + 1].as_str());
         assert_eq!(at("--setting-sources"), Some(""));
@@ -711,7 +823,12 @@ mod tests {
 
     #[test]
     fn codex_resumes_by_thread_and_reads_the_prompt_from_stdin() {
-        let first = arguments(&request(Engine::Codex, None), Path::new(""), Path::new(""));
+        let first = arguments(
+            &request(Engine::Codex, None),
+            Path::new(""),
+            Path::new(""),
+            &[],
+        );
         assert_eq!(first[0], "exec");
         assert!(first.windows(2).any(|w| w == ["-s", "read-only"]));
         assert_eq!(first.last().map(String::as_str), Some("-"));
@@ -719,6 +836,7 @@ mod tests {
             &request(Engine::Codex, Some("t1")),
             Path::new(""),
             Path::new(""),
+            &[],
         );
         assert_eq!(&next[..3], ["exec", "resume", "t1"]);
         assert!(!next.iter().any(|x| x.contains("secret")));
@@ -730,17 +848,17 @@ mod tests {
     #[test]
     fn the_chosen_model_and_effort_go_on_the_command_line() {
         let mut r = request(Engine::Claude, None);
-        let none = arguments(&r, Path::new("m.json"), Path::new("i.txt"));
+        let none = arguments(&r, Path::new("m.json"), Path::new("i.txt"), &[]);
         assert!(!none.iter().any(|x| x == "--model" || x == "--effort"));
         r.model = Some("fable".into());
         r.effort = Some("high".into());
-        let a = arguments(&r, Path::new("m.json"), Path::new("i.txt"));
+        let a = arguments(&r, Path::new("m.json"), Path::new("i.txt"), &[]);
         assert!(a.windows(2).any(|w| w == ["--model", "fable"]));
         assert!(a.windows(2).any(|w| w == ["--effort", "high"]));
         let mut r = request(Engine::Codex, Some("t1"));
         r.model = Some("gpt-6.1-sol".into());
         r.effort = Some("xhigh".into());
-        let a = arguments(&r, Path::new(""), Path::new(""));
+        let a = arguments(&r, Path::new(""), Path::new(""), &[]);
         assert!(a.windows(2).any(|w| w == ["-m", "gpt-6.1-sol"]));
         assert!(
             a.windows(2)

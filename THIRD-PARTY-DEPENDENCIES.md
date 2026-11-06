@@ -1,6 +1,6 @@
 # Third-party Rust dependencies
 
-Generated from Cargo.lock with cargo metadata (HwpCraft 0.21, RHWP 0.8.7).
+Generated from Cargo.lock with cargo metadata (HwpCraft 0.22, RHWP 0.8.7).
 Crates offered under a choice of licenses are used under MIT where available, otherwise Apache-2.0.
 
 | Crate | Version | License | Repository |
@@ -16,6 +16,7 @@ Crates offered under a choice of licenses are used under MIT where available, ot
 | android-properties | 0.2.2 | MIT | https://github.com/miklelappo/android-properties |
 | android_system_properties | 0.1.6 | MIT OR Apache-2.0 | https://github.com/nical/android_system_properties |
 | anyhow | 1.0.104 | MIT OR Apache-2.0 | https://github.com/dtolnay/anyhow |
+| arbitrary | 1.5.0 | MIT OR Apache-2.0 | https://github.com/rust-fuzz/arbitrary/ |
 | arboard | 3.7.0 | MIT OR Apache-2.0 | https://github.com/1Password/arboard |
 | argon2 | 0.6.0 | MIT OR Apache-2.0 | https://github.com/RustCrypto/password-hashes |
 | arrayref | 0.3.9 | BSD-2-Clause | https://github.com/droundy/arrayref |
@@ -95,6 +96,7 @@ Crates offered under a choice of licenses are used under MIT where available, ot
 | data-encoding | 2.11.1 | MIT | https://github.com/ia0/data-encoding |
 | data-url | 0.3.2 | MIT OR Apache-2.0 | https://github.com/servo/rust-url |
 | der | 0.8.2 | Apache-2.0 OR MIT | https://github.com/RustCrypto/formats |
+| derive_arbitrary | 1.5.0 | MIT OR Apache-2.0 | https://github.com/rust-fuzz/arbitrary |
 | des | 0.9.0 | MIT OR Apache-2.0 | https://github.com/RustCrypto/block-ciphers |
 | digest | 0.11.3 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits |
 | dispatch | 0.2.0 | MIT | http://github.com/SSheldon/rust-dispatch |
@@ -329,8 +331,8 @@ Crates offered under a choice of licenses are used under MIT where available, ot
 | rhwp-contracts | 0.1.0 | MIT |  |
 | rhwp-ooxml-chart | 0.1.0 | MIT |  |
 | rhwp-password-crypto | 0.1.0 | MIT |  |
-| rmcp | 3.7.0 | Apache-2.0 | https://github.com/modelcontextprotocol/rust-sdk/ |
-| rmcp-macros | 3.7.0 | Apache-2.0 | https://github.com/modelcontextprotocol/rust-sdk/ |
+| rmcp | 3.8.0 | Apache-2.0 | https://github.com/modelcontextprotocol/rust-sdk/ |
+| rmcp-macros | 3.8.0 | Apache-2.0 | https://github.com/modelcontextprotocol/rust-sdk/ |
 | roxmltree | 0.20.0 | MIT OR Apache-2.0 | https://github.com/RazrFalcon/roxmltree |
 | roxmltree | 0.21.1 | MIT OR Apache-2.0 | https://github.com/RazrFalcon/roxmltree |
 | rustc-hash | 1.1.0 | Apache-2.0/MIT | https://github.com/rust-lang-nursery/rustc-hash |
@@ -487,6 +489,9 @@ Crates offered under a choice of licenses are used under MIT where available, ot
 | winit | 0.30.13 | Apache-2.0 | https://github.com/rust-windowing/winit |
 | winnow | 1.0.4 | MIT | https://github.com/winnow-rs/winnow |
 | wit-bindgen | 0.57.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/bytecodealliance/wit-bindgen |
+| wordcraft-doc | 0.15.1 | MIT OR Apache-2.0 | https://github.com/storytold/wordcraft |
+| wordcraft-docx | 0.15.1 | MIT OR Apache-2.0 | https://github.com/storytold/wordcraft |
+| wordcraft-geom | 0.15.1 | MIT OR Apache-2.0 | https://github.com/storytold/wordcraft |
 | write-fonts | 0.48.1 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations |
 | x11-dl | 2.21.0 | MIT | https://github.com/AltF02/x11-rs.git |
 | x11rb | 0.13.2 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb |
@@ -499,6 +504,7 @@ Crates offered under a choice of licenses are used under MIT where available, ot
 | zerocopy | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT | https://github.com/google/zerocopy |
 | zerocopy-derive | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT | https://github.com/google/zerocopy |
 | zeroize | 1.9.1 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils |
+| zip | 3.0.0 | MIT | https://github.com/zip-rs/zip2.git |
 | zip | 8.6.0 | MIT | https://github.com/zip-rs/zip2 |
 | zlib-rs | 0.6.8 | Zlib | https://github.com/trifectatechfoundation/zlib-rs |
 | zmij | 1.0.23 | MIT | https://github.com/dtolnay/zmij |

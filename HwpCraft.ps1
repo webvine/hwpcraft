@@ -86,6 +86,8 @@ switch ($Action) {
         Copy-Item -LiteralPath (Join-Path $Runtime 'LICENSE-Lucide-ISC.txt') -Destination $InstalledDir -Force
         Copy-Item -LiteralPath (Join-Path $Project 'THIRD-PARTY-DEPENDENCIES.md') -Destination (Join-Path $Runtime 'THIRD-PARTY-DEPENDENCIES.md') -Force
         Copy-Item -LiteralPath (Join-Path $Runtime 'THIRD-PARTY-DEPENDENCIES.md') -Destination $InstalledDir -Force
+        Copy-Item -LiteralPath (Join-Path $Project 'THIRD-PARTY-LICENSES.txt') -Destination (Join-Path $Runtime 'THIRD-PARTY-LICENSES.txt') -Force
+        Copy-Item -LiteralPath (Join-Path $Runtime 'THIRD-PARTY-LICENSES.txt') -Destination $InstalledDir -Force
         $sample = Join-Path $Project 'samples'
         New-Item -ItemType Directory -Force -Path $sample | Out-Null
         if (!(Test-Path -LiteralPath (Join-Path $sample 'HwpCraft-시작하기.hwpx'))) {

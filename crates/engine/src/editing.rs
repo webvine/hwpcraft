@@ -193,6 +193,7 @@ impl Session {
         self.cursor = cursor;
         self.cursor.offset = self.cursor.offset.min(self.len());
         self.accept_visual_hit(self.cursor);
+        self.accept_after_hit(self.cursor);
         self.typing = None;
         Ok(())
     }
@@ -353,6 +354,68 @@ impl Session {
         let v = self.caret_at(c).ok()?;
         let along = if v["vertical"] == true { "x" } else { "y" };
         Some((v["pageIndex"].as_u64()?, v[along].as_f64()?))
+    }
+    /// ↓/↑ inside a paragraph: from the stored line (`line_segs`) the caret is shown on
+    /// to the one after (`up`: before) it, in the order the paragraph runs through
+    /// columns and pages, keeping the caret's distance from the start of its line.
+    /// `caret` is the caret as shown (page, x, y). `None` on the paragraph's last
+    /// (`up`: first) line, or when the result would not leave the caret's line.
+    fn row_neighbour(&self, c: Cursor, caret: (u64, f64, f64), h: f64, up: bool) -> Option<Cursor> {
+        let p = self.paragraph(c).ok()?;
+        // Positions count an object treated as a character as one; the text does not.
+        let len = crate::contexts::logical_split_offset(p, p.text.chars().count());
+        // Each line's first character, as RHWP finds it (0104's `row_text_start`).
+        let starts: Vec<usize> = p
+            .line_segs
+            .iter()
+            .map(|l| {
+                let text = p
+                    .char_offsets
+                    .iter()
+                    .position(|&start| start >= l.text_start)
+                    .unwrap_or(p.char_offsets.len());
+                crate::contexts::logical_split_offset(p, text)
+            })
+            .collect();
+        let end = |k: usize| starts.get(k + 1).copied().unwrap_or(len);
+        let at = |offset: usize| Cursor { offset, ..c };
+        // A line's place: its second position, as the first is shown at the end of
+        // the line before.
+        let place = |k: usize| {
+            let v = self.caret_at(at((starts[k] + 1).min(end(k)))).ok()?;
+            Some((v["pageIndex"].as_u64()?, v["x"].as_f64()?, v["y"].as_f64()?))
+        };
+        let same = |a: (u64, f64, f64), b: (u64, f64, f64)| a.0 == b.0 && (a.2 - b.2).abs() < 0.5;
+        let mut r = starts.iter().rposition(|&s| s <= c.offset)?;
+        let mut here = place(r)?;
+        // A line's first position may be shown at the end of the line before.
+        if r > 0 && c.offset == starts[r] && !same(here, caret) {
+            r -= 1;
+            here = place(r)?;
+        }
+        if !same(here, caret) {
+            return None;
+        }
+        let target = if up { r.checked_sub(1)? } else { r + 1 };
+        if target >= starts.len() {
+            return None;
+        }
+        let there = place(target)?;
+        let t = self
+            .hit_test(
+                there.0 as u32,
+                caret.1 - here.1 + there.1,
+                there.2 + h * 0.5,
+            )
+            .ok()
+            .filter(|t| {
+                t.section == c.section
+                    && t.cell == c.cell
+                    && index(t) == index(&c)
+                    && (starts[target]..=end(target)).contains(&t.offset)
+            })
+            .unwrap_or(at((starts[target] + 1).min(end(target))));
+        (t != c).then_some(t)
     }
     /// In a vertical section (세로쓰기) the arrows follow the columns: ↑↓ move through
     /// the column's characters, ← goes on to the next column (to the left), → back.
@@ -580,6 +643,12 @@ impl Session {
                     // A line made tall by an object treated as a character holds the
                     // caret low in it: probe on, a caret height at a time, until the hit
                     // leaves the caret's line.
+                    // Inside a paragraph, the next or previous stored line.
+                    Motion::Up | Motion::Down
+                        if let Some(t) = self.row_neighbour(c, (u64::from(page), x, y), h, up) =>
+                    {
+                        Ok(t)
+                    }
                     Motion::Up | Motion::Down => {
                         let line = self.caret_line(c);
                         let probe = |k: f64| {
@@ -609,6 +678,18 @@ impl Session {
                                 _ => break,
                             }
                         }
+                        // Still on the line the caret is shown on (the first or last line
+                        // of the document or page): no line to go to there.
+                        if let Ok(t) = &hit
+                            && t.section == c.section
+                            && t.cell == c.cell
+                            && index(t) == i
+                            && self
+                                .caret_line(*t)
+                                .is_some_and(|(p, ty)| p == u64::from(page) && (ty - y).abs() < 0.5)
+                        {
+                            hit = Ok(c);
+                        }
                         hit
                     }
                     Motion::PageUp if page > 0 => self.hit_test(page - 1, x, y),
@@ -617,14 +698,39 @@ impl Session {
                     }
                     _ => Ok(c),
                 };
+                // A paragraph reached by stepping (one on another page, or past a
+                // table): its last line (↑) or first line (↓) at the caret's x.
+                let aligned = |n: Cursor| -> Cursor {
+                    if n == c || vertical || !matches!(motion, Motion::Up | Motion::Down) {
+                        return n;
+                    }
+                    let Ok(p) = self.paragraph(n) else {
+                        return n;
+                    };
+                    let edge = if up {
+                        crate::contexts::logical_split_offset(p, p.text.chars().count())
+                    } else {
+                        0
+                    };
+                    let Some((at_page, at_y)) = self.caret_line(Cursor { offset: edge, ..n })
+                    else {
+                        return n;
+                    };
+                    self.hit_test(at_page as u32, x, at_y + h * 0.5)
+                        .ok()
+                        .filter(|t| {
+                            t.section == n.section && t.cell == n.cell && index(t) == index(&n)
+                        })
+                        .unwrap_or(n)
+                };
                 match target {
                     Ok(t) if t != c && self.paragraph(t).is_ok() && caretable(t) => t,
                     // A table-only paragraph has no caret: go on to the next one with
                     // a caret beyond it.
-                    Ok(t) if t != c && self.paragraph(t).is_ok() => neighbour(t),
+                    Ok(t) if t != c && self.paragraph(t).is_ok() => aligned(neighbour(t)),
                     // Fall back to the neighbouring paragraph when hit testing lands
                     // in a margin, a nested object or the same place.
-                    _ => neighbour(c),
+                    _ => aligned(neighbour(c)),
                 }
             }
             Motion::ParagraphStart => Cursor { offset: 0, ..c },
@@ -751,6 +857,14 @@ impl Session {
     fn move_caret_unrecorded(&mut self, motion: Motion, extend: bool) -> Result<()> {
         self.hit_hint.set(None);
         let motion = self.vertical_motion(motion);
+        // An inline object without a character of its own is one step (`bare_objects`).
+        if !extend
+            && !self.has_selection()
+            && matches!(motion, Motion::Left | Motion::Right)
+            && self.step_over_object(motion == Motion::Right)
+        {
+            return Ok(());
+        }
         if !extend && self.has_selection() && matches!(motion, Motion::Left | Motion::Right) {
             // Like Hangul, an arrow collapses a selection to its matching edge.
             let edges = self.selected_paragraphs()?;
@@ -797,6 +911,13 @@ impl Session {
                     Affinity::Downstream
                 },
             );
+        }
+        if !extend {
+            match motion {
+                Motion::Left => self.landed_left(from),
+                Motion::LineEnd => self.landed_line_end(),
+                _ => {}
+            }
         }
         Ok(())
     }

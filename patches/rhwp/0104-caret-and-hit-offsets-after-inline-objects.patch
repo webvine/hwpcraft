@@ -1,0 +1,448 @@
+diff --git a/src/document_core/queries/cursor_rect.rs b/src/document_core/queries/cursor_rect.rs
+index a6096b9..e508865 100644
+--- a/src/document_core/queries/cursor_rect.rs
++++ b/src/document_core/queries/cursor_rect.rs
+@@ -248,6 +248,30 @@ fn note_marker_text(
+     format!("{}{}{}", prefix, number, suffix)
+ }
+ 
++/// [HwpCraft 0104] The raw text indexes (into `para.text`) of the inline objects
++/// (treated as characters) of `para`: an object sits before the character at its index.
++pub(crate) fn inline_object_text_positions(para: &Paragraph) -> Vec<usize> {
++    let positions = para.control_text_positions();
++    para.controls
++        .iter()
++        .enumerate()
++        .filter(|(_, ctrl)| is_treat_as_char_object_control(ctrl))
++        .filter_map(|(ci, _)| positions.get(ci).copied())
++        .collect()
++}
++
++/// [HwpCraft 0104] The raw text index of the first character of `para`'s stored row
++/// `line_index`.
++pub(crate) fn row_text_start(para: &Paragraph, line_index: usize) -> Option<usize> {
++    let row_start = para.line_segs.get(line_index)?.text_start;
++    Some(
++        para.char_offsets
++            .iter()
++            .position(|&start| start >= row_start)
++            .unwrap_or(para.char_offsets.len()),
++    )
++}
++
+ /// 한 시각 줄(line)을 구성하는 한 run 의, 클릭 x → 문자 위치 해석에 필요한 최소 정보.
+ ///
+ /// `hit_test_native` 내부의 `RunInfo` 에서 줄별로 추려 만든 가벼운 view.
+@@ -554,6 +578,19 @@ impl DocumentCore {
+             stops: &mut std::collections::BTreeMap<usize, CursorHit>,
+             page_index: u32,
+         ) {
++            // [HwpCraft 0104] Each stored row starts the walk at its first character, so the
++            // rows on a later page of a paragraph that began on an earlier one map their
++            // characters to their own caret offsets (the walk used to start at 0 per page).
++            if let RenderNodeType::TextLine(ref line) = node.node_type {
++                if line.section_index == Some(sec) && line.para_index == Some(para_idx) {
++                    if let Some(start) = line
++                        .line_index
++                        .and_then(|row| row_text_start(para, row as usize))
++                    {
++                        *raw_text_index = start;
++                    }
++                }
++            }
+             if let RenderNodeType::TextRun(ref text_run) = node.node_type {
+                 if text_run.section_index == Some(sec)
+                     && text_run.para_index == Some(para_idx)
+@@ -1578,6 +1615,9 @@ impl DocumentCore {
+             // 소속 표 RenderNode id. 중첩 표에서 같은 cell_index가 반복되므로
+             // TextRun과 TableCell bbox를 같은 표 단위로 묶는 데 사용한다.
+             table_id: Option<u32>,
++            // [HwpCraft 0104] 본문 TextLine 의 줄 인덱스와 run 글자 (캐럿 위치 보정용).
++            line_index: Option<u32>,
++            text: String,
+         }
+ 
+         /// 안내문(guide text) TextRun 정보 (char_start: None)
+@@ -1710,7 +1750,12 @@ impl DocumentCore {
+             current_table_meta: Option<(usize, usize, usize)>,
+             current_table_ctx: Option<CellContext>,
+             current_cell_ctx: Option<CellContext>,
++            current_line: Option<u32>,
+         ) {
++            let current_line = match &node.node_type {
++                RenderNodeType::TextLine(line) => line.line_index,
++                _ => current_line,
++            };
+             // Column 노드 진입 시 칼럼 인덱스 전파
+             let col = if let RenderNodeType::Column(col_idx) = node.node_type {
+                 Some(col_idx)
+@@ -1837,6 +1882,8 @@ impl DocumentCore {
+                             is_textbox: false,
+                             column_index: col,
+                             table_id: current_table_id,
++                            line_index: current_line,
++                            text: text_run.text.clone(),
+                         });
+                     } else {
+                         // char_start: None → 안내문 TextRun
+@@ -1864,6 +1911,7 @@ impl DocumentCore {
+                     table_meta,
+                     table_ctx.clone(),
+                     child_cell_ctx.clone(),
++                    current_line,
+                 );
+             }
+         }
+@@ -2089,7 +2137,77 @@ impl DocumentCore {
+             None,
+             None,
+             None,
++            None,
+         );
++        // [HwpCraft 0104] A body text run's `char_start` counts the inline objects (treated
++        // as characters) that the layout met at a run boundary or inside that run, but not
++        // the ones inside an earlier run of the paragraph (nor, after a row holding only an
++        // inline object and a line break, that line break), so it can fall short of the
++        // caret offsets, which count every inline object before the run. Walk each row's
++        // runs from the row's first character as `get_cursor_rect_native` walks the text,
++        // and raise a run whose first character is the paragraph's character there and
++        // whose `char_start` falls short of that character's caret offset to it. Rows
++        // showing object markers (U+FFFC) already count them as characters and are left
++        // alone.
++        let mut para_objects: Option<((usize, usize), Vec<char>, Vec<usize>)> = None;
++        let mut row_walk: Option<((usize, usize, u32), Option<usize>)> = None;
++        for run in runs.iter_mut().filter(|run| run.cell_context.is_none()) {
++            let Some(line_index) = run.line_index else {
++                continue;
++            };
++            let para_key = (run.section_index, run.paragraph_index);
++            let row_key = (run.section_index, run.paragraph_index, line_index);
++            if para_objects.as_ref().map(|(key, ..)| *key) != Some(para_key) {
++                para_objects = self
++                    .get_render_paragraph_ref(run.section_index, run.paragraph_index)
++                    .ok()
++                    .map(|para| {
++                        (
++                            para_key,
++                            para.text.chars().collect(),
++                            inline_object_text_positions(para),
++                        )
++                    });
++                row_walk = None;
++            }
++            let Some((_, para_chars, objects)) = para_objects.as_ref() else {
++                continue;
++            };
++            if objects.is_empty() {
++                continue;
++            }
++            if row_walk.as_ref().map(|(key, _)| *key) != Some(row_key) {
++                let start = self
++                    .get_render_paragraph_ref(run.section_index, run.paragraph_index)
++                    .ok()
++                    .and_then(|para| row_text_start(para, line_index as usize));
++                row_walk = Some((row_key, start));
++            }
++            let Some((_, cursor)) = row_walk.as_mut() else {
++                continue;
++            };
++            let Some(raw) = *cursor else {
++                continue;
++            };
++            if run.text.contains('\u{fffc}') {
++                *cursor = None;
++                continue;
++            }
++            if run.text.chars().next() != para_chars.get(raw).copied() {
++                continue;
++            }
++            let before = objects.iter().filter(|&&pos| pos <= raw).count();
++            if run.char_start < raw + before {
++                run.char_start = raw + before;
++            }
++            let mut next = raw;
++            for ch in run.text.chars() {
++                if para_chars.get(next) == Some(&ch) {
++                    next += 1;
++                }
++            }
++            *cursor = Some(next);
++        }
+ 
+         // cell_bboxes의 section_index/parent_para_index/control_index/cellPath를 runs로 보완.
+         // Table 노드에서 이미 채워진 최외곽 메타는 유지하되, 중첩 표의 Table 노드에는
+@@ -2172,6 +2290,15 @@ impl DocumentCore {
+ 
+         let mut inline_image_hits = Vec::new();
+         collect_body_inline_image_hits(self, &tree.root, &mut inline_image_hits);
++        // [HwpCraft 0104] The margins beside an inline image catch clicks next to it; a
++        // click on a character of the row there is answered by that character's run.
++        let over_body_text = runs.iter().any(|run| {
++            run.cell_context.is_none()
++                && x >= run.bbox_x
++                && x <= run.bbox_x + run.bbox_w
++                && y >= run.bbox_y
++                && y <= run.bbox_y + run.bbox_h
++        });
+         for (si, pi, char_offset, ix, iy, iw, ih) in inline_image_hits {
+             let (caret_y, caret_h) = inline_image_caret_metrics(iy, ih);
+             let right = ix + iw;
+@@ -2186,7 +2313,12 @@ impl DocumentCore {
+                     page_num, si, pi, offset, caret_x, caret_y, caret_h,
+                 ));
+             }
+-            if x >= right && x <= right + caret_h && y >= caret_y && y <= caret_y + caret_h {
++            if !over_body_text
++                && x >= right
++                && x <= right + caret_h
++                && y >= caret_y
++                && y <= caret_y + caret_h
++            {
+                 return Ok(format_body_inline_image_hit(
+                     page_num,
+                     si,
+@@ -2197,7 +2329,12 @@ impl DocumentCore {
+                     caret_h,
+                 ));
+             }
+-            if x <= ix && x >= ix - caret_h && y >= caret_y && y <= caret_y + caret_h {
++            if !over_body_text
++                && x <= ix
++                && x >= ix - caret_h
++                && y >= caret_y
++                && y <= caret_y + caret_h
++            {
+                 return Ok(format_body_inline_image_hit(
+                     page_num,
+                     si,
+@@ -7122,3 +7259,230 @@ mod tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++mod hwpcraft_inline_object_hit_tests {
++    use crate::document_core::helpers::is_treat_as_char_object_control;
++    use crate::document_core::DocumentCore;
++    use crate::renderer::render_tree::{RenderNode, RenderNodeType};
++
++    const SENTENCE: &str = "글자처럼 취급한 도형이 첫 줄을 높게 만든다. ";
++
++    fn core_with_text() -> DocumentCore {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        core.insert_text_native(0, 0, 0, &SENTENCE.repeat(12))
++            .unwrap();
++        core
++    }
++
++    fn insert_rectangle(core: &mut DocumentCore, offset: usize) {
++        core.create_shape_control_native(
++            0,
++            0,
++            offset,
++            11339,
++            7654,
++            0,
++            0,
++            true,
++            "TopAndBottom",
++            "rectangle",
++            false,
++            false,
++            &[],
++        )
++        .unwrap();
++    }
++
++    fn number(json: &serde_json::Value, key: &str) -> f64 {
++        json[key]
++            .as_f64()
++            .unwrap_or_else(|| panic!("missing {key} in {json}"))
++    }
++
++    /// Clicking just right of every caret position of the paragraph in `offsets` (all of
++    /// them when `None`) finds that position again, on the rows after the inline objects
++    /// as well as on the first.
++    fn assert_round_trip(
++        core: &DocumentCore,
++        inline_objects: usize,
++        offsets: Option<std::ops::Range<usize>>,
++    ) {
++        let para = &core.document().sections[0].paragraphs[0];
++        let found = para
++            .controls
++            .iter()
++            .filter(|ctrl| is_treat_as_char_object_control(ctrl))
++            .count();
++        assert_eq!(found, inline_objects);
++        assert!(para.line_segs.len() > 3, "several rows");
++        let last = para.text.chars().count() + inline_objects;
++        let mut wrong = Vec::new();
++        for offset in offsets.unwrap_or(0..last) {
++            let rect: serde_json::Value =
++                serde_json::from_str(&core.get_cursor_rect_native(0, 0, offset).unwrap()).unwrap();
++            let hit: serde_json::Value = serde_json::from_str(
++                &core
++                    .hit_test_native(
++                        number(&rect, "pageIndex") as u32,
++                        number(&rect, "x") + 1.0,
++                        number(&rect, "y") + number(&rect, "height") / 2.0,
++                    )
++                    .unwrap(),
++            )
++            .unwrap();
++            if hit["charOffset"].as_u64() != Some(offset as u64) {
++                wrong.push((offset, hit["charOffset"].clone()));
++            }
++        }
++        assert!(wrong.is_empty(), "caret offset -> hit: {wrong:?}");
++    }
++
++    #[test]
++    fn hit_test_finds_the_caret_offsets_after_an_inline_shape() {
++        let mut core = core_with_text();
++        insert_rectangle(&mut core, 10);
++        assert_round_trip(&core, 1, None);
++    }
++
++    #[test]
++    fn hit_test_finds_the_caret_offsets_after_two_inline_shapes() {
++        let mut core = core_with_text();
++        insert_rectangle(&mut core, 10);
++        insert_rectangle(&mut core, 80);
++        let para = &core.document().sections[0].paragraphs[0];
++        let second = para.control_text_positions()[3];
++        assert!(
++            para.char_offsets[second] > para.line_segs[1].text_start,
++            "on a later row"
++        );
++        assert_round_trip(&core, 2, None);
++    }
++
++    /// Caret -> hit round trips over `offsets` of a body paragraph of a sample file.
++    fn sample_round_trip_misses(
++        file: &str,
++        section: usize,
++        para: usize,
++        offsets: std::ops::Range<usize>,
++    ) -> Vec<(usize, serde_json::Value)> {
++        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
++        let core = DocumentCore::from_bytes(&std::fs::read(path).unwrap()).unwrap();
++        let mut wrong = Vec::new();
++        for offset in offsets {
++            let rect: serde_json::Value =
++                serde_json::from_str(&core.get_cursor_rect_native(section, para, offset).unwrap())
++                    .unwrap();
++            let hit: serde_json::Value = serde_json::from_str(
++                &core
++                    .hit_test_native(
++                        number(&rect, "pageIndex") as u32,
++                        number(&rect, "x") + 1.0,
++                        number(&rect, "y") + number(&rect, "height") / 2.0,
++                    )
++                    .unwrap(),
++            )
++            .unwrap();
++            if hit["sectionIndex"].as_u64() != Some(section as u64)
++                || hit["paragraphIndex"].as_u64() != Some(para as u64)
++                || hit["charOffset"].as_u64() != Some(offset as u64)
++            {
++                wrong.push((offset, hit));
++            }
++        }
++        wrong
++    }
++
++    /// A row holding only an inline table and a line break: the text runs of the next row
++    /// start a line break and an object short of their caret offsets.
++    #[test]
++    fn hit_test_finds_the_caret_offsets_after_a_row_of_an_inline_table() {
++        let wrong = sample_round_trip_misses("samples/issue6044/156513948.hwpx", 3, 73, 2..57);
++        assert!(wrong.is_empty(), "caret offset -> hit: {wrong:?}");
++    }
++
++    /// A paragraph with an inline rectangle that goes on to the next page: the rows there
++    /// already count the rectangle (a run boundary) and keep their offsets.
++    #[test]
++    fn hit_test_keeps_the_caret_offsets_of_rows_that_count_the_inline_object() {
++        let wrong = sample_round_trip_misses("samples/HWP5-nopassword-123456.hwp", 0, 258, 39..151);
++        assert!(wrong.is_empty(), "caret offset -> hit: {wrong:?}");
++    }
++
++    #[test]
++    fn hit_test_finds_the_caret_offsets_on_the_next_page_of_an_inline_shape_paragraph() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        core.insert_text_native(0, 0, 0, &SENTENCE.repeat(82))
++            .unwrap();
++        insert_rectangle(&mut core, 10);
++        let len = core.document().sections[0].paragraphs[0]
++            .text
++            .chars()
++            .count();
++        let last: serde_json::Value =
++            serde_json::from_str(&core.get_cursor_rect_native(0, 0, len).unwrap()).unwrap();
++        assert!(
++            number(&last, "pageIndex") >= 1.0,
++            "the paragraph reaches page 2"
++        );
++        // On page 2 the caret after each row's first character stands where that
++        // character ends (one inline object before it: caret offset = text index + 1).
++        fn first_chars(node: &RenderNode, row: Option<u32>, out: &mut Vec<(u32, f64)>) {
++            let row = match &node.node_type {
++                RenderNodeType::TextLine(line) if line.para_index == Some(0) => line.line_index,
++                _ => row,
++            };
++            if let (RenderNodeType::TextRun(run), Some(row)) = (&node.node_type, row) {
++                if run.para_index == Some(0) && !out.iter().any(|(r, _)| *r == row) {
++                    let positions = run.replay_positions_for(&run.text).into_owned();
++                    out.push((row, node.bbox.x + positions[1]));
++                }
++            }
++            for child in &node.children {
++                first_chars(child, row, out);
++            }
++        }
++        let tree = core.build_page_tree(1).unwrap();
++        let mut rows = Vec::new();
++        first_chars(&tree.root, None, &mut rows);
++        assert!(rows.len() > 1);
++        let para = &core.document().sections[0].paragraphs[0];
++        let page_two = super::row_text_start(para, rows[0].0 as usize).unwrap();
++        for (row, x) in rows {
++            let start = super::row_text_start(para, row as usize).unwrap();
++            let caret: serde_json::Value =
++                serde_json::from_str(&core.get_cursor_rect_native(0, 0, start + 2).unwrap())
++                    .unwrap();
++            assert_eq!(number(&caret, "pageIndex"), 1.0);
++            assert!(
++                (number(&caret, "x") - x).abs() < 0.5,
++                "row {row}: {caret} vs {x}"
++            );
++        }
++        assert_round_trip(&core, 1, Some(page_two..page_two + 120));
++    }
++
++    #[test]
++    fn hit_test_finds_the_caret_offsets_after_an_inline_picture() {
++        let mut core = core_with_text();
++        let png = [
++            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
++            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
++            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
++            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x00, 0x00, 0x00,
++            0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
++        ];
++        core.insert_picture_native(0, 0, 10, &[], &png, 8504, 5669, 1, 1, "png", "", None, None)
++            .unwrap();
++        let ctrl = core.document().sections[0].paragraphs[0]
++            .controls
++            .iter()
++            .position(|ctrl| matches!(ctrl, crate::model::control::Control::Picture(_)))
++            .unwrap();
++        core.set_picture_properties_native(0, 0, ctrl, r#"{"treatAsChar":true}"#)
++            .unwrap();
++        assert_round_trip(&core, 1, None);
++    }
++}

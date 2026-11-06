@@ -131,7 +131,7 @@ pub const PARAMS: &[(&str, &str, &str)] = &[
     ),
     (
         "file.open",
-        "HWP/HWPX/HWP3/HML 파일 경로. force:true면 저장하지 않은 변경을 버립니다.",
+        "HWP/HWPX/HWP3/HML 또는 Word(DOCX) 파일 경로. DOCX는 한글 문서로 바꿔 엽니다. force:true면 저장하지 않은 변경을 버립니다.",
         r##"{"path":"input.hwpx","force":false}"##,
     ),
     (
@@ -290,6 +290,9 @@ impl Session {
     }
     fn run_unrecorded(&mut self, id: &str, params: Value) -> Result<Value> {
         if let Some(result) = self.run_master_addressed(id, &params) {
+            return result;
+        }
+        if let Some(result) = self.run_hf_addressed(id, &params) {
             return result;
         }
         let object = params

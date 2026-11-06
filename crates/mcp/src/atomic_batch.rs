@@ -31,7 +31,7 @@ mod tests {
 
     fn data(value: Value) -> Value {
         assert_eq!(value["isError"], false, "{value}");
-        serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap()
+        tools::take_data(value)
     }
 
     #[test]
@@ -52,7 +52,7 @@ mod tests {
             ]}),
         );
         assert_eq!(response["isError"], true);
-        let body: Value = serde_json::from_str(response["content"][0]["text"].as_str().unwrap())?;
+        let body = tools::take_data(response);
         assert_eq!(body["rolledBack"], true);
         assert_eq!(b.session.text(), "A B");
         for expected in ["A B C", "A B C D"] {

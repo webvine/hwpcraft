@@ -176,6 +176,43 @@ fn picture_rejects_bad_files_and_props_without_changes() -> anyhow::Result<()> {
 }
 
 #[test]
+fn a_pasted_picture_goes_in_at_the_caret_like_a_character() -> anyhow::Result<()> {
+    let img = image::RgbaImage::from_fn(96, 48, |x, y| image::Rgba([x as u8, y as u8, 90, 255]));
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("그림 앞".into()))?;
+    let generation = s.generation;
+    // Bytes that are no picture change nothing.
+    assert!(s.paste_picture(b"not a picture").is_err());
+    assert_eq!(s.generation, generation);
+    let a = s
+        .paste_picture(&png)?
+        .ok_or_else(|| anyhow::anyhow!("no address"))?;
+    let p = s.object_properties(a)?["props"].clone();
+    assert_eq!(p["treatAsChar"], true, "{p}");
+    // 96 px at 96 dpi: one inch wide, half an inch high.
+    let (w, h) = (
+        p["width"].as_f64().unwrap_or(0.0),
+        p["height"].as_f64().unwrap_or(0.0),
+    );
+    assert!(
+        (w - 7200.0).abs() < 2.0 && (h - 3600.0).abs() < 2.0,
+        "{w} x {h}"
+    );
+    assert_eq!(kinds(&s).iter().filter(|k| *k == "picture").count(), 1);
+    // In a table cell too.
+    s.run("table.create", json!({"rows":1,"columns":1}))?;
+    s.paste_picture(&png)?;
+    assert_eq!(kinds(&s).iter().filter(|k| *k == "picture").count(), 2);
+    s.execute(Command::Undo)?;
+    assert_eq!(kinds(&s).iter().filter(|k| *k == "picture").count(), 1);
+    let r = reopen(&mut s, "hwp")?;
+    assert_eq!(kinds(&r).iter().filter(|k| *k == "picture").count(), 1);
+    Ok(())
+}
+
+#[test]
 fn shapes_of_every_kind_with_line_fill_rotation_and_textbox_paragraphs() -> anyhow::Result<()> {
     let mut s = Session::new()?;
     s.execute(Command::Insert("도형".into()))?;

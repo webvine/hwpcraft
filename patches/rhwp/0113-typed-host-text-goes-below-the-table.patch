@@ -1,0 +1,501 @@
+diff --git a/src/document_core/commands/object_ops/table.rs b/src/document_core/commands/object_ops/table.rs
+index de446decd..b2546215e 100644
+--- a/src/document_core/commands/object_ops/table.rs
++++ b/src/document_core/commands/object_ops/table.rs
+@@ -2129,8 +2129,13 @@ mod topbottom_table_next_paragraph_tests {
+     /// `below` 면 한글이 글 있는 host 를 저장하듯 host 첫 줄을 표 상자 아래에 두고 다음
+     /// 문단은 host 줄 바로 뒤에 둔다.
+     fn hangul_rows_with(core: &mut DocumentCore, below: bool) -> i32 {
++        hangul_rows_at(core, 1, below)
++    }
++
++    /// [`hangul_rows_with`] 를 `host_index` 번째 문단의 표에 대해 한다.
++    fn hangul_rows_at(core: &mut DocumentCore, host_index: usize, below: bool) -> i32 {
+         let paragraphs = &mut core.document_mut().sections[0].paragraphs;
+-        let box_end = paragraphs[1]
++        let box_end = paragraphs[host_index]
+             .controls
+             .iter()
+             .find_map(|ctrl| match ctrl {
+@@ -2145,13 +2150,13 @@ mod topbottom_table_next_paragraph_tests {
+             .unwrap();
+         let (mut vpos, mut host) = (0, 0);
+         for (pi, para) in paragraphs.iter_mut().enumerate() {
+-            if pi == 1 {
++            if pi == host_index {
+                 host = vpos;
+                 if below {
+                     vpos += box_end;
+                 }
+             }
+-            if pi == 2 {
++            if pi == host_index + 1 {
+                 vpos = vpos.max(host + box_end);
+             }
+             for line in &mut para.line_segs {
+@@ -2163,13 +2168,41 @@ mod topbottom_table_next_paragraph_tests {
+         box_end
+     }
+ 
+-    /// 한글이 저장한 줄에서 빈 host 에 글자를 치면 다음 문단은 저장된 자리(표 상자
+-    /// 아래)에 그대로 있어야 한다 — host 줄 끝으로 다시 이으면 표 안으로 올라간다.
++    /// 그려진 글자 조각 `text` 의 위끝과 첫 표의 아래끝.
++    fn run_top_and_table_bottom(core: &DocumentCore, text: &str) -> (f64, f64) {
++        fn walk(node: &RenderNode, text: &str, run: &mut Option<f64>, table: &mut Option<f64>) {
++            match &node.node_type {
++                RenderNodeType::TextRun(r) if r.text.contains(text) && run.is_none() => {
++                    *run = Some(node.bbox.y);
++                }
++                RenderNodeType::Table(_) if table.is_none() => {
++                    *table = Some(node.bbox.y + node.bbox.height);
++                }
++                _ => {}
++            }
++            for child in &node.children {
++                walk(child, text, run, table);
++            }
++        }
++        let (mut run, mut table) = (None, None);
++        walk(
++            &core.build_page_render_tree(0).unwrap().root,
++            text,
++            &mut run,
++            &mut table,
++        );
++        (run.expect("run"), table.expect("table"))
++    }
++
++    /// 한글이 저장한 줄에서 빈 host 에 글자를 치면 한글처럼 글이 표 상자 아래로 가고
++    /// 다음 문단은 그 줄을 따라 표 아래에 있어야 한다 — host 줄 끝으로 다음 문단을
++    /// 다시 이으면 표 안으로 올라가고, 줄을 host 위끝에 두면 표가 그 줄 아래로
++    /// 그려져 다음 문단과 겹친다.
+     #[test]
+     fn typing_into_a_host_with_hangul_rows_keeps_the_next_paragraph_below_the_table() {
+         let mut core = document(None);
+-        hangul_rows(&mut core);
+-        let next = first(&core, 2);
++        let box_end = hangul_rows(&mut core);
++        let (host, next) = (first(&core, 1), first(&core, 2));
+         let (_, bottom, before) = geometry(&core);
+         assert!(
+             before >= bottom,
+@@ -2177,17 +2210,103 @@ mod topbottom_table_next_paragraph_tests {
+         );
+         core.insert_text_native(0, 1, 0, "가나").unwrap();
+         assert_eq!(
+-            first(&core, 2),
+-            next,
+-            "the next paragraph keeps its stored place"
++            first(&core, 1),
++            host + box_end,
++            "the host line goes below the table box"
++        );
++        let line = core.document().sections[0].paragraphs[1].line_segs[0].clone();
++        assert!(
++            first(&core, 2) >= line.vertical_pos + line.line_height && first(&core, 2) > next,
++            "the next paragraph follows the host line: next {} (stored {next})",
++            first(&core, 2)
+         );
+         let (_, bottom, after) = geometry(&core);
++        let (text, table_bottom) = run_top_and_table_bottom(&core, "가나");
+         assert!(
+-            after >= bottom - 0.5,
++            text >= table_bottom - 0.5,
++            "host text {text} below the table bottom {table_bottom}"
++        );
++        assert!(
++            after >= bottom - 0.5 && after < bottom + 40.0,
+             "box and host text bottom {bottom}, next {after}"
+         );
+     }
+ 
++    /// 표에 세로 오프셋이 있어도 첫 줄이 그 안에 들지 않으면 여러 줄 글이 모두 표
++    /// 아래에 그려지고 다음 문단은 그 글 아래에 있어야 한다 — 레이아웃이 host 한 줄을
++    /// 표 위 제목 줄로 보고 표를 그 아래에 그리면 둘째 줄부터 표와 겹쳤다.
++    #[test]
++    fn typing_lines_into_a_host_whose_table_has_a_small_offset_draws_them_below_the_table() {
++        let mut core = document(None);
++        core.set_table_properties_native(0, 1, 0, r#"{"vertOffset":150}"#)
++            .unwrap();
++        hangul_rows(&mut core);
++        core.insert_text_native(0, 1, 0, &"가나다라마바사아자차".repeat(20))
++            .unwrap();
++        assert!(core.document().sections[0].paragraphs[1].line_segs.len() > 1);
++        let (text, table_bottom) = run_top_and_table_bottom(&core, "가나다");
++        assert!(
++            text >= table_bottom - 0.5,
++            "host text {text} below the table bottom {table_bottom}"
++        );
++        let (_, bottom, next) = geometry(&core);
++        assert!(
++            next >= bottom - 0.5 && next < bottom + 40.0,
++            "table and host text bottom {bottom}, next {next}"
++        );
++    }
++
++    /// 글자를 하나씩 쳐도 host 줄은 표 상자 아래로 한 번만 내려가고 다음 문단도 그대로다.
++    /// 하나씩 지우면 둘 다 저장된 자리로 돌아온다. 구역 첫 문단 host 는 다시 이을 앞
++    /// 문단이 없어, 앞 편집이 내린 자리를 위끝으로 보면 칠 때마다 표 상자만큼 더
++    /// 내려갔다.
++    fn type_and_delete_one_by_one(mut core: DocumentCore, host: usize) {
++        let box_end = hangul_rows_at(&mut core, host, false);
++        let (top, next) = (first(&core, host), first(&core, host + 1));
++        let mut seen = Vec::new();
++        for (i, ch) in ["가", "나", "다"].iter().enumerate() {
++            core.insert_text_native(0, host, i, ch).unwrap();
++            seen.push((first(&core, host) - top, first(&core, host + 1)));
++        }
++        assert!(
++            seen.iter().all(|s| s.0 == box_end) && seen.windows(2).all(|w| w[0].1 == w[1].1),
++            "typing: (host shift, next) {seen:?}, box {box_end}"
++        );
++        let mut seen = Vec::new();
++        for i in (0..3).rev() {
++            core.delete_text_native(0, host, i, 1).unwrap();
++            seen.push((first(&core, host) - top, first(&core, host + 1)));
++        }
++        assert!(
++            seen[..2].iter().all(|s| s.0 == box_end) && seen[2] == (0, next),
++            "deleting: (host shift, next) {seen:?}, box {box_end}, stored next {next}"
++        );
++    }
++
++    #[test]
++    fn keystrokes_into_a_host_with_hangul_rows_move_its_line_below_the_table_once() {
++        type_and_delete_one_by_one(document(None), 1);
++    }
++
++    #[test]
++    fn keystrokes_into_a_first_paragraph_host_move_its_line_below_the_table_once() {
++        let mut core = DocumentCore::new_empty();
++        core.create_blank_document_native().unwrap();
++        mark_own(&mut core.document_mut().sections[0].paragraphs);
++        core.create_table_native(0, 0, 0, 3, 3).unwrap();
++        let control = core.document().sections[0].paragraphs[0]
++            .controls
++            .iter()
++            .position(|ctrl| matches!(ctrl, Control::Table(_)))
++            .unwrap();
++        for cell in 0..9 {
++            core.insert_text_in_cell_native(0, 0, control, cell, 0, 0, "가")
++                .unwrap();
++        }
++        core.insert_text_native(0, 1, 0, "다음 문단").unwrap();
++        type_and_delete_one_by_one(core, 0);
++    }
++
+     /// host 의 줄이 저장된 거리를 넘게 자라면 다음 문단은 host 마지막 줄 아래로 밀린다.
+     #[test]
+     fn a_host_with_hangul_rows_that_grows_past_the_stored_gap_pushes_the_next_paragraph() {
+diff --git a/src/renderer/composer/line_breaking.rs b/src/renderer/composer/line_breaking.rs
+index 18a86ca21..f42d82f49 100755
+--- a/src/renderer/composer/line_breaking.rs
++++ b/src/renderer/composer/line_breaking.rs
+@@ -5251,6 +5251,8 @@ pub(crate) fn recalculate_section_vpos(
+     // 직전 문단이 이번 편집의 변조 대상이었는가 + 직전 문단에 적용된 delta.
+     let mut prev_modified = false;
+     let mut prev_delta: i32 = 0;
++    // 편집한 host 의 위끝(표가 놓이는 자리) — 글이 표 아래로 내려가도 표 상자는 여기서 잰다.
++    let mut prev_host_top: Option<i32> = None;
+ 
+     for pi in start_para..paragraphs.len() {
+         if paragraphs[pi].line_segs.is_empty() {
+@@ -5308,16 +5310,28 @@ pub(crate) fn recalculate_section_vpos(
+                 .and_then(|pp| {
+                     let box_end = para_topbottom_table_box_end_hu(&paragraphs[pp])?;
+                     let stored_first = orig_prev_first?;
+-                    let first = paragraphs[pp].line_segs.first()?.vertical_pos;
+-                    let floor = (current_start >= stored_first.saturating_add(box_end))
+-                        .then(|| first.saturating_add(box_end));
++                    let top = prev_host_top?;
++                    // [HwpCraft 0113] 앞 편집이 host 줄을 표 상자 아래로 내렸으면 저장된 host
++                    // 위끝은 첫 줄에서 표 상자를 뺀 자리다 — 앞 문단은 이번 편집에서 움직이지
++                    // 않아 저장 위끝은 지금 위끝과 같고, 첫 줄이 그보다 표 상자 반 넘게
++                    // 아래면 내려간 줄이다(한글이 글을 표 아래에 저장한 host 도 같다). host 가
++                    // 다음 문단을 미는 끝은 "줄 끝 + 문단 간격"과 "위끝 + 표 상자" 중 큰
++                    // 쪽이고, 그 끝이 줄어든 만큼 다음 문단이 따라 올라온다.
++                    let stored_top = if stored_first.saturating_sub(top) > box_end / 2 {
++                        stored_first.saturating_sub(box_end)
++                    } else {
++                        stored_first
++                    };
++                    let floor = (current_start >= stored_top.saturating_add(box_end))
++                        .then(|| top.saturating_add(box_end));
+                     let carry = start_stored_end
+                         .filter(|&end| end <= current_start)
+                         .map(|end| {
+-                            let grew = next_vpos
+-                                .saturating_sub(first)
+-                                .saturating_sub(end.saturating_sub(stored_first));
+-                            current_start.saturating_add(grew.min(0))
++                            let before = end
++                                .saturating_add(gap)
++                                .max(stored_top.saturating_add(box_end));
++                            let after = flow.max(top.saturating_add(box_end));
++                            current_start.saturating_add(after.saturating_sub(before).min(0))
+                         });
+                     floor.max(carry)
+                 });
+@@ -5338,9 +5352,99 @@ pub(crate) fn recalculate_section_vpos(
+             }
+         }
+ 
++        // [HwpCraft 0113] 한글이 저장한 줄의 구역에서 문단 기준 자리차지 표의 host 에
++        // 글이 있고 첫 줄이 표 세로 오프셋 안에 들지 않으면 host 줄을 모두 표 상자
++        // 아래로 내린다 — 한글은 그런 글을 표 아래에 두고 다음 문단이 그 줄을 따른다.
++        // 줄을 host 위끝에 두면 레이아웃이 표를 그 줄 아래에 그려 다음 문단과 겹친다.
++        // 빈 host 의 줄은 위끝에 둔다(한글 저장 줄). 첫 줄이 오프셋 안에 들면(제목 줄)
++        // 줄을 그대로 둔다. host 의 저장 end 를 넘겨 주는 글 편집만 — 열 때의 재조판과
++        // 붙여넣기·가져오기는 종전대로다. 레이아웃이 같은 host 를 표 아래 글로 그리는
++        // 조건(`host_text_stored_below_float_band`)과 맞춰, 표가 하나이고 앞 문단이
++        // 자리차지 개체 host 가 아닐 때만 한다.
++        //
++        // host 위끝: 앞 문단이 있으면 편집 문단은 위에서 앞 문단 끝에 다시 이어졌으므로
++        // 첫 줄이 곧 위끝이다. 구역 첫 문단은 다시 이을 곳이 없어 위끝이 0(또는 문단
++        // 위 간격)이고, 앞 편집이 줄을 내렸으면 그 자리 + 표 상자에 있다 — 둘 다
++        // 아니면 위끝을 알 수 없어 줄을 옮기지 않는다.
++        let mut host_top = paragraphs[pi].line_segs[0].vertical_pos;
++        let mut push = 0;
++        let prev_is_float_host = prev_idx.is_some_and(|pp| {
++            paragraphs[pp].controls.iter().any(|ctrl| match ctrl {
++                Control::Table(table) => {
++                    crate::renderer::float_placement::is_para_topbottom_float(&table.common)
++                }
++                Control::Picture(picture) => {
++                    crate::renderer::float_placement::is_para_topbottom_float(&picture.common)
++                }
++                Control::Shape(shape) => {
++                    crate::renderer::float_placement::is_para_topbottom_float(shape.common())
++                }
++                _ => false,
++            })
++        });
++        let float_tables = paragraphs[pi]
++            .controls
++            .iter()
++            .filter(|ctrl| {
++                matches!(ctrl, Control::Table(table)
++                    if crate::renderer::float_placement::is_para_topbottom_float(&table.common))
++            })
++            .count();
++        if pi == start_para
++            && start_stored_end.is_some()
++            && !own_rows
++            && !is_reset
++            && !is_ignored(pi)
++            && !prev_is_float_host
++            && float_tables == 1
++        {
++            if let Some((band_top, band_end)) = para_topbottom_table_band_hu(&paragraphs[pi]) {
++                let first = paragraphs[pi].line_segs[0].clone();
++                let top = if prev_idx.is_some() {
++                    Some(first.vertical_pos)
++                } else {
++                    let spacing_before = styles
++                        .para_styles
++                        .get(paragraphs[pi].para_shape_id as usize)
++                        .map_or(0.0, |style| style.spacing_before);
++                    let spacing_before = px_to_hwpunit(
++                        crate::renderer::hwp3_variant_flow_spacing_before(
++                            spacing_before,
++                            is_hwp3_variant,
++                        ),
++                        dpi,
++                    );
++                    [0, spacing_before]
++                        .into_iter()
++                        .find(|&top| first.vertical_pos == top)
++                        .or_else(|| {
++                            [0, spacing_before]
++                                .into_iter()
++                                .find(|&top| first.vertical_pos == top.saturating_add(band_end))
++                        })
++                };
++                if let Some(top) = top {
++                    host_top = top;
++                    let below = !paragraphs[pi].text.is_empty() && first.line_height > band_top;
++                    let target = if below {
++                        top.saturating_add(band_end)
++                    } else {
++                        top
++                    };
++                    push = target.saturating_sub(first.vertical_pos);
++                    if push != 0 {
++                        for seg in &mut paragraphs[pi].line_segs {
++                            seg.vertical_pos = seg.vertical_pos.saturating_add(push);
++                        }
++                    }
++                }
++            }
++        }
++        prev_host_top = (pi == start_para).then_some(host_top);
++
+         // 다음 문단의 시작 vpos 계산 (이동 후 end = 저장 end + delta)
+         if let Some(end) = orig_end {
+-            next_vpos = end.saturating_add(delta);
++            next_vpos = end.saturating_add(delta).saturating_add(push);
+         }
+         orig_prev_first = Some(orig_first);
+         orig_prev_end = orig_end;
+@@ -5406,6 +5510,30 @@ pub(crate) fn para_topbottom_table_box_end_hu(para: &Paragraph) -> Option<i32> {
+         .max()
+ }
+ 
++/// 문단에 앵커된 문단 기준 위 정렬 자리차지 표들이 차지하는 세로 띠 — 문단 첫 줄
++/// vpos 에서 잰 (위끝, 아래끝) HWPUNIT. 위끝은 가장 위 표의 세로 오프셋(음수는 0),
++/// 아래끝은 [`para_topbottom_table_box_end_hu`].
++pub(crate) fn para_topbottom_table_band_hu(para: &Paragraph) -> Option<(i32, i32)> {
++    use crate::model::shape::{TextWrap, VertAlign, VertRelTo};
++    let end = para_topbottom_table_box_end_hu(para)?;
++    let top = para
++        .controls
++        .iter()
++        .filter_map(|ctrl| match ctrl {
++            Control::Table(table)
++                if !table.common.treat_as_char
++                    && table.common.text_wrap == TextWrap::TopAndBottom
++                    && table.common.vert_rel_to == VertRelTo::Para
++                    && matches!(table.common.vert_align, VertAlign::Top | VertAlign::Inside) =>
++            {
++                Some((table.common.vertical_offset as i32).max(0))
++            }
++            _ => None,
++        })
++        .min()?;
++    Some((top, end))
++}
++
+ /// [Task #2299] 문단의 흐름 end (마지막 LineSeg 의 vpos + 전진량, TAC th-관례).
+ /// 편집 호출자가 reflow 이전에 캡처해 `recalculate_section_vpos` 의
+ /// `start_stored_end` 로 전달하기 위한 헬퍼 — reflow 가 end 를 덮은 뒤에는 저장
+diff --git a/src/renderer/layout.rs b/src/renderer/layout.rs
+index b6b00f82e..76f93c9ee 100644
+--- a/src/renderer/layout.rs
++++ b/src/renderer/layout.rs
+@@ -2279,6 +2279,54 @@ fn tac_paragraph_tail_stored_line_top(
+     Some(top)
+ }
+ 
++/// [HwpCraft 0113] 글 있는 host 의 첫 줄이 문단 기준 자리차지 표 띠 **아래**에
++/// 저장됐는가 — 앞 문단 줄 끝에서 host 첫 줄까지의 저장 간격이 표 높이의 0.85
++/// 이상(`relocate_float_anchor_lines_below_band` 와 같은 서명). 한글은 표 세로
++/// 오프셋 안에 들지 않는 글을 표 아래에 두고(저장 줄 실측: 오프셋에 드는 첫 줄은
++/// 위 121곳·아래 0곳, 안 드는 첫 줄은 아래 41곳·위 7곳), 편집한 host 의 줄도 그렇게 둔다.
++/// 표가 하나뿐이고 앞 문단이 자리차지 표 host 가 아닐 때만 본다 — 앞 host 의
++/// 줄 끝에는 그 표 상자가 없어 간격이 표 상자로 부풀어 보인다. 구역 첫 문단은
++/// 구역 위끝(0)에서 잰다.
++fn host_text_stored_below_float_band(
++    paragraphs: &[Paragraph],
++    para_index: usize,
++    para: &Paragraph,
++) -> bool {
++    let mut tables = para.controls.iter().filter_map(|control| match control {
++        Control::Table(table) if is_para_topbottom_float(&table.common) => Some(table),
++        _ => None,
++    });
++    let (Some(table), None) = (tables.next(), tables.next()) else {
++        return false;
++    };
++    let Some(first) = para.line_segs.first() else {
++        return false;
++    };
++    let prev = paragraphs[..para_index.min(paragraphs.len())]
++        .iter()
++        .rev()
++        .find(|prev| !prev.line_segs.is_empty());
++    if prev.is_some_and(|prev| {
++        prev.controls.iter().any(|control| match control {
++            Control::Table(table) => is_para_topbottom_float(&table.common),
++            Control::Picture(picture) => is_para_topbottom_float(&picture.common),
++            Control::Shape(shape) => is_para_topbottom_float(shape.common()),
++            _ => false,
++        })
++    }) {
++        return false;
++    }
++    let prev_end = prev
++        .and_then(|prev| prev.line_segs.last())
++        .map_or(0, |last| {
++            last.vertical_pos
++                .saturating_add(last.line_height)
++                .saturating_add(last.line_spacing)
++        });
++    let gap = first.vertical_pos.saturating_sub(prev_end);
++    gap > 0 && f64::from(gap) >= 0.85 * f64::from(table.common.height.min(i32::MAX as u32))
++}
++
+ fn native_multiline_visible_float_table_top(
+     native_hwp5_layout: bool,
+     para: &Paragraph,
+@@ -12245,6 +12293,46 @@ impl LayoutEngine {
+                         matches!(control, Control::Table(previous)
+                             if is_para_topbottom_float(&previous.common))
+                     });
++                // [HwpCraft 0113] 글이 표 띠 아래에 저장된 host: 표는 문단 위끝 + 세로 오프셋 +
++                // 위 바깥 여백에 그리고 host 글은 표 아래에서 시작한다 — host 한 줄을 표 위에
++                // 예약하는 제목 줄 배치(#2711)는 오프셋 안에 드는 글의 것이다.
++                let host_text_below_band = is_current_visible_para_float
++                    && signed_hwpunit(t.common.vertical_offset) > 0
++                    && host_text_stored_below_float_band(paragraphs, para_index, para)
++                    && {
++                        // 이 쪽의 host 글이 표 뒤에서 첫 줄부터 시작할 때만 — 앞 쪽에서
++                        // 이어진 글이나 표 앞에 놓인 글은 문단 위끝이 이 쪽에 없다.
++                        let mut seen_table = false;
++                        let mut starts_after = None;
++                        for item in page_content
++                            .column_contents
++                            .iter()
++                            .flat_map(|cc| cc.items.iter())
++                        {
++                            match item {
++                                PageItem::Table {
++                                    para_index: owner,
++                                    control_index: ctrl,
++                                } if *owner == para_index && *ctrl == control_index => {
++                                    seen_table = true;
++                                }
++                                PageItem::PartialParagraph {
++                                    para_index: owner,
++                                    start_line,
++                                    ..
++                                } if *owner == para_index => {
++                                    starts_after.get_or_insert(seen_table && *start_line == 0);
++                                }
++                                PageItem::FullParagraph { para_index: owner }
++                                    if *owner == para_index =>
++                                {
++                                    starts_after.get_or_insert(seen_table);
++                                }
++                                _ => {}
++                            }
++                        }
++                        starts_after == Some(true)
++                    };
+                 let profile = self.profile.get();
+                 let issue2439_visible_host_stack = profile.hwp5_stored_pagination_layout()
+                     && page_content.column_contents.len() == 1
+@@ -12529,6 +12617,13 @@ impl LayoutEngine {
+                         table_y_start
+                     }
+                 };
++                let table_y_start = if host_text_below_band {
++                    para_y_for_table
++                        + visible_outer_top_px
++                        + hwpunit_to_px(signed_hwpunit(t.common.vertical_offset), self.dpi)
++                } else {
++                    table_y_start
++                };
+                 let allow_para_top_bleed =
+                     is_current_visible_para_float && signed_hwpunit(t.common.vertical_offset) < 0;
+                 // 이월된 빈 RowBreak 그림 표의 stale negative picture offset은 native
+@@ -12712,7 +12807,9 @@ impl LayoutEngine {
+                     None
+                 };
+                 y_offset = if is_current_visible_para_float {
+-                    let mut flow_y = if signed_hwpunit(t.common.vertical_offset) > 0 {
++                    let mut flow_y = if host_text_below_band {
++                        table_visual_end + visible_outer_bottom_px
++                    } else if signed_hwpunit(t.common.vertical_offset) > 0 {
+                         if issue2439_visible_host_stack {
+                             // #2439: 저장된 두 표 visible-host 형상은 후행 표가 선행
+                             // 표 아래로 밀려난 높이까지 host 흐름이 실제로 소비한다.

@@ -1,0 +1,49 @@
+diff --git a/src/document_core/commands/document.rs b/src/document_core/commands/document.rs
+index 96d442132..3aa2b8682 100644
+--- a/src/document_core/commands/document.rs
++++ b/src/document_core/commands/document.rs
+@@ -1802,12 +1802,12 @@ impl DocumentCore {
+ 
+         if reflowed > 0 {
+             // 재구성 · 페이지네이션 재실행 필요
+-            self.rebuild_resolved_styles();
+-            self.rebuild_embedded_exact_font_sources();
+-            self.recompose_all_with_horizontal_shaping();
+-            let sec_count = self.document.sections.len();
+-            self.dirty_sections = vec![true; sec_count];
+-            self.paginate();
++            // [HwpCraft] 측정도 처음부터 다시 한다. 구역만 dirty 로 두면 조판이 문단 dirty
++            // 비트(모두 clean)를 보고 다시 흐른 줄의 표 측정을 옛 값으로 재사용해, 연 직후
++            // 쪽이 같은 문서의 전체 재구성(`rebuild_derived_state`)과 달랐다.
++            // 남은 셀 서식 vpos 보정은 먼저 반영한다(재구성은 그 표시를 지운다).
++            self.flush_cell_format_vpos();
++            self.rebuild_derived_state();
+         }
+ 
+         reflowed
+@@ -4264,6 +4264,25 @@ mod fresh_flow_tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod hwpcraft_reflow_on_demand_tests {
++    use super::DocumentCore;
++
++    /// Lines reflowed after loading are measured again: the opened pages equal a
++    /// full rebuild of the same document (a table after them kept its old height).
++    #[test]
++    fn reflowed_lines_are_measured_again() {
++        let mut core = DocumentCore::from_bytes(include_bytes!(
++            "../../../samples/80168_regulatory_analysis.hwp"
++        ))
++        .expect("open");
++        assert!(core.reflow_linesegs_on_demand() > 0);
++        let opened = core.dump_page_items(None);
++        core.rebuild_derived_state();
++        assert_eq!(opened, core.dump_page_items(None));
++    }
++}
++
+ #[cfg(test)]
+ mod source_format_tests {
+     use crate::document_core::DocumentCore;

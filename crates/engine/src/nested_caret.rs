@@ -104,6 +104,10 @@ fn triples(address: &ContextAddress) -> Result<Vec<(usize, usize, usize)>> {
                 shape_path,
                 paragraph,
             } if shape_path.is_empty() => Ok((*control, 0, *paragraph)),
+            // A header or footer (`hf_edit`) edits its text through these paths too; its
+            // geometry comes from RHWP's header/footer API, never from the path API.
+            ContextStep::Header { control, paragraph }
+            | ContextStep::Footer { control, paragraph } => Ok((*control, 0, *paragraph)),
             _ => bail!("이 영역은 [편집 > 문서 영역 편집]에서 고칠 수 있습니다."),
         })
         .collect()
@@ -128,6 +132,8 @@ fn container(host: &Paragraph, control: usize, cell: usize) -> Option<(&[Paragra
         Control::Shape(shape) if !matches!(**shape, ShapeObject::Group(_)) => {
             Some((&shape.drawing()?.text_box.as_ref()?.paragraphs, true))
         }
+        Control::Header(header) => Some((&header.paragraphs, false)),
+        Control::Footer(footer) => Some((&footer.paragraphs, false)),
         _ => None,
     }
 }

@@ -129,9 +129,11 @@ async fn require_token(
         return next.run(request).await;
     }
     if let (Some(value), Some(gate)) = (presented, token.1.as_ref())
-        && gate.accepts(value.as_bytes())
+        && let Some(run) = gate.accepts(value.as_bytes())
     {
-        request.extensions_mut().insert(crate::ai_gate::AiClient);
+        request
+            .extensions_mut()
+            .insert(crate::ai_gate::AiClient(run));
         return next.run(request).await;
     }
     // Read a small unread body before answering: closing a socket with unread
@@ -156,22 +158,50 @@ async fn require_token(
 /// keep-alive), or when its client sends DELETE.
 pub(crate) const MAX_LEGACY_SESSIONS: usize = 64;
 
+/// The open 2025-era sessions, and a lock held while a request that may open one
+/// runs: counting and opening happen together, so concurrent `initialize`
+/// requests cannot all take the last place.
+pub(crate) struct LegacySessions {
+    sessions: Arc<LocalSessionManager>,
+    opening: tokio::sync::Mutex<()>,
+}
+
 /// Refuse a new 2025-era session once [`MAX_LEGACY_SESSIONS`] are open. A request
-/// that may open one is a POST without `Mcp-Session-Id` that is not a 2026-07-28
-/// request (those always name their version and never open a session).
+/// that may open one is a POST without `Mcp-Session-Id` that is either not a
+/// 2026-07-28 request or, whatever version it names, an `initialize`: the SDK
+/// opens a session for every `initialize`. A 2026-07-28 request always carries
+/// `Mcp-Method` and the SDK refuses one that contradicts the body; only
+/// `initialize` may leave it out.
 async fn limit_legacy_sessions(
-    State(sessions): State<Arc<LocalSessionManager>>,
+    State(legacy): State<Arc<LegacySessions>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
     let headers = request.headers();
+    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     let opens_session = request.method() == axum::http::Method::POST
         && !headers.contains_key("mcp-session-id")
-        && headers
-            .get("mcp-protocol-version")
-            .and_then(|value| value.to_str().ok())
-            .is_none_or(|version| version < "2026-07-28");
-    if opens_session && sessions.sessions.read().await.len() >= MAX_LEGACY_SESSIONS {
+        && (header("mcp-protocol-version").is_none_or(|version| version < "2026-07-28")
+            || header("mcp-method").is_none_or(|method| method == "initialize"));
+    if !opens_session {
+        return next.run(request).await;
+    }
+    // The body is read before the lock is taken, so a client that sends it slowly
+    // holds up no one else's `initialize` (an `initialize` body is about 1 KB).
+    let (parts, body) = request.into_parts();
+    let body = match tokio::time::timeout(
+        REJECTED_BODY_DRAIN_TIME,
+        axum::body::to_bytes(body, REJECTED_BODY_DRAIN_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
+    let request = Request::from_parts(parts, Body::from(body));
+    let _opening = legacy.opening.lock().await;
+    if legacy.sessions.sessions.read().await.len() >= MAX_LEGACY_SESSIONS {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(header::CONTENT_TYPE, "application/json")],
@@ -186,21 +216,88 @@ async fn limit_legacy_sessions(
     next.run(request).await
 }
 
-/// The SDK refuses a request from another browser origin before it reads the
-/// body. Closing a socket with unread request bytes makes some systems (macOS)
-/// reset the connection, so the client would see a reset instead of the 403:
-/// read a small body first and hand the request on unchanged.
-async fn read_foreign_origin_body(
-    State(allowed): State<Arc<Vec<String>>>,
+/// The hosts and browser origins the SDK lets through.
+struct Allowed {
+    hosts: Vec<(String, Option<u16>)>,
+    origins: Vec<Origin>,
+}
+
+/// An Origin as the SDK compares it (RFC 6454): scheme and host in lower case,
+/// the host without IPv6 brackets, and the port as written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Origin {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+}
+
+impl Origin {
+    fn parse(value: &str) -> Option<Self> {
+        let uri = axum::http::Uri::try_from(value.trim()).ok()?;
+        let scheme = uri.scheme_str()?.to_ascii_lowercase();
+        let authority = uri.authority()?;
+        Some(Self {
+            scheme,
+            host: authority
+                .host()
+                .trim_matches(['[', ']'])
+                .to_ascii_lowercase(),
+            port: authority.port_u16(),
+        })
+    }
+
+    /// Whether this allowed origin lets `origin` through: the same scheme and
+    /// host, and the same port with the scheme's default filled in (an allowed
+    /// origin without a port allows any).
+    fn allows(&self, origin: &Origin) -> bool {
+        let default = match origin.scheme.as_str() {
+            "http" => Some(80),
+            "https" => Some(443),
+            _ => None,
+        };
+        self.scheme == origin.scheme
+            && self.host == origin.host
+            && self
+                .port
+                .is_none_or(|port| origin.port.or(default) == Some(port))
+    }
+}
+
+/// A Host value as the SDK compares it: lowercase name without IPv6 brackets,
+/// and the port.
+fn authority(value: &str) -> Option<(String, Option<u16>)> {
+    let authority = axum::http::uri::Authority::try_from(value.trim()).ok()?;
+    let host = authority
+        .host()
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    Some((host, authority.port_u16()))
+}
+
+/// The SDK refuses a request for another host or from another browser origin
+/// before it reads the body. Closing a socket with unread request bytes makes
+/// some systems (macOS) reset the connection, so the client would see a reset
+/// instead of the 403: read a small body first and hand the request on
+/// unchanged.
+async fn read_refused_body(
+    State(allowed): State<Arc<Allowed>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let foreign = request
-        .headers()
-        .get(header::ORIGIN)
+    let headers = request.headers();
+    let foreign_host = headers
+        .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|origin| !allowed.iter().any(|own| own == origin));
-    if !foreign {
+        .and_then(authority)
+        .is_some_and(|host| !allowed.hosts.contains(&host));
+    let foreign_origin = headers.get(header::ORIGIN).is_some_and(|value| {
+        value
+            .to_str()
+            .ok()
+            .and_then(Origin::parse)
+            .is_none_or(|origin| !allowed.origins.iter().any(|own| own.allows(&origin)))
+    });
+    if !foreign_host && !foreign_origin {
         return next.run(request).await;
     }
     let (parts, body) = request.into_parts();
@@ -223,19 +320,48 @@ async fn read_foreign_origin_body(
 /// 400 with -32700 Parse error, or -32600 for valid JSON that is no message (a
 /// batch array, for example).
 async fn json_rpc_body_errors(request: Request<Body>, next: Next) -> Response {
-    let json = request
+    let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.to_ascii_lowercase().starts_with("application/json"));
+        .unwrap_or_default();
+    let json = content_type
+        .to_ascii_lowercase()
+        .starts_with("application/json");
+    // The SDK refuses a POST whose Content-Type does not start with exactly
+    // `application/json` before reading its body. Closing a socket with unread
+    // request bytes makes some systems (macOS) reset the connection instead of
+    // sending the 415, so a small body is read first.
+    let request = if request.method() == axum::http::Method::POST
+        && !content_type.starts_with("application/json")
+    {
+        let (parts, body) = request.into_parts();
+        match tokio::time::timeout(
+            REJECTED_BODY_DRAIN_TIME,
+            axum::body::to_bytes(body, REJECTED_BODY_DRAIN_BYTES),
+        )
+        .await
+        {
+            Ok(Ok(bytes)) => Request::from_parts(parts, Body::from(bytes)),
+            _ => return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response(),
+        }
+    } else {
+        request
+    };
     let response = next.run(request).await;
     if !json || response.status() != StatusCode::UNSUPPORTED_MEDIA_TYPE {
         return response;
     }
-    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+    let (parts, body) = response.into_parts();
+    let body = axum::body::to_bytes(body, 64 * 1024)
         .await
         .unwrap_or_default();
     let reason = String::from_utf8_lossy(&body);
+    // The SDK also answers 415 for a media type it does not take (it compares
+    // `application/json` with case); that one is a real 415.
+    if !reason.starts_with("fail to deserialize") {
+        return Response::from_parts(parts, Body::from(body));
+    }
     let (code, message) = if reason.contains("unrecognized JSON-RPC message") {
         (-32600, "Invalid Request")
     } else {
@@ -310,7 +436,7 @@ where
         .with_legacy_session_mode(true)
         .with_stateless_protocol_metadata_required(true)
         .with_json_response(true)
-        .with_allowed_hosts(allowed_hosts)
+        .with_allowed_hosts(allowed_hosts.clone())
         .with_allowed_origins(allowed_origins.clone())
         .enforce_origin_validation()
         // SDK enforcement consumes a bounded streaming body; Content-Length
@@ -320,17 +446,30 @@ where
     let sessions = Arc::new(LocalSessionManager::default());
     let transport =
         StreamableHttpService::new(move || Ok(service.clone()), sessions.clone(), config);
+    let legacy = Arc::new(LegacySessions {
+        sessions,
+        opening: tokio::sync::Mutex::new(()),
+    });
     // Authentication runs before routing, so unauthenticated callers learn nothing
     // about paths, methods or protocol versions.
     let router = axum::Router::new()
         .nest_service("/mcp", transport)
         .layer(middleware::from_fn(json_rpc_body_errors))
         .layer(middleware::from_fn_with_state(
-            Arc::new(allowed_origins.to_vec()),
-            read_foreign_origin_body,
+            Arc::new(Allowed {
+                hosts: allowed_hosts
+                    .iter()
+                    .filter_map(|host| authority(host))
+                    .collect(),
+                origins: allowed_origins
+                    .iter()
+                    .filter_map(|origin| Origin::parse(origin))
+                    .collect(),
+            }),
+            read_refused_body,
         ))
         .layer(middleware::from_fn_with_state(
-            sessions,
+            legacy,
             limit_legacy_sessions,
         ))
         .layer(middleware::from_fn_with_state(token, require_token));
@@ -881,6 +1020,117 @@ mod tests {
         server.finish().await
     }
 
+    /// The SDK opens a session for every `initialize`, also one sent with a
+    /// 2026-07-28 header and body; those count, and many at once stop at the cap.
+    #[tokio::test]
+    async fn initialize_requests_naming_2026_count_toward_the_session_cap() -> Result<()> {
+        let server = Running::start().await?;
+        let initialize = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2026-07-28","capabilities":{},
+                "clientInfo":{"name":"many","version":"1"}}}))?;
+        let header = [("MCP-Protocol-Version", "2026-07-28")];
+        let replies = futures_join(
+            (0..MAX_LEGACY_SESSIONS + 8)
+                .map(|_| server.request("POST", "/mcp", &header, &initialize))
+                .collect(),
+        )
+        .await;
+        let mut opened = 0;
+        let mut refused = 0;
+        for reply in replies {
+            match reply?.status {
+                200 => opened += 1,
+                503 => refused += 1,
+                other => anyhow::bail!("status {other}"),
+            }
+        }
+        assert_eq!((opened, refused), (MAX_LEGACY_SESSIONS, 8));
+        // 2026-07-28 requests still go through when the cap is reached.
+        let modern = server
+            .request(
+                "POST",
+                "/mcp",
+                &headers("server/discover"),
+                &serde_json::to_vec(&request("server/discover"))?,
+            )
+            .await?;
+        assert_eq!(modern.status, 200);
+        server.finish().await
+    }
+
+    /// A client that sends an `initialize` body slowly does not keep others from
+    /// opening sessions (the cap's lock covers the server's work only).
+    #[tokio::test]
+    async fn a_slow_initialize_body_holds_up_no_other_session() -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let server = Running::start().await?;
+        let mut slow = tokio::net::TcpStream::connect(server.address).await?;
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {TOKEN}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: 400\r\n\r\n{{\"jsonrpc\":\"2.0\"",
+            server.address
+        );
+        slow.write_all(head.as_bytes()).await?;
+        slow.flush().await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let initialize = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18","capabilities":{},
+                "clientInfo":{"name":"quick","version":"1"}}}))?;
+        let quick = tokio::time::timeout(
+            Duration::from_secs(3),
+            server.request("POST", "/mcp", &[], &initialize),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("an initialize waited behind a slow body"))??;
+        assert_eq!(quick.status, 200);
+        drop(slow);
+        server.finish().await
+    }
+
+    /// Run futures concurrently on this task and collect their outputs in order.
+    async fn futures_join<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+        let mut tasks: Vec<_> = futures.into_iter().map(Box::pin).collect();
+        let mut out: Vec<Option<F::Output>> = tasks.iter().map(|_| None).collect();
+        std::future::poll_fn(|cx| {
+            let mut pending = false;
+            for (task, slot) in tasks.iter_mut().zip(out.iter_mut()) {
+                if slot.is_none() {
+                    match task.as_mut().poll(cx) {
+                        std::task::Poll::Ready(value) => *slot = Some(value),
+                        std::task::Poll::Pending => pending = true,
+                    }
+                }
+            }
+            if pending {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        })
+        .await;
+        out.into_iter().map(Option::unwrap).collect()
+    }
+
+    /// A media type the SDK does not take keeps the SDK's own 415.
+    #[tokio::test]
+    async fn a_media_type_the_sdk_refuses_stays_415() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let server = Running::start().await?;
+        let body = serde_json::to_vec(&request("server/discover"))?;
+        // Only this Content-Type (the test client's helper adds its own).
+        let mut socket = tokio::net::TcpStream::connect(server.address).await?;
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {TOKEN}\r\nAccept: application/json, text/event-stream\r\nContent-Type: Application/JSON\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: server/discover\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            server.address,
+            body.len()
+        );
+        socket.write_all(head.as_bytes()).await?;
+        socket.write_all(&body).await?;
+        let mut reply = String::new();
+        socket.read_to_string(&mut reply).await?;
+        assert!(reply.starts_with("HTTP/1.1 415"), "{reply}");
+        server.finish().await
+    }
+
     /// A broken JSON body is a JSON-RPC parse error (400, -32700), and a JSON array
     /// an invalid request (-32600), not 415 (MCP 2nd review D4).
     #[tokio::test]
@@ -924,32 +1174,75 @@ mod tests {
             let reply = server.request("POST", "/mcp", &origin, &bytes).await?;
             assert_eq!(reply.status, status, "{value}");
         }
-        // These are refused before the body is read. Closing a socket with unread
-        // request bytes makes some systems (macOS) reset the connection instead
-        // of sending the status: either way the request was not served.
-        let refused = |reply: Result<Reply>, status: u16| -> Result<()> {
-            match reply {
-                Ok(reply) => assert_eq!(reply.status, status),
-                Err(error)
-                    if error.chain().any(|cause| {
-                        cause
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset)
-                    }) => {}
-                Err(error) => return Err(error),
-            }
-            Ok(())
-        };
-        let mut host = headers("server/discover").to_vec();
-        host.push(("Host", "attacker.invalid"));
-        refused(server.request("POST", "/mcp", &host, &bytes).await, 403)?;
+        // Another host gets 403; the SDK compares host names without case, and
+        // a request it lets through keeps a body larger than the part read for a
+        // refusal.
+        let upper = format!("LOCALHOST:{}", server.address.port());
+        let mut large = request("server/discover");
+        let port = server.address.port();
+        large["params"]["padding"] = serde_json::json!("x".repeat(2 * REJECTED_BODY_DRAIN_BYTES));
+        // Origins the SDK lets through however they are written: case, a path, the
+        // host's other name the SDK allows.
+        let large_origin = serde_json::to_vec(&large)?;
+        for value in [
+            format!("HTTP://LOCALHOST:{port}"),
+            format!("http://127.0.0.1:{port}/"),
+            format!("http://LocalHost:{port}"),
+        ] {
+            let mut origin = headers("server/discover").to_vec();
+            origin.push(("Origin", value.as_str()));
+            let reply = server
+                .request("POST", "/mcp", &origin, &large_origin)
+                .await?;
+            assert_eq!(reply.status, 200, "{value}");
+        }
+        // Look-alikes are other sites: another host, another port, a name in
+        // front, a user part.
+        let small = serde_json::to_vec(&request("server/discover"))?;
+        for value in [
+            format!("http://localhost.evil:{port}"),
+            format!("http://127.0.0.1.nip.io:{port}"),
+            format!("http://evil.localhost:{port}"),
+            format!("http://127.0.0.1:{}", port.wrapping_add(1)),
+            format!("https://127.0.0.1:{port}"),
+            "http://127.0.0.1".to_owned(),
+            "null".to_owned(),
+        ] {
+            let mut origin = headers("server/discover").to_vec();
+            origin.push(("Origin", value.as_str()));
+            let reply = server.request("POST", "/mcp", &origin, &small).await?;
+            assert_eq!(reply.status, 403, "{value}");
+        }
+        let mut large = request("server/discover");
+        large["params"]["padding"] = serde_json::json!("x".repeat(2 * REJECTED_BODY_DRAIN_BYTES));
+        let large = serde_json::to_vec(&large)?;
+        for (value, body, status) in [
+            ("attacker.invalid", &bytes, 403),
+            (upper.as_str(), &bytes, 200),
+            (upper.as_str(), &large, 200),
+        ] {
+            let mut host = headers("server/discover").to_vec();
+            host.push(("Host", value));
+            let reply = server.request("POST", "/mcp", &host, body).await?;
+            assert_eq!(reply.status, status, "{value}");
+        }
+        // An oversized body is refused before it is read. Closing a socket with
+        // unread request bytes makes some systems (macOS) reset the connection
+        // instead of sending the status: either way the request was not served.
         let oversized = vec![b' '; MAX_REQUEST_BODY_BYTES + 1];
-        refused(
-            server
-                .request("POST", "/mcp", &headers("server/discover"), &oversized)
-                .await,
-            413,
-        )?;
+        match server
+            .request("POST", "/mcp", &headers("server/discover"), &oversized)
+            .await
+        {
+            Ok(reply) => assert_eq!(reply.status, 413),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset)
+                }) => {}
+            Err(error) => return Err(error),
+        }
         server.finish().await
     }
 

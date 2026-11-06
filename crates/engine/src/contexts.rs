@@ -340,6 +340,45 @@ fn container_mut<'a>(
     descend(para, &address.path)
 }
 
+/// A table's height as its rows are laid out from their content, the way RHWP lays
+/// out lines it made itself (what the reopened file shows), never below the rows'
+/// stored heights. One measurement per table, of a copy without its caption.
+fn laid_out_height(
+    table: &hwpcraft_doc::model::table::Table,
+    styles: &hwpcraft_doc::ResolvedStyleSet,
+) -> u32 {
+    fn own(table: &mut hwpcraft_doc::model::table::Table) {
+        for cell in &mut table.cells {
+            for paragraph in &mut cell.paragraphs {
+                for line in &mut paragraph.line_segs {
+                    line.tag |=
+                        hwpcraft_doc::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY;
+                }
+                for control in &mut paragraph.controls {
+                    if let Control::Table(nested) = control {
+                        own(nested);
+                    }
+                }
+            }
+        }
+    }
+    let rows: u32 = table.get_row_heights().iter().sum();
+    let mut copy = table.clone();
+    copy.caption = None;
+    // A declared height above the rows' would stretch them: start from the rows.
+    copy.common.height = rows;
+    own(&mut copy);
+    let mut host = Paragraph::default();
+    host.controls.push(Control::Table(Box::new(copy)));
+    let px = hwpcraft_doc::HeightMeasurer::new(96.0).cell_controls_height(
+        std::slice::from_ref(&host),
+        styles,
+        0,
+        0.0,
+    );
+    ((px * 75.0).round() as u32).max(rows)
+}
+
 fn containing_width(
     doc: &hwpcraft_doc::model::document::Document,
     address: &DocumentAddress,
@@ -698,6 +737,7 @@ impl Session {
         if address.path.is_empty() {
             return Ok(());
         }
+        let styles = hwpcraft_doc::resolve_styles(&self.core.document().doc_info, 96.0);
         for depth in (1..=address.path.len()).rev() {
             let mut cell_address = address.clone();
             cell_address.path.truncate(depth);
@@ -837,7 +877,10 @@ impl Session {
                     cell.height = shift(cell.height)?;
                 }
             }
-            table.common.height = shift(table.common.height)?;
+            // The grown cell's stored height left out the line an empty cell shows, so
+            // adding its growth to the old height overstated the table and live layout
+            // stretched its rows. Store the height its rows are laid out at instead.
+            table.common.height = laid_out_height(table, &styles);
             if table.raw_ctrl_data.len() >= 20 {
                 table.raw_ctrl_data[16..20].copy_from_slice(&table.common.height.to_le_bytes());
             }
@@ -1064,6 +1107,12 @@ impl Session {
             (table.row_count, table.col_count, table.common.instance_id);
         let doc_info = generator.core.document().doc_info.clone();
         drop(generator);
+        // The new table's lines are RHWP's own, as the reopened file has them. Left
+        // as stored lines, the table was laid out one outer margin lower while editing.
+        let mut host = host;
+        for line in &mut host.line_segs {
+            line.tag |= hwpcraft_doc::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY;
+        }
         let index = p.address.index() + usize::from(matches!(p.position, Placement::After));
         let host_address = p.address.with_index(index);
         self.transaction(|s| {

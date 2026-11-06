@@ -247,6 +247,32 @@ fn print_pdf_writes_selected_page_ranges() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 현재 구역: the caret's section, pages 3 and 4 of a document whose second section
+/// starts on page 3; pages 1 and 2 with the caret in the first section.
+#[test]
+fn print_pdf_prints_the_current_section() -> anyhow::Result<()> {
+    let mut s = Session::new()?;
+    s.execute(Command::Insert("1쪽".into()))?;
+    s.execute(Command::PageBreak)?;
+    s.execute(Command::Insert("2쪽".into()))?;
+    s.run("page.section_break", json!({}))?;
+    s.execute(Command::Insert("3쪽".into()))?;
+    s.execute(Command::PageBreak)?;
+    s.execute(Command::Insert("4쪽".into()))?;
+    assert_eq!(s.core.page_count(), 4);
+    assert_eq!(s.cursor.section, 1);
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("section.pdf");
+    let r = s.run(
+        "file.print_pdf",
+        json!({"path": path, "pages": "section", "current": 3}),
+    )?;
+    assert_eq!(r["pages"], json!([3, 4]), "{r}");
+    s.cursor = hwpcraft_engine::Cursor::default();
+    assert_eq!(s.print_pdf_pages("section", 0)?, [0, 1]);
+    Ok(())
+}
+
 // ----- 0.13 -----
 
 fn header_text(s: &Session) -> Option<String> {
@@ -1412,6 +1438,43 @@ fn a_label_page_is_added_with_the_same_empty_table() -> anyhow::Result<()> {
     s.execute(Command::Undo)?;
     assert_eq!(tables(&s).len(), 1, "one undo step");
     assert_eq!(s.page_count()?, 1);
+    Ok(())
+}
+
+/// 라벨 줄이 용지 높이를 거의 다 쓰는 시트(가운데 정렬, 위 여백 6 mm 미만)도 표 뒤 빈
+/// 문단 때문에 둘째 쪽이 생기지 않습니다. 화면에서와 HWP·HWPX로 저장해 다시 열었을 때 모두
+/// 1쪽이고, 새 쪽 추가는 2쪽입니다.
+#[test]
+fn a_label_sheet_that_fills_the_paper_height_stays_one_page() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // (rows, label height): 285, 290 and 296 mm of labels. A full 297 mm sheet leaves no
+    // room for the paragraph at all (a limit in the README).
+    for (rows, height) in [(10, 28.5), (10, 29.0), (8, 37.0)] {
+        let case = format!("{rows} x {height} mm");
+        let mut s = Session::new()?;
+        let v = s.run(
+            "page.label",
+            json!({"rows": rows, "columns": 2, "labelWidthMm": 99.1, "labelHeightMm": height, "gapXMm": 2.5}),
+        )?;
+        assert_eq!(v["pages"].as_u64(), Some(1), "{case}");
+        assert_eq!(s.page_count()?, 1, "{case}");
+        for ext in ["hwp", "hwpx"] {
+            let path = dir.path().join(format!("label.{ext}"));
+            s.save(&path)?;
+            let mut r = Session::new()?;
+            r.open(&path)?;
+            assert_eq!(r.page_count()?, 1, "{case} {ext}");
+        }
+        let v = s.run("page.label.add_page", json!({}))?;
+        assert_eq!(v["pages"].as_u64(), Some(2), "{case} add page");
+        for ext in ["hwp", "hwpx"] {
+            let path = dir.path().join(format!("label2.{ext}"));
+            s.save(&path)?;
+            let mut r = Session::new()?;
+            r.open(&path)?;
+            assert_eq!(r.page_count()?, 2, "{case} {ext} add page");
+        }
+    }
     Ok(())
 }
 

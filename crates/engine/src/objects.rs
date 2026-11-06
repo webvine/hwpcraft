@@ -12,6 +12,25 @@ pub struct ObjectAddress {
     pub paragraph: usize,
     pub control: usize,
 }
+impl ObjectAddress {
+    /// The top-level table a `page_control_layout` entry is a piece of. Nested
+    /// tables (in cells) carry their host's section/paragraph/control indices and
+    /// differ only by a longer `stableIndex`; header/footer tables are not body
+    /// objects. Both give `None`.
+    pub fn top_level_table(entry: &serde_json::Value) -> Option<Self> {
+        if entry["type"] != "table"
+            || entry.get("headerFooter").is_some()
+            || entry["stableIndex"].as_array().map(Vec::len) != Some(3)
+        {
+            return None;
+        }
+        Some(Self {
+            section: entry["secIdx"].as_u64()? as usize,
+            paragraph: entry["paraIdx"].as_u64()? as usize,
+            control: entry["controlIdx"].as_u64()? as usize,
+        })
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EquationOptions {
@@ -189,6 +208,20 @@ impl Session {
         }
         self.paragraph(self.cursor)?;
         Ok(())
+    }
+    /// Forget the stored lines of the paragraph holding `at`, so the next layout measures
+    /// them again (an object in the line changed its size).
+    pub(crate) fn drop_stored_lines(&mut self, at: ObjectAddress) {
+        if let Some(para) = self
+            .core
+            .document_mut()
+            .sections
+            .get_mut(at.section)
+            .and_then(|sec| sec.paragraphs.get_mut(at.paragraph))
+        {
+            para.line_segs.clear();
+            para.invalidate_layout_inputs();
+        }
     }
     pub(crate) fn object(&self, at: ObjectAddress) -> Result<&Control> {
         self.core

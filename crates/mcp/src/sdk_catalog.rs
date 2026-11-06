@@ -51,12 +51,7 @@ pub(crate) fn static_resource(uri: &str) -> Option<Value> {
         "hwpcraft://commands" => crate::catalog::commands(""),
         "hwpcraft://hwp-actions" => crate::catalog::actions(""),
         "hwpcraft://capabilities" => {
-            let commands = crate::catalog::commands("");
-            let ids: Vec<_> = commands
-                .as_array()?
-                .iter()
-                .filter_map(|entry| entry["id"].as_str())
-                .collect();
+            let ids = crate::catalog::command_ids();
             json!({
                 "engineVersion":hwpcraft_engine::VERSION.trim(),
                 "commandCount":ids.len(),"commands":ids,

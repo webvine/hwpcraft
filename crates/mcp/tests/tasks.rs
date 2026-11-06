@@ -179,3 +179,68 @@ async fn long_file_tools_become_tasks_only_for_clients_that_declare_the_extensio
         .await;
     assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
 }
+
+/// One tools/call line with a fixed id, as a pipelining client writes it.
+fn call_line(id: u64, name: &str, arguments: Value) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+        "params":{"name":name,"arguments":arguments,"_meta":meta(true)}}))
+    .unwrap();
+    line.push(b'\n');
+    line
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_save_sent_as_a_task_keeps_its_place_before_a_later_edit() {
+    for round in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = Client::start();
+        let created = client.tool("new_document", json!({}), true).await;
+        let doc = created["result"]["structuredContent"]["document_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        client
+            .tool("type_text", json!({"document_id":doc,"text":"앞"}), true)
+            .await;
+        let path = dir.path().join("order.hwpx");
+        // The save (a task) and a later edit go out together, before any answer.
+        let mut both = call_line(
+            1001,
+            "save_document",
+            json!({"document_id":doc,"path":path.to_str().unwrap()}),
+        );
+        both.extend(call_line(
+            1002,
+            "type_text",
+            json!({"document_id":doc,"text":" 뒤"}),
+        ));
+        client.input.write_all(&both).await.unwrap();
+        client.input.flush().await.unwrap();
+        let mut task_id = None;
+        let mut edited = false;
+        tokio::time::timeout(DEADLINE, async {
+            while task_id.is_none() || !edited {
+                let mut text = String::new();
+                assert_ne!(client.output.read_line(&mut text).await.unwrap(), 0);
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["id"] == 1001 {
+                    assert_eq!(value["result"]["resultType"], "task", "{value}");
+                    task_id = value["result"]["taskId"].as_str().map(str::to_owned);
+                } else if value["id"] == 1002 {
+                    edited = true;
+                }
+            }
+        })
+        .await
+        .expect("answers");
+        let done = client.settle(&task_id.unwrap()).await;
+        assert_eq!(done["status"], "completed", "{done}");
+        let mut saved = hwpcraft_engine::Session::new().unwrap();
+        saved.open(&path).unwrap();
+        assert_eq!(
+            saved.text(),
+            "앞",
+            "round {round}: the later edit reached the save"
+        );
+    }
+}

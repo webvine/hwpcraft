@@ -9,7 +9,12 @@ anyhow.workspace = true
 hwpcraft-doc.workspace = true
 # The workspace forbids unsafe code; this crate alone may memory-map system
 # font files once (user decision 2026-10-26), each use marked `allow(unsafe_code)`.
+# Printing on Windows draws through GDI (print_windows.rs), and `cursor_screen_position`
+# asks Windows where the mouse is: the only other unsafe uses.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Printing", "Win32_Storage_Xps", "Win32_UI_WindowsAndMessaging"] }
 [lints.rust]
 unsafe_code = "deny"
 [dev-dependencies]
 hwpcraft-formats.workspace = true
+tempfile.workspace = true

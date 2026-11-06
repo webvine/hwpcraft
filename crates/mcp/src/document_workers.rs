@@ -142,10 +142,16 @@ enum Operation {
     #[cfg(test)]
     InvalidateRollback,
 }
+/// Tests: the window PDF writer panics when it writes this path.
+#[cfg(test)]
+pub(crate) static PANIC_PDF_WRITER_AT: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
 struct Job {
     operation: Operation,
     cancel: CancellationToken,
     reply: oneshot::Sender<Result<Value>>,
+    /// The AI run whose request queued it (`ai_gate::AI_RUN`).
+    ai_run: Option<u64>,
 }
 
 pub(crate) struct DocumentWorkers {
@@ -186,6 +192,7 @@ impl DocumentWorkers {
                 .iter()
                 .filter(|(_, worker)| {
                     worker.state.load(Ordering::Acquire) == ACTIVE
+                        && worker.external.is_none()
                         && worker.activity.evictable(self.idle_eviction)
                 })
                 .map(|(id, worker)| (worker.activity.last_used(), id.clone(), worker.clone()))
@@ -229,7 +236,7 @@ impl DocumentWorkers {
     ) -> Result<(Option<String>, Value)> {
         match self.create_inner(tool, args, cancel).await {
             Ok(result) => Ok(result),
-            Err(error) => Ok((None, error_result(&error.to_string()))),
+            Err(error) => Ok((None, error_result(&format!("{error:#}")))),
         }
     }
 
@@ -350,8 +357,13 @@ impl DocumentWorkers {
                 operation: Operation::Panic,
                 cancel: CancellationToken::new(),
                 reply,
+                ai_run: None,
             })
             .map_err(|_| anyhow!("queue full"))
+    }
+    /// Whether `id` names an open document.
+    pub(crate) fn exists(&self, id: &str) -> bool {
+        self.lookup(id).is_ok()
     }
     fn lookup(&self, id: &str) -> Result<Worker> {
         let mut registry = self
@@ -473,11 +485,19 @@ impl DocumentWorkers {
         &self,
         wake: Wake,
         info: ExternalInfo,
+        replacing: Option<&ExternalDocument>,
     ) -> Result<ExternalDocument> {
         let mut registry = self
             .registry
             .lock()
             .map_err(|_| anyhow!("문서 목록을 사용할 수 없습니다."))?;
+        // The window's next document takes the place of the one it replaces, so a
+        // full server cannot leave the window without an id.
+        if let Some(old) = replacing {
+            old.state.store(CLOSED, Ordering::Release);
+            registry.remove(&old.id);
+            self.subscriptions.closed(&old.id);
+        }
         registry.retain(|_, worker| worker.state.load(Ordering::Acquire) != CLOSED);
         if registry.len() >= MAX_DOCUMENTS {
             bail!("문서는 동시에 16개까지 열 수 있습니다.");
@@ -549,8 +569,14 @@ impl ExternalDocument {
         }
     }
     /// Run queued jobs on `backend` until none is left or `budget` has passed
-    /// (at least one runs). Returns how many ran.
-    pub(crate) fn serve(&mut self, backend: &mut Headless, budget: Duration) -> usize {
+    /// (at least one runs). Returns how many ran. A job an AI request queued runs
+    /// only while its run is `ai_run` (the open run, or the one being drained).
+    pub(crate) fn serve(
+        &mut self,
+        backend: &mut Headless,
+        budget: Duration,
+        ai_run: Option<u64>,
+    ) -> usize {
         let started = Instant::now();
         let mut served = 0;
         loop {
@@ -569,6 +595,14 @@ impl ExternalDocument {
                 break;
             };
             served += 1;
+            if job.ai_run.is_some() && job.ai_run != ai_run {
+                let _done = JobDone {
+                    activity: &self.activity,
+                    touch: false,
+                };
+                let _ = job.reply.send(Ok(error_result(crate::ai_gate::RUN_ENDED)));
+                continue;
+            }
             match window_pdf_path(&job) {
                 Some(path) if self.state.load(Ordering::Acquire) != CLOSED => {
                     self.pdf = self.start_pdf(backend, job, path);
@@ -659,17 +693,30 @@ impl ExternalDocument {
                         let activity = self.activity.clone();
                         std::thread::spawn(move || {
                             let token = job.cancel.clone();
-                            let written = hwpcraft_formats::file_access::confine(
-                                roots.as_ref(),
-                                || -> Result<()> {
-                                    let _scope =
-                                        hwpcraft_formats::file_access::cancel_scope(move || {
-                                            token.is_cancelled()
-                                        });
-                                    let bytes = pdf.convert()?;
-                                    hwpcraft_formats::atomic_write(&path, &bytes)
-                                },
-                            );
+                            // A panic here would drop the reply; answer it as a
+                            // failure instead (the payload may hold document text).
+                            let written = catch_unwind(AssertUnwindSafe(|| {
+                                hwpcraft_formats::file_access::confine(
+                                    roots.as_ref(),
+                                    || -> Result<()> {
+                                        let _scope = hwpcraft_formats::file_access::cancel_scope(
+                                            move || token.is_cancelled(),
+                                        );
+                                        #[cfg(test)]
+                                        if PANIC_PDF_WRITER_AT
+                                            .lock()
+                                            .is_ok_and(|at| at.as_deref() == Some(path.as_path()))
+                                        {
+                                            std::panic::resume_unwind(Box::new(
+                                                "private-test-pdf-writer-panic",
+                                            ));
+                                        }
+                                        let bytes = pdf.convert()?;
+                                        hwpcraft_formats::atomic_write(&path, &bytes)
+                                    },
+                                )
+                            }))
+                            .unwrap_or_else(|_| Err(anyhow!("PDF를 만들다 내부 오류가 났습니다.")));
                             let _done = JobDone {
                                 activity: &activity,
                                 touch: true,
@@ -835,6 +882,7 @@ async fn dispatch(
             operation,
             cancel: cancel.clone(),
             reply,
+            ai_run: crate::ai_gate::current_ai_run(),
         })
         .inspect_err(|_| {
             worker.activity.pending.fetch_sub(1, Ordering::AcqRel);
@@ -856,7 +904,11 @@ async fn dispatch(
         .await
         .ok_or_else(cancelled)?
         .map_err(|_| {
-            worker.state.store(CLOSED, Ordering::Release);
+            // A headless worker that dropped a reply is gone. The window's document
+            // stays: only that request was lost (see the window PDF writer).
+            if worker.external.is_none() {
+                worker.state.store(CLOSED, Ordering::Release);
+            }
             anyhow!("문서 worker가 종료돼 요청을 완료하지 못했습니다.")
         })?;
     check_cancel(&cancel)?;
@@ -952,7 +1004,7 @@ fn process(
                 state.store(CLOSED, Ordering::Release);
                 (tools::result(json!({"closed":true}), false), true)
             }
-            Err(error) => (error_result(&error.to_string()), false),
+            Err(error) => (error_result(&format!("{error:#}")), false),
         },
         Operation::Evict { idle } => {
             let quiet =
@@ -995,7 +1047,7 @@ fn process(
             (
                 match result {
                     Ok(()) => tools::result(json!({"unexpectedRestoreSuccess":true}), false),
-                    Err(error) => error_result(&error.to_string()),
+                    Err(error) => error_result(&format!("{error:#}")),
                 },
                 false,
             )
@@ -1028,7 +1080,7 @@ mod tests {
 
     fn data(result: Value) -> Value {
         assert_eq!(result["isError"], false, "{result}");
-        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+        tools::take_data(result)
     }
     async fn document(workers: &DocumentWorkers) -> String {
         let (id, result) = workers
@@ -1050,7 +1102,8 @@ mod tests {
                 .try_send(Job {
                     operation,
                     cancel,
-                    reply
+                    reply,
+                    ai_run: None,
                 })
                 .is_ok()
         );
@@ -1089,6 +1142,32 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_window_document_is_never_evicted_to_make_room() {
+        let workers = DocumentWorkers::new(None).with_idle_eviction(Duration::from_millis(200));
+        // The window's document is the oldest; its window never serves here.
+        let window = workers
+            .attach_external(Arc::new(|| {}), ExternalInfo::default(), None)
+            .unwrap();
+        let mut clean = Vec::new();
+        for _ in 1..MAX_DOCUMENTS {
+            clean.push(document(&workers).await);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let replacement = tokio::time::timeout(Duration::from_secs(10), document(&workers))
+            .await
+            .expect("making room waited on the window");
+        assert!(workers.lookup(&replacement).is_ok());
+        assert!(
+            workers.lookup(window.id()).is_ok(),
+            "window document closed"
+        );
+        assert!(
+            workers.lookup(&clean[0]).is_err(),
+            "oldest MCP document kept"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

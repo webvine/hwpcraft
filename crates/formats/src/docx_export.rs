@@ -780,8 +780,9 @@ impl<'a> Writer<'a> {
                 for c in value["controls"].as_array().into_iter().flatten() {
                     // Body level only: cell, header/footer and note objects carry more keys.
                     if !matches!(c["type"].as_str(), Some("shape" | "ole"))
-                        || c.get("cellIdx").is_some()
-                        || c.get("hf").is_some()
+                        || ["cellIdx", "headerFooter", "noteRef"]
+                            .iter()
+                            .any(|k| c.get(k).is_some())
                     {
                         continue;
                     }
